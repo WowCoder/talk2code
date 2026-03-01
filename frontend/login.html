@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>登录 - Vibe Coding</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .form-container {
+            backdrop-filter: blur(10px);
+            background: rgba(255, 255, 255, 0.95);
+        }
+        .tab-btn {
+            transition: all 0.3s ease;
+        }
+        .tab-btn.active {
+            color: #667eea;
+            border-bottom-color: #667eea;
+        }
+    </style>
+</head>
+<body class="min-h-screen flex items-center justify-center p-4">
+    <div class="form-container rounded-2xl shadow-2xl p-8 w-full max-w-md">
+        <!-- 标题 -->
+        <h1 class="text-3xl font-bold text-center text-gray-800 mb-2">Vibe Coding</h1>
+        <p class="text-center text-gray-500 mb-8">AI 驱动的代码生成平台</p>
+
+        <!-- 切换标签 -->
+        <div class="flex mb-8 border-b">
+            <button id="loginTab" class="tab-btn active flex-1 pb-3 font-medium border-b-2">登录</button>
+            <button id="registerTab" class="tab-btn flex-1 pb-3 font-medium border-b-2 border-transparent">注册</button>
+        </div>
+
+        <!-- 错误提示 -->
+        <div id="errorMsg" class="hidden bg-red-50 text-red-600 px-4 py-3 rounded-lg mb-4 text-sm"></div>
+
+        <!-- 成功提示 -->
+        <div id="successMsg" class="hidden bg-green-50 text-green-600 px-4 py-3 rounded-lg mb-4 text-sm"></div>
+
+        <!-- 登录表单 -->
+        <form id="loginForm" class="space-y-5">
+            <div>
+                <label class="block text-gray-700 text-sm font-medium mb-2">用户名</label>
+                <input
+                    type="text"
+                    id="loginUsername"
+                    class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500 transition-all"
+                    placeholder="请输入用户名"
+                    required
+                />
+            </div>
+            <div>
+                <label class="block text-gray-700 text-sm font-medium mb-2">密码</label>
+                <input
+                    type="password"
+                    id="loginPassword"
+                    class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500 transition-all"
+                    placeholder="请输入密码"
+                    required
+                />
+            </div>
+            <button
+                type="submit"
+                class="w-full py-3 bg-gradient-to-r from-purple-500 to-indigo-600 text-white rounded-lg font-medium hover:from-purple-600 hover:to-indigo-700 transition-all transform hover:scale-[1.02]"
+            >
+                登录
+            </button>
+        </form>
+
+        <!-- 注册表单 -->
+        <form id="registerForm" class="hidden space-y-5">
+            <div>
+                <label class="block text-gray-700 text-sm font-medium mb-2">用户名</label>
+                <input
+                    type="text"
+                    id="registerUsername"
+                    class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500 transition-all"
+                    placeholder="至少 3 个字符"
+                    required
+                    minlength="3"
+                />
+            </div>
+            <div>
+                <label class="block text-gray-700 text-sm font-medium mb-2">密码</label>
+                <input
+                    type="password"
+                    id="registerPassword"
+                    class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500 transition-all"
+                    placeholder="至少 6 个字符"
+                    required
+                    minlength="6"
+                />
+            </div>
+            <div>
+                <label class="block text-gray-700 text-sm font-medium mb-2">确认密码</label>
+                <input
+                    type="password"
+                    id="registerConfirm"
+                    class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500 transition-all"
+                    placeholder="再次输入密码"
+                    required
+                />
+            </div>
+            <button
+                type="submit"
+                class="w-full py-3 bg-gradient-to-r from-purple-500 to-indigo-600 text-white rounded-lg font-medium hover:from-purple-600 hover:to-indigo-700 transition-all transform hover:scale-[1.02]"
+            >
+                注册
+            </button>
+        </form>
+
+        <!-- 测试账号提示 -->
+        <div class="mt-6 p-4 bg-gray-50 rounded-lg">
+            <p class="text-xs text-gray-500 text-center">
+                测试账号：<span class="font-mono">test</span> / <span class="font-mono">123456</span>
+            </p>
+        </div>
+    </div>
+
+    <script>
+        // API 基础地址 - 后端运行在 5001 端口
+        const API_BASE = 'http://localhost:5001';
+
+        // DOM 元素
+        const loginTab = document.getElementById('loginTab');
+        const registerTab = document.getElementById('registerTab');
+        const loginForm = document.getElementById('loginForm');
+        const registerForm = document.getElementById('registerForm');
+        const errorMsg = document.getElementById('errorMsg');
+        const successMsg = document.getElementById('successMsg');
+
+        // 切换标签
+        loginTab.addEventListener('click', () => {
+            loginTab.classList.add('active');
+            registerTab.classList.remove('active');
+            loginForm.classList.remove('hidden');
+            registerForm.classList.add('hidden');
+            hideMessages();
+        });
+
+        registerTab.addEventListener('click', () => {
+            registerTab.classList.add('active');
+            loginTab.classList.remove('active');
+            registerForm.classList.remove('hidden');
+            loginForm.classList.add('hidden');
+            hideMessages();
+        });
+
+        // 隐藏消息
+        function hideMessages() {
+            errorMsg.classList.add('hidden');
+            successMsg.classList.add('hidden');
+        }
+
+        // 显示错误
+        function showError(message) {
+            errorMsg.textContent = message;
+            errorMsg.classList.remove('hidden');
+            setTimeout(hideMessages, 5000);
+        }
+
+        // 显示成功
+        function showSuccess(message) {
+            successMsg.textContent = message;
+            successMsg.classList.remove('hidden');
+            setTimeout(() => {
+                hideMessages();
+                loginTab.click();
+            }, 1500);
+        }
+
+        // 登录
+        loginForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const username = document.getElementById('loginUsername').value.trim();
+            const password = document.getElementById('loginPassword').value;
+
+            try {
+                const response = await fetch(`${API_BASE}/api/login`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    // 保存 Token
+                    localStorage.setItem('token', data.token);
+                    localStorage.setItem('user', JSON.stringify(data.user));
+                    // 跳转到首页
+                    window.location.href = '/index.html';
+                } else {
+                    showError(data.error || '登录失败');
+                }
+            } catch (error) {
+                showError('网络错误，请稍后重试');
+                console.error(error);
+            }
+        });
+
+        // 注册
+        registerForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const username = document.getElementById('registerUsername').value.trim();
+            const password = document.getElementById('registerPassword').value;
+            const confirm = document.getElementById('registerConfirm').value;
+
+            if (password !== confirm) {
+                showError('两次输入的密码不一致');
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE}/api/register`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    showSuccess('注册成功，请登录');
+                } else {
+                    showError(data.error || '注册失败');
+                }
+            } catch (error) {
+                showError('网络错误，请稍后重试');
+                console.error(error);
+            }
+        });
+
+        // 检查是否已登录
+        document.addEventListener('DOMContentLoaded', () => {
+            const token = localStorage.getItem('token');
+            if (token) {
+                window.location.href = '/index.html';
+            }
+        });
+    </script>
+</body>
+</html>

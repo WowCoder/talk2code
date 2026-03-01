@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vibe Coding 智能生成</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+        }
+        .input-focus:focus {
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.3);
+        }
+        .btn-gradient {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .btn-gradient:hover {
+            background: linear-gradient(135deg, #5a6fd6 0%, #6a4190 100%);
+        }
+    </style>
+</head>
+<body class="min-h-screen flex items-center justify-center p-4">
+    <div class="w-full max-w-4xl">
+        <!-- 顶部导航 -->
+        <div class="flex justify-between items-center mb-8">
+            <h1 class="text-5xl font-bold text-gray-800">
+                Vibe Coding 智能生成
+            </h1>
+            <button
+                onclick="showMyApps()"
+                class="px-6 py-3 bg-white text-purple-600 rounded-xl font-semibold shadow-md hover:shadow-lg transition-all flex items-center gap-2"
+            >
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/>
+                </svg>
+                我的应用
+            </button>
+        </div>
+        <p class="text-center text-gray-500 mb-12 text-lg">
+            输入你的产品需求，AI 将实时生成可运行的代码
+        </p>
+
+        <!-- 错误提示 -->
+        <div id="errorMsg" class="hidden bg-red-50 text-red-600 px-4 py-3 rounded-lg mb-6 text-center"></div>
+
+        <!-- 需求输入框 -->
+        <div class="bg-white rounded-2xl shadow-xl p-8">
+            <textarea
+                id="requirementInput"
+                class="w-full h-40 px-6 py-4 border-2 border-gray-200 rounded-xl focus:outline-none focus:border-purple-400 input-focus resize-none text-lg text-gray-700"
+                placeholder="输入你的产品需求，如：开发一个待办清单 App，支持增删改查"
+            ></textarea>
+
+            <!-- 提交按钮 -->
+            <div class="text-center mt-6">
+                <button
+                    id="submitBtn"
+                    class="btn-gradient px-12 py-4 text-white rounded-xl font-semibold text-lg transition-all transform hover:scale-[1.02] disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
+                    disabled
+                >
+                    <span id="btnText">生成代码</span>
+                    <span id="btnLoading" class="hidden">
+                        <svg class="animate-spin inline-block h-5 w-5 mr-2" viewBox="0 0 24 24">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/>
+                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"/>
+                        </svg>
+                        正在提交...
+                    </span>
+                </button>
+            </div>
+        </div>
+
+        <!-- 使用提示 -->
+        <div class="mt-12 text-center">
+            <p class="text-gray-500 text-sm mb-4">💡 试试这样描述你的需求：</p>
+            <div class="flex flex-wrap justify-center gap-3">
+                <span class="px-4 py-2 bg-white rounded-full text-sm text-gray-600 shadow-sm">开发一个待办清单 App，支持增删改查</span>
+                <span class="px-4 py-2 bg-white rounded-full text-sm text-gray-600 shadow-sm">做一个计算器应用</span>
+                <span class="px-4 py-2 bg-white rounded-full text-sm text-gray-600 shadow-sm">创建一个笔记应用，支持保存和分类</span>
+            </div>
+        </div>
+
+        <!-- 我的应用弹窗 -->
+        <div id="myAppsModal" class="hidden fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+            <div class="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[80vh] overflow-hidden">
+                <!-- 弹窗头部 -->
+                <div class="flex justify-between items-center px-6 py-4 border-b border-gray-200">
+                    <h2 class="text-2xl font-bold text-gray-800">我的应用</h2>
+                    <button onclick="closeMyApps()" class="text-gray-400 hover:text-gray-600 transition-colors">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                        </svg>
+                    </button>
+                </div>
+                <!-- 弹窗内容 -->
+                <div id="appsList" class="p-6 overflow-y-auto max-h-[60vh]">
+                    <div class="text-center text-gray-500 py-8">加载中...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // API 基础地址 - 后端运行在 5001 端口
+        const API_BASE = 'http://localhost:5001';
+
+        // 页面加载完成后初始化
+        document.addEventListener('DOMContentLoaded', function() {
+            // DOM 元素
+            const requirementInput = document.getElementById('requirementInput');
+            const submitBtn = document.getElementById('submitBtn');
+            const btnText = document.getElementById('btnText');
+            const btnLoading = document.getElementById('btnLoading');
+            const errorMsg = document.getElementById('errorMsg');
+
+            // 检查登录状态
+            function checkAuth() {
+                const token = localStorage.getItem('token');
+                if (!token) {
+                    window.location.href = '/login.html';
+                    return false;
+                }
+                return true;
+            }
+
+            // 页面加载时检查登录状态
+            if (!checkAuth()) return;
+
+            console.log('页面已加载，按钮初始状态:', submitBtn.disabled);
+            console.log('输入框元素:', requirementInput);
+
+            // 隐藏错误消息
+            function hideError() {
+                errorMsg.classList.add('hidden');
+            }
+
+            // 显示错误消息
+            function showError(message) {
+                errorMsg.textContent = message;
+                errorMsg.classList.remove('hidden');
+                setTimeout(hideError, 5000);
+            }
+
+            // 设置按钮加载状态
+            function setLoading(loading) {
+                if (loading) {
+                    btnText.classList.add('hidden');
+                    btnLoading.classList.remove('hidden');
+                    submitBtn.disabled = true;
+                } else {
+                    btnText.classList.remove('hidden');
+                    btnLoading.classList.add('hidden');
+                    submitBtn.disabled = false;
+                }
+            }
+
+            // 提交需求
+            async function submitRequirement() {
+                const content = requirementInput.value.trim();
+                if (!content) return;
+
+                setLoading(true);
+                hideError();
+
+                const token = localStorage.getItem('token');
+
+                try {
+                    const response = await fetch(`${API_BASE}/api/requirements`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${token}`
+                        },
+                        body: JSON.stringify({ content })
+                    });
+
+                    const data = await response.json();
+
+                    if (response.ok) {
+                        // 存储需求信息，跳转到详情页
+                        sessionStorage.setItem('currentRequirementId', data.requirement.id);
+                        window.location.href = `/detail.html?id=${data.requirement.id}`;
+                    } else {
+                        showError(data.error || '提交失败，请重试');
+                        setLoading(false);
+                    }
+                } catch (error) {
+                    showError('网络错误，请稍后重试');
+                    console.error(error);
+                    setLoading(false);
+                }
+            }
+
+            // 输入框状态监听 - 关键修复：确保每次输入都更新按钮状态
+            requirementInput.addEventListener('input', function() {
+                const hasContent = requirementInput.value.trim().length > 0;
+                submitBtn.disabled = !hasContent;
+                console.log('输入内容:', requirementInput.value.trim().length, '按钮状态:', submitBtn.disabled);
+            });
+
+            // 提交按钮点击
+            submitBtn.addEventListener('click', submitRequirement);
+
+            // 回车提交（Ctrl+Enter）
+            requirementInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && e.ctrlKey) {
+                    submitRequirement();
+                }
+            });
+
+            // 显示我的应用
+            window.showMyApps = async function() {
+                const modal = document.getElementById('myAppsModal');
+                const appsList = document.getElementById('appsList');
+                modal.classList.remove('hidden');
+                appsList.innerHTML = '<div class="text-center text-gray-500 py-8">加载中...</div>';
+
+                const token = localStorage.getItem('token');
+                try {
+                    const response = await fetch(`${API_BASE}/api/requirements`, {
+                        headers: {
+                            'Authorization': `Bearer ${token}`
+                        }
+                    });
+
+                    const data = await response.json();
+                    const requirements = data.requirements || [];
+
+                    if (requirements.length === 0) {
+                        appsList.innerHTML = `
+                            <div class="text-center text-gray-500 py-12">
+                                <svg class="w-16 h-16 mx-auto mb-4 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/>
+                                </svg>
+                                <p>暂无应用，创建一个吧！</p>
+                            </div>
+                        `;
+                        return;
+                    }
+
+                    appsList.innerHTML = requirements.map(req => {
+                        const statusColor = {
+                            'pending': 'yellow',
+                            'processing': 'blue',
+                            'finished': 'green',
+                            'failed': 'red'
+                        }[req.status] || 'gray';
+
+                        const statusText = {
+                            'pending': '处理中',
+                            'processing': '生成中',
+                            'finished': '已完成',
+                            'failed': '失败'
+                        }[req.status] || req.status;
+
+                        return `
+                            <div class="border border-gray-200 rounded-xl p-4 mb-3 hover:shadow-md transition-shadow cursor-pointer" onclick="goToRequirement(${req.id})">
+                                <div class="flex justify-between items-center">
+                                    <div class="flex-1">
+                                        <h3 class="font-semibold text-gray-800 text-lg">${escapeHtml(req.title)}</h3>
+                                        <p class="text-sm text-gray-500 mt-1">创建于 ${formatTime(req.create_time)}</p>
+                                    </div>
+                                    <span class="px-3 py-1 bg-${statusColor}-100 text-${statusColor}-700 rounded-full text-sm font-medium">
+                                        ${statusText}
+                                    </span>
+                                </div>
+                            </div>
+                        `;
+                    }).join('');
+
+                } catch (error) {
+                    appsList.innerHTML = '<div class="text-center text-red-500 py-8">加载失败，请重试</div>';
+                    console.error('加载应用列表失败:', error);
+                }
+            };
+
+            // 关闭我的应用
+            window.closeMyApps = function() {
+                document.getElementById('myAppsModal').classList.add('hidden');
+            };
+
+            // 跳转到需求详情
+            window.goToRequirement = function(id) {
+                window.location.href = `/detail.html?id=${id}`;
+            };
+
+            // 格式化时间
+            window.formatTime = function(timeStr) {
+                if (!timeStr) return '未知';
+                const date = new Date(timeStr);
+                return date.toLocaleString('zh-CN');
+            };
+
+            // 转义 HTML
+            window.escapeHtml = function(text) {
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            };
+
+            // 点击弹窗外部关闭
+            document.getElementById('myAppsModal').addEventListener('click', (e) => {
+                if (e.target === e.currentTarget) {
+                    window.closeMyApps();
+                }
+            });
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,971 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>需求详情 - Vibe Coding</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- CodeMirror 核心 -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/theme/dracula.min.css">
+    <style>
+        /* 左右分栏布局 */
+        .split-container {
+            display: grid;
+            grid-template-columns: 40% 60%;
+            height: calc(100vh - 80px);
+            gap: 16px;
+        }
+
+        /* 左侧 AI 对话面板 */
+        .dialogue-panel {
+            background: #ffffff;
+            border-radius: 12px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* 右侧代码面板 */
+        .code-panel {
+            background: #1a1a2e;
+            border-radius: 12px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* 对话流样式 */
+        .dialogue-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+        }
+
+        .message {
+            margin-bottom: 16px;
+            animation: fadeIn 0.3s ease;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .message-user {
+            display: flex;
+            justify-content: flex-end;
+        }
+
+        .message-user .message-content {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 12px 16px;
+            border-radius: 12px 12px 0 12px;
+            max-width: 85%;
+        }
+
+        .message-agent {
+            display: flex;
+            justify-content: flex-start;
+        }
+
+        .message-agent .message-content {
+            background: #f3f4f6;
+            color: #1f2937;
+            padding: 12px 16px;
+            border-radius: 12px 12px 12px 0;
+            max-width: 90%;
+        }
+
+        .message-agent .agent-name {
+            font-size: 12px;
+            color: #667eea;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .message-system {
+            display: flex;
+            justify-content: center;
+        }
+
+        .message-system .message-content {
+            background: #e0e7ff;
+            color: #4338ca;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 13px;
+        }
+
+        /* CodeMirror 覆盖样式 */
+        .CodeMirror {
+            height: 100%;
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;
+            font-size: 14px;
+        }
+
+        /* 文件标签 */
+        .file-tabs {
+            display: flex;
+            background: #0f0f1a;
+            padding: 8px 12px 0;
+            gap: 4px;
+        }
+
+        .file-tab {
+            padding: 8px 16px;
+            background: transparent;
+            color: #888;
+            border: none;
+            border-radius: 8px 8px 0 0;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 13px;
+        }
+
+        .file-tab:hover {
+            background: #2a2a3e;
+            color: #fff;
+        }
+
+        .file-tab.active {
+            background: #1a1a2e;
+            color: #fff;
+        }
+
+        /* 进度条 */
+        .progress-bar {
+            height: 3px;
+            background: #2a2a3e;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+            transition: width 0.3s ease;
+        }
+
+        /* 工具栏 */
+        .toolbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 12px;
+            background: #0f0f1a;
+            border-radius: 8px;
+            margin: 8px;
+        }
+
+        .toolbar-group {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .toolbar-btn {
+            padding: 6px 12px;
+            background: #2a2a3e;
+            color: #fff;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.2s;
+        }
+
+        .toolbar-btn:hover {
+            background: #3a3a4e;
+        }
+
+        .toolbar-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        /* 滚动条美化 */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #1a1a2e;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #4a4a6a;
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #5a5a7a;
+        }
+
+        /* 打字机光标效果 */
+        .typing-cursor::after {
+            content: '|';
+            animation: blink 1s infinite;
+        }
+
+        @keyframes blink {
+            0%, 50% { opacity: 1; }
+            51%, 100% { opacity: 0; }
+        }
+
+        /* Tab 切换样式 */
+        .code-tabs {
+            display: flex;
+            background: #0f0f1a;
+            padding: 8px 12px;
+            gap: 8px;
+            margin: 8px 8px 0;
+            border-radius: 8px 8px 0 0;
+        }
+
+        .code-tab {
+            padding: 8px 20px;
+            background: #2a2a3e;
+            color: #888;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+
+        .code-tab:hover {
+            background: #3a3a4e;
+            color: #fff;
+        }
+
+        .code-tab.active {
+            background: #667eea;
+            color: #fff;
+        }
+
+        .editor-container {
+            flex: 1;
+            min-height: 400px;
+            overflow: hidden;
+        }
+
+        .editor-container.hidden,
+        .preview-container.hidden,
+        .code-tab-content.hidden,
+        .preview-tab-content.hidden {
+            display: none !important;
+        }
+
+        .preview-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-height: 400px;
+            padding: 8px;
+        }
+
+        .preview-frame {
+            flex: 1;
+            width: 100%;
+            border: none;
+            background: #fff;
+            border-radius: 8px;
+        }
+
+        /* TAB 内容容器 */
+        .code-tab-content,
+        .preview-tab-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+    </style>
+</head>
+<body class="bg-gray-900 min-h-screen">
+    <!-- 顶部导航 -->
+    <header class="bg-gray-800 px-6 py-4 flex items-center justify-between">
+        <div class="flex items-center gap-4">
+            <a href="/index.html" class="text-white hover:text-gray-300 transition-colors">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+                </svg>
+            </a>
+            <h1 id="requirementTitle" class="text-white font-semibold text-lg truncate max-w-xl">
+                需求详情
+            </h1>
+        </div>
+        <div class="flex items-center gap-3">
+            <button onclick="refreshPage()" class="px-4 py-2 text-gray-300 hover:text-white transition-colors">
+                刷新
+            </button>
+            <button onclick="logout()" class="px-4 py-2 text-gray-300 hover:text-white transition-colors">
+                退出登录
+            </button>
+        </div>
+    </header>
+
+    <!-- 主内容区 -->
+    <main class="p-4">
+        <div class="split-container">
+            <!-- 左侧 AI 对话面板 -->
+            <div class="dialogue-panel">
+                <div class="px-4 py-3 border-b border-gray-200 flex items-center justify-between">
+                    <h2 class="font-semibold text-gray-800">AI 对话</h2>
+                    <span id="agentStatus" class="text-xs text-gray-500">等待中...</span>
+                </div>
+                <div id="dialogueContainer" class="dialogue-container">
+                    <!-- 对话内容动态生成 -->
+                    <div class="text-center text-gray-400 py-8">
+                        <p>正在初始化智能体...</p>
+                    </div>
+                </div>
+                <!-- 持续对话输入框 -->
+                <div class="px-4 py-3 border-t border-gray-200 bg-gray-50">
+                    <div class="flex gap-2">
+                        <input
+                            type="text"
+                            id="chatInput"
+                            placeholder="输入消息继续对话..."
+                            class="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500"
+                            onkeypress="handleChatKeypress(event)"
+                        />
+                        <button
+                            id="sendBtn"
+                            onclick="sendChatMessage()"
+                            class="px-6 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors disabled:opacity-50"
+                        >
+                            发送
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 右侧代码文件面板 -->
+            <div class="code-panel">
+                <!-- 进度条 -->
+                <div class="progress-bar">
+                    <div id="progressFill" class="progress-fill" style="width: 0%"></div>
+                </div>
+
+                <!-- 代码/预览 TAB 切换 -->
+                <div class="code-tabs">
+                    <button class="code-tab active" data-tab="code" onclick="switchTab('code')">代码</button>
+                    <button class="code-tab" data-tab="preview" onclick="switchTab('preview')">预览</button>
+                </div>
+
+                <!-- 代码 TAB 内容 -->
+                <div id="codeTabContent" class="flex-1 flex flex-col">
+                    <!-- 文件标签 -->
+                    <div id="fileTabs" class="file-tabs">
+                        <!-- 文件标签动态生成 -->
+                    </div>
+
+                    <!-- 工具栏 -->
+                    <div class="toolbar">
+                        <div class="toolbar-group">
+                            <button id="copyBtn" class="toolbar-btn" disabled>复制</button>
+                            <button id="downloadBtn" class="toolbar-btn" disabled>下载</button>
+                        </div>
+                    </div>
+
+                    <!-- 代码编辑器容器 -->
+                    <div id="codeEditorContainer" class="editor-container">
+                        <div id="codeEditor" class="flex-1"></div>
+                    </div>
+                </div>
+
+                <!-- 预览 TAB 内容 -->
+                <div id="previewTabContent" class="flex-1 flex flex-col hidden">
+                    <div class="preview-container">
+                        <div class="preview-header">
+                            <span>实时预览</span>
+                            <button id="refreshPreview" class="text-gray-400 hover:text-white text-xs" onclick="refreshPreview()">刷新预览</button>
+                        </div>
+                        <iframe id="previewFrame" class="preview-frame" sandbox="allow-scripts allow-same-origin allow-forms"></iframe>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- CodeMirror 核心库 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/xml/xml.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/javascript/javascript.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/css/css.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/htmlmixed/htmlmixed.min.js"></script>
+
+    <script>
+        // ==================== 全局状态 ====================
+        // API 基础地址 - 后端运行在 5001 端口
+        const API_BASE = 'http://localhost:5001';
+        let requirementId = null;
+        let sseEventSource = null;
+        let editor = null;
+        let currentFile = null;
+        let codeFiles = {};
+        let isGenerating = true;
+        let dialogueMessages = [];
+
+        // ==================== 初始化 ====================
+        document.addEventListener('DOMContentLoaded', () => {
+            // 获取需求 ID
+            const params = new URLSearchParams(window.location.search);
+            requirementId = params.get('id') || sessionStorage.getItem('currentRequirementId');
+
+            if (!requirementId) {
+                alert('未找到需求信息');
+                window.location.href = '/index.html';
+                return;
+            }
+
+            // 初始化编辑器
+            initEditor();
+
+            // 加载需求数据
+            loadRequirement();
+
+            // 连接 SSE
+            connectSSE();
+
+            // 设置事件监听
+            setupEventListeners();
+        });
+
+        // ==================== 编辑器初始化 ====================
+        function initEditor() {
+            editor = CodeMirror(document.getElementById('codeEditor'), {
+                theme: 'dracula',
+                mode: 'htmlmixed',
+                lineNumbers: true,
+                lineWrapping: true,
+                readOnly: true,
+                scrollbarStyle: 'native',
+                extraKeys: {
+                    'Ctrl-S': function() { downloadCurrentFile(); }
+                }
+            });
+        }
+
+        // ==================== 事件监听设置 ====================
+        function setupEventListeners() {
+            // 复制按钮
+            document.getElementById('copyBtn').addEventListener('click', copyCurrentFile);
+
+            // 下载按钮
+            document.getElementById('downloadBtn').addEventListener('click', downloadCurrentFile);
+
+            // Tab 切换初始化
+            document.querySelectorAll('.code-tab').forEach(tab => {
+                tab.addEventListener('click', (e) => {
+                    switchTab(e.target.dataset.tab);
+                });
+            });
+        }
+
+        // Tab 切换
+        function switchTab(tab) {
+            const codeTabContent = document.getElementById('codeTabContent');
+            const previewTabContent = document.getElementById('previewTabContent');
+            const tabs = document.querySelectorAll('.code-tab');
+
+            tabs.forEach(t => t.classList.remove('active'));
+
+            if (tab === 'code') {
+                codeTabContent.classList.remove('hidden');
+                previewTabContent.classList.add('hidden');
+                document.querySelector('.code-tab[data-tab="code"]').classList.add('active');
+                // 刷新编辑器布局
+                setTimeout(() => editor.refresh(), 100);
+            } else {
+                codeTabContent.classList.add('hidden');
+                previewTabContent.classList.remove('hidden');
+                document.querySelector('.code-tab[data-tab="preview"]').classList.add('active');
+                refreshPreview();
+            }
+        }
+
+        // ==================== 加载需求数据 ====================
+        async function loadRequirement() {
+            const token = localStorage.getItem('token');
+            if (!token) {
+                window.location.href = '/login.html';
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE}/api/requirements/${requirementId}`, {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+
+                if (!response.ok) {
+                    throw new Error('加载失败');
+                }
+
+                const data = await response.json();
+                const req = data.requirement;
+
+                // 设置标题
+                document.getElementById('requirementTitle').textContent = req.title || '需求详情';
+
+                // 加载对话历史
+                if (req.dialogue_history && req.dialogue_history.length > 0) {
+                    dialogueMessages = req.dialogue_history;
+                    renderDialogue();
+                }
+
+                // 加载代码文件
+                if (req.code_files && req.code_files.length > 0) {
+                    codeFiles = {};
+                    req.code_files.forEach(file => {
+                        codeFiles[file.filename] = file.content;
+                    });
+                    renderFileTabs();
+                    if (req.code_files.length > 0) {
+                        switchToFile(req.code_files[0].filename);
+                    }
+                }
+
+                // 检查状态
+                if (req.status === 'finished') {
+                    isGenerating = false;
+                    updateUIForGenerationComplete();
+                } else if (req.status === 'failed') {
+                    showError('生成失败');
+                } else if (req.status === 'processing') {
+                    // 正在处理中，保持禁用状态
+                    isGenerating = true;
+                    document.getElementById('sendBtn').disabled = true;
+                    document.getElementById('agentStatus').textContent = '智能体处理中...';
+                }
+
+            } catch (error) {
+                console.error('加载需求失败:', error);
+                showError('加载需求失败，请刷新页面重试');
+            }
+        }
+
+        // ==================== SSE 连接 ====================
+        function connectSSE() {
+            sseEventSource = new EventSource(`${API_BASE}/api/sse/${requirementId}`);
+
+            sseEventSource.addEventListener('connected', (e) => {
+                console.log('SSE 连接成功');
+            });
+
+            sseEventSource.addEventListener('dialogue', (e) => {
+                const data = JSON.parse(e.data);
+                addDialogueMessage(data);
+            });
+
+            sseEventSource.addEventListener('code', (e) => {
+                const data = JSON.parse(e.data);
+                appendCode(data.filename, data.content);
+            });
+
+            sseEventSource.addEventListener('progress', (e) => {
+                const data = JSON.parse(e.data);
+                updateProgress(data.current_agent, data.progress);
+            });
+
+            sseEventSource.addEventListener('complete', (e) => {
+                const data = JSON.parse(e.data);
+                generationComplete();
+            });
+
+            sseEventSource.onerror = (e) => {
+                console.error('SSE 连接错误');
+                // 不关闭连接，让后端处理重连
+            };
+        }
+
+        // ==================== 对话管理 ====================
+
+        // 检查消息是否已存在
+        function messageExists(newMsg) {
+            return dialogueMessages.some(msg =>
+                msg.role === newMsg.role &&
+                msg.name === newMsg.name &&
+                msg.content === newMsg.content &&
+                msg.timestamp === newMsg.timestamp
+            );
+        }
+
+        function addDialogueMessage(msg) {
+            // 检查消息是否已存在，避免重复添加
+            if (!messageExists(msg)) {
+                dialogueMessages.push(msg);
+                renderDialogue();
+            }
+        }
+
+        function renderDialogue() {
+            const container = document.getElementById('dialogueContainer');
+            container.innerHTML = dialogueMessages.map(msg => {
+                if (msg.role === 'user') {
+                    return `
+                        <div class="message message-user">
+                            <div class="message-content">
+                                <div>${escapeHtml(msg.content)}</div>
+                                <div class="text-xs opacity-75 mt-2">${msg.timestamp || ''}</div>
+                            </div>
+                        </div>
+                    `;
+                } else if (msg.role === 'agent') {
+                    return `
+                        <div class="message message-agent">
+                            <div class="message-content">
+                                <div class="agent-name">🤖 ${escapeHtml(msg.name)}</div>
+                                <div class="whitespace-pre-wrap">${escapeHtml(msg.content)}</div>
+                                <div class="text-xs text-gray-500 mt-2">${msg.timestamp || ''}</div>
+                            </div>
+                        </div>
+                    `;
+                } else if (msg.role === 'system') {
+                    return `
+                        <div class="message message-system">
+                            <div class="message-content">
+                                ${escapeHtml(msg.content)}
+                            </div>
+                        </div>
+                    `;
+                }
+                return '';
+            }).join('');
+
+            // 滚动到底部
+            container.scrollTop = container.scrollHeight;
+        }
+
+        // ==================== 代码管理 ====================
+        function appendCode(filename, content) {
+            if (!codeFiles[filename]) {
+                codeFiles[filename] = '';
+            }
+            codeFiles[filename] += content;
+
+            if (currentFile === filename) {
+                editor.setValue(codeFiles[filename]);
+                editor.scrollTo(editor.lineCount(), 0);
+            }
+
+            updatePreview();
+        }
+
+        function renderFileTabs() {
+            const tabsContainer = document.getElementById('fileTabs');
+            const filenames = Object.keys(codeFiles);
+
+            if (filenames.length === 0) {
+                tabsContainer.innerHTML = '<span class="text-gray-500 text-sm px-4 py-2">暂无文件</span>';
+                return;
+            }
+
+            tabsContainer.innerHTML = filenames.map(filename => `
+                <button class="file-tab ${filename === currentFile ? 'active' : ''}" onclick="switchToFile('${filename}')">
+                    ${getFileIcon(filename)} ${filename}
+                </button>
+            `).join('');
+        }
+
+        function switchToFile(filename) {
+            currentFile = filename;
+            const content = codeFiles[filename] || '';
+
+            editor.setValue(content);
+
+            // 根据文件类型设置模式
+            if (filename.endsWith('.html')) {
+                editor.setOption('mode', 'htmlmixed');
+            } else if (filename.endsWith('.css')) {
+                editor.setOption('mode', 'css');
+            } else if (filename.endsWith('.js')) {
+                editor.setOption('mode', 'javascript');
+            }
+
+            renderFileTabs();
+            updatePreview();
+        }
+
+        function getFileIcon(filename) {
+            if (filename.endsWith('.html')) return '📄';
+            if (filename.endsWith('.css')) return '🎨';
+            if (filename.endsWith('.js')) return '📜';
+            return '📁';
+        }
+
+        // ==================== 进度更新 ====================
+        function updateProgress(agentName, progress) {
+            document.getElementById('progressFill').style.width = progress + '%';
+            document.getElementById('agentStatus').textContent = `${agentName} 工作中...`;
+        }
+
+        // ==================== 生成完成 ====================
+        function generationComplete() {
+            isGenerating = false;
+            updateUIForGenerationComplete();
+            document.getElementById('agentStatus').textContent = '生成完成';
+
+            // 重新加载需求数据确保数据完整
+            setTimeout(loadRequirement, 500);
+        }
+
+        function updateUIForGenerationComplete() {
+            document.getElementById('copyBtn').disabled = false;
+            document.getElementById('downloadBtn').disabled = false;
+        }
+
+        // ==================== 预览功能 ====================
+        function updatePreview() {
+            // 使用 Blob URL 方式刷新预览，避免资源加载问题
+            refreshPreview();
+        }
+
+        // 刷新预览（使用 Blob URL - 最稳定可靠的方案）
+        function refreshPreview() {
+            const html = codeFiles['index.html'] || '';
+            const css = codeFiles['style.css'] || '';
+            const js = codeFiles['script.js'] || '';
+
+            const iframe = document.getElementById('previewFrame');
+
+            // 如果代码为空，不显示内容
+            if (!html && !css && !js) {
+                iframe.src = 'about:blank';
+                return;
+            }
+
+            // 合并 HTML/CSS/JS 为完整的 HTML 文档
+            const previewContent = `
+                <!DOCTYPE html>
+                <html lang="zh-CN">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>预览</title>
+                    <style>
+                        /* 重置样式，避免干扰 */
+                        * { margin: 0; padding: 0; box-sizing: border-box; }
+                        ${css}
+                    </style>
+                </head>
+                <body>
+                    ${html}
+                    <script>
+                        // 错误捕获
+                        window.addEventListener('error', function(e) {
+                            console.error('预览错误:', e.message);
+                        });
+
+                        // 禁用 Service Worker 注册（避免 404 错误）
+                        if ('serviceWorker' in navigator) {
+                            navigator.serviceWorker.register = function() {
+                                console.log('预览模式：已禁用 Service Worker 注册');
+                                return Promise.resolve({ active: null, installing: null, waiting: null });
+                            };
+                        }
+
+                        // 拦截所有页面跳转方式
+                        (function() {
+                            var originalLocation = window.location.href;
+
+                            // 拦截 href 设置
+                            try {
+                                Object.defineProperty(window.location, 'href', {
+                                    set: function(value) {
+                                        console.log('预览模式：已阻止 location.href 跳转', value);
+                                    },
+                                    get: function() {
+                                        return originalLocation;
+                                    }
+                                });
+                            } catch(e) {}
+
+                            // 拦截 location.replace
+                            try {
+                                window.location.replace = function(url) {
+                                    console.log('预览模式：已阻止 location.replace 跳转', url);
+                                };
+                            } catch(e) {}
+
+                            // 拦截 location.assign
+                            try {
+                                window.location.assign = function(url) {
+                                    console.log('预览模式：已阻止 location.assign 跳转', url);
+                                };
+                            } catch(e) {}
+
+                            // 拦截 location.reload
+                            try {
+                                window.location.reload = function() {
+                                    console.log('预览模式：已阻止 location.reload');
+                                };
+                            } catch(e) {}
+
+                            // 拦截 window.open
+                            window.open = function(url, target) {
+                                console.log('预览模式：已阻止 window.open', url, target);
+                                return null;
+                            };
+                        })();
+                    <\/script>
+                    <script>
+                        // 用户代码 - 在最后执行，确保拦截器已经设置
+                        try {
+                            ${js}
+                        } catch(e) {
+                            console.error('JS 执行错误:', e);
+                        }
+                    <\/script>
+                </body>
+                </html>
+            `;
+
+            // 创建 Blob URL
+            const blob = new Blob([previewContent], { type: 'text/html' });
+            const blobUrl = URL.createObjectURL(blob);
+
+            // 清理旧的 Blob URL（防止内存泄漏）
+            if (iframe.dataset.oldBlobUrl) {
+                URL.revokeObjectURL(iframe.dataset.oldBlobUrl);
+            }
+
+            // 保存新的 Blob URL 引用
+            iframe.dataset.oldBlobUrl = blobUrl;
+            iframe.src = blobUrl;
+        }
+
+        // ==================== 工具函数 ====================
+        function copyCurrentFile() {
+            if (!currentFile || !codeFiles[currentFile]) return;
+
+            navigator.clipboard.writeText(codeFiles[currentFile]).then(() => {
+                showToast('已复制到剪贴板');
+            }).catch(() => {
+                showToast('复制失败');
+            });
+        }
+
+        function downloadCurrentFile() {
+            if (!currentFile || !codeFiles[currentFile]) return;
+
+            const blob = new Blob([codeFiles[currentFile]], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = currentFile;
+            a.click();
+            URL.revokeObjectURL(url);
+
+            showToast(`已下载 ${currentFile}`);
+        }
+
+        function showToast(message) {
+            // 简单实现：使用 alert 替代
+            console.log('Toast:', message);
+        }
+
+        // ==================== 通用工具 ====================
+        function escapeHtml(text) {
+            if (!text) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // ==================== 持续对话功能 ====================
+        let isSending = false;
+
+        function handleChatKeypress(event) {
+            if (event.key === 'Enter') {
+                sendChatMessage();
+            }
+        }
+
+        async function sendChatMessage() {
+            const input = document.getElementById('chatInput');
+            const sendBtn = document.getElementById('sendBtn');
+            const message = input.value.trim();
+
+            // 在生成过程中禁止发送消息
+            if (isGenerating) {
+                showError('智能体正在生成代码中，请稍候...');
+                return;
+            }
+
+            if (!message || isSending) return;
+
+            isSending = true;
+            sendBtn.disabled = true;
+            input.value = '';
+
+            // 添加用户消息到对话显示
+            const userMsg = {
+                role: 'user',
+                name: '用户',
+                content: message,
+                timestamp: new Date().toLocaleString('zh-CN')
+            };
+            addDialogueMessage(userMsg);
+
+            try {
+                const token = localStorage.getItem('token');
+                const response = await fetch(`${API_BASE}/api/requirements/${requirementId}/chat`, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ message: message })
+                });
+
+                if (!response.ok) {
+                    throw new Error('发送失败');
+                }
+
+                const data = await response.json();
+
+                // 更新对话历史
+                if (data.dialogue_history) {
+                    dialogueMessages = data.dialogue_history;
+                    renderDialogue();
+                }
+
+                // 滚动到底部
+                const container = document.getElementById('dialogueContainer');
+                container.scrollTop = container.scrollHeight;
+
+            } catch (error) {
+                console.error('发送消息失败:', error);
+                showError('发送消息失败，请重试');
+                // 回滚：删除刚添加的用户消息
+                dialogueMessages.pop();
+                renderDialogue();
+            } finally {
+                isSending = false;
+                sendBtn.disabled = false;
+                input.focus();
+            }
+        }
+
+        function showError(message) {
+            alert(message);
+        }
+
+        function refreshPage() {
+            window.location.reload();
+        }
+
+        function logout() {
+            localStorage.removeItem('token');
+            localStorage.removeItem('user');
+            window.location.href = '/login.html';
+        }
+    </script>
+</body>
+</html>
