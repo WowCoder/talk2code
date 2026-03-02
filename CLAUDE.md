@@ -10,7 +10,7 @@ pip install -r requirements.txt
 python app.py
 ```
 
-访问 http://localhost:5000/login.html，使用测试账号：test / 123456
+访问 http://localhost:5001/login.html，使用测试账号：test / 123456
 
 ## 架构概览
 

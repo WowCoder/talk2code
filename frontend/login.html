@@ -122,7 +122,8 @@
 
     <script>
         // API 基础地址 - 后端运行在 5001 端口
-        const API_BASE = 'http://localhost:5001';
+        // API 基础地址 - 使用相对路径，与当前页面同源
+        const API_BASE = window.location.origin;
 
         // DOM 元素
         const loginTab = document.getElementById('loginTab');

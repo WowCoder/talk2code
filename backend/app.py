@@ -1642,7 +1642,7 @@ if __name__ == '__main__':
     print("Atoms.dev Vibe Coding Demo")
     print("=" * 50)
     print("后端服务启动中...")
-    print("前端页面：http://localhost:5000/login.html")
+    print("前端页面：http://localhost:5001/login.html")
     print("=" * 50)
 
     app.run(debug=False, host='0.0.0.0', port=5001, threaded=True)
