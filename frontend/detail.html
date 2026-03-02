@@ -105,12 +105,33 @@
             font-size: 14px;
         }
 
+        /* CodeMirror 滚动条样式 */
+        .CodeMirror-vscrollbar,
+        .CodeMirror-hscrollbar {
+            outline: none;
+        }
+        .CodeMirror-vscrollbar::-webkit-scrollbar,
+        .CodeMirror-hscrollbar::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+        }
+        .CodeMirror-vscrollbar::-webkit-scrollbar-thumb,
+        .CodeMirror-hscrollbar::-webkit-scrollbar-thumb {
+            background: #444;
+            border-radius: 5px;
+        }
+        .CodeMirror-vscrollbar::-webkit-scrollbar-thumb:hover,
+        .CodeMirror-hscrollbar::-webkit-scrollbar-thumb:hover {
+            background: #555;
+        }
+
         /* 文件标签 */
         .file-tabs {
             display: flex;
             background: #0f0f1a;
             padding: 8px 12px 0;
             gap: 4px;
+            flex-shrink: 0; /* 不压缩 */
         }
 
         .file-tab {
@@ -157,6 +178,7 @@
             background: #0f0f1a;
             border-radius: 8px;
             margin: 8px;
+            flex-shrink: 0; /* 不压缩 */
         }
 
         .toolbar-group {
@@ -223,6 +245,15 @@
             gap: 8px;
             margin: 8px 8px 0;
             border-radius: 8px 8px 0 0;
+            flex-shrink: 0; /* 不压缩 */
+        }
+
+        /* 代码 TAB 内容区域 */
+        #codeTabContent {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-height: 0; /* 关键：允许 flex 容器正确计算高度 */
         }
 
         .code-tab {
@@ -249,8 +280,16 @@
 
         .editor-container {
             flex: 1;
-            min-height: 400px;
+            min-height: 0; /* 关键：允许 flex 容器正确计算高度 */
             overflow: hidden;
+            position: relative;
+            display: flex;
+            flex-direction: column;
+        }
+
+        #codeEditor {
+            flex: 1;
+            min-height: 0; /* 关键：允许 flex 容器正确计算高度 */
         }
 
         .editor-container.hidden,
@@ -300,6 +339,13 @@
             </h1>
         </div>
         <div class="flex items-center gap-3">
+            <!-- 用户信息显示 -->
+            <div class="flex items-center gap-2 px-3 py-1.5 bg-gray-700 rounded-lg">
+                <svg class="w-4 h-4 text-gray-300" fill="currentColor" viewBox="0 0 20 20">
+                    <path fill-rule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clip-rule="evenodd"/>
+                </svg>
+                <span id="currentUser" class="text-gray-300 text-sm"></span>
+            </div>
             <button onclick="refreshPage()" class="px-4 py-2 text-gray-300 hover:text-white transition-colors">
                 刷新
             </button>
@@ -428,6 +474,9 @@
             // 初始化编辑器
             initEditor();
 
+            // 加载当前用户信息
+            loadCurrentUser();
+
             // 加载需求数据
             loadRequirement();
 
@@ -447,6 +496,7 @@
                 lineWrapping: true,
                 readOnly: true,
                 scrollbarStyle: 'native',
+                viewportMargin: Infinity, // 渲染所有内容，确保滚动正确
                 extraKeys: {
                     'Ctrl-S': function() { downloadCurrentFile(); }
                 }
@@ -653,6 +703,8 @@
             if (currentFile === filename) {
                 editor.setValue(codeFiles[filename]);
                 editor.scrollTo(editor.lineCount(), 0);
+                // 刷新编辑器布局，确保滚动条正确显示
+                setTimeout(() => editor.refresh(), 0);
             }
 
             updatePreview();
@@ -688,6 +740,9 @@
             } else if (filename.endsWith('.js')) {
                 editor.setOption('mode', 'javascript');
             }
+
+            // 刷新编辑器布局，确保滚动条正确显示
+            setTimeout(() => editor.refresh(), 0);
 
             renderFileTabs();
             updatePreview();
@@ -966,6 +1021,27 @@
             localStorage.removeItem('token');
             localStorage.removeItem('user');
             window.location.href = '/login.html';
+        }
+
+        // 获取当前用户信息
+        async function loadCurrentUser() {
+            const token = localStorage.getItem('token');
+            if (!token) return;
+
+            try {
+                const response = await fetch(`${API_BASE}/api/user/info`, {
+                    headers: {
+                        'Authorization': `Bearer ${token}`
+                    }
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    document.getElementById('currentUser').textContent = data.user.username || '用户';
+                }
+            } catch (error) {
+                console.error('获取用户信息失败:', error);
+            }
         }
     </script>
 </body>

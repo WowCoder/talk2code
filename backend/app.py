@@ -683,6 +683,12 @@ def run_engineer(requirement: str, context: str = None) -> str:
         print(f"[调试] LLM 响应长度：{len(response)}")
         sys.stdout.flush()
 
+        # 检查是否是错误响应
+        if response.startswith('[错误]') or response.startswith('API 请求失败'):
+            print(f"[警告] LLM 返回错误，使用 Fallback 代码")
+            sys.stdout.flush()
+            return json.dumps(generate_fallback_code(requirement), ensure_ascii=False)
+
         # 清理可能的 markdown 标记
         response = response.strip()
         if response.startswith('```json'):
@@ -703,6 +709,8 @@ def run_engineer(requirement: str, context: str = None) -> str:
 
     except json.JSONDecodeError as e:
         print(f"[错误] 工程师 JSON 解析失败：{e}")
+        # 打印响应内容的前 500 字符，帮助调试
+        print(f"[调试] 响应内容前 500 字符：{repr(response[:500]) if 'response' in locals() else 'N/A'}")
         sys.stdout.flush()
     except Exception as e:
         print(f"工程师 LLM 调用失败：{e}")
