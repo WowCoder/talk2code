@@ -25,11 +25,11 @@ if ENV_FILE.exists():
                 os.environ.setdefault(key.strip(), value)
 
 # 数据库配置 - 使用 SQLite 轻量数据库
-DATABASE_PATH = os.path.join(BACKEND_DIR, 'atoms.db')
+DATABASE_PATH = os.path.join(BACKEND_DIR, 'vcd.db')
 DATABASE_URI = f'sqlite:///{DATABASE_PATH}'
 
 # JWT 配置
-JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY', 'vibe-coding-secret-key-change-in-production')
+JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY', 'talk2code-secret-key-change-in-production')
 JWT_ACCESS_TOKEN_EXPIRES = timedelta(hours=24)  # Token 过期时间
 
 # SSE 配置

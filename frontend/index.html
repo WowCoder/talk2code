@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Vibe Coding 智能生成</title>
+    <title>Talk2Code 智能生成</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         body {
@@ -25,7 +25,7 @@
         <!-- 顶部导航 -->
         <div class="flex justify-between items-center mb-8">
             <h1 class="text-5xl font-bold text-gray-800">
-                Vibe Coding 智能生成
+                Talk2Code 智能生成
             </h1>
             <div class="flex items-center gap-4">
                 <!-- 用户信息显示 -->
@@ -188,6 +188,7 @@
                 hideError();
 
                 const token = localStorage.getItem('token');
+                console.log('提交需求 - Token:', token ? token.substring(0, 20) + '...' : '无 token');
 
                 try {
                     const response = await fetch(`${API_BASE}/api/requirements`, {
@@ -199,7 +200,9 @@
                         body: JSON.stringify({ content })
                     });
 
+                    console.log('响应状态:', response.status);
                     const data = await response.json();
+                    console.log('响应数据:', data);
 
                     if (response.ok) {
                         // 存储需求信息，跳转到详情页
@@ -211,7 +214,7 @@
                     }
                 } catch (error) {
                     showError('网络错误，请稍后重试');
-                    console.error(error);
+                    console.error('提交错误:', error);
                     setLoading(false);
                 }
             }

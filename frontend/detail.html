@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>需求详情 - Vibe Coding</title>
+    <title>需求详情 - Talk2Code</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- CodeMirror 核心 -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.css">
@@ -329,30 +329,44 @@
 </head>
 <body class="bg-gray-900 min-h-screen">
     <!-- 顶部导航 -->
-    <header class="bg-gray-800 px-6 py-4 flex items-center justify-between">
+    <header class="bg-white px-6 py-4 flex items-center justify-between shadow-sm">
         <div class="flex items-center gap-4">
-            <a href="/index.html" class="text-white hover:text-gray-300 transition-colors">
+            <a href="/index.html" class="text-gray-600 hover:text-gray-800 transition-colors">
                 <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
                 </svg>
             </a>
-            <h1 id="requirementTitle" class="text-white font-semibold text-lg truncate max-w-xl">
+            <h1 id="requirementTitle" class="text-gray-800 font-semibold text-lg truncate max-w-xl">
                 需求详情
             </h1>
         </div>
-        <div class="flex items-center gap-3">
+        <div class="flex items-center gap-4">
             <!-- 用户信息显示 -->
-            <div class="flex items-center gap-2 px-3 py-1.5 bg-gray-700 rounded-lg">
-                <svg class="w-4 h-4 text-gray-300" fill="currentColor" viewBox="0 0 20 20">
+            <div class="flex items-center gap-2 px-4 py-2 bg-white rounded-xl shadow-md">
+                <svg class="w-5 h-5 text-purple-600" fill="currentColor" viewBox="0 0 20 20">
                     <path fill-rule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clip-rule="evenodd"/>
                 </svg>
-                <span id="currentUser" class="text-gray-300 text-sm"></span>
+                <span id="currentUser" class="text-gray-700 font-medium"></span>
             </div>
-            <button onclick="refreshPage()" class="px-4 py-2 text-gray-300 hover:text-white transition-colors">
-                刷新
+            <!-- 刷新按钮 -->
+            <button
+                onclick="refreshPage()"
+                class="px-4 py-2 text-gray-500 hover:text-gray-700 transition-colors"
+                title="刷新页面"
+            >
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                </svg>
             </button>
-            <button onclick="logout()" class="px-4 py-2 text-gray-300 hover:text-white transition-colors">
-                退出登录
+            <!-- 退出登录按钮 -->
+            <button
+                onclick="logout()"
+                class="px-4 py-2 text-gray-500 hover:text-red-600 transition-colors"
+                title="退出登录"
+            >
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/>
+                </svg>
             </button>
         </div>
     </header>
@@ -416,8 +430,15 @@
                     <!-- 工具栏 -->
                     <div class="toolbar">
                         <div class="toolbar-group">
+                            <button id="saveBtn" class="toolbar-btn" title="保存 (Ctrl+S)">
+                                <svg class="w-4 h-4 inline" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"/>
+                                </svg>
+                                保存
+                            </button>
                             <button id="copyBtn" class="toolbar-btn" disabled>复制</button>
                             <button id="downloadBtn" class="toolbar-btn" disabled>下载</button>
+                            <span id="saveStatus" class="text-xs text-gray-500 ml-2"></span>
                         </div>
                     </div>
 
@@ -496,17 +517,32 @@
                 mode: 'htmlmixed',
                 lineNumbers: true,
                 lineWrapping: true,
-                readOnly: true,
+                readOnly: false,  // 允许编辑
                 scrollbarStyle: 'native',
-                viewportMargin: Infinity, // 渲染所有内容，确保滚动正确
+                viewportMargin: Infinity,
                 extraKeys: {
-                    'Ctrl-S': function() { downloadCurrentFile(); }
+                    'Ctrl-S': function() { saveCurrentFile(); }
+                }
+            });
+
+            // 监听代码变化，自动保存
+            let saveTimeout;
+            editor.on('change', function() {
+                if (currentFile) {
+                    // 防抖，1 秒后自动保存
+                    clearTimeout(saveTimeout);
+                    saveTimeout = setTimeout(() => {
+                        saveCurrentFile(true);
+                    }, 1000);
                 }
             });
         }
 
         // ==================== 事件监听设置 ====================
         function setupEventListeners() {
+            // 保存按钮
+            document.getElementById('saveBtn').addEventListener('click', saveCurrentFile);
+
             // 复制按钮
             document.getElementById('copyBtn').addEventListener('click', copyCurrentFile);
 
@@ -539,7 +575,8 @@
                 codeTabContent.classList.add('hidden');
                 previewTabContent.classList.remove('hidden');
                 document.querySelector('.code-tab[data-tab="preview"]').classList.add('active');
-                refreshPreview();
+                // 立即刷新预览
+                refreshPreviewImmediately();
             }
         }
 
@@ -749,6 +786,9 @@
             // 刷新编辑器布局，确保滚动条正确显示
             setTimeout(() => editor.refresh(), 0);
 
+            // 同步本地文件列表（确保编辑器内容与本地一致）
+            codeFiles[filename] = content;
+
             renderFileTabs();
             updatePreview();
         }
@@ -784,13 +824,30 @@
         }
 
         // ==================== 预览功能 ====================
+        let previewUpdateTimeout;
+
         function updatePreview() {
-            // 使用 Blob URL 方式刷新预览，避免资源加载问题
+            // 防抖：1 秒后自动刷新预览
+            clearTimeout(previewUpdateTimeout);
+            previewUpdateTimeout = setTimeout(() => {
+                refreshPreview();
+            }, 1000);
+        }
+
+        // 立即刷新预览
+        function refreshPreviewImmediately() {
+            clearTimeout(previewUpdateTimeout);
             refreshPreview();
         }
 
         // 刷新预览（使用 Blob URL - 最稳定可靠的方案）
         function refreshPreview() {
+            // 只有在预览 tab 激活时才刷新
+            const previewTabContent = document.getElementById('previewTabContent');
+            if (previewTabContent.classList.contains('hidden')) {
+                return;
+            }
+
             const html = codeFiles['index.html'] || '';
             const css = codeFiles['style.css'] || '';
             const js = codeFiles['script.js'] || '';
@@ -904,6 +961,65 @@
         }
 
         // ==================== 工具函数 ====================
+        function saveCurrentFile(silent = false) {
+            if (!currentFile) return;
+
+            const token = localStorage.getItem('token');
+            if (!token) {
+                showError('请先登录');
+                return;
+            }
+
+            const content = editor.getValue();
+            const saveStatus = document.getElementById('saveStatus');
+
+            // 更新本地文件列表
+            codeFiles[currentFile] = content;
+
+            // 显示保存中状态
+            if (!silent) {
+                saveStatus.textContent = '保存中...';
+                saveStatus.className = 'text-xs text-yellow-500 ml-2';
+            }
+
+            fetch(`${API_BASE}/api/requirements/${requirementId}/code`, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${token}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    filename: currentFile,
+                    content: content
+                })
+            })
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error('保存失败');
+                }
+                return response.json();
+            })
+            .then(data => {
+                if (!silent) {
+                    saveStatus.textContent = '已保存';
+                    saveStatus.className = 'text-xs text-green-500 ml-2';
+                    setTimeout(() => {
+                        saveStatus.textContent = '';
+                    }, 2000);
+                }
+                // 保存成功后刷新预览
+                updatePreview();
+            })
+            .catch(error => {
+                console.error('保存失败:', error);
+                if (!silent) {
+                    saveStatus.textContent = '保存失败';
+                    saveStatus.className = 'text-xs text-red-500 ml-2';
+                    showError('保存失败，请重试');
+                }
+            });
+        }
+
         function copyCurrentFile() {
             if (!currentFile || !codeFiles[currentFile]) return;
 
@@ -997,6 +1113,20 @@
                 if (data.dialogue_history) {
                     dialogueMessages = data.dialogue_history;
                     renderDialogue();
+                }
+
+                // 如果 AI 返回了更新后的代码，更新本地文件
+                if (data.code_files) {
+                    const newCodeFiles = {};
+                    data.code_files.forEach(file => {
+                        newCodeFiles[file.filename] = file.content;
+                    });
+                    codeFiles = newCodeFiles;
+                    renderFileTabs();
+                    if (currentFile) {
+                        editor.setValue(codeFiles[currentFile] || '');
+                    }
+                    updatePreview();
                 }
 
                 // 滚动到底部

@@ -22,13 +22,15 @@ class BailianClient:
         if not self.api_key:
             raise ValueError("请配置 DASHSCOPE_API_KEY 环境变量或在 config.py 中设置")
 
-    def chat(self, messages: list, stream: bool = False, max_tokens: int = 4000) -> Generator:
+    def chat(self, messages: list, stream: bool = False, max_tokens: int = 4000, timeout: int = 180) -> Generator:
         """
         发送聊天请求
 
         Args:
             messages: 消息列表，格式：[{"role": "user|assistant|system", "content": "..."}]
             stream: 是否使用流式输出
+            max_tokens: 最大生成 token 数
+            timeout: 超时时间（秒）
 
         Yields:
             流式输出时，每次 yield 一个文本片段
@@ -52,7 +54,7 @@ class BailianClient:
         try:
             if stream:
                 # 流式输出
-                response = requests.post(url, headers=headers, json=data, stream=True, timeout=180)
+                response = requests.post(url, headers=headers, json=data, stream=True, timeout=timeout)
                 response.raise_for_status()
 
                 for line in response.iter_lines():
@@ -72,14 +74,14 @@ class BailianClient:
                                 continue
             else:
                 # 非流式输出
-                response = requests.post(url, headers=headers, json=data, timeout=180)
+                response = requests.post(url, headers=headers, json=data, timeout=timeout)
                 response.raise_for_status()
                 result = response.json()
                 content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
                 yield content
 
         except requests.exceptions.Timeout:
-            yield f"[错误] API 请求超时（180 秒）"
+            yield f"[错误] API 请求超时（{timeout}秒）"
         except requests.exceptions.RequestException as e:
             error_msg = f"API 请求失败：{str(e)}"
             if hasattr(e, 'response') and e.response is not None:
@@ -99,7 +101,7 @@ def get_client() -> BailianClient:
     return _client
 
 
-def chat_with_llm(prompt: str, system_prompt: str = None, max_tokens: int = 4000) -> str:
+def chat_with_llm(prompt: str, system_prompt: str = None, max_tokens: int = 4000, timeout: int = 60) -> str:
     """
     简单的聊天接口（非流式）
 
@@ -107,6 +109,7 @@ def chat_with_llm(prompt: str, system_prompt: str = None, max_tokens: int = 4000
         prompt: 用户输入
         system_prompt: 系统提示词
         max_tokens: 最大生成 token 数
+        timeout: 超时时间（秒）
 
     Returns:
         LLM 响应文本
@@ -117,7 +120,7 @@ def chat_with_llm(prompt: str, system_prompt: str = None, max_tokens: int = 4000
     messages.append({"role": "user", "content": prompt})
 
     client = get_client()
-    response = client.chat(messages, stream=False, max_tokens=max_tokens)
+    response = client.chat(messages, stream=False, max_tokens=max_tokens, timeout=timeout)
     return ''.join(response)
 
 

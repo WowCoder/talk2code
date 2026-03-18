@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Atoms.dev Vibe Coding Demo - Flask 主应用
+Talk2Code - Flask 主应用
 实现用户认证、需求管理、AI 多智能体协同、SSE 实时推送
 """
 
@@ -23,8 +23,10 @@ from prompts import (
     PRODUCT_MANAGER_SYSTEM_PROMPT, PRODUCT_MANAGER_USER_PROMPT,
     ARCHITECT_SYSTEM_PROMPT, ARCHITECT_USER_PROMPT,
     ENGINEER_SYSTEM_PROMPT, ENGINEER_USER_PROMPT,
-    FALLBACK_RESPONSES
+    FALLBACK_RESPONSES,
+    CODE_EDIT_SYSTEM_PROMPT, CODE_EDIT_USER_PROMPT
 )
+from diff_utils import parse_diff, apply_diff
 
 # ==================== 应用初始化 ====================
 
@@ -421,6 +423,268 @@ def chat_with_requirement(req_id):
         db.close()
 
 
+# ==================== 代码编辑 API ====================
+
+@app.route('/api/requirements/<int:req_id>/code', methods=['POST'])
+@jwt_required()
+def save_code(req_id):
+    """
+    保存用户修改的代码
+    POST /api/requirements/<req_id>/code
+    Headers: Authorization: Bearer <token>
+    Body: {"filename": "index.html", "content": "..."}
+    """
+    current_user_id = get_jwt_identity()
+    data = request.get_json()
+
+    if not data or not data.get('filename'):
+        return jsonify({'error': '文件名不能为空'}), 400
+
+    db = SessionLocal()
+    try:
+        requirement = db.query(Requirement).filter(
+            Requirement.id == req_id,
+            Requirement.user_id == current_user_id
+        ).first()
+
+        if not requirement:
+            return jsonify({'error': '需求不存在'}), 404
+
+        filename = data.get('filename', '').strip()
+        content = data.get('content', '')
+
+        # 获取现有代码文件列表
+        code_files = requirement.code_files or []
+
+        # 查找是否已存在该文件
+        file_found = False
+        for i, file in enumerate(code_files):
+            if file.get('filename') == filename:
+                code_files[i]['content'] = content
+                code_files[i]['status'] = 'modified'
+                file_found = True
+                break
+
+        # 如果是新文件，添加到列表
+        if not file_found:
+            code_files.append({
+                'filename': filename,
+                'content': content,
+                'status': 'modified'
+            })
+
+        requirement.code_files = code_files
+
+        # 添加修改记录到对话历史
+        dialogue_history = requirement.dialogue_history or []
+        dialogue_history.append({
+            'role': 'user',
+            'name': '用户',
+            'content': f'修改了文件 {filename}',
+            'timestamp': get_current_timestamp(),
+            'type': 'code_edit'
+        })
+        requirement.dialogue_history = dialogue_history
+
+        db.commit()
+
+        return jsonify({
+            'message': '代码已保存',
+            'filename': filename,
+            'code_files': code_files
+        }), 200
+
+    except Exception as e:
+        print(f"[错误] 保存代码失败：{e}")
+        db.rollback()
+        return jsonify({'error': f'保存失败：{str(e)}'}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/requirements/<int:req_id>/code/all', methods=['PUT'])
+@jwt_required()
+def save_all_code(req_id):
+    """
+    批量保存所有代码文件
+    PUT /api/requirements/<req_id>/code/all
+    Headers: Authorization: Bearer <token>
+    Body: {"code_files": [{"filename": "index.html", "content": "..."}, ...]}
+    """
+    current_user_id = get_jwt_identity()
+    data = request.get_json()
+
+    if not data or not data.get('code_files'):
+        return jsonify({'error': '代码文件列表不能为空'}), 400
+
+    db = SessionLocal()
+    try:
+        requirement = db.query(Requirement).filter(
+            Requirement.id == req_id,
+            Requirement.user_id == current_user_id
+        ).first()
+
+        if not requirement:
+            return jsonify({'error': '需求不存在'}), 404
+
+        new_code_files = []
+        for file in data.get('code_files', []):
+            if 'filename' in file and 'content' in file:
+                new_code_files.append({
+                    'filename': file['filename'],
+                    'content': file['content'],
+                    'status': 'modified'
+                })
+
+        requirement.code_files = new_code_files
+        db.commit()
+
+        return jsonify({
+            'message': '所有代码已保存',
+            'code_files': new_code_files
+        }), 200
+
+    except Exception as e:
+        print(f"[错误] 批量保存代码失败：{e}")
+        db.rollback()
+        return jsonify({'error': f'保存失败：{str(e)}'}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/requirements/<int:req_id>/chat', methods=['POST'])
+@jwt_required()
+def chat_with_requirement_diff(req_id):
+    """
+    与需求对话（支持 diff 代码修改）
+    POST /api/requirements/<req_id>/chat
+    Headers: Authorization: Bearer <token>
+    Body: {"message": "把按钮改成红色" / "添加一个删除功能"}
+    """
+    current_user_id = get_jwt_identity()
+    data = request.get_json()
+
+    if not data or not data.get('message'):
+        return jsonify({'error': '消息内容不能为空'}), 400
+
+    db = SessionLocal()
+    try:
+        requirement = db.query(Requirement).filter(
+            Requirement.id == req_id,
+            Requirement.user_id == current_user_id
+        ).first()
+
+        if not requirement:
+            return jsonify({'error': '需求不存在'}), 404
+
+        user_message = data.get('message', '').strip()
+
+        # 从数据库加载对话历史
+        dialogue_history = requirement.dialogue_history or []
+
+        # 构建对话上下文：提取最近的 N 条对话
+        recent_dialogues = dialogue_history[-6:] if len(dialogue_history) > 6 else dialogue_history
+        context_parts = []
+        for msg in recent_dialogues:
+            if msg.get('role') == 'user':
+                context_parts.append(f"用户：{msg.get('content', '')}")
+            elif msg.get('role') == 'agent':
+                context_parts.append(f"AI: {msg.get('content', '')}")
+        context = '\n'.join(context_parts)
+
+        # 获取当前代码文件 - 压缩格式，只保留必要的
+        current_code = ""
+        code_files = requirement.code_files or []
+        for file in code_files:
+            current_code += f"\n\n// === {file.get('filename', 'unknown')} ===\n{file.get('content', '')}"
+
+        # 保存用户消息到对话历史
+        dialogue_history.append({
+            'role': 'user',
+            'name': '用户',
+            'content': user_message,
+            'timestamp': get_current_timestamp()
+        })
+
+        # 使用 LLM 生成 diff
+        user_prompt = CODE_EDIT_USER_PROMPT.format(
+            requirement=requirement.content,
+            current_code=current_code if current_code else '暂无代码',
+            user_message=user_message
+        )
+
+        # 调用 LLM 获取 diff 响应
+        ai_response = chat_with_llm(user_prompt, CODE_EDIT_SYSTEM_PROMPT, max_tokens=3000, timeout=45)
+
+        # 解析并应用 diff
+        code_updated = False
+        updated_files = []
+
+        for diff_file in parse_diff(ai_response):
+            # 找到对应的原文件
+            original_file = None
+            for f in code_files:
+                if f.get('filename') == diff_file.filename:
+                    original_file = f
+                    break
+
+            if original_file:
+                try:
+                    # 应用 diff
+                    new_content = apply_diff(original_file.get('content', ''), diff_file)
+                    if new_content != original_file.get('content', ''):
+                        original_file['content'] = new_content
+                        original_file['status'] = 'modified'
+                        code_updated = True
+                        updated_files.append(diff_file.filename)
+                        print(f"[信息] 文件 {diff_file.filename} 已通过 diff 更新")
+                except Exception as e:
+                    print(f"[警告] 应用 diff 失败：{e}，回退到原文件")
+                    # diff 应用失败，保留原文件
+            else:
+                print(f"[警告] 未找到文件 {diff_file.filename}，无法应用 diff")
+
+        # 如果有代码更新，添加系统消息
+        if code_updated:
+            dialogue_history.append({
+                'role': 'system',
+                'name': '系统',
+                'content': f'已更新文件：{", ".join(updated_files)}',
+                'timestamp': get_current_timestamp(),
+                'type': 'code_updated'
+            })
+        else:
+            # 没有代码修改，保存 AI 文字回复
+            dialogue_history.append({
+                'role': 'agent',
+                'name': 'AI 助手',
+                'content': ai_response,
+                'timestamp': get_current_timestamp()
+            })
+
+        # 更新对话历史和代码到数据库
+        requirement.dialogue_history = dialogue_history
+        requirement.code_files = code_files
+        db.commit()
+
+        return jsonify({
+            'message': 'success',
+            'dialogue_history': dialogue_history,
+            'code_files': requirement.code_files,
+            'ai_response': ai_response,
+            'updated_files': updated_files if code_updated else []
+        }), 200
+
+    except Exception as e:
+        print(f"[错误] 处理对话失败：{e}")
+        import traceback
+        traceback.print_exc()
+        db.rollback()
+        return jsonify({'error': f'处理失败：{str(e)}'}), 500
+    finally:
+        db.close()
+
+
 # ==================== SSE 实时推送 ====================
 
 @app.route('/api/sse/<int:req_id>')
@@ -533,7 +797,7 @@ def process_requirement_with_agents(requirement_id: int):
         send_sse_message(client_id, '架构师', output, 'agent')
 
         # 发送进度更新
-        send_sse_progress(client_id, '工程师', 100)
+        send_sse_progress(client_id, '工程师', 90)
 
         # 4. 工程师智能体 - 传入前面所有智能体的输出作为上下文
         print("[信息] 工程师智能体开始工作...")
@@ -541,6 +805,9 @@ def process_requirement_with_agents(requirement_id: int):
         # 压缩上下文：只提取每个智能体的核心内容，减少 token 消耗
         compressed_context = compress_agent_outputs(agent_outputs)
         code_output = run_engineer(requirement.content, compressed_context)
+
+        # 发送进度更新 - 工程师完成
+        send_sse_progress(client_id, '完成', 100)
 
         # 解析并保存代码文件
         try:
@@ -714,18 +981,24 @@ def run_architect(requirement: str) -> str:
 def run_engineer(requirement: str, context: str = None) -> str:
     """
     工程师智能体：生成代码
-    接收前面智能体的输出作为上下文参考
+
+    优化策略：
+    1. 降低 max_tokens 到 4000 减少生成时间
+    2. timeout 设置为 30 秒，超时快速失败
+    3. 只重试 1 次，总等待时间不超过 60 秒
+    4. 失败后快速 fallback 到模板代码
     """
     # 使用压缩后的 context，如果为空则使用默认提示
     context_text = context if context else "请根据需求生成代码。"
 
-    # 第一次尝试：使用标准 prompt
+    # 第一次尝试：使用标准 prompt，max_tokens=4000, timeout=30 秒
     user_prompt = ENGINEER_USER_PROMPT.format(
         requirement=requirement,
         context=context_text
     )
 
-    response = _try_generate_code(user_prompt, max_retries=2)
+    # 只给一次机会，30 秒超时
+    response = _try_generate_code(user_prompt, max_tokens=4000, max_retries=0, timeout=30)
 
     # 如果失败，使用简化 prompt 重试（不带 context）
     if not response or response.startswith('[错误]'):
@@ -743,7 +1016,7 @@ def run_engineer(requirement: str, context: str = None) -> str:
 
 请以 JSON 数组格式返回：[{{"filename": "index.html", "content": "..."}}, ...]
 只返回 JSON，不要其他解释文字。"""
-        response = _try_generate_code(simple_prompt, max_retries=1)
+        response = _try_generate_code(simple_prompt, max_tokens=4000, max_retries=0, timeout=30)
 
     # 如果还是失败，使用 Fallback
     if not response or response.startswith('[错误]'):
@@ -754,9 +1027,15 @@ def run_engineer(requirement: str, context: str = None) -> str:
     return response
 
 
-def _try_generate_code(prompt: str, max_tokens: int = 8000, max_retries: int = 1) -> str:
+def _try_generate_code(prompt: str, max_tokens: int = 4000, max_retries: int = 0, timeout: int = 30) -> str:
     """
     尝试生成代码，支持重试
+
+    优化：
+    - max_tokens 降低到 4000（约 20-30 秒生成时间）
+    - timeout 默认 30 秒，超时快速失败
+    - max_retries 默认 0 次，避免过长等待
+    - 快速失败机制，总等待时间不超过 60 秒
     """
     last_error = None
 
@@ -766,8 +1045,8 @@ def _try_generate_code(prompt: str, max_tokens: int = 8000, max_retries: int = 1
                 print(f"[调试] 第 {attempt + 1} 次尝试生成代码...")
                 sys.stdout.flush()
 
-            # 使用更大的 max_tokens 确保能生成完整代码
-            response = chat_with_llm(prompt, ENGINEER_SYSTEM_PROMPT, max_tokens=max_tokens)
+            # 使用降低后的 max_tokens 和 timeout
+            response = chat_with_llm(prompt, ENGINEER_SYSTEM_PROMPT, max_tokens=max_tokens, timeout=timeout)
             print(f"[调试] LLM 响应长度：{len(response)}")
             sys.stdout.flush()
 
@@ -2005,7 +2284,7 @@ if __name__ == '__main__':
 
     # 启动服务
     print("=" * 50)
-    print("Atoms.dev Vibe Coding Demo")
+    print("Talk2Code")
     print("=" * 50)
     print("后端服务启动中...")
     print("前端页面：http://localhost:5001/login.html")
