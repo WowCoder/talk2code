@@ -13,20 +13,33 @@
 - **数据库**: SQLite
 - **实时通信**: SSE (Server-Sent Events)
 - **认证**: JWT
-- **AI 模型**: 阿里云百炼（通义千问）+ LangChain
+- **AI 编排**: LangGraph + LangChain
+- **AI 模型**: 阿里云百炼（通义千问）
 
 ## 项目结构
 
 ```
 talk2code/
 ├── backend/
-│   ├── app.py              # Flask 主程序（API、AI 智能体、SSE）
-│   ├── config.py           # 配置文件
+│   ├── app.py              # Flask 主程序（API、SSE 推送）
+│   ├── config.py           # 配置文件（数据库、JWT、SSE、AI 模型）
 │   ├── models.py           # 数据库模型（User, Requirement）
-│   ├── utils.py            # 工具类（密码加密、SSE 消息）
-│   ├── llm_client.py       # 基础 LLM 客户端（DashScope API）
-│   ├── langchain_client.py # LangChain 封装的 LLM 客户端
-│   └── requirements.txt    # Python 依赖
+│   ├── services/
+│   │   ├── requirement_service.py  # 需求管理服务（LangGraph 工作流集成）
+│   │   └── sse_manager.py          # SSE 管理器（线程安全的广播）
+│   ├── agents/
+│   │   ├── state.py        # LangGraph AgentState 定义
+│   │   ├── nodes.py        # 智能体节点函数（研究员/产品经理/架构师/工程师）
+│   │   └── workflow.py     # LangGraph StateGraph 工作流定义
+│   ├── llm/
+│   │   └── client.py       # 统一 LLM 客户端（DashScope API，支持重试）
+│   ├── prompts/
+│   │   └── prompts.py      # 系统提示词模板
+│   └── utils/
+│       ├── logger.py       # 日志工具
+│       ├── sse.py          # SSE 消息格式化
+│       ├── retry.py        # 指数退避重试
+│       └── rate_limiter.py # 限流器
 └── frontend/
     ├── login.html          # 登录/注册页
     ├── index.html          # 首页（需求输入、我的应用列表）
@@ -97,10 +110,54 @@ python app.py
 - 点击快速跳转到应用详情
 
 ### AI 多智能体协同
-1. **研究员**: 分析市场需求和可行性
-2. **产品经理**: 拆解功能清单和交互逻辑
-3. **架构师**: 设计技术架构和数据结构
-4. **工程师**: 流式生成可运行代码
+
+基于 **LangGraph** 实现的工作流编排，4 个智能体按顺序协同：
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  研究员     │────▶│  产品经理   │────▶│  架构师     │────▶│  工程师     │
+│  市场分析   │     │  功能拆解   │     │  技术设计   │     │  代码生成   │
+└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+```
+
+### 工作流程
+
+1. **研究员节点** (`researcher_node`)
+   - 分析市场需求和可行性
+   - 输出：市场与需求分析报告
+
+2. **产品经理节点** (`product_manager_node`)
+   - 拆解功能清单和交互逻辑
+   - 输出：产品功能规划
+
+3. **架构师节点** (`architect_node`)
+   - 设计技术架构和数据结构
+   - 输出：技术架构设计方案
+
+4. **工程师节点** (`engineer_node`)
+   - 生成可运行的代码文件
+   - 输出：代码文件列表（JSON 格式）
+
+### LangGraph StateGraph
+
+```python
+# 状态定义 (AgentState)
+class AgentState(TypedDict):
+    requirement_id: int           # 需求 ID
+    requirement_content: str      # 需求内容
+    agent_outputs: List[dict]     # 智能体输出（自动累积）
+    current_step: str             # 当前步骤
+    code_files: Optional[List]    # 生成的代码文件
+    error: Optional[str]          # 错误信息
+    dialogue_history: List[dict]  # 对话历史（自动累积）
+    metadata: dict                # 元数据
+```
+
+### 错误处理
+
+- 每个节点独立的 fallback 机制
+- 架构师失败后工程师使用降级方案
+- JSON 解析失败时生成模板代码
 
 ### 持续对话
 - 会话历史持久化到数据库
@@ -160,7 +217,8 @@ python app.py
 
 ## 注意事项
 
-1. 这是一个 Demo 项目，AI 智能体逻辑为预设模板
-2. 实际生产环境需要接入真实 AI 模型（如 Claude API）
-3. JWT 密钥请生产环境使用环境变量配置
+1. 这是一个 Demo 项目，AI 智能体使用预设的 prompt 模板
+2. 生产环境请配置环境变量 `DASHSCOPE_API_KEY` 接入真实 AI 模型
+3. JWT 密钥请生产环境使用环境变量 `JWT_SECRET_KEY` 配置
 4. 建议使用现代浏览器（Chrome/Edge/Safari）
+5. 基于 LangGraph 的多智能体工作流支持错误降级和 fallback 机制
