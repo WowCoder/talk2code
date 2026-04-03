@@ -10,7 +10,8 @@ from datetime import datetime
 
 from models import SessionLocal, Requirement
 from utils.logger import get_logger
-from utils import get_current_timestamp, SSEMessage
+from utils.time_utils import get_current_timestamp
+from utils.sse import SSEMessage
 from services.sse_manager import sse_manager
 from agents.workflow import get_workflow
 from agents.state import AgentState

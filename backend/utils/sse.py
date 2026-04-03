@@ -1,27 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 SSE 工具函数
-包含 SSE 消息格式化、内容分块等功能
+包含 SSE 消息格式化等功能
 """
 
 import json
-import time
-from typing import Callable
-from flask import Response
-
-
-def chunk_content(content: str, chunk_size: int = 50) -> list:
-    """
-    将内容分块，用于流式推送
-
-    Args:
-        content: 完整内容
-        chunk_size: 每块大小（字符数）
-
-    Returns:
-        分块后的内容列表
-    """
-    return [content[i:i+chunk_size] for i in range(0, len(content), chunk_size)]
 
 
 class SSEMessage:
@@ -118,21 +101,3 @@ class SSEMessage:
         return SSEMessage.format_event('complete', {
             'requirement_id': requirement_id
         })
-
-
-def stream_generator(chunks: list, event_type: str = 'message') -> Callable:
-    """
-    创建流式生成器
-
-    Args:
-        chunks: 内容分块列表
-        event_type: 事件类型
-
-    Yields:
-        SSE 格式的消息
-    """
-    def generate():
-        for chunk in chunks:
-            yield SSEMessage.format_event(event_type, {'content': chunk})
-            time.sleep(0.1)
-    return generate

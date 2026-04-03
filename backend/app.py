@@ -113,7 +113,7 @@ def static_files(filename):
 def register():
     """用户注册接口"""
     from models import User, SessionLocal
-    from utils import hash_password
+    from utils.security import hash_password
 
     data = request.get_json()
     if not data:
@@ -155,7 +155,7 @@ def register():
 def login():
     """用户登录接口"""
     from models import User, SessionLocal
-    from utils import verify_password
+    from utils.security import verify_password
 
     data = request.get_json()
     if not data:
@@ -691,13 +691,8 @@ def sse_stream(req_id):
 
 # ==================== 辅助函数 ====================
 
-def get_current_timestamp() -> str:
-    """获取当前时间戳"""
-    from datetime import datetime
-    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-
-from utils import SSEMessage
+from utils.sse import SSEMessage
+from utils.time_utils import get_current_timestamp
 
 
 # ==================== 主程序入口 ====================

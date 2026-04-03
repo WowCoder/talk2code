@@ -15,7 +15,6 @@ from datetime import datetime
 import requests
 from config import DASHSCOPE_API_KEY, DASHSCOPE_BASE_URL, DASHSCOPE_MODEL
 from utils.logger import get_logger
-from utils.retry import retry_with_backoff, RetryError
 
 logger = get_logger(__name__)
 
