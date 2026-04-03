@@ -12,7 +12,7 @@ from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
-from config import JWT_SECRET_KEY, JWT_ACCESS_TOKEN_EXPIRES
+from config import JWT_SECRET_KEY, JWT_ACCESS_TOKEN_EXPIRES, DASHSCOPE_API_KEY, DASHSCOPE_MODEL
 from models import init_db
 from services.sse_manager import sse_manager
 from services.task_queue import task_queue
@@ -57,6 +57,46 @@ def handle_rate_limit_exceeded(e):
 
 # 初始化数据库
 init_db()
+
+# ==================== 生产环境安全检查 ====================
+
+def check_production_security():
+    """
+    生产环境安全检查
+    在应用启动时验证关键安全配置
+    """
+    from config import settings
+
+    issues = []
+
+    # 1. 检查 JWT 密钥
+    if JWT_SECRET_KEY == 'talk2code-secret-key-change-in-production':
+        issues.append("JWT_SECRET_KEY 使用默认值，生产环境必须修改！")
+        logger.warning("⚠️  JWT_SECRET_KEY 使用默认值，存在安全风险")
+
+    # 2. 检查 API Key
+    if not DASHSCOPE_API_KEY:
+        issues.append("DASHSCOPE_API_KEY 未配置，AI 功能将不可用")
+        logger.warning("⚠️  DASHSCOPE_API_KEY 未配置")
+
+    # 3. 检查调试模式
+    if settings.APP_DEBUG:
+        issues.append("APP_DEBUG 已开启，生产环境应关闭")
+        logger.warning("⚠️  调试模式已开启，生产环境应关闭")
+
+    if issues:
+        logger.warning("=" * 50)
+        logger.warning("生产环境安全检查发现问题：")
+        for issue in issues:
+            logger.warning(f"  - {issue}")
+        logger.warning("请修改 .env 文件或环境变量")
+        logger.warning("=" * 50)
+
+    return len(issues) == 0
+
+
+# 执行安全检查
+check_production_security()
 
 logger.info("Talk2Code 应用启动")
 
@@ -687,6 +727,128 @@ def sse_stream(req_id):
             'X-Accel-Buffering': 'no'
         }
     )
+
+
+# ==================== 健康检查 API ====================
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """
+    健康检查接口
+
+    检查项目：
+    - 数据库连接状态
+    - LLM API 配置状态
+    - 系统基本信息
+
+    Returns:
+        {
+            'status': 'healthy' | 'degraded' | 'unhealthy',
+            'checks': {
+                'database': {'status': 'ok' | 'error', ...},
+                'llm': {'status': 'ok' | 'not_configured' | 'error', ...},
+            },
+            'version': '2.1.0',
+            'timestamp': '...'
+        }
+    """
+    from models import SessionLocal
+    import time
+
+    checks = {}
+    overall_status = 'healthy'
+
+    # 1. 检查数据库连接
+    db_status = 'ok'
+    db_error = None
+    try:
+        db = SessionLocal()
+        # 执行简单查询验证连接
+        db.execute('SELECT 1')
+        db.close()
+    except Exception as e:
+        db_status = 'error'
+        db_error = str(e)
+        overall_status = 'unhealthy'
+
+    checks['database'] = {
+        'status': db_status,
+        'type': 'sqlite',
+        'error': db_error
+    }
+
+    # 2. 检查 LLM API 配置
+    llm_status = 'ok'
+    llm_error = None
+    try:
+        if not DASHSCOPE_API_KEY:
+            llm_status = 'not_configured'
+            overall_status = 'degraded'
+        else:
+            # 可选：尝试发送一个简单请求验证 API 可用性
+            # 但为了避免延迟，我们只检查配置
+            llm_status = 'configured'
+    except Exception as e:
+        llm_status = 'error'
+        llm_error = str(e)
+        overall_status = 'degraded'
+
+    checks['llm'] = {
+        'status': llm_status,
+        'provider': 'dashscope',
+        'model': DASHSCOPE_MODEL,
+        'error': llm_error
+    }
+
+    # 3. 检查任务队列
+    queue_status = 'ok'
+    try:
+        active_tasks = len(task_queue._tasks) if hasattr(task_queue, '_tasks') else 0
+        checks['task_queue'] = {
+            'status': queue_status,
+            'active_tasks': active_tasks
+        }
+    except Exception as e:
+        checks['task_queue'] = {
+            'status': 'error',
+            'error': str(e)
+        }
+
+    return jsonify({
+        'status': overall_status,
+        'checks': checks,
+        'version': '2.1.0',
+        'timestamp': get_current_timestamp()
+    }), 200 if overall_status != 'unhealthy' else 503
+
+
+@app.route('/api/health/live', methods=['GET'])
+def liveness_check():
+    """
+    Kubernetes liveness probe
+
+    只检查应用是否存活，不检查依赖服务
+    """
+    return jsonify({'status': 'alive'}), 200
+
+
+@app.route('/api/health/ready', methods=['GET'])
+def readiness_check():
+    """
+    Kubernetes readiness probe
+
+    检查应用是否准备好接收请求
+    """
+    from models import SessionLocal
+
+    # 只检查数据库
+    try:
+        db = SessionLocal()
+        db.execute('SELECT 1')
+        db.close()
+        return jsonify({'status': 'ready'}), 200
+    except Exception as e:
+        return jsonify({'status': 'not_ready', 'error': str(e)}), 503
 
 
 # ==================== 辅助函数 ====================

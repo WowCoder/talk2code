@@ -5,6 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Talk2Code 智能生成</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <!-- DOMPurify XSS 防护 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
+    <!-- 安全工具 -->
+    <script src="js/security.js"></script>
     <style>
         body {
             background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
@@ -241,7 +245,14 @@
                 const modal = document.getElementById('myAppsModal');
                 const appsList = document.getElementById('appsList');
                 modal.classList.remove('hidden');
-                appsList.innerHTML = '<div class="text-center text-gray-500 py-8">加载中...</div>';
+
+                // 清空容器（安全方式）
+                while (appsList.firstChild) {
+                    appsList.removeChild(appsList.firstChild);
+                }
+
+                const loadingDiv = createSafeElement('div', { class: 'text-center text-gray-500 py-8' }, '加载中...');
+                appsList.appendChild(loadingDiv);
 
                 const token = localStorage.getItem('token');
                 try {
@@ -254,19 +265,33 @@
                     const data = await response.json();
                     const requirements = data.requirements || [];
 
+                    // 清空容器
+                    while (appsList.firstChild) {
+                        appsList.removeChild(appsList.firstChild);
+                    }
+
                     if (requirements.length === 0) {
-                        appsList.innerHTML = `
-                            <div class="text-center text-gray-500 py-12">
-                                <svg class="w-16 h-16 mx-auto mb-4 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/>
-                                </svg>
-                                <p>暂无应用，创建一个吧！</p>
-                            </div>
-                        `;
+                        const emptyDiv = createSafeElement('div', { class: 'text-center text-gray-500 py-12' });
+                        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+                        svg.setAttribute('class', 'w-16 h-16 mx-auto mb-4 text-gray-300');
+                        svg.setAttribute('fill', 'none');
+                        svg.setAttribute('stroke', 'currentColor');
+                        svg.setAttribute('viewBox', '0 0 24 24');
+                        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                        path.setAttribute('stroke-linecap', 'round');
+                        path.setAttribute('stroke-linejoin', 'round');
+                        path.setAttribute('stroke-width', '2');
+                        path.setAttribute('d', 'M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10');
+                        svg.appendChild(path);
+                        emptyDiv.appendChild(svg);
+                        const p = createSafeElement('p', {}, '暂无应用，创建一个吧！');
+                        emptyDiv.appendChild(p);
+                        appsList.appendChild(emptyDiv);
                         return;
                     }
 
-                    appsList.innerHTML = requirements.map(req => {
+                    // 使用 DOM 操作创建列表项，避免 XSS
+                    requirements.forEach(req => {
                         const statusColor = {
                             'pending': 'yellow',
                             'processing': 'blue',
@@ -281,23 +306,42 @@
                             'failed': '失败'
                         }[req.status] || req.status;
 
-                        return `
-                            <div class="border border-gray-200 rounded-xl p-4 mb-3 hover:shadow-md transition-shadow cursor-pointer" onclick="goToRequirement(${req.id})">
-                                <div class="flex justify-between items-center">
-                                    <div class="flex-1">
-                                        <h3 class="font-semibold text-gray-800 text-lg">${escapeHtml(req.title)}</h3>
-                                        <p class="text-sm text-gray-500 mt-1">创建于 ${formatTime(req.create_time)}</p>
-                                    </div>
-                                    <span class="px-3 py-1 bg-${statusColor}-100 text-${statusColor}-700 rounded-full text-sm font-medium">
-                                        ${statusText}
-                                    </span>
-                                </div>
-                            </div>
-                        `;
-                    }).join('');
+                        // 安全验证 req.id
+                        const reqId = parseInt(req.id, 10);
+                        if (!reqId || reqId <= 0) return;
+
+                        const cardDiv = createSafeElement('div', {
+                            class: 'border border-gray-200 rounded-xl p-4 mb-3 hover:shadow-md transition-shadow cursor-pointer',
+                            onclick: (e) => {
+                                e.preventDefault();
+                                goToRequirement(reqId);
+                            }
+                        });
+
+                        const flexDiv = createSafeElement('div', { class: 'flex justify-between items-center' });
+                        const leftDiv = createSafeElement('div', { class: 'flex-1' });
+                        const titleH3 = createSafeElement('h3', { class: 'font-semibold text-gray-800 text-lg' }, req.title);
+                        const timeP = createSafeElement('p', { class: 'text-sm text-gray-500 mt-1' }, '创建于 ' + formatTime(req.create_time));
+                        leftDiv.appendChild(titleH3);
+                        leftDiv.appendChild(timeP);
+
+                        const statusSpan = createSafeElement('span', {
+                            class: 'px-3 py-1 bg-' + statusColor + '-100 text-' + statusColor + '-700 rounded-full text-sm font-medium'
+                        }, statusText);
+
+                        flexDiv.appendChild(leftDiv);
+                        flexDiv.appendChild(statusSpan);
+                        cardDiv.appendChild(flexDiv);
+                        appsList.appendChild(cardDiv);
+                    });
 
                 } catch (error) {
-                    appsList.innerHTML = '<div class="text-center text-red-500 py-8">加载失败，请重试</div>';
+                    // 清空容器
+                    while (appsList.firstChild) {
+                        appsList.removeChild(appsList.firstChild);
+                    }
+                    const errorDiv = createSafeElement('div', { class: 'text-center text-red-500 py-8' }, '加载失败，请重试');
+                    appsList.appendChild(errorDiv);
                     console.error('加载应用列表失败:', error);
                 }
             };

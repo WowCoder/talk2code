@@ -5,6 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>需求详情 - Talk2Code</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <!-- DOMPurify XSS 防护 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
+    <!-- 安全工具 -->
+    <script src="js/security.js"></script>
     <!-- CodeMirror 核心 -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/theme/dracula.min.css">
@@ -701,37 +705,44 @@
 
         function renderDialogue() {
             const container = document.getElementById('dialogueContainer');
-            container.innerHTML = dialogueMessages.map(msg => {
+
+            // 清空容器（安全方式）
+            while (container.firstChild) {
+                container.removeChild(container.firstChild);
+            }
+
+            // 使用 DOM 操作创建元素，避免 XSS
+            dialogueMessages.forEach(msg => {
+                let messageDiv;
+
                 if (msg.role === 'user') {
-                    return `
-                        <div class="message message-user">
-                            <div class="message-content">
-                                <div>${escapeHtml(msg.content)}</div>
-                                <div class="text-xs opacity-75 mt-2">${msg.timestamp || ''}</div>
-                            </div>
-                        </div>
-                    `;
+                    messageDiv = createSafeElement('div', { class: 'message message-user' });
+                    const contentDiv = createSafeElement('div', { class: 'message-content' });
+                    const textDiv = createSafeElement('div', {}, msg.content);
+                    const timeDiv = createSafeElement('div', { class: 'text-xs opacity-75 mt-2' }, msg.timestamp || '');
+                    contentDiv.appendChild(textDiv);
+                    contentDiv.appendChild(timeDiv);
+                    messageDiv.appendChild(contentDiv);
                 } else if (msg.role === 'agent') {
-                    return `
-                        <div class="message message-agent">
-                            <div class="message-content">
-                                <div class="agent-name">🤖 ${escapeHtml(msg.name)}</div>
-                                <div class="whitespace-pre-wrap">${escapeHtml(msg.content)}</div>
-                                <div class="text-xs text-gray-500 mt-2">${msg.timestamp || ''}</div>
-                            </div>
-                        </div>
-                    `;
+                    messageDiv = createSafeElement('div', { class: 'message message-agent' });
+                    const contentDiv = createSafeElement('div', { class: 'message-content' });
+                    const nameDiv = createSafeElement('div', { class: 'agent-name' }, '🤖 ' + (msg.name || 'AI'));
+                    const textDiv = createSafeElement('div', { class: 'whitespace-pre-wrap' }, msg.content);
+                    const timeDiv = createSafeElement('div', { class: 'text-xs text-gray-500 mt-2' }, msg.timestamp || '');
+                    contentDiv.appendChild(nameDiv);
+                    contentDiv.appendChild(textDiv);
+                    contentDiv.appendChild(timeDiv);
+                    messageDiv.appendChild(contentDiv);
                 } else if (msg.role === 'system') {
-                    return `
-                        <div class="message message-system">
-                            <div class="message-content">
-                                ${escapeHtml(msg.content)}
-                            </div>
-                        </div>
-                    `;
+                    messageDiv = createSafeElement('div', { class: 'message message-system' });
+                    const contentDiv = createSafeElement('div', { class: 'message-content' }, msg.content);
+                    messageDiv.appendChild(contentDiv);
                 }
-                return '';
-            }).join('');
+
+                if (messageDiv) {
+                    container.appendChild(messageDiv);
+                }
+            });
 
             // 滚动到底部
             container.scrollTop = container.scrollHeight;
@@ -758,20 +769,47 @@
             const tabsContainer = document.getElementById('fileTabs');
             const filenames = Object.keys(codeFiles);
 
+            // 清空容器（安全方式）
+            while (tabsContainer.firstChild) {
+                tabsContainer.removeChild(tabsContainer.firstChild);
+            }
+
             if (filenames.length === 0) {
-                tabsContainer.innerHTML = '<span class="text-gray-500 text-sm px-4 py-2">暂无文件</span>';
+                const emptySpan = createSafeElement('span', { class: 'text-gray-500 text-sm px-4 py-2' }, '暂无文件');
+                tabsContainer.appendChild(emptySpan);
                 return;
             }
 
-            tabsContainer.innerHTML = filenames.map(filename => {
+            // 使用 DOM 操作创建元素，避免 XSS
+            filenames.forEach(filename => {
                 const isModified = modifiedFiles.has(filename);
-                return `
-                    <button class="file-tab ${filename === currentFile ? 'active' : ''}" onclick="switchToFile('${filename}')">
-                        ${getFileIcon(filename)} ${filename}
-                        ${isModified ? '<span class="modified-indicator" style="display:inline-block;width:8px;height:8px;background:#ef4444;border-radius:50%;margin-left:6px;" title="已修改"></span>' : ''}
-                    </button>
-                `;
-            }).join('');
+                const isActive = filename === currentFile;
+
+                // 创建按钮
+                const button = createSafeElement('button', {
+                    class: 'file-tab ' + (isActive ? 'active' : ''),
+                    onclick: (e) => {
+                        e.preventDefault();
+                        switchToFile(filename);
+                    }
+                });
+
+                // 添加图标（使用 textContent 安全添加）
+                const iconSpan = document.createElement('span');
+                iconSpan.textContent = getFileIcon(filename) + ' ' + filename;
+                button.appendChild(iconSpan);
+
+                // 如果已修改，添加指示器
+                if (isModified) {
+                    const indicator = document.createElement('span');
+                    indicator.className = 'modified-indicator';
+                    indicator.style.cssText = 'display:inline-block;width:8px;height:8px;background:#ef4444;border-radius:50%;margin-left:6px;';
+                    indicator.title = '已修改';
+                    button.appendChild(indicator);
+                }
+
+                tabsContainer.appendChild(button);
+            });
         }
 
         function switchToFile(filename) {
