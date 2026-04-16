@@ -24,9 +24,11 @@
 **Plans:** 3 plans
 
 **Plans:**
-- [ ] 01-01-PLAN.md — Python 3.11.11 environment setup (.python-version, backend/.venv)
-- [ ] 01-02-PLAN.md — Dependency upgrade (langchain-core>=1.0.0, langgraph>=0.1.0)
-- [ ] 01-03-PLAN.md — Verification (imports, pytest, Flask startup)
+- [x] 01-01-PLAN.md — Python 3.11.11 environment setup (.python-version, backend/.venv) `completed: 2026-04-16`
+- [x] 01-02-PLAN.md — Dependency upgrade (langchain-core>=1.0.0, langgraph>=0.1.0) `completed: 2026-04-16`
+- [x] 01-03-PLAN.md — Verification (imports, pytest, Flask startup) `completed: 2026-04-16`
+
+**Status:** ✓ Complete (2026-04-16)
 
 **Success Criteria:**
 1. `.python-version` 文件创建并指定 3.11.11
