@@ -11,6 +11,9 @@ from typing import Dict, Any, List, Union, Tuple
 from agents.state import AgentState
 from llm.client import get_client
 from prompts import (
+    RESEARCHER_PROMPT, PRODUCT_MANAGER_PROMPT,
+    ARCHITECT_PROMPT, ENGINEER_PROMPT,
+    # Deprecated imports kept for backward compatibility
     RESEARCHER_SYSTEM_PROMPT, RESEARCHER_USER_PROMPT,
     PRODUCT_MANAGER_SYSTEM_PROMPT, PRODUCT_MANAGER_USER_PROMPT,
     ARCHITECT_SYSTEM_PROMPT, ARCHITECT_USER_PROMPT,
@@ -89,11 +92,15 @@ def researcher_node(state: AgentState) -> Dict[str, Any]:
 
     try:
         client = get_client()
-        user_prompt = RESEARCHER_USER_PROMPT.format(requirement=state['requirement_content'])
+        # Use ChatPromptTemplate.format_messages() for LangChain-compatible message formatting
+        messages = RESEARCHER_PROMPT.format_messages(requirement=state['requirement_content'])
+        # Extract system and user prompts for custom client compatibility
+        system_prompt = next((m.content for m in messages if m.type == 'system'), None)
+        user_prompt = next((m.content for m in messages if m.type == 'human'), None)
 
         response = client.chat(
             prompt=user_prompt,
-            system_prompt=RESEARCHER_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             use_memory=False,
             max_tokens=2000,
             timeout=45
@@ -146,14 +153,18 @@ def product_manager_node(state: AgentState) -> Dict[str, Any]:
         # 获取研究员输出作为上下文
         context = compress_outputs(state.get('agent_outputs', []))
 
-        user_prompt = PRODUCT_MANAGER_USER_PROMPT.format(
+        # Use ChatPromptTemplate.format_messages() for LangChain-compatible message formatting
+        messages = PRODUCT_MANAGER_PROMPT.format_messages(
             requirement=state['requirement_content'],
             context=context if context else '无'
         )
+        # Extract system and user prompts for custom client compatibility
+        system_prompt = next((m.content for m in messages if m.type == 'system'), None)
+        user_prompt = next((m.content for m in messages if m.type == 'human'), None)
 
         response = client.chat(
             prompt=user_prompt,
-            system_prompt=PRODUCT_MANAGER_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             use_memory=False,
             max_tokens=2000,
             timeout=45
@@ -206,14 +217,18 @@ def architect_node(state: AgentState) -> Dict[str, Any]:
         # 获取前面所有智能体的输出
         context = compress_outputs(state.get('agent_outputs', []))
 
-        user_prompt = ARCHITECT_USER_PROMPT.format(
+        # Use ChatPromptTemplate.format_messages() for LangChain-compatible message formatting
+        messages = ARCHITECT_PROMPT.format_messages(
             requirement=state['requirement_content'],
             context=context if context else '无'
         )
+        # Extract system and user prompts for custom client compatibility
+        system_prompt = next((m.content for m in messages if m.type == 'system'), None)
+        user_prompt = next((m.content for m in messages if m.type == 'human'), None)
 
         response = client.chat(
             prompt=user_prompt,
-            system_prompt=ARCHITECT_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             use_memory=False,
             max_tokens=2000,
             timeout=45
@@ -266,14 +281,18 @@ def engineer_node(state: AgentState) -> Dict[str, Any]:
         # 获取前面所有智能体的输出作为上下文
         context = compress_outputs(state.get('agent_outputs', []))
 
-        user_prompt = ENGINEER_USER_PROMPT.format(
+        # Use ChatPromptTemplate.format_messages() for LangChain-compatible message formatting
+        messages = ENGINEER_PROMPT.format_messages(
             requirement=state['requirement_content'],
             context=context if context else '请根据需求生成代码'
         )
+        # Extract system and user prompts for custom client compatibility
+        system_prompt = next((m.content for m in messages if m.type == 'system'), None)
+        user_prompt = next((m.content for m in messages if m.type == 'human'), None)
 
         response = client.chat(
             prompt=user_prompt,
-            system_prompt=ENGINEER_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             use_memory=False,
             max_tokens=4000,
             timeout=60
