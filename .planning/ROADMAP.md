@@ -21,6 +21,13 @@
 - PY-01, PY-02, PY-03, PY-04 (Python 版本)
 - DEP-01, DEP-02, DEP-03 (依赖升级)
 
+**Plans:** 3 plans
+
+**Plans:**
+- [ ] 01-01-PLAN.md — Python 3.11.11 environment setup (.python-version, backend/.venv)
+- [ ] 01-02-PLAN.md — Dependency upgrade (langchain-core>=1.0.0, langgraph>=0.1.0)
+- [ ] 01-03-PLAN.md — Verification (imports, pytest, Flask startup)
+
 **Success Criteria:**
 1. `.python-version` 文件创建并指定 3.11.11
 2. 虚拟环境使用 Python 3.11.11
