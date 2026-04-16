@@ -763,8 +763,9 @@ def health_check():
     db_error = None
     try:
         db = SessionLocal()
-        # 执行简单查询验证连接
-        db.execute('SELECT 1')
+        # 执行简单查询验证连接 (SQLAlchemy 2.x 需要 text())
+        from sqlalchemy import text
+        db.execute(text('SELECT 1'))
         db.close()
     except Exception as e:
         db_status = 'error'
@@ -844,7 +845,8 @@ def readiness_check():
     # 只检查数据库
     try:
         db = SessionLocal()
-        db.execute('SELECT 1')
+        from sqlalchemy import text
+        db.execute(text('SELECT 1'))
         db.close()
         return jsonify({'status': 'ready'}), 200
     except Exception as e:
