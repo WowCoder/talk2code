@@ -2,6 +2,10 @@
 """
 统一 LLM 客户端模块
 整合阿里云百炼 LLM 调用，支持流式输出、会话记忆、自动重试
+
+Note: Using direct DashScope REST API instead of langchain-dashscope
+for better control over retry logic, streaming, and timeout handling.
+See: .planning/phases/02-langchain-api-migration/02-RESEARCH.md
 """
 
 import os
@@ -13,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 import requests
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from config import DASHSCOPE_API_KEY, DASHSCOPE_BASE_URL, DASHSCOPE_MODEL
 from utils.logger import get_logger
 
@@ -38,6 +43,27 @@ class LLMResponse:
     @property
     def is_error(self) -> bool:
         return self.error is not None
+
+
+def to_langchain_message(msg: Message) -> BaseMessage:
+    """
+    Convert internal Message to langchain_core BaseMessage.
+
+    Enables future integration with LangChain components while keeping
+    the custom DashScope API client.
+
+    Args:
+        msg: Internal Message object with role and content
+
+    Returns:
+        langchain_core BaseMessage subclass (HumanMessage, AIMessage, or SystemMessage)
+    """
+    if msg.role == 'user':
+        return HumanMessage(content=msg.content)
+    elif msg.role == 'assistant':
+        return AIMessage(content=msg.content)
+    else:
+        return SystemMessage(content=msg.content)
 
 
 class LLMClient:
