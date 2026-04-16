@@ -2,10 +2,16 @@
 """
 LangGraph 工作流定义
 定义多智能体协同的状态图和执行流程
+
+LangChain 1.x 兼容验证:
+- 使用 from langgraph.graph import StateGraph, END (正确)
+- 无 from langchain.schema 导入 (正确)
+- AgentState 使用 TypedDict + Annotated[operator.add] 模式 (正确)
 """
 
 from typing import TypedDict, List, Annotated, Optional
 from langgraph.graph import StateGraph, END
+from langchain_core.messages import BaseMessage
 
 from agents.state import AgentState
 from agents.nodes import (

@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 LangGraph 工作流状态定义
+
+LangChain 1.x 兼容验证:
+- 使用 TypedDict 定义状态 (正确)
+- 使用 Annotated[T, operator.add] 进行状态归约 (正确)
+- 模式在 langgraph>=1.0.0 中稳定
 """
 
 from typing import TypedDict, List, Annotated, Optional
