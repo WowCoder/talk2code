@@ -50,17 +50,27 @@
 **Requirements Covered:**
 - API-01, API-02, API-03, API-04
 
+**Plans:** 3 plans
+
+**Plans:**
+- [ ] 02-01-PLAN.md — Import verification and langchain_core type integration
+- [ ] 02-02-PLAN.md — Migrate prompts to ChatPromptTemplate format
+- [ ] 02-03-PLAN.md — Workflow verification and integration tests
+
 **Success Criteria:**
 1. 所有导入语句使用新包结构 (`langchain_core.*`)
-2. `llm/client.py` 使用新 API 无弃用警告
-3. `agents/nodes.py` prompt 模板迁移完成
-4. `agents/workflow.py` StateGraph 使用新 API
+2. `llm/client.py` 集成 langchain_core 类型 (保持自定义 DashScope 客户端)
+3. `agents/nodes.py` 使用 ChatPromptTemplate 格式化消息
+4. `agents/workflow.py` StateGraph 通过验证 (已是 1.x 兼容)
+5. 添加集成测试验证工作流结构
 
 **Deliverables:**
-- 更新的 `backend/llm/client.py`
-- 更新的 `backend/agents/nodes.py`
-- 更新的 `backend/agents/workflow.py`
-- 更新的 `backend/prompts.py`
+- 更新的 `backend/llm/client.py` (添加 langchain_core 类型转换)
+- 更新的 `backend/prompts.py` (ChatPromptTemplate 格式)
+- 更新的 `backend/agents/nodes.py` (使用 format_messages)
+- 更新的 `backend/agents/workflow.py` (类型注解)
+- 新增 `backend/tests/unit/test_imports.py`
+- 新增 `backend/tests/integration/test_workflow.py`
 
 ---
 
