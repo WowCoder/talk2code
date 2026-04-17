@@ -5,7 +5,7 @@ LangGraph 工作流定义
 
 LangChain 1.x 兼容验证:
 - 使用 from langgraph.graph import StateGraph, END (正确)
-- 无 from langchain.schema 导入 (正确)
+- 无弃用的 langchain.schema 导入 (正确)
 - AgentState 使用 TypedDict + Annotated[operator.add] 模式 (正确)
 """
 

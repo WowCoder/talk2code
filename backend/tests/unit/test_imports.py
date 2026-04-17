@@ -76,13 +76,17 @@ class TestNoDeprecatedImports:
     def test_no_langchain_schema_imports(self):
         """扫描源文件确保无 'from langchain.schema' 导入"""
         files = self.get_project_python_files()
-        deprecated_pattern = "from langchain.schema"
+        # Match actual import statements, not comments (imports start at line beginning after whitespace)
+        deprecated_pattern = r"^\s*from langchain\.schema\b"
 
         files_with_deprecated = []
         for py_file in files:
             content = py_file.read_text(encoding='utf-8')
-            if deprecated_pattern in content:
-                files_with_deprecated.append(str(py_file.relative_to(Path(__file__).parent.parent.parent)))
+            for line in content.splitlines():
+                import re
+                if re.match(deprecated_pattern, line):
+                    files_with_deprecated.append(str(py_file.relative_to(Path(__file__).parent.parent.parent)))
+                    break
 
         assert len(files_with_deprecated) == 0, \
             f"发现弃用导入 'from langchain.schema' 在文件：{files_with_deprecated}"
