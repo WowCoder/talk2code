@@ -41,19 +41,33 @@ app.config['JWT_HEADER_TYPE'] = 'Bearer'
 
 jwt = JWTManager(app)
 
-# 限流配置
-limiter = Limiter(
-    key_func=get_user_identity,
-    app=app,
-    default_limits=[RATE_LIMITS['default']],
-    storage_uri="memory://",
-    headers_enabled=True
-)
+# 限流配置 - 测试环境下禁用
+DISABLE_RATE_LIMIT = os.environ.get('DISABLE_RATE_LIMIT', 'false').lower() == 'true'
+if DISABLE_RATE_LIMIT:
+    logger.info("测试环境：限流已禁用")
+    limiter = None
+else:
+    limiter = Limiter(
+        key_func=get_user_identity,
+        app=app,
+        default_limits=[RATE_LIMITS['default']],
+        storage_uri="memory://",
+        headers_enabled=True
+    )
 
 # 限流触发处理
 @app.errorhandler(429)
 def handle_rate_limit_exceeded(e):
     return rate_limit_handler(e)
+
+# 测试环境下使用无操作装饰器
+if limiter:
+    rate_limit_auth = limiter.limit(RATE_LIMITS['auth'])
+    rate_limit_requirement = limiter.limit(RATE_LIMITS['requirement_create'])
+    rate_limit_chat = limiter.limit(RATE_LIMITS['chat'])
+else:
+    # No-op decorator for tests
+    rate_limit_auth = rate_limit_requirement = rate_limit_chat = lambda f: f
 
 # 初始化数据库
 init_db()
@@ -149,7 +163,7 @@ def static_files(filename):
 # ==================== 用户认证 API ====================
 
 @app.route('/api/register', methods=['POST'])
-@limiter.limit(RATE_LIMITS['auth'])
+@rate_limit_auth
 def register():
     """用户注册接口"""
     from models import User, SessionLocal
@@ -191,7 +205,7 @@ def register():
 
 
 @app.route('/api/login', methods=['POST'])
-@limiter.limit(RATE_LIMITS['auth'])
+@rate_limit_auth
 def login():
     """用户登录接口"""
     from models import User, SessionLocal
@@ -252,7 +266,7 @@ def get_user_info():
 # ==================== 需求管理 API ====================
 
 @app.route('/api/requirements', methods=['POST'])
-@limiter.limit(RATE_LIMITS['requirement_create'])
+@rate_limit_requirement
 @jwt_required()
 def create_requirement():
     """创建需求接口"""
@@ -380,7 +394,7 @@ def get_requirement(req_id):
 
 
 @app.route('/api/requirements/<int:req_id>/chat', methods=['POST'])
-@limiter.limit(RATE_LIMITS['chat'])
+@rate_limit_chat
 @jwt_required()
 def chat_with_requirement(req_id):
     """与需求对话（支持 diff 代码修改）"""

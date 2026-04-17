@@ -17,6 +17,7 @@ os.environ.setdefault('JWT_SECRET_KEY', 'test-secret-key-for-testing-only')
 os.environ.setdefault('DASHSCOPE_API_KEY', 'test-api-key')
 os.environ.setdefault('DATABASE_NAME', 'test_vcd.db')
 os.environ.setdefault('APP_DEBUG', 'false')
+os.environ.setdefault('DISABLE_RATE_LIMIT', 'true')  # Disable rate limiting for tests
 
 
 @pytest.fixture(scope='session')
@@ -136,3 +137,42 @@ def sample_requirement_data():
         'dialogue_history': [],
         'code_files': []
     }
+
+
+@pytest.fixture(scope='function')
+def test_user():
+    """创建测试用户 fixture"""
+    from models import User, SessionLocal
+    from utils.security import hash_password
+
+    # Clean up any existing user with username 'test_func'
+    db = SessionLocal()
+    try:
+        existing_user = db.query(User).filter(User.username == 'test_func').first()
+        if existing_user:
+            db.delete(existing_user)
+            db.commit()
+
+        # Create new test user
+        hashed = hash_password('test123456')
+        user = User(username='test_func', password_hash=hashed)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+        return {'username': 'test_func', 'password': 'test123456', 'id': user.id}
+    finally:
+        db.close()
+
+
+@pytest.fixture(scope='function')
+def auth_token(app_client, test_user):
+    """获取认证 token fixture"""
+    response = app_client.post('/api/login', json={
+        'username': test_user['username'],
+        'password': test_user['password']
+    })
+    data = response.get_json()
+    assert response.status_code == 200, f"Login failed: {data}"
+    assert 'token' in data, f"No token in response: {data}"
+    return data['token']

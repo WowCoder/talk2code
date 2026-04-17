@@ -33,12 +33,19 @@ def get_user_identity() -> str:
     return f"ip:{ip}"
 
 
-def rate_limit_handler(response):
+def rate_limit_handler(e=None):
     """限流触发时的处理函数"""
+    # Handle both exception and response object
+    retry_after = '60'
+    if hasattr(e, 'retry_after'):
+        retry_after = str(e.retry_after)
+    elif hasattr(e, 'headers') and e.headers.get('Retry-After'):
+        retry_after = e.headers.get('Retry-After', '60')
+
     logger.warning(f"限流触发：{get_user_identity()}")
     return jsonify({
         'error': '请求过于频繁，请稍后再试',
-        'retry_after': response.headers.get('Retry-After', '60')
+        'retry_after': retry_after
     }), 429
 
 
