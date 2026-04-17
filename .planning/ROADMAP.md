@@ -69,32 +69,13 @@
 - TEST-01, TEST-02, TEST-03, TEST-04
 - FUNC-01, FUNC-02, FUNC-03, FUNC-04, FUNC-05
 
-**Plans:** 0 plans (TBD)
+**Plans:** 4 plans
 
-**Success Criteria:**
-1. 所有导入语句使用新包结构 (`langchain_core.*`)
-2. `llm/client.py` 集成 langchain_core 类型 (保持自定义 DashScope 客户端)
-3. `agents/nodes.py` 使用 ChatPromptTemplate 格式化消息
-4. `agents/workflow.py` StateGraph 通过验证 (已是 1.x 兼容)
-5. 添加集成测试验证工作流结构
-
-**Deliverables:**
-- 更新的 `backend/llm/client.py` (添加 langchain_core 类型转换)
-- 更新的 `backend/prompts.py` (ChatPromptTemplate 格式)
-- 更新的 `backend/agents/nodes.py` (使用 format_messages)
-- 更新的 `backend/agents/workflow.py` (类型注解)
-- 新增 `backend/tests/unit/test_imports.py`
-- 新增 `backend/tests/integration/test_workflow.py`
-
----
-
-## Phase 3: 测试与验证
-
-**Goal:** 验证所有功能在升级后正常工作
-
-**Requirements Covered:**
-- TEST-01, TEST-02, TEST-03, TEST-04
-- FUNC-01, FUNC-02, FUNC-03, FUNC-04, FUNC-05
+**Plans:**
+- [ ] 03-01-PLAN.md — Unit and integration test execution (TEST-01, TEST-02, TEST-03)
+- [ ] 03-02-PLAN.md — Flask startup and authentication testing (TEST-04, FUNC-01)
+- [ ] 03-03-PLAN.md — Requirement and SSE conversation testing (FUNC-02, FUNC-03, FUNC-04, FUNC-05)
+- [ ] 03-04-PLAN.md — Complete test suite and verification report (All requirements)
 
 **Success Criteria:**
 1. 所有单元测试通过 (`pytest`)
@@ -118,8 +99,8 @@
 | PY-01 ~ PY-04 | Phase 1 | ✓ Complete |
 | DEP-01 ~ DEP-03 | Phase 1 | ✓ Complete |
 | API-01 ~ API-04 | Phase 2 | ✓ Complete |
-| TEST-01 ~ TEST-04 | Phase 3 | Pending |
-| FUNC-01 ~ FUNC-05 | Phase 3 | Pending |
+| TEST-01 ~ TEST-04 | Phase 3 | Planned |
+| FUNC-01 ~ FUNC-05 | Phase 3 | Planned |
 
 **Coverage:** 100% (19/19 requirements mapped)
 
