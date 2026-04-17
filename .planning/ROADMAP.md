@@ -53,9 +53,23 @@
 **Plans:** 3 plans
 
 **Plans:**
-- [ ] 02-01-PLAN.md — Import verification and langchain_core type integration
-- [ ] 02-02-PLAN.md — Migrate prompts to ChatPromptTemplate format
-- [ ] 02-03-PLAN.md — Workflow verification and integration tests
+- [x] 02-01-PLAN.md — Import verification and langchain_core type integration `completed: 2026-04-17`
+- [x] 02-02-PLAN.md — Migrate prompts to ChatPromptTemplate format `completed: 2026-04-17`
+- [x] 02-03-PLAN.md — Workflow verification and integration tests `completed: 2026-04-17`
+
+**Status:** ✓ Complete (2026-04-17)
+
+---
+
+## Phase 3: 测试与验证
+
+**Goal:** 验证所有功能在升级后正常工作
+
+**Requirements Covered:**
+- TEST-01, TEST-02, TEST-03, TEST-04
+- FUNC-01, FUNC-02, FUNC-03, FUNC-04, FUNC-05
+
+**Plans:** 0 plans (TBD)
 
 **Success Criteria:**
 1. 所有导入语句使用新包结构 (`langchain_core.*`)
@@ -101,9 +115,9 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| PY-01 ~ PY-04 | Phase 1 | Pending |
-| DEP-01 ~ DEP-03 | Phase 1 | Pending |
-| API-01 ~ API-04 | Phase 2 | Pending |
+| PY-01 ~ PY-04 | Phase 1 | ✓ Complete |
+| DEP-01 ~ DEP-03 | Phase 1 | ✓ Complete |
+| API-01 ~ API-04 | Phase 2 | ✓ Complete |
 | TEST-01 ~ TEST-04 | Phase 3 | Pending |
 | FUNC-01 ~ FUNC-05 | Phase 3 | Pending |
 
