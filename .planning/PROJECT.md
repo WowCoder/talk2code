@@ -1,12 +1,12 @@
-# Talk2Code 技术栈升级
+# Talk2Code Agent 范式重构
 
 ## What This Is
 
-Talk2Code 是一个 AI 驱动的代码生成平台，用户输入自然语言需求 → AI 多智能体协同处理 → 实时生成可运行的产品代码。当前项目需要进行技术栈升级，包括 Python 版本和 LangChain 框架。
+Talk2Code 是一个 AI 驱动的代码生成平台，用户输入自然语言需求，AI 多智能体协同处理并实时生成可运行代码。当前项目已完成技术栈升级（Python 3.11 + LangChain 1.x），下一步核心工作是重构 AI 智能体架构，从低效的 4 节点流水线升级为 Planner+Coder 的两阶段范式。
 
 ## Core Value
 
-保持项目技术栈现代化，利用 LangChain 最新特性和 Python 新特性，提升代码质量和可维护性。
+用最小的 LLM 调用成本，生成高质量的完整前端代码。每个需求处理的延迟和 token 消耗减半，代码质量不降反升。
 
 ## Requirements
 
@@ -15,50 +15,59 @@ Talk2Code 是一个 AI 驱动的代码生成平台，用户输入自然语言需
 - ✓ 现有 LangGraph 工作流（研究员→产品经理→架构师→工程师）正常运行
 - ✓ Flask 应用启动并提供 API 服务
 - ✓ 用户认证和 SSE 实时推送功能正常
+- ✓ LangChain 1.x + LangGraph 升级完成
 
 ### Active
 
-- [ ] 升级 Python 到 3.11.11（pyenv 可用最新版本）
-- [ ] 升级 langchain-core 从 0.1.x 到 1.x 最新版本
-- [ ] 升级 langgraph 到最新版本
-- [ ] 迁移代码使用 LangChain 新 API（如 v1.x 的 ChatPromptTemplate 等）
-- [ ] 确保所有现有功能在升级后正常工作
-- [ ] 更新测试以覆盖新特性
+- [ ] **PLN-01**: 合并研究员、产品经理、架构师为 Planner 节点，产出结构化 Plan JSON
+- [ ] **COD-01**: 改造 Coder 节点，使用结构化 Plan 替代 compress_outputs 压缩文本
+- [ ] **VAL-01**: 新增 Validator 节点，静态检查 + LLM 代码审查
+- [ ] **VAL-02**: 实现验证循环（不通过则回退 Coder 重试，最多 2 次）
+- [ ] **WFL-01**: 重构 Workflow DAG 从 4 节点线性改为 3 节点 + 条件循环
+- [ ] **SSE-01**: 更新 SSE 推送内容适配新节点（Plan 展示 + 代码展示）
+- [ ] **CLN-01**: 清理旧节点（researcher/product_manager/architect）和旧 prompt
+- [ ] **API-01**: Chat 修改接口支持独立触发 Coder（不重跑 Planner）
 
 ### Out of Scope
 
-- 不改变现有的 AI 智能体工作流架构
-- 不引入新的外部依赖（除非必要）
-- 不重写前端代码
+- Supervisor/Router 范式 — Talk2Code 只有两个固定场景，不需要动态路由
+- 引入新的 LLM provider — 继续使用 DashScope
+- 重写前端 — SSE 推送接口兼容，前端可选适配
+- 大规模测试覆盖 — 保留现有 fallback 兜底即可
 
 ## Context
 
-**技术环境：**
-- 当前 Python 版本：通过 pyenv 管理，目标 3.11.11
-- 当前 LangChain：langchain-core>=0.1.0, langgraph>=0.0.40
-- 目标 LangChain：langchain-core 1.x, langchain 1.x
-- 应用类型：Flask + LangGraph + DashScope API
+**架构现状：**
+- 4 个串联 LLM 调用：研究员(2000tok) → 产品经理(2000tok) → 架构师(2000tok) → 工程师(4000tok)
+- 前 3 个节点输出经过 `compress_outputs()` 关键词提取压缩为 ~200 字传给工程师
+- 研究员的"市场需求分析"对工程师写代码完全无用
+- 信息压缩率 ~95% 丢失
 
-**代码库状态：**
-- 已有代码库映射完成（`.planning/codebase/` 7 个文档）
-- 核心功能：用户认证、需求管理、AI 工作流、SSE 推送
-- 测试覆盖：部分单元测试，缺少集成测试
+**技术栈：**
+- LangGraph StateGraph 工作流
+- LangChain ChatPromptTemplate prompts
+- DashScope API (qwen 系列模型)
+- SSE 实时推送
+
+**已知问题：**
+- `generate_fallback_code()` 包含完整模板代码，质量与 LLM 产出相当
+- 说明简单应用不需要 4 轮 LLM 调用
 
 ## Constraints
 
-- **[兼容性]**: 升级后必须保持现有 API 接口不变 — 前端和外部调用方不应受影响
-- **[渐进式]**: 需要逐步迁移，不能一次性破坏所有功能 — 保持可运行状态
-- **[Python 版本]**: 目标版本必须在 pyenv 中可用 — 已确认 3.11.11 已安装
-- **[API 密钥]**: DashScope API 需要有效配置 — 升级过程不影响现有密钥
+- **[兼容性]**: 输出格式不变（code_files JSON 数组），前端无需重写
+- **[兜底]**: 保留 `generate_fallback_code()` 作为 Coder 失败时的备用
+- **[增量]**: 先完成核心重构，Validator 可后续增强
+- **[LLM Provider]**: 继续用 DashScope，不引入新依赖
 
 ## Key Decisions
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| Python 3.11.11 作为目标版本 | pyenv 中已安装的最新版本，Python 3.11 性能提升明显 | — Pending |
-| 升级到 LangChain 1.x | 最新稳定版本，支持新特性和更好的模块化 | — Pending |
-| 保留 LangGraph 工作流设计 | 现有 4 智能体架构工作良好，只需 API 迁移 | — Pending |
-| 使用 langchain-core 而非完整 langchain | 更轻量的依赖，只引入需要的组件 | — Pending |
+| Planner 产出结构化 JSON | Coder 需要完整信息而非压缩文本 | ✓ 信息无损传递 |
+| 合并研究员+产品经理+架构师 | 研究员输出对写代码无用 | ⚠️ 待验证代码质量 |
+| Validator 最多重试 2 次 | 2 次是性价比拐点 | — Pending |
+| 保留 Fallback 代码 | LLM 调用失败时兜底 | ✓ 向后兼容 |
 
 ## Evolution
 
@@ -70,4 +79,4 @@ Talk2Code 是一个 AI 驱动的代码生成平台，用户输入自然语言需
 3. _决策需要记录？_ → 添加到 Key Decisions
 
 ---
-*Last updated: 2026-04-16 after technical stack upgrade initialization*
+*Last updated: 2026-04-29 after agent paradigm refactoring initialization*

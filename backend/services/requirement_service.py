@@ -27,10 +27,8 @@ class RequirementService:
         self.workflow = get_workflow()
         # 进度映射
         self._progress_map = {
-            'researcher': 25,
-            'product_manager': 50,
-            'architect': 75,
-            'engineer': 90
+            'planner': 40,
+            'coder': 80,
         }
 
     def _execute_workflow_with_stream(self, requirement_id: int, initial_state: AgentState) -> Optional[AgentState]:
@@ -55,10 +53,8 @@ class RequirementService:
                 # 发送进度更新
                 progress = self._progress_map.get(node_name, 0)
                 agent_name_map = {
-                    'researcher': '研究员',
-                    'product_manager': '产品经理',
-                    'architect': '架构师',
-                    'engineer': '工程师'
+                    'planner': 'Planner',
+                    'coder': 'Coder'
                 }
                 agent_name = agent_name_map.get(node_name, node_name)
                 self._send_progress(requirement_id, agent_name, progress)
@@ -69,7 +65,7 @@ class RequirementService:
                         self._send_dialogue(requirement_id, dialogue.get('name', agent_name), dialogue.get('content', ''))
 
                 # 发送代码更新
-                if node_name == 'engineer' and 'code_files' in node_output:
+                if node_name == 'coder' and 'code_files' in node_output:
                     code_files = node_output.get('code_files', [])
                     for file_data in code_files:
                         filename = file_data.get('filename', 'unknown.txt')
@@ -116,9 +112,11 @@ class RequirementService:
             initial_state: AgentState = {
                 'requirement_id': requirement_id,
                 'requirement_content': requirement.content,
-                'agent_outputs': [],
+                'plan': None,
                 'current_step': 'starting',
                 'code_files': None,
+                'validation_result': None,
+                'retry_count': 0,
                 'error': None,
                 'dialogue_history': requirement.dialogue_history or [],
                 'metadata': {}

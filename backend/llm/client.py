@@ -1,11 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 统一 LLM 客户端模块
-整合阿里云百炼 LLM 调用，支持流式输出、会话记忆、自动重试
-
-Note: Using direct DashScope REST API instead of langchain-dashscope
-for better control over retry logic, streaming, and timeout handling.
-See: .planning/phases/02-langchain-api-migration/02-RESEARCH.md
+支持 OpenAI 兼容接口 和 Anthropic 兼容接口 两种协议
+通过 LLM_PROVIDER 配置切换，支持流式输出、会话记忆、自动重试
 """
 
 import os
@@ -18,7 +15,7 @@ from datetime import datetime
 
 import requests
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
-from config import DASHSCOPE_API_KEY, DASHSCOPE_BASE_URL, DASHSCOPE_MODEL
+from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_PROVIDER
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -67,21 +64,33 @@ def to_langchain_message(msg: Message) -> BaseMessage:
 
 
 class LLMClient:
-    """阿里云百炼 LLM 客户端（统一实现）"""
+    """
+    统一 LLM 客户端
+
+    支持两种 API 协议，通过 provider 参数切换：
+    - openai_compatible:    POST {base_url}/chat/completions
+                            Header: Authorization: Bearer {api_key}
+                            system prompt 放在 messages 数组中
+    - anthropic_compatible: POST {base_url}/messages
+                            Header: x-api-key: {api_key}
+                            system prompt 作为顶层字段
+    """
 
     def __init__(
         self,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         model: Optional[str] = None,
+        provider: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 4000,
         timeout: int = 60,
         max_retries: int = 2
     ):
-        self.api_key = api_key or DASHSCOPE_API_KEY
-        self.base_url = base_url or DASHSCOPE_BASE_URL
-        self.model = model or DASHSCOPE_MODEL
+        self.api_key = api_key or LLM_API_KEY
+        self.base_url = base_url or LLM_BASE_URL
+        self.model = model or LLM_MODEL
+        self.provider = provider or LLM_PROVIDER
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout = timeout
@@ -91,9 +100,12 @@ class LLMClient:
         self._messages: List[Message] = []
 
         if not self.api_key:
-            raise ValueError("请配置 DASHSCOPE_API_KEY 环境变量")
+            raise ValueError("请配置 LLM_API_KEY 环境变量")
 
-        logger.info(f"LLMClient 初始化：model={self.model}, base_url={self.base_url}")
+        if self.provider not in ('openai_compatible', 'anthropic_compatible'):
+            raise ValueError(f"不支持的 LLM_PROVIDER: {self.provider}，可选值：openai_compatible, anthropic_compatible")
+
+        logger.info(f"LLMClient 初始化：provider={self.provider}, model={self.model}, base_url={self.base_url}")
 
     def clear_memory(self):
         """清空会话记忆"""
@@ -139,12 +151,12 @@ class LLMClient:
 
         return messages
 
-    def _do_request(
+    def _request_openai(
         self,
         messages: List[Dict[str, str]],
         stream: bool = False
     ) -> Generator[str, None, None]:
-        """发送 API 请求（带重试）"""
+        """发送 OpenAI 兼容 API 请求（带重试）"""
         headers = {
             'Authorization': f'Bearer {self.api_key}',
             'Content-Type': 'application/json'
@@ -160,7 +172,6 @@ class LLMClient:
 
         url = f'{self.base_url}/chat/completions'
 
-        # 重试逻辑
         last_error = None
         for attempt in range(self.max_retries + 1):
             try:
@@ -195,12 +206,11 @@ class LLMClient:
                     result = response.json()
                     content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
                     yield content
-                return  # 成功，退出重试循环
+                return
 
             except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
                 last_error = e
                 if attempt < self.max_retries:
-                    # 指数退避延迟
                     import random
                     delay = min(1.0 * (2 ** attempt), 10.0) * (0.5 + random.random() * 0.5)
                     logger.warning(f"LLM 请求失败：{str(e)}，{delay:.2f}秒后重试 ({attempt + 1}/{self.max_retries})")
@@ -208,6 +218,102 @@ class LLMClient:
                 else:
                     logger.error(f"LLM 请求失败，已达最大重试次数：{str(e)}")
                     yield f"[错误] API 请求失败：{str(e)}"
+
+    def _request_anthropic(
+        self,
+        messages: List[Dict[str, str]],
+        stream: bool = False
+    ) -> Generator[str, None, None]:
+        """发送 Anthropic 兼容 API 请求（带重试）"""
+        headers = {
+            'x-api-key': self.api_key,
+            'Content-Type': 'application/json',
+            'anthropic-version': '2023-06-01'
+        }
+
+        # Anthropic: system 是顶层字段，不在 messages 数组中
+        system_prompt = None
+        api_messages = []
+        for m in messages:
+            if m['role'] == 'system':
+                system_prompt = m['content']
+            else:
+                api_messages.append(m)
+
+        data = {
+            'model': self.model,
+            'messages': api_messages,
+            'stream': stream,
+            'max_tokens': self.max_tokens
+        }
+        if system_prompt:
+            data['system'] = system_prompt
+
+        url = f'{self.base_url}/messages'
+
+        last_error = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                if stream:
+                    response = requests.post(
+                        url, headers=headers, json=data,
+                        stream=True, timeout=self.timeout
+                    )
+                    response.raise_for_status()
+
+                    for line in response.iter_lines():
+                        if line:
+                            line = line.decode('utf-8')
+                            if line.startswith('data: '):
+                                content = line[6:]
+                                try:
+                                    chunk = json.loads(content)
+                                    if chunk.get('type') == 'content_block_delta':
+                                        delta = chunk.get('delta', {})
+                                        text = delta.get('text', '')
+                                        if text:
+                                            yield text
+                                    elif chunk.get('type') == 'message_stop':
+                                        break
+                                except json.JSONDecodeError:
+                                    continue
+                else:
+                    response = requests.post(
+                        url, headers=headers, json=data,
+                        timeout=self.timeout
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+                    content_blocks = result.get('content', [])
+                    text = ''.join(
+                        block.get('text', '')
+                        for block in content_blocks
+                        if block.get('type') == 'text'
+                    )
+                    yield text
+                return
+
+            except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
+                last_error = e
+                if attempt < self.max_retries:
+                    import random
+                    delay = min(1.0 * (2 ** attempt), 10.0) * (0.5 + random.random() * 0.5)
+                    logger.warning(f"LLM 请求失败：{str(e)}，{delay:.2f}秒后重试 ({attempt + 1}/{self.max_retries})")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"LLM 请求失败，已达最大重试次数：{str(e)}")
+                    yield f"[错误] API 请求失败：{str(e)}"
+
+    def _do_request(
+        self,
+        messages: List[Dict[str, str]],
+        stream: bool = False
+    ) -> Generator[str, None, None]:
+        """根据 provider 分发到对应的请求方法"""
+        if self.provider == 'anthropic_compatible':
+            yield from self._request_anthropic(messages, stream)
+        else:
+            yield from self._request_openai(messages, stream)
 
     def chat(
         self,

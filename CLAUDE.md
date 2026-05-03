@@ -23,8 +23,9 @@ python app.py
 - `models.py`: SQLAlchemy 数据库模型 (User, Requirement)
 - `config.py`: 配置管理 (数据库、JWT、SSE、AI 模型)
 - `utils.py`: 工具函数 (密码加密、SSE 消息格式)
-- `llm_client.py`: 基础 LLM 客户端 (DashScope API)
-- `langchain_client.py`: LangChain 封装的 LLM 客户端 (支持会话记忆)
+- `llm/client.py`: 统一 LLM 客户端，支持 OpenAI 兼容和 Anthropic 兼容两种协议，通过 LLM_PROVIDER 配置切换
+- `agents/`: LangGraph 多智能体节点和工作流
+- `services/`: 需求处理、SSE 推送、任务队列服务
 
 **前端结构** (`frontend/`):
 - `login.html`: 登录/注册页
@@ -33,14 +34,14 @@ python app.py
 
 ## 关键设计
 
-**AI 智能体**：app.py 中的 `generate_requirement_data()` 函数实现了 4 个角色的模拟对话，通过 SSE 实时推送。生产环境需替换为真实 AI 调用。
+**AI 智能体**：使用 LangGraph 工作流编排 Planner → Coder 两个智能体节点，通过 `llm/client.py` 调用 LLM。
 
 **SSE 推送**：使用 `flask.Response` with `text/event-stream`，消息格式为 `data: {...}\n\n`，前端自动重连。
 
-**代码生成**：`CodeGenerator` 类根据应用类型 (待办/计算器/笔记) 生成不同的模板代码，通过 `speed` 参数控制打字机速度。
+**代码生成**：`agents/nodes.py` 中的 `engineer_node` 调用 LLM 生成代码，失败时使用 `prompts.py` 中的 `generate_fallback_code()` 模板兜底。
 
-**会话记忆**：`langchain_client.BailianLLM` 使用 LangChain 的 `ConversationBufferMemory` 实现多轮对话记忆。
+**LLM 配置**：通过 `.env` 中的 `LLM_PROVIDER` 切换 API 协议，支持 OpenAI 兼容接口和 Anthropic 兼容接口。
 
 ## 常见问题修复
 
-**LangChain 导入冲突**：`langchain_client.py:86` 使用局部导入 `from langchain.schema import HumanMessage` 避免与回退逻辑冲突。
+**LangChain 模板花括号转义**：`prompts.py` 中 `SystemMessagePromptTemplate.from_template()` 需要将 JSON 中的 `{` `}` 转义为 `{{` `}}`，否则新版 langchain-core 会报错。

@@ -1,96 +1,60 @@
-# Roadmap: Talk2Code 技术栈升级
+# Roadmap: Talk2Code Agent 范式重构
 
-**Created:** 2026-04-16
-**Project:** Talk2Code Python & LangChain 升级
+**Created:** 2026-04-29
+**Project:** Talk2Code Agent 范式重构（Planner + Coder）
 
 ## Summary
 
 | Metric | Value |
 |--------|-------|
 | Total Phases | 3 |
-| Total Requirements | 19 |
-| Estimated Timeline | 3-5 days |
+| Total Requirements | 17 |
+| Estimated Timeline | 2-3 days |
 
 ---
 
-## Phase 1: Python 版本与依赖升级
+## Phase 1: Planner + State + Workflow 重构
 
-**Goal:** 完成 Python 3.11.11 环境设置和依赖包升级
+**Goal:** 删除研究员/产品经理/架构师节点，替换为 Planner 节点；重构 AgentState；更新 Workflow DAG
 
 **Requirements Covered:**
-- PY-01, PY-02, PY-03, PY-04 (Python 版本)
-- DEP-01, DEP-02, DEP-03 (依赖升级)
-
-**Plans:** 3 plans
+- PLN-01, PLN-02 (Planner 节点)
+- WFL-01, WFL-02 (AgentState + Workflow DAG)
 
 **Plans:**
-- [x] 01-01-PLAN.md — Python 3.11.11 environment setup (.python-version, backend/.venv) `completed: 2026-04-16`
-- [x] 01-02-PLAN.md — Dependency upgrade (langchain-core>=1.0.0, langgraph>=0.1.0) `completed: 2026-04-16`
-- [x] 01-03-PLAN.md — Verification (imports, pytest, Flask startup) `completed: 2026-04-16`
-
-**Status:** ✓ Complete (2026-04-16)
-
-**Success Criteria:**
-1. `.python-version` 文件创建并指定 3.11.11
-2. 虚拟环境使用 Python 3.11.11
-3. `pip list` 显示 langchain-core>=1.0.0
-4. Flask 应用可以启动无 import 错误
-
-**Deliverables:**
-- `.python-version` 文件
-- 更新的 `requirements.txt`
-- 新的虚拟环境
+- [ ] 01-01-PLAN.md — 重构 AgentState：删除 agent_outputs，新增 plan、validation_result、retry_count
+- [ ] 01-02-PLAN.md — 创建 Planner 节点：合并研究员+产品经理+架构师职责，产出结构化 Plan JSON
+- [ ] 01-03-PLAN.md — 重构 Workflow DAG：从 4 节点线性改为 Planner→Coder→Validator→条件循环
 
 ---
 
-## Phase 2: LangChain API 迁移
+## Phase 2: Coder + Validator + SSE 适配
 
-**Goal:** 迁移代码使用 LangChain 1.x 新 API
+**Goal:** 改造 Coder 使用结构化 Plan；新增 Validator 节点；更新 SSE 推送
 
 **Requirements Covered:**
-- API-01, API-02, API-03, API-04
-
-**Plans:** 3 plans
+- COD-01, COD-02, COD-03 (Coder 节点)
+- VAL-01, VAL-02, VAL-03, VAL-04 (Validator 节点)
+- WFL-03, SSE-01, SSE-02, SSE-03 (进度+推送)
 
 **Plans:**
-- [x] 02-01-PLAN.md — Import verification and langchain_core type integration `completed: 2026-04-17`
-- [x] 02-02-PLAN.md — Migrate prompts to ChatPromptTemplate format `completed: 2026-04-17`
-- [x] 02-03-PLAN.md — Workflow verification and integration tests `completed: 2026-04-17`
-
-**Status:** ✓ Complete (2026-04-17)
+- [ ] 02-01-PLAN.md — 改造 Coder 节点：使用 Plan JSON 替代 compress_outputs，保留 fallback 逻辑
+- [ ] 02-02-PLAN.md — 创建 Validator 节点：静态检查 + LLM 审查 + fix_instructions
+- [ ] 02-03-PLAN.md — SSE 推送适配：更新进度映射和对话内容
+- [ ] 02-04-PLAN.md — 清理旧代码：删除 researcher/product_manager/architect 节点和旧 prompt
 
 ---
 
-## Phase 3: 测试与验证
+## Phase 3: Chat 修改接口 + 验证
 
-**Goal:** 验证所有功能在升级后正常工作
+**Goal:** 对话修改场景独立触发 Coder；端到端验证
 
 **Requirements Covered:**
-- TEST-01, TEST-02, TEST-03, TEST-04
-- FUNC-01, FUNC-02, FUNC-03, FUNC-04, FUNC-05
-
-**Plans:** 4 plans
+- API-01, API-02 (Chat 修改接口)
 
 **Plans:**
-- [x] 03-01-PLAN.md — Unit and integration test execution (TEST-01, TEST-02, TEST-03) `completed: 2026-04-17`
-- [x] 03-02-PLAN.md — Flask startup and authentication testing (TEST-04, FUNC-01) `completed: 2026-04-17`
-- [x] 03-03-PLAN.md — Requirement and SSE conversation testing (FUNC-02, FUNC-03, FUNC-04, FUNC-05) `completed: 2026-04-17`
-- [x] 03-04-PLAN.md — Complete test suite and verification report (All requirements) `completed: 2026-04-17`
-
-**Status:** ✓ Complete (2026-04-17)
-
-**Success Criteria:**
-1. 所有单元测试通过 (`pytest`)
-2. Flask 应用启动正常
-3. 用户可以登录/注册
-4. 创建需求触发 AI 工作流并生成代码
-5. SSE 推送正常工作
-6. 持续对话功能正常
-
-**Deliverables:**
-- 测试通过报告
-- 功能验证清单
-- 升级完成文档
+- [ ] 03-01-PLAN.md — 改造 chat API：区分新建需求（Planner+Coder）和对话修改（仅 Coder）
+- [ ] 03-02-PLAN.md — 端到端验证：创建需求触发新 pipeline，chat 修改触发 Coder
 
 ---
 
@@ -98,13 +62,25 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| PY-01 ~ PY-04 | Phase 1 | ✓ Complete |
-| DEP-01 ~ DEP-03 | Phase 1 | ✓ Complete |
-| API-01 ~ API-04 | Phase 2 | ✓ Complete |
-| TEST-01 ~ TEST-04 | Phase 3 | ✓ Complete |
-| FUNC-01 ~ FUNC-05 | Phase 3 | ✓ Complete |
+| PLN-01 | Phase 1 | Pending |
+| PLN-02 | Phase 1 | Pending |
+| COD-01 | Phase 2 | Pending |
+| COD-02 | Phase 2 | Pending |
+| COD-03 | Phase 2 | Pending |
+| VAL-01 | Phase 2 | Pending |
+| VAL-02 | Phase 2 | Pending |
+| VAL-03 | Phase 2 | Pending |
+| VAL-04 | Phase 2 | Pending |
+| WFL-01 | Phase 1 | Pending |
+| WFL-02 | Phase 1 | Pending |
+| WFL-03 | Phase 2 | Pending |
+| SSE-01 | Phase 2 | Pending |
+| SSE-02 | Phase 2 | Pending |
+| SSE-03 | Phase 2 | Pending |
+| API-01 | Phase 3 | Pending |
+| API-02 | Phase 3 | Pending |
 
-**Coverage:** 100% (19/19 requirements mapped) - All Complete
+**Coverage:** 100% (17/17 requirements mapped) - All Pending
 
 ---
-*Roadmap created: 2026-04-16*
+*Roadmap created: 2026-04-29*

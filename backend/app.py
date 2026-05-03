@@ -12,7 +12,7 @@ from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
-from config import JWT_SECRET_KEY, JWT_ACCESS_TOKEN_EXPIRES, DASHSCOPE_API_KEY, DASHSCOPE_MODEL
+from config import JWT_SECRET_KEY, JWT_ACCESS_TOKEN_EXPIRES, LLM_API_KEY, LLM_MODEL, LLM_PROVIDER
 from models import init_db
 from services.sse_manager import sse_manager
 from services.task_queue import task_queue
@@ -89,9 +89,9 @@ def check_production_security():
         logger.warning("⚠️  JWT_SECRET_KEY 使用默认值，存在安全风险")
 
     # 2. 检查 API Key
-    if not DASHSCOPE_API_KEY:
-        issues.append("DASHSCOPE_API_KEY 未配置，AI 功能将不可用")
-        logger.warning("⚠️  DASHSCOPE_API_KEY 未配置")
+    if not LLM_API_KEY:
+        issues.append("LLM_API_KEY 未配置，AI 功能将不可用")
+        logger.warning("⚠️  LLM_API_KEY 未配置")
 
     # 3. 检查调试模式
     if settings.APP_DEBUG:
@@ -796,12 +796,10 @@ def health_check():
     llm_status = 'ok'
     llm_error = None
     try:
-        if not DASHSCOPE_API_KEY:
+        if not LLM_API_KEY:
             llm_status = 'not_configured'
             overall_status = 'degraded'
         else:
-            # 可选：尝试发送一个简单请求验证 API 可用性
-            # 但为了避免延迟，我们只检查配置
             llm_status = 'configured'
     except Exception as e:
         llm_status = 'error'
@@ -810,8 +808,8 @@ def health_check():
 
     checks['llm'] = {
         'status': llm_status,
-        'provider': 'dashscope',
-        'model': DASHSCOPE_MODEL,
+        'provider': LLM_PROVIDER,
+        'model': LLM_MODEL,
         'error': llm_error
     }
 

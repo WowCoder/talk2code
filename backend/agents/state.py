@@ -8,34 +8,37 @@ LangChain 1.x 兼容验证:
 - 模式在 langgraph>=1.0.0 中稳定
 """
 
-from typing import TypedDict, List, Annotated, Optional
-import operator
+from typing import TypedDict, List, Optional
 
 
 class AgentState(TypedDict):
     """
-    智能体工作流状态
-
-    所有状态字段在节点执行时自动合并（使用 operator.add）
+    智能体工作流状态（Planner + Coder 范式）
     """
     # 基础信息
     requirement_id: int
     requirement_content: str
 
-    # 累积的智能体输出（自动追加）
-    agent_outputs: Annotated[List[dict], operator.add]
+    # Planner 输出的结构化设计
+    plan: Optional[dict]
 
     # 当前步骤（用于 SSE 推送）
     current_step: str
 
-    # 最终代码文件
+    # Coder 生成的最终代码文件
     code_files: Optional[List[dict]]
+
+    # Validator 检查结果
+    validation_result: Optional[dict]
+
+    # Coder 重试次数
+    retry_count: int
 
     # 错误信息
     error: Optional[str]
 
     # 对话历史（用于保存到数据库）
-    dialogue_history: Annotated[List[dict], operator.add]
+    dialogue_history: List[dict]
 
     # 元数据
     metadata: dict

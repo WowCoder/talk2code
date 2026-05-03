@@ -14,7 +14,7 @@ sys.path.insert(0, str(backend_dir))
 
 # 设置测试环境变量
 os.environ.setdefault('JWT_SECRET_KEY', 'test-secret-key-for-testing-only')
-os.environ.setdefault('DASHSCOPE_API_KEY', 'test-api-key')
+os.environ.setdefault('LLM_API_KEY', 'test-api-key')
 os.environ.setdefault('DATABASE_NAME', 'test_vcd.db')
 os.environ.setdefault('APP_DEBUG', 'false')
 os.environ.setdefault('DISABLE_RATE_LIMIT', 'true')  # Disable rate limiting for tests
@@ -26,7 +26,7 @@ def test_config():
     from config import Settings
     return Settings(
         JWT_SECRET_KEY='test-secret-key-for-testing-only',
-        DASHSCOPE_API_KEY='test-api-key',
+        LLM_API_KEY='test-api-key',
         DATABASE_NAME='test_vcd.db',
         APP_DEBUG=False
     )
@@ -41,7 +41,7 @@ def app_client():
 
     # 使用测试配置初始化应用
     os.environ['DATABASE_NAME'] = ':memory:'  # 使用内存数据库
-    os.environ['DASHSCOPE_API_KEY'] = 'test-api-key'
+    os.environ['LLM_API_KEY'] = 'test-api-key'
     os.environ['JWT_SECRET_KEY'] = 'test-secret-key'
 
     # 导入并配置应用

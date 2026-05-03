@@ -81,15 +81,16 @@ class Settings(BaseSettings):
 
     # ==================== LLM 配置 ====================
 
-    DASHSCOPE_API_KEY: str = Field(default='', description='阿里云百炼 API Key')
-    DASHSCOPE_BASE_URL: str = Field(
-        default='https://dashscope.aliyuncs.com/compatible-mode/v1',
-        description='阿里云百炼 API 地址'
+    # LLM 协议类型
+    LLM_PROVIDER: Literal['openai_compatible', 'anthropic_compatible'] = Field(
+        default='openai_compatible',
+        description='LLM 协议类型：openai_compatible 或 anthropic_compatible'
     )
-    DASHSCOPE_MODEL: Literal['qwen-plus', 'qwen-turbo', 'qwen-max', 'qwen-max-longcontext'] = Field(
-        default='qwen-plus',
-        description='阿里云百炼模型名称'
-    )
+
+    # LLM 通用配置
+    LLM_API_KEY: str = Field(default='', description='LLM API Key')
+    LLM_BASE_URL: str = Field(default='', description='LLM API 地址')
+    LLM_MODEL: str = Field(default='qwen-plus', description='LLM 模型名称')
 
     # LLM 调用配置
     LLM_TEMPERATURE: float = Field(default=0.7, ge=0, le=2, description='LLM 温度参数')
@@ -97,14 +98,13 @@ class Settings(BaseSettings):
     LLM_TIMEOUT: int = Field(default=60, ge=10, le=300, description='LLM 调用超时时间（秒）')
     LLM_MAX_RETRIES: int = Field(default=2, ge=0, le=5, description='LLM 调用最大重试次数')
 
-    @field_validator('DASHSCOPE_API_KEY')
+    @field_validator('LLM_API_KEY')
     @classmethod
     def validate_api_key(cls, v):
         if not v:
             import warnings
             warnings.warn(
-                "⚠️  未配置 DASHSCOPE_API_KEY，请在 .env 文件中设置或访问 "
-                "https://bailian.console.aliyun.com/ 申请 API Key",
+                "⚠️  未配置 LLM_API_KEY，请在 .env 文件中设置",
                 UserWarning,
                 stacklevel=2
             )
@@ -145,8 +145,8 @@ class Settings(BaseSettings):
         if self.JWT_SECRET_KEY == 'talk2code-secret-key-change-in-production':
             errors.append("JWT_SECRET_KEY 使用默认值，生产环境必须修改")
 
-        if not self.DASHSCOPE_API_KEY:
-            errors.append("DASHSCOPE_API_KEY 未配置")
+        if not self.LLM_API_KEY:
+            errors.append("LLM_API_KEY 未配置")
 
         if self.APP_DEBUG:
             errors.append("生产环境不应开启 DEBUG 模式")
@@ -184,8 +184,9 @@ JWT_ACCESS_TOKEN_EXPIRES = settings.JWT_ACCESS_TOKEN_EXPIRES
 SSE_RETRY_TIMEOUT = settings.SSE_RETRY_TIMEOUT
 CODE_GEN_SPEED = settings.CODE_GEN_SPEED
 DEFAULT_SPEED = settings.DEFAULT_SPEED
-DASHSCOPE_API_KEY = settings.DASHSCOPE_API_KEY
-DASHSCOPE_BASE_URL = settings.DASHSCOPE_BASE_URL
-DASHSCOPE_MODEL = settings.DASHSCOPE_MODEL
+LLM_PROVIDER = settings.LLM_PROVIDER
+LLM_API_KEY = settings.LLM_API_KEY
+LLM_BASE_URL = settings.LLM_BASE_URL
+LLM_MODEL = settings.LLM_MODEL
 LOG_LEVEL = settings.LOG_LEVEL
 LOG_FILE = settings.LOG_FILE

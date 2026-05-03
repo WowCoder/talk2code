@@ -94,7 +94,7 @@ class TestLLMClientInit:
 
     def test_client_init_no_api_key_raises(self):
         """测试缺少 API Key 抛出异常"""
-        with patch('llm.client.DASHSCOPE_API_KEY', ''):
+        with patch('llm.client.LLM_API_KEY', ''):
             with pytest.raises(ValueError, match="API_KEY"):
                 LLMClient()
 
@@ -249,21 +249,21 @@ class TestGetClient:
     def test_get_client_singleton(self):
         """测试获取默认客户端单例"""
         with patch('llm.client._client', None):
-            with patch('llm.client.DASHSCOPE_API_KEY', 'test_key'):
+            with patch('llm.client.LLM_API_KEY', 'test_key'):
                 client1 = get_client()
                 client2 = get_client()
                 assert client1 is client2
 
     def test_get_client_with_instance_id(self):
         """测试使用实例 ID 获取客户端"""
-        with patch('llm.client.DASHSCOPE_API_KEY', 'test_key'):
+        with patch('llm.client.LLM_API_KEY', 'test_key'):
             client1 = get_client('instance1')
             client2 = get_client('instance2')
             assert client1 is not client2
 
     def test_clear_client_memory(self):
         """测试清空客户端记忆"""
-        with patch('llm.client.DASHSCOPE_API_KEY', 'test_key'):
+        with patch('llm.client.LLM_API_KEY', 'test_key'):
             client = get_client('test_clear')
             client._messages.append(Message(role='user', content='Test'))
             clear_client_memory('test_clear')
@@ -285,7 +285,7 @@ class TestChatWithLLM:
         mock_response.raise_for_status = Mock()
         mock_post.return_value = mock_response
 
-        with patch('llm.client.DASHSCOPE_API_KEY', 'test_key'):
+        with patch('llm.client.LLM_API_KEY', 'test_key'):
             result = chat_with_llm('Hello', 'Be helpful')
             assert result == 'Response'
 
