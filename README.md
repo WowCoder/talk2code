@@ -176,6 +176,27 @@ cd backend && python app.py
 - **日历 App** (输入包含"日历"、"日程"或"calendar")
 - **通用应用** (其他需求)
 
+## 界面预览
+
+### 登录页面
+![登录页面](docs/images/login.png)
+
+### 首页（已登录）
+![首页](docs/images/index.png)
+
+### 需求详情页
+![详情页](docs/images/detail.png)
+
+### 需求详情页（预览）
+![预览页](docs/images/detail_preview.png)
+
+---
+
+**页面说明**:
+- **登录页**: 支持登录/注册切换，测试账号 `test / 123456`
+- **首页**: 输入产品需求，AI 实时生成可运行代码
+- **详情页**: 左侧 AI 智能体协同讨论，右侧代码/预览实时切换
+
 ## 注意事项
 
 1. 这是一个 Demo 项目，AI 智能体使用预设的 prompt 模板
