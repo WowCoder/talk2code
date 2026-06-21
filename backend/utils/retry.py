@@ -9,7 +9,7 @@ import random
 from typing import Callable, Any, Optional, Tuple, Type
 from functools import wraps
 
-from utils.logger import get_logger
+from harness.observability.logger import get_logger
 
 logger = get_logger(__name__)
 

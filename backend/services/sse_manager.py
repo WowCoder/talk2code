@@ -8,7 +8,7 @@ import threading
 import queue
 from datetime import datetime
 from typing import Dict, List, Optional
-from utils.logger import get_logger
+from harness.observability.logger import get_logger
 
 logger = get_logger(__name__)
 

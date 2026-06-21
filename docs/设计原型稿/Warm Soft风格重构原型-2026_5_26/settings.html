@@ -1,0 +1,424 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>设置 — Talk2Code</title>
+<style>
+  :root {
+    --bg:      oklch(97% 0.018 70);
+    --surface: oklch(99% 0.008 70);
+    --fg:      oklch(22% 0.02 50);
+    --muted:   oklch(50% 0.018 50);
+    --border:  oklch(90% 0.014 70);
+    --accent:  oklch(64% 0.13 28);
+    --accent-soft: oklch(88% 0.04 38);
+    --font-display: 'Tiempos Headline', 'Newsreader', 'Iowan Old Style', Georgia, serif;
+    --font-body: 'Söhne', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  }
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: var(--font-body);
+    background: var(--bg);
+    color: var(--fg);
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .nav {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 0 32px;
+    height: 60px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    backdrop-filter: blur(12px);
+    background: oklch(99% 0.008 70 / 85%);
+  }
+  .nav-brand {
+    font-family: var(--font-display);
+    font-size: 22px;
+    font-weight: 600;
+    color: var(--fg);
+    text-decoration: none;
+    letter-spacing: -0.01em;
+  }
+  .nav-brand span { color: var(--accent); }
+  .nav-links { display: flex; align-items: center; gap: 8px; }
+  .nav-link {
+    padding: 8px 16px;
+    border-radius: 10px;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--muted);
+    text-decoration: none;
+    transition: color 0.15s, background 0.15s;
+  }
+  .nav-link:hover { color: var(--fg); background: var(--bg); }
+  .nav-link.active { color: var(--accent); }
+  .nav-user {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .nav-avatar {
+    width: 32px; height: 32px;
+    border-radius: 50%;
+    background: var(--accent-soft);
+    color: var(--accent);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .nav-username { font-size: 14px; color: var(--fg); font-weight: 500; }
+
+  /* — sidebar layout — */
+  .layout {
+    flex: 1;
+    display: flex;
+    max-width: 880px;
+    margin: 0 auto;
+    width: 100%;
+    padding: 48px 24px;
+    gap: 48px;
+  }
+  .sidebar {
+    width: 180px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .sidebar h2 {
+    font-family: var(--font-display);
+    font-size: 24px;
+    font-weight: 600;
+    margin-bottom: 20px;
+    letter-spacing: -0.02em;
+  }
+  .sidebar-link {
+    padding: 10px 14px;
+    border-radius: 10px;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--muted);
+    cursor: pointer;
+    border: none;
+    background: none;
+    text-align: left;
+    font-family: var(--font-body);
+    transition: color 0.15s, background 0.15s;
+  }
+  .sidebar-link:hover { color: var(--fg); background: var(--bg); }
+  .sidebar-link.active { color: var(--accent); background: var(--accent-soft); }
+
+  .content { flex: 1; }
+
+  .section { display: none; }
+  .section.active { display: block; }
+
+  .section h3 {
+    font-family: var(--font-display);
+    font-size: 20px;
+    font-weight: 600;
+    margin-bottom: 6px;
+    letter-spacing: -0.01em;
+  }
+  .section > p {
+    font-size: 14px;
+    color: var(--muted);
+    margin-bottom: 28px;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 24px;
+    margin-bottom: 16px;
+  }
+  .card-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 0;
+  }
+  .card-row + .card-row {
+    border-top: 1px solid var(--border);
+  }
+  .card-row .label {
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--fg);
+  }
+  .card-row .desc {
+    font-size: 13px;
+    color: var(--muted);
+    margin-top: 2px;
+  }
+
+  .field {
+    margin-bottom: 18px;
+  }
+  .field label {
+    display: block;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--fg);
+    margin-bottom: 6px;
+  }
+  .field input {
+    width: 100%;
+    padding: 10px 14px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    font-size: 14px;
+    font-family: var(--font-body);
+    color: var(--fg);
+    background: var(--bg);
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+  .field input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px oklch(64% 0.13 28 / 10%);
+  }
+
+  .toggle {
+    position: relative;
+    width: 44px; height: 26px;
+    background: var(--border);
+    border-radius: 100px;
+    cursor: pointer;
+    transition: background 0.2s;
+    border: none;
+  }
+  .toggle.on {
+    background: var(--accent);
+  }
+  .toggle::after {
+    content: '';
+    position: absolute;
+    top: 3px; left: 3px;
+    width: 20px; height: 20px;
+    border-radius: 50%;
+    background: #fff;
+    transition: transform 0.2s;
+  }
+  .toggle.on::after {
+    transform: translateX(18px);
+  }
+
+  .btn-primary {
+    padding: 10px 24px;
+    border: none;
+    border-radius: 12px;
+    font-size: 14px;
+    font-weight: 600;
+    font-family: var(--font-body);
+    cursor: pointer;
+    background: var(--accent);
+    color: #fff;
+    transition: background 0.2s, transform 0.15s;
+  }
+  .btn-primary:hover {
+    background: oklch(58% 0.13 28);
+  }
+  .btn-ghost {
+    padding: 10px 24px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    font-size: 14px;
+    font-weight: 500;
+    font-family: var(--font-body);
+    cursor: pointer;
+    background: transparent;
+    color: var(--muted);
+    transition: border-color 0.2s, color 0.2s;
+  }
+  .btn-ghost:hover { border-color: var(--fg); color: var(--fg); }
+  .btn-danger {
+    padding: 10px 24px;
+    border: 1px solid oklch(75% 0.08 20);
+    border-radius: 12px;
+    font-size: 14px;
+    font-weight: 500;
+    font-family: var(--font-body);
+    cursor: pointer;
+    background: transparent;
+    color: oklch(42% 0.15 20);
+    transition: background 0.2s, color 0.2s;
+  }
+  .btn-danger:hover { background: oklch(94% 0.03 20); }
+
+  .avatar-lg {
+    width: 72px; height: 72px;
+    border-radius: 50%;
+    background: var(--accent-soft);
+    color: var(--accent);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 28px;
+    font-weight: 600;
+    margin-bottom: 16px;
+  }
+
+  .about-line {
+    display: flex;
+    justify-content: space-between;
+    padding: 8px 0;
+    font-size: 14px;
+  }
+  .about-line .key { color: var(--muted); }
+  .about-line .val { color: var(--fg); font-weight: 500; }
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <a href="index.html" class="nav-brand">Talk<span>2</span>Code</a>
+  <div class="nav-links">
+    <a href="history.html" class="nav-link">历史对话</a>
+    <a href="settings.html" class="nav-link active">设置</a>
+  </div>
+  <div class="nav-user">
+    <span class="nav-username">用户名</span>
+    <span class="nav-avatar">U</span>
+  </div>
+</nav>
+
+<div class="layout">
+  <aside class="sidebar">
+    <h2>设置</h2>
+    <button class="sidebar-link active" data-section="profile">个人资料</button>
+    <button class="sidebar-link" data-section="appearance">外观偏好</button>
+    <button class="sidebar-link" data-section="account">账户安全</button>
+    <button class="sidebar-link" data-section="about">关于</button>
+  </aside>
+
+  <div class="content">
+
+    <!-- Profile -->
+    <div class="section active" id="section-profile">
+      <h3>个人资料</h3>
+      <p>管理你的账户信息和展示方式</p>
+
+      <div class="card">
+        <div class="avatar-lg">U</div>
+        <div class="field">
+          <label>用户名</label>
+          <input type="text" value="用户名" placeholder="你的用户名">
+        </div>
+        <div class="field">
+          <label>邮箱</label>
+          <input type="email" value="user@example.com" placeholder="你的邮箱">
+        </div>
+        <button class="btn-primary">保存修改</button>
+      </div>
+    </div>
+
+    <!-- Appearance -->
+    <div class="section" id="section-appearance">
+      <h3>外观偏好</h3>
+      <p>自定义界面显示方式</p>
+
+      <div class="card">
+        <div class="card-row">
+          <div>
+            <div class="label">深色模式</div>
+            <div class="desc">切换深色主题以减少眼部疲劳</div>
+          </div>
+          <button class="toggle" onclick="this.classList.toggle('on')"></button>
+        </div>
+        <div class="card-row">
+          <div>
+            <div class="label">代码字体大小</div>
+            <div class="desc">编辑器内代码的显示字号</div>
+          </div>
+          <select style="padding:8px 12px; border:1px solid var(--border); border-radius:10px; font-size:14px; font-family:var(--font-body); background:var(--bg); color:var(--fg); outline:none;">
+            <option>12px</option>
+            <option selected>14px</option>
+            <option>16px</option>
+            <option>18px</option>
+          </select>
+        </div>
+        <div class="card-row">
+          <div>
+            <div class="label">自动保存</div>
+            <div class="desc">编辑代码时自动保存更改</div>
+          </div>
+          <button class="toggle on" onclick="this.classList.toggle('on')"></button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Account -->
+    <div class="section" id="section-account">
+      <h3>账户安全</h3>
+      <p>管理密码和账户设置</p>
+
+      <div class="card">
+        <div class="field">
+          <label>当前密码</label>
+          <input type="password" placeholder="输入当前密码">
+        </div>
+        <div class="field">
+          <label>新密码</label>
+          <input type="password" placeholder="至少 6 个字符">
+        </div>
+        <div class="field">
+          <label>确认新密码</label>
+          <input type="password" placeholder="再次输入新密码">
+        </div>
+        <button class="btn-primary">更新密码</button>
+      </div>
+
+      <div class="card" style="margin-top:20px;">
+        <div class="card-row">
+          <div>
+            <div class="label">注销账户</div>
+            <div class="desc">永久删除你的账户和所有数据</div>
+          </div>
+          <button class="btn-danger">注销账户</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- About -->
+    <div class="section" id="section-about">
+      <h3>关于</h3>
+      <p>Talk2Code 版本与信息</p>
+
+      <div class="card">
+        <div class="about-line"><span class="key">版本</span><span class="val">v2.0.0</span></div>
+        <div class="about-line"><span class="key">构建</span><span class="val">2026.05.20</span></div>
+        <div class="about-line"><span class="key">技术栈</span><span class="val">Flask + CodeMirror + SSE</span></div>
+        <div class="about-line"><span class="key">设计系统</span><span class="val">Warm Soft</span></div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+  document.querySelectorAll('.sidebar-link').forEach(link => {
+    link.addEventListener('click', () => {
+      document.querySelectorAll('.sidebar-link').forEach(l => l.classList.remove('active'));
+      link.classList.add('active');
+      document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+      document.getElementById('section-' + link.dataset.section).classList.add('active');
+    });
+  });
+</script>
+
+</body>
+</html>

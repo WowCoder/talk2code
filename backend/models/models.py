@@ -5,9 +5,10 @@
 """
 
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, JSON
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, JSON, Float
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.sql import func
 from config import DATABASE_URI
 
 # 创建数据库引擎
@@ -67,6 +68,36 @@ class Requirement(Base):
 
     def __repr__(self):
         return f'<Requirement {self.id}: {self.title[:50]}...>'
+
+
+class AgentMemory(Base):
+    """Agent 长期记忆表"""
+    __tablename__ = "agent_memories"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    requirement_id = Column(Integer, nullable=True)
+    memory_type = Column(String(32), default="domain_knowledge")
+    fact = Column(Text, nullable=False)
+    importance = Column(Float, default=0.5)
+    access_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=func.now())
+    last_accessed_at = Column(DateTime, onupdate=func.now())
+
+
+class AgentTrace(Base):
+    """Agent 链路追踪表"""
+    __tablename__ = "agent_traces"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trace_id = Column(String(32), unique=True, nullable=False, index=True)
+    requirement_id = Column(Integer, nullable=False)
+    user_id = Column(Integer, nullable=False)
+    data = Column(JSON, default=dict)
+    total_tokens = Column(Integer, default=0)
+    total_cost = Column(Float, default=0.0)
+    duration_ms = Column(Integer, default=0)
+    created_at = Column(DateTime, default=func.now())
 
 
 # 初始化数据库（创建所有表）

@@ -1,10 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 SSE 工具函数
-包含 SSE 消息格式化等功能
+包含 SSE 消息格式化、时间戳等工具函数
 """
 
 import json
+from datetime import datetime
+
+
+def get_current_timestamp() -> str:
+    """获取当前时间戳（ISO 格式）"""
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
 
 class SSEMessage:

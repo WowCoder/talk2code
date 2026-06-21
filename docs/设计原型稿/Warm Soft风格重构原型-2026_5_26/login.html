@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 — Talk2Code</title>
+<style>
+  :root {
+    --bg:      oklch(97% 0.018 70);
+    --surface: oklch(99% 0.008 70);
+    --fg:      oklch(22% 0.02 50);
+    --muted:   oklch(50% 0.018 50);
+    --border:  oklch(90% 0.014 70);
+    --accent:  oklch(64% 0.13 28);
+    --accent-soft: oklch(88% 0.04 38);
+    --font-display: 'Tiempos Headline', 'Newsreader', 'Iowan Old Style', Georgia, serif;
+    --font-body: 'Söhne', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  }
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: var(--font-body);
+    background: var(--bg);
+    color: var(--fg);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .login-container {
+    width: 100%;
+    max-width: 420px;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 48px 40px;
+    position: relative;
+    overflow: hidden;
+  }
+  .card::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: 20px;
+    background: radial-gradient(ellipse 80% 60% at 50% 0%, oklch(94% 0.04 45 / 25%), transparent);
+    pointer-events: none;
+  }
+
+  .brand {
+    text-align: center;
+    margin-bottom: 36px;
+    position: relative;
+  }
+  .brand h1 {
+    font-family: var(--font-display);
+    font-size: 36px;
+    font-weight: 600;
+    color: var(--fg);
+    letter-spacing: -0.01em;
+    line-height: 1.1;
+  }
+  .brand h1 span {
+    color: var(--accent);
+  }
+  .brand p {
+    color: var(--muted);
+    font-size: 14px;
+    margin-top: 6px;
+  }
+
+  .tabs {
+    display: flex;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 32px;
+    position: relative;
+  }
+  .tab {
+    flex: 1;
+    padding: 12px 0;
+    text-align: center;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--muted);
+    cursor: pointer;
+    border: none;
+    background: none;
+    font-family: var(--font-body);
+    position: relative;
+    transition: color 0.2s;
+  }
+  .tab.active {
+    color: var(--accent);
+  }
+  .tab.active::after {
+    content: '';
+    position: absolute;
+    bottom: -1px;
+    left: 20%;
+    right: 20%;
+    height: 2px;
+    background: var(--accent);
+    border-radius: 1px;
+  }
+  .tab:hover { color: var(--fg); }
+  .tab.active:hover { color: var(--accent); }
+
+  .form {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    position: relative;
+  }
+  .form.hidden { display: none; }
+
+  .field label {
+    display: block;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--fg);
+    margin-bottom: 6px;
+    letter-spacing: 0.01em;
+  }
+  .field input {
+    width: 100%;
+    padding: 12px 16px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    font-size: 15px;
+    font-family: var(--font-body);
+    color: var(--fg);
+    background: var(--bg);
+    transition: border-color 0.2s, box-shadow 0.2s;
+    outline: none;
+  }
+  .field input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px oklch(64% 0.13 28 / 12%);
+  }
+  .field input::placeholder { color: oklch(65% 0.01 70); }
+
+  .btn-primary {
+    width: 100%;
+    padding: 14px 24px;
+    border: none;
+    border-radius: 14px;
+    font-size: 15px;
+    font-weight: 600;
+    font-family: var(--font-body);
+    cursor: pointer;
+    background: var(--accent);
+    color: #fff;
+    transition: background 0.2s, transform 0.15s, box-shadow 0.15s;
+    position: relative;
+  }
+  .btn-primary:hover {
+    background: oklch(58% 0.13 28);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 16px oklch(64% 0.13 28 / 25%);
+  }
+  .btn-primary:active { transform: translateY(0); }
+
+  .msg {
+    padding: 10px 14px;
+    border-radius: 10px;
+    font-size: 13px;
+    margin-bottom: 16px;
+    display: none;
+  }
+  .msg.error   { display: block; background: oklch(94% 0.03 20); color: oklch(42% 0.15 20); }
+  .msg.success { display: block; background: oklch(95% 0.04 150); color: oklch(40% 0.12 150); }
+
+  .test-hint {
+    margin-top: 28px;
+    text-align: center;
+    font-size: 12px;
+    color: var(--muted);
+    position: relative;
+  }
+  .test-hint code {
+    font-family: ui-monospace, 'JetBrains Mono', monospace;
+    background: var(--bg);
+    padding: 2px 8px;
+    border-radius: 6px;
+    font-size: 12px;
+  }
+</style>
+</head>
+<body>
+<div class="login-container">
+  <div class="card">
+    <div class="brand">
+      <h1>Talk<span>2</span>Code</h1>
+      <p>用自然语言创造应用</p>
+    </div>
+
+    <div class="tabs">
+      <button class="tab active" data-tab="login">登录</button>
+      <button class="tab" data-tab="register">注册</button>
+    </div>
+
+    <div id="loginMsg" class="msg"></div>
+
+    <form id="loginForm" class="form">
+      <div class="field">
+        <label>用户名</label>
+        <input type="text" placeholder="请输入用户名" autocomplete="username">
+      </div>
+      <div class="field">
+        <label>密码</label>
+        <input type="password" placeholder="请输入密码" autocomplete="current-password">
+      </div>
+      <button type="submit" class="btn-primary">登录</button>
+    </form>
+
+    <form id="registerForm" class="form hidden">
+      <div class="field">
+        <label>用户名</label>
+        <input type="text" placeholder="至少 3 个字符" minlength="3" autocomplete="username">
+      </div>
+      <div class="field">
+        <label>密码</label>
+        <input type="password" placeholder="至少 6 个字符" minlength="6" autocomplete="new-password">
+      </div>
+      <div class="field">
+        <label>确认密码</label>
+        <input type="password" placeholder="再次输入密码" autocomplete="new-password">
+      </div>
+      <button type="submit" class="btn-primary">注册</button>
+    </form>
+
+    <div class="test-hint">
+      测试账号 <code>test</code> / <code>123456</code>
+    </div>
+  </div>
+</div>
+
+<script>
+  const tabs = document.querySelectorAll('.tab');
+  const loginForm = document.getElementById('loginForm');
+  const registerForm = document.getElementById('registerForm');
+  const msg = document.getElementById('loginMsg');
+
+  tabs.forEach(tab => {
+    tab.addEventListener('click', () => {
+      tabs.forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      const target = tab.dataset.tab;
+      loginForm.classList.toggle('hidden', target !== 'login');
+      registerForm.classList.toggle('hidden', target !== 'register');
+      msg.className = 'msg';
+    });
+  });
+
+  loginForm.addEventListener('submit', e => {
+    e.preventDefault();
+    msg.className = 'msg success';
+    msg.textContent = '登录成功，正在跳转…';
+  });
+
+  registerForm.addEventListener('submit', e => {
+    e.preventDefault();
+    const pw = registerForm.querySelectorAll('input[type="password"]');
+    if (pw[0].value !== pw[1].value) {
+      msg.className = 'msg error';
+      msg.textContent = '两次输入的密码不一致';
+      return;
+    }
+    msg.className = 'msg success';
+    msg.textContent = '注册成功，请登录';
+  });
+</script>
+</body>
+</html>

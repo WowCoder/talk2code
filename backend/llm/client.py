@@ -16,9 +16,79 @@ from datetime import datetime
 import requests
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_PROVIDER
-from utils.logger import get_logger
+from harness.observability.logger import get_logger
 
 logger = get_logger(__name__)
+
+# LLM 请求/响应专用日志（独立于应用日志，便于排查问题）
+import logging as _logging
+_llm_logger = _logging.getLogger("llm.traffic")
+_llm_logger.setLevel(_logging.DEBUG)
+if not _llm_logger.handlers:
+    import os as _os
+    _log_dir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "..", "logs")
+    _os.makedirs(_log_dir, exist_ok=True)
+    _fh = _logging.FileHandler(_os.path.join(_log_dir, "llm_traffic.log"), encoding="utf-8")
+    _fh.setLevel(_logging.DEBUG)
+    _fh.setFormatter(_logging.Formatter('%(asctime)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+    _llm_logger.addHandler(_fh)
+    _llm_logger.propagate = False
+
+
+def _log_llm_request(call_id: str, provider: str, model: str, url: str, payload: dict):
+    """记录 LLM 请求"""
+    _llm_logger.info(
+        f"[{call_id}] REQUEST | provider={provider} model={model} url={url}\n"
+        f"[{call_id}] PAYLOAD | {json.dumps(payload, ensure_ascii=False, default=str)[:8000]}"
+    )
+
+
+def _log_llm_response(call_id: str, status: int, body: dict, duration_ms: float):
+    """记录 LLM 响应"""
+    _llm_logger.info(
+        f"[{call_id}] RESPONSE | status={status} duration={duration_ms:.0f}ms\n"
+        f"[{call_id}] BODY | {json.dumps(body, ensure_ascii=False, default=str)[:8000]}"
+    )
+
+
+def _try_fix_json(raw: str) -> dict | None:
+    """尝试修复 LLM 返回的不完整 JSON"""
+    # 方法1: 补齐末尾的 } 和 "
+    stack = []
+    in_str = False
+    escaped = False
+    for ch in raw:
+        if escaped:
+            escaped = False
+            continue
+        if ch == '\\':
+            escaped = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+        elif not in_str and ch in '{[':
+            stack.append(ch)
+        elif not in_str and ch in '}]':
+            if stack and ((ch == '}' and stack[-1] == '{') or (ch == ']' and stack[-1] == '[')):
+                stack.pop()
+    # 补齐
+    fixed = raw.rstrip()
+    if in_str:
+        fixed += '"'
+    for opener in reversed(stack):
+        fixed += '}' if opener == '{' else ']'
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        pass
+    # 方法2: 去掉最后不完整的字段
+    last_quote = fixed.rfind('",')
+    if last_quote > 0:
+        try:
+            return json.loads(fixed[:last_quote + 1] + '}')
+        except json.JSONDecodeError:
+            pass
+    return None
 
 
 @dataclass
@@ -30,12 +100,20 @@ class Message:
 
 
 @dataclass
+class ToolCall:
+    """LLM 工具调用"""
+    name: str
+    arguments: dict
+
+
+@dataclass
 class LLMResponse:
     """LLM 响应对象"""
     content: str
     usage: Optional[Dict[str, int]] = None
     finish_reason: Optional[str] = None
     error: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
 
     @property
     def is_error(self) -> bool:
@@ -198,12 +276,17 @@ class LLMClient:
                                 except json.JSONDecodeError:
                                     continue
                 else:
+                    import uuid
+                    call_id = uuid.uuid4().hex[:8]
+                    t0 = time.time()
+                    _log_llm_request(call_id, self.provider, self.model, url, data)
                     response = requests.post(
                         url, headers=headers, json=data,
                         timeout=self.timeout
                     )
                     response.raise_for_status()
                     result = response.json()
+                    _log_llm_response(call_id, response.status_code, result, (time.time() - t0) * 1000)
                     content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
                     yield content
                 return
@@ -278,12 +361,17 @@ class LLMClient:
                                 except json.JSONDecodeError:
                                     continue
                 else:
+                    import uuid
+                    call_id = uuid.uuid4().hex[:8]
+                    t0 = time.time()
+                    _log_llm_request(call_id, self.provider, self.model, url, data)
                     response = requests.post(
                         url, headers=headers, json=data,
                         timeout=self.timeout
                     )
                     response.raise_for_status()
                     result = response.json()
+                    _log_llm_response(call_id, response.status_code, result, (time.time() - t0) * 1000)
                     content_blocks = result.get('content', [])
                     text = ''.join(
                         block.get('text', '')
@@ -429,6 +517,176 @@ class LLMClient:
         if use_memory and full_content and not full_content.startswith('[错误]'):
             self._messages.append(Message(role='user', content=prompt))
             self._messages.append(Message(role='assistant', content=full_content))
+
+
+    def chat_with_tools(
+        self,
+        messages: list,
+        tools: list,
+        tool_choice: str = "auto",
+        max_tokens: Optional[int] = None,
+    ) -> LLMResponse:
+        """
+        支持 function calling 的聊天接口
+
+        Args:
+            messages: 消息列表 [{"role": "...", "content": "..."}]
+            tools: 工具描述列表（OpenAI function calling 格式）
+            tool_choice: "auto" / "none" / "required"
+            max_tokens: 最大 token 数
+
+        Returns:
+            LLMResponse 含 tool_calls 字段
+        """
+        old_max_tokens = self.max_tokens
+        if max_tokens:
+            self.max_tokens = max_tokens
+
+        content = ""
+        tool_calls = None
+        usage = None
+        finish_reason = None
+        error = None
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                if self.provider == 'anthropic_compatible':
+                    content, tool_calls, usage = self._request_anthropic_with_tools(messages, tools)
+                else:
+                    content, tool_calls, usage = self._request_openai_with_tools(messages, tools, tool_choice)
+                break
+            except Exception as e:
+                error = str(e)
+                logger.error(f"chat_with_tools 失败：{error}")
+                if attempt >= self.max_retries:
+                    content = f"[错误] 工具调用失败：{error}"
+
+        self.max_tokens = old_max_tokens
+        return LLMResponse(content=content, usage=usage, finish_reason=finish_reason,
+                           error=error, tool_calls=tool_calls)
+
+    def _request_openai_with_tools(self, messages: list, tools: list, tool_choice: str):
+        """OpenAI function calling 协议"""
+        import uuid
+        headers = {
+            'Authorization': f'Bearer {self.api_key}',
+            'Content-Type': 'application/json'
+        }
+        data = {
+            'model': self.model,
+            'messages': messages,
+            'temperature': self.temperature,
+            'max_tokens': self.max_tokens,
+            'tools': tools,
+            'tool_choice': tool_choice,
+        }
+        url = f'{self.base_url}/chat/completions'
+
+        call_id = uuid.uuid4().hex[:8]
+        t0 = time.time()
+        _log_llm_request(call_id, self.provider, self.model, url, data)
+
+        response = requests.post(url, headers=headers, json=data, timeout=self.timeout)
+        response.raise_for_status()
+        result = response.json()
+
+        _log_llm_response(call_id, response.status_code, result, (time.time() - t0) * 1000)
+
+        choice = result.get('choices', [{}])[0]
+        msg = choice.get('message', {})
+        content = msg.get('content', '') or ''
+        usage_data = result.get('usage')
+
+        # 解析 tool_calls
+        raw_tool_calls = msg.get('tool_calls', [])
+        tool_calls = []
+        for tc in raw_tool_calls:
+            fn = tc.get('function', {})
+            raw_args = fn.get('arguments', '{}')
+            try:
+                parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except json.JSONDecodeError as e:
+                # 尝试修复：补齐截断的 JSON
+                if isinstance(raw_args, str):
+                    fixed = _try_fix_json(raw_args)
+                    if fixed:
+                        parsed_args = fixed
+                        logger.warning(f"LLM tool call 参数已自动修复: {tc.get('function', {}).get('name', '?')}")
+                    else:
+                        logger.warning(f"LLM 返回了无法修复的 tool call 参数: {e}，跳过")
+                        continue
+                else:
+                    logger.warning(f"LLM 返回了无法解析的 tool call 参数: {e}，跳过")
+                    continue
+            tool_calls.append(ToolCall(
+                name=fn.get('name', ''),
+                arguments=parsed_args
+            ))
+
+        return content, (tool_calls or None), usage_data
+
+    def _request_anthropic_with_tools(self, messages: list, tools: list):
+        """Anthropic tool use 协议"""
+        headers = {
+            'x-api-key': self.api_key,
+            'Content-Type': 'application/json',
+            'anthropic-version': '2023-06-01'
+        }
+
+        # Anthropic: system 是顶层字段, tools 格式不同
+        system_prompt = None
+        api_messages = []
+        for m in messages:
+            if m['role'] == 'system':
+                system_prompt = m['content']
+            else:
+                api_messages.append(m)
+
+        anthropic_tools = []
+        for t in tools:
+            fn = t.get('function', t)
+            anthropic_tools.append({
+                'name': fn.get('name', ''),
+                'description': fn.get('description', ''),
+                'input_schema': fn.get('parameters', {}),
+            })
+
+        data = {
+            'model': self.model,
+            'messages': api_messages,
+            'max_tokens': self.max_tokens,
+            'tools': anthropic_tools,
+        }
+        if system_prompt:
+            data['system'] = system_prompt
+
+        url = f'{self.base_url}/messages'
+
+        import uuid
+        call_id = uuid.uuid4().hex[:8]
+        t0 = time.time()
+        _log_llm_request(call_id, self.provider, self.model, url, data)
+
+        response = requests.post(url, headers=headers, json=data, timeout=self.timeout)
+        response.raise_for_status()
+        result = response.json()
+
+        _log_llm_response(call_id, response.status_code, result, (time.time() - t0) * 1000)
+
+        content = ""
+        tool_calls = []
+        usage_data = result.get('usage')
+
+        for block in result.get('content', []):
+            if block.get('type') == 'text':
+                content += block.get('text', '')
+            elif block.get('type') == 'tool_use':
+                tool_calls.append(ToolCall(
+                    name=block.get('name', ''),
+                    arguments=block.get('input', {})
+                ))
+
+        return content, (tool_calls or None), usage_data
 
 
 # 全局客户端实例（延迟初始化）

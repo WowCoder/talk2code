@@ -17,7 +17,7 @@ from models import init_db
 from services.sse_manager import sse_manager
 from services.task_queue import task_queue
 from services.requirement_service import process_requirement_async
-from utils.logger import setup_logger, get_logger
+from harness.observability.logger import setup_logger, get_logger
 from utils.rate_limiter import get_user_identity, rate_limit_handler, RATE_LIMITS
 
 # ==================== 日志配置 ====================
@@ -397,11 +397,18 @@ def get_requirement(req_id):
 @rate_limit_chat
 @jwt_required()
 def chat_with_requirement(req_id):
-    """与需求对话（支持 diff 代码修改）"""
+    """与需求对话（基于工具调用循环修改代码）"""
     from models import Requirement, SessionLocal
-    from llm.client import get_client
-    from prompts import CODE_EDIT_SYSTEM_PROMPT, CODE_EDIT_USER_PROMPT
-    from diff_utils import parse_diff, apply_diff, validate_diff
+    from harness.state.workspace import WorkspaceFS
+    from harness.state.versioning import GitVersioning
+    from harness.tools.registry import create_tool_registry
+    from harness.constraints.hooks import create_default_hook_manager
+    from harness.environment.permissions import PermissionManager
+    from harness.instructions.compactor import ContextCompactor
+    from harness.observability.sse_reporter import SSEReporter
+    from harness.observability.tracer import Tracer
+    from harness.observability.cost import CostTracker
+    from harness.runtime import ToolCallLoop
 
     current_user_id = get_jwt_identity()
     data = request.get_json()
@@ -420,160 +427,92 @@ def chat_with_requirement(req_id):
             return jsonify({'error': '需求不存在'}), 404
 
         user_message = data.get('message', '').strip()
-        dialogue_history = requirement.dialogue_history or []
-        code_files = requirement.code_files or []
 
-        # ==================== 阶段 2.1+2.3: 传递对话历史 + 版本感知 ====================
-        # 计算修改次数（用于版本感知）
-        modification_count = sum(1 for msg in dialogue_history if msg.get('type') == 'code_updated')
+        # 初始化 harness 层
+        workspace = WorkspaceFS(current_user_id, req_id)
+        workspace.init(requirement.code_files)
+        git = GitVersioning(workspace)
+        tools = create_tool_registry()
+        hooks = create_default_hook_manager()
+        permissions = PermissionManager()
+        permissions.grant(req_id, 'write')  # chat 中自动授权写入
+        sse = SSEReporter(sse_manager)
+        tracer = Tracer()
+        cost_tracker = CostTracker()
 
-        # 构建对话上下文（最近 10 轮对话）
-        recent_dialogues = dialogue_history[-10:] if len(dialogue_history) > 10 else dialogue_history
-        context_parts = []
-        for msg in recent_dialogues:
-            if msg.get('role') == 'user':
-                context_parts.append(f"用户：{msg.get('content', '')}")
-            elif msg.get('role') in ('agent', 'assistant'):
-                context_parts.append(f"AI: {msg.get('content', '')}")
-            elif msg.get('type') == 'code_updated':
-                context_parts.append(f"系统：{msg.get('content', '')}")
-        dialogue_context = '\n'.join(context_parts)
-
-        # ==================== 获取当前代码 ====================
-        current_code = ""
-        for file in code_files:
-            current_code += f"\n\n// === {file.get('filename', 'unknown')} ===\n{file.get('content', '')}"
-
-        # 保存用户消息
-        dialogue_history.append({
-            'role': 'user',
-            'name': '用户',
+        # 构建对话历史（保留已有对话 + 新消息）
+        existing_dialogue = list(requirement.dialogue_history or [])
+        existing_dialogue.append({
+            'role': 'user', 'name': '用户',
             'content': user_message,
             'timestamp': get_current_timestamp()
         })
 
-        # ==================== 阶段 2.2: 优化 prompt ====================
-        user_prompt = CODE_EDIT_USER_PROMPT.format(
-            requirement=requirement.content,
-            current_code=current_code if current_code else '暂无代码',
-            user_message=user_message,
-            dialogue_context=dialogue_context if dialogue_context else '无历史对话',
-            modification_count=modification_count
+        # 构建代码上下文
+        existing_files = workspace.list()
+        file_list_text = "\n".join(f"- {f}" for f in existing_files) if existing_files else "(空)"
+
+        # 进入 Coder ReAct 循环（跳过 Planner），使用修改专用 prompt
+        tool_loop = ToolCallLoop(
+            workspace=workspace, git=git, tools=tools,
+            hooks=hooks, tracer=tracer, cost_tracker=cost_tracker,
+            sse_reporter=sse, permission_manager=permissions,
         )
+        # 临时替换 system prompt 为修改模式
+        original_build = tool_loop._build_system_prompt
+        def _chat_prompt(state):
+            return f"""你是资深前端工程师。用户想要修改代码。
 
-        client = get_client()
-        response = client.chat(user_prompt, CODE_EDIT_SYSTEM_PROMPT, use_memory=False, max_tokens=3500, timeout=60)
-        ai_response = response.content
+## 用户要求
+{user_message}
 
-        if response.is_error:
-            raise Exception(response.error or "LLM 响应错误")
+## 当前文件列表
+{file_list_text}
 
-        # ==================== 阶段 1.3: Diff 格式校验 ====================
-        is_valid, diff_error = validate_diff(ai_response)
-        if not is_valid:
-            # LLM 没有返回有效的 diff，可能是纯文本回复
-            logger.info(f"LLM 返回的内容不是有效的 diff: {diff_error}")
-            # 直接返回 AI 回复，不修改代码
-            dialogue_history.append({
-                'role': 'agent',
-                'name': 'AI 助手',
-                'content': ai_response,
-                'timestamp': get_current_timestamp()
-            })
-            requirement.dialogue_history = dialogue_history
-            db.commit()
+## 工作方式
+1. 分析用户要求，判断需要修改哪个文件（通常只需改1个）
+2. 用 read_file 读取该文件（只读1次）
+3. 立即用 write_file 写入修改后的完整内容
+4. 告诉我改了什么
 
-            return jsonify({
-                'message': 'success',
-                'dialogue_history': dialogue_history,
-                'code_files': code_files,
-                'ai_response': ai_response,
-                'updated_files': [],
-                'warning': 'AI 返回的是文本回复而非代码修改'
-            }), 200
+## 规则
+- 一次请求最多修改1个文件
+- 读文件只读1次，读完立刻改
+- 不要重复读同一个文件"""
+        tool_loop._build_system_prompt = _chat_prompt
 
-        # ==================== 阶段 1.2 + 1.4: Diff 应用 + 失败回滚 + 日志 ====================
-        code_updated = False
-        updated_files = []
-        failed_files = []
-
-        for diff_file in parse_diff(ai_response):
-            original_file = None
-            for f in code_files:
-                if f.get('filename') == diff_file.filename:
-                    original_file = f
-                    break
-
-            if original_file:
-                try:
-                    # apply_diff 现在返回 (new_content, success, error_message)
-                    new_content, success, error_msg = apply_diff(original_file.get('content', ''), diff_file)
-
-                    if success and new_content != original_file.get('content', ''):
-                        original_file['content'] = new_content
-                        original_file['status'] = 'modified'
-                        code_updated = True
-                        updated_files.append(diff_file.filename)
-                        logger.info(f"[Chat] 文件 {diff_file.filename} 已通过 diff 更新")
-                    else:
-                        # Diff 应用失败
-                        error_detail = f"文件 {diff_file.filename}: {error_msg}"
-                        logger.warning(f"[Chat] Diff 应用失败：{error_detail}")
-                        failed_files.append({'filename': diff_file.filename, 'error': error_msg})
-
-                except Exception as e:
-                    error_detail = f"文件 {diff_file.filename}: {str(e)}"
-                    logger.error(f"[Chat] Diff 应用异常：{error_detail}", exc_info=True)
-                    failed_files.append({'filename': diff_file.filename, 'error': str(e)})
-            else:
-                logger.warning(f"[Chat] Diff 引用的文件不存在：{diff_file.filename}")
-
-        # ==================== 构建返回消息 ====================
-        # 保存 AI 回复和修改结果
-        if code_updated:
-            dialogue_history.append({
-                'role': 'system',
-                'name': '系统',
-                'content': f'已更新文件：{", ".join(updated_files)}',
-                'timestamp': get_current_timestamp(),
-                'type': 'code_updated'
-            })
-
-            # 如果有失败的文件，也记录下来
-            if failed_files:
-                failed_names = [f['filename'] for f in failed_files]
-                dialogue_history.append({
-                    'role': 'system',
-                    'name': '系统',
-                    'content': f'以下文件修改失败：{", ".join(failed_names)}',
-                    'timestamp': get_current_timestamp(),
-                    'type': 'code_update_failed'
-                })
-        else:
-            dialogue_history.append({
-                'role': 'agent',
-                'name': 'AI 助手',
-                'content': ai_response,
-                'timestamp': get_current_timestamp()
-            })
-
-        requirement.dialogue_history = dialogue_history
-        requirement.code_files = code_files
-        db.commit()
-
-        # ==================== 阶段 3.1: API 返回修改文件列表 ====================
-        result = {
-            'message': 'success',
-            'dialogue_history': dialogue_history,
-            'code_files': requirement.code_files,
-            'ai_response': ai_response,
-            'updated_files': updated_files
+        state = {
+            'requirement_id': req_id,
+            'requirement_content': requirement.content,
+            'user_id': current_user_id,
+            'plan': {},
+            'current_step': 'tool_coder_ready',
+            'code_files': requirement.code_files or [],
+            'dialogue_history': existing_dialogue,
+            'metadata': {'trace_id': '', 'is_chat': True},
+            'tool_call_count': 0,
+            'no_progress_count': 0,
+            'last_file_list': existing_files,
+            'hook_failures': {},
         }
 
-        if failed_files:
-            result['failed_files'] = failed_files
+        final_state = tool_loop.run(state)
 
-        return jsonify(result), 200
+        # 获取更新后的文件
+        updated_files = workspace.snapshot()
+
+        # 保存结果
+        final_dialogue = final_state.get('dialogue_history', [])
+        requirement.dialogue_history = final_dialogue
+        requirement.code_files = updated_files
+        db.commit()
+
+        return jsonify({
+            'message': 'success',
+            'code_files': updated_files,
+            'dialogue_history': final_dialogue,
+            'updated_files': [f['filename'] for f in updated_files],
+        }), 200
 
     except Exception as e:
         logger.error(f"处理对话失败：{e}", exc_info=True)
@@ -874,6 +813,31 @@ def health_check():
             'error': str(e)
         }
 
+    # 4. 检查 Harness 层状态
+    try:
+        from harness.tools.registry import create_tool_registry
+        tools = create_tool_registry()
+        checks['tool_registry'] = {
+            'status': 'ok',
+            'tools_count': len(tools.list_tools()),
+        }
+    except Exception as e:
+        checks['tool_registry'] = {'status': 'error', 'error': str(e)}
+
+    try:
+        from harness.environment.sandbox import SandboxExecutor
+        sandbox = SandboxExecutor()
+        checks['sandbox'] = {'status': 'ok'}
+    except Exception as e:
+        checks['sandbox'] = {'status': 'error', 'error': str(e)}
+
+    try:
+        from harness.state.memory_store import MemoryStore
+        memory = MemoryStore()
+        checks['memory_store'] = {'status': 'ok'}
+    except Exception as e:
+        checks['memory_store'] = {'status': 'error', 'error': str(e)}
+
     return jsonify({
         'status': overall_status,
         'checks': checks,
@@ -912,10 +876,67 @@ def readiness_check():
         return jsonify({'status': 'not_ready', 'error': str(e)}), 503
 
 
+@app.route('/api/requirements/<int:req_id>/permission', methods=['POST'])
+@jwt_required()
+def permission_approval(req_id):
+    """接收用户权限审批决策"""
+    user_id = get_jwt_identity()
+    data = request.get_json() or {}
+    decision = data.get('decision', 'deny')  # 'allow' | 'deny'
+
+    from models import SessionLocal, Requirement
+    db = SessionLocal()
+    requirement = db.query(Requirement).filter_by(id=req_id, user_id=user_id).first()
+    if not requirement:
+        db.close()
+        return jsonify({'error': '需求不存在'}), 404
+
+    logger.info(f"用户 {user_id} 对需求 {req_id} 的权限请求做出了 {decision} 决定")
+
+    # 允许写入权限
+    if decision == 'allow':
+        from harness.environment.permissions import PermissionManager
+        pm = PermissionManager()
+        pm.grant(req_id, 'write')
+
+    db.close()
+    return jsonify({'status': 'ok', 'decision': decision})
+
+
+@app.route('/api/metrics', methods=['GET'])
+def metrics():
+    """Prometheus 监控指标端点"""
+    import time
+    metrics_data = {
+        'talk2code_requests_total': 0,
+        'talk2code_active_sessions': 0,
+        'timestamp': time.time(),
+        'uptime_seconds': time.time() - app.config.get('START_TIME', time.time()),
+    }
+
+    try:
+        from models import SessionLocal
+        db = SessionLocal()
+        from sqlalchemy import text
+        result = db.execute(text("SELECT COUNT(*) FROM requirements")).fetchone()
+        metrics_data['talk2code_requests_total'] = result[0] if result else 0
+        db.close()
+    except Exception:
+        pass
+
+    # Prometheus text 格式
+    lines = []
+    for key, value in metrics_data.items():
+        if isinstance(value, (int, float)):
+            safe_key = key.replace('.', '_')
+            lines.append(f"talk2code_{safe_key} {value}")
+    return '\n'.join(lines) + '\n', 200, {'Content-Type': 'text/plain; charset=utf-8'}
+
+
 # ==================== 辅助函数 ====================
 
 from utils.sse import SSEMessage
-from utils.time_utils import get_current_timestamp
+from utils.sse import get_current_timestamp
 
 
 # ==================== 主程序入口 ====================

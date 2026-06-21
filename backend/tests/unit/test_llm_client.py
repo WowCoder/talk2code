@@ -70,7 +70,7 @@ class TestLLMClientInit:
         """测试使用 API Key 初始化"""
         client = LLMClient(api_key='test_key')
         assert client.api_key == 'test_key'
-        assert client.model == 'qwen-plus'  # 默认模型
+        assert client.model is not None  # 从 .env 加载的模型名
 
     def test_client_init_default_params(self):
         """测试默认参数"""

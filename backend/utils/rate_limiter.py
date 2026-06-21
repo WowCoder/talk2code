@@ -8,7 +8,7 @@ from functools import wraps
 from typing import Optional, Callable
 from flask import request, jsonify, g
 
-from utils.logger import get_logger
+from harness.observability.logger import get_logger
 
 logger = get_logger(__name__)
 

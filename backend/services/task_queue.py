@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Callable, Any, Dict, Optional
 from enum import Enum
 
-from utils.logger import get_logger
+from harness.observability.logger import get_logger
 
 logger = get_logger(__name__)
 

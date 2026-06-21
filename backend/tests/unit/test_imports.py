@@ -110,27 +110,31 @@ class TestProjectImportsClean:
     """验证项目文件使用正确的导入"""
 
     def test_agents_state_uses_annotated_pattern(self):
-        """验证 agents/state.py 使用 Annotated 模式"""
-        import agents.state
-        from agents.state import AgentState
-        # 如果能成功导入 AgentState，说明导入路径正确
+        """验证 harness/state/agent_state.py 使用 Annotated 模式"""
+        from harness.state.agent_state import AgentState
         assert AgentState is not None
 
-    def test_agents_workflow_uses_langgraph(self):
-        """验证 agents/workflow.py 使用 langgraph.graph.StateGraph"""
-        import agents.workflow
-        from agents.workflow import create_workflow
+    def test_harness_graph_uses_langgraph(self):
+        """验证 harness/graph.py 使用 langgraph.graph.StateGraph"""
+        from harness.graph import create_workflow
         workflow = create_workflow()
         assert workflow is not None
 
-    def test_agents_nodes_import_prompts_correctly(self):
-        """验证 agents/nodes.py 导入 prompts"""
-        import agents.nodes
-        # 验证节点函数存在
-        assert hasattr(agents.nodes, 'researcher_node')
-        assert hasattr(agents.nodes, 'product_manager_node')
-        assert hasattr(agents.nodes, 'architect_node')
-        assert hasattr(agents.nodes, 'engineer_node')
+    def test_harness_instructions_nodes_exist(self):
+        """验证 harness/instructions/nodes.py 节点函数存在"""
+        from harness.instructions import nodes
+        assert hasattr(nodes, 'planner_node')
+        assert hasattr(nodes, 'tool_coder_node')
+
+    def test_agents_backward_compat(self):
+        """验证 agents/ 向后兼容重导出仍然有效"""
+        from agents.workflow import create_workflow
+        from agents.nodes import planner_node, tool_coder_node
+        from agents.tool_loop import ToolCallLoop
+        assert create_workflow is not None
+        assert planner_node is not None
+        assert tool_coder_node is not None
+        assert ToolCallLoop is not None
 
     def test_llm_client_imports(self):
         """验证 llm/client.py 可以正常导入"""
@@ -167,9 +171,14 @@ class TestProjectImportsClean:
         assert result.content == 'System message'
 
     def test_prompts_imports(self):
-        """验证 prompts.py 可以正常导入"""
-        import prompts
-        assert hasattr(prompts, 'RESEARCHER_SYSTEM_PROMPT')
-        assert hasattr(prompts, 'PRODUCT_MANAGER_SYSTEM_PROMPT')
-        assert hasattr(prompts, 'ARCHITECT_SYSTEM_PROMPT')
-        assert hasattr(prompts, 'ENGINEER_SYSTEM_PROMPT')
+        """验证 harness/instructions/prompts.py 可以正常导入"""
+        from harness.instructions.prompts import (
+            PLANNER_SYSTEM,
+            PLANNER_PROMPT,
+            TOOL_CODER_SYSTEM,
+            TOOL_CODER_PROMPT,
+        )
+        assert PLANNER_SYSTEM
+        assert PLANNER_PROMPT
+        assert TOOL_CODER_SYSTEM
+        assert TOOL_CODER_PROMPT

@@ -1,0 +1,98 @@
+# -*- coding: utf-8 -*-
+"""
+SSEReporter —— SSE 事件统一管理
+"""
+
+from utils.sse import SSEMessage, get_current_timestamp
+
+
+class SSEReporter:
+    """SSE 事件统一管理，通过 SSEManager 推送事件"""
+
+    def __init__(self, sse_manager):
+        self.sse = sse_manager
+
+    def progress(self, requirement_id: int, percent: int, message: str = ""):
+        self._send(requirement_id, "progress", {
+            "current_agent": message, "progress": percent, "status": "processing"
+        })
+
+    def dialogue(self, requirement_id: int, role: str, name: str, content: str, status: str = ""):
+        self._send(requirement_id, "dialogue", {
+            "role": role, "name": name, "content": content,
+            "timestamp": get_current_timestamp(), "status": status
+        })
+
+    def code(self, requirement_id: int, files: list):
+        self._send(requirement_id, "code", {"files": files})
+
+    def tool_call(self, requirement_id: int, tool_name: str, arguments: dict):
+        readable = self._make_readable(tool_name, arguments)
+        self._send(requirement_id, "tool_call", {
+            "tool_name": tool_name, "arguments": arguments, "readable": readable
+        })
+
+    def tool_result(self, requirement_id: int, tool_name: str, success: bool,
+                    summary: str = "", error: str = ""):
+        self._send(requirement_id, "tool_result", {
+            "tool_name": tool_name, "success": success,
+            "summary": summary, "error": error
+        })
+
+    def thinking(self, requirement_id: int, content: str):
+        self._send(requirement_id, "thinking", {"content": content})
+
+    def hook_check(self, requirement_id: int, hook_name: str, passed: bool, message: str = ""):
+        self._send(requirement_id, "hook_check", {
+            "hook_name": hook_name, "passed": passed, "message": message
+        })
+
+    def permission_request(self, requirement_id: int, tool_name: str, arguments: dict, reason: str):
+        self._send(requirement_id, "permission_request", {
+            "tool_name": tool_name, "arguments": arguments, "reason": reason
+        })
+
+    def trace_summary(self, requirement_id: int, trace_data: dict):
+        self._send(requirement_id, "trace_summary", trace_data)
+
+    def complete(self, requirement_id: int, code_files: list = None):
+        self._send(requirement_id, "complete", {
+            "requirement_id": requirement_id,
+            "code_files": code_files or []
+        })
+
+    def error(self, requirement_id: int, message: str):
+        self._send(requirement_id, "error", {"message": message})
+
+    def _send(self, requirement_id: int, event: str, data: dict):
+        try:
+            msg = SSEMessage.format_event(event, data)
+            self.sse.broadcast(str(requirement_id), msg)
+        except Exception:
+            pass
+
+    def _make_readable(self, tool_name: str, arguments: dict) -> str:
+        if tool_name == "write_file":
+            filename = arguments.get("filename", "unknown")
+            content = arguments.get("content", "")
+            lines = content.count('\n') + 1 if content else 0
+            return f"📝 正在创建 {filename} ({lines} 行)"
+        elif tool_name == "read_file":
+            return f"📖 读取 {arguments.get('filename', 'unknown')}"
+        elif tool_name == "list_files":
+            return f"📋 列出所有文件"
+        elif tool_name == "delete_file":
+            return f"🗑 删除 {arguments.get('filename', 'unknown')}"
+        elif tool_name == "execute_code":
+            return f"▶ 正在运行代码验证..."
+        elif tool_name == "validate_html":
+            return f"🔍 HTML 语法检查：{arguments.get('filename', '')}"
+        elif tool_name == "lint_css":
+            return f"🔍 CSS 语法检查：{arguments.get('filename', '')}"
+        elif tool_name == "lint_js":
+            return f"🔍 JS 语法检查：{arguments.get('filename', '')}"
+        elif tool_name == "search_docs":
+            return f"🔎 搜索文档：{arguments.get('query', '')}"
+        elif tool_name == "fetch_cdn_library":
+            return f"📦 获取 {arguments.get('library', '')} CDN"
+        return f"🔧 调用 {tool_name}"

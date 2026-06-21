@@ -122,6 +122,10 @@ class Settings(BaseSettings):
         description='日志级别'
     )
     LOG_FILE: str = Field(default='logs/app.log', description='日志文件路径')
+    LOG_DIR: str = Field(default='logs', description='日志目录（项目根目录下）')
+    AGENT_LOG_RETENTION_DAYS: int = Field(default=30, description='agent/llm 日志保留天数')
+    APP_LOG_RETENTION_DAYS: int = Field(default=90, description='app/access 日志保留天数')
+    LOG_FILE_MAX_SIZE_MB: int = Field(default=50, description='单日志文件最大大小 (MB)')
 
     # ==================== 安全配置 ====================
 
@@ -191,3 +195,6 @@ LLM_BASE_URL = settings.LLM_BASE_URL
 LLM_MODEL = settings.LLM_MODEL
 LOG_LEVEL = settings.LOG_LEVEL
 LOG_FILE = settings.LOG_FILE
+LOG_DIR = settings.LOG_DIR
+AGENT_LOG_RETENTION_DAYS = settings.AGENT_LOG_RETENTION_DAYS
+LOG_FILE_MAX_SIZE_MB = settings.LOG_FILE_MAX_SIZE_MB

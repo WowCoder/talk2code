@@ -12,8 +12,10 @@ class TestUserRegistration:
 
     def test_register_new_user(self, app_client):
         """Test registering a new user"""
+        import time
+        uname = f'newuser{int(time.time()*1000)%100000}'
         response = app_client.post('/api/register', json={
-            'username': 'newuser123',
+            'username': uname,
             'password': 'password123'
         })
         data = response.get_json()

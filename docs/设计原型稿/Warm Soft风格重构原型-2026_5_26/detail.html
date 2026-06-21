@@ -1,0 +1,740 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>对话详情 — Talk2Code</title>
+<style>
+  :root {
+    --bg:      oklch(97% 0.018 70);
+    --surface: oklch(99% 0.008 70);
+    --fg:      oklch(22% 0.02 50);
+    --muted:   oklch(50% 0.018 50);
+    --border:  oklch(90% 0.014 70);
+    --accent:  oklch(64% 0.13 28);
+    --accent-soft: oklch(88% 0.04 38);
+    --font-display: 'Tiempos Headline', 'Newsreader', 'Iowan Old Style', Georgia, serif;
+    --font-body: 'Söhne', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+
+    --dark-bg:     oklch(22% 0.015 60);
+    --dark-surface:oklch(18% 0.012 60);
+    --dark-border: oklch(32% 0.012 60);
+    --dark-fg:     oklch(90% 0.005 70);
+    --dark-muted:  oklch(58% 0.01 60);
+    --dark-hover:  oklch(28% 0.012 60);
+  }
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: var(--font-body);
+    background: var(--bg);
+    color: var(--fg);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* — Navigation — */
+  .nav {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 0 24px;
+    height: 56px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+    backdrop-filter: blur(12px);
+    background: oklch(99% 0.008 70 / 88%);
+  }
+  .nav-left {
+    display: flex; align-items: center; gap: 12px; min-width: 0;
+  }
+  .nav-back {
+    width: 32px; height: 32px;
+    border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--muted); cursor: pointer;
+    border: 1px solid var(--border); background: none;
+    transition: color 0.15s, background 0.15s;
+    flex-shrink: 0;
+  }
+  .nav-back:hover { color: var(--fg); background: var(--bg); }
+  .nav-back svg { width: 16px; height: 16px; }
+  .nav-title {
+    font-family: var(--font-display);
+    font-size: 16px; font-weight: 600;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    color: var(--fg);
+  }
+  .nav-user { display: flex; align-items: center; gap: 12px; }
+  .nav-status { font-size: 12px; color: var(--muted); margin-right: 8px; }
+  .status-dot {
+    display: inline-block; width: 6px; height: 6px;
+    border-radius: 50%; margin-right: 6px;
+    background: var(--accent);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+  .nav-avatar {
+    width: 30px; height: 30px;
+    border-radius: 50%;
+    background: var(--accent-soft); color: var(--accent);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 12px; font-weight: 600;
+  }
+
+  .split {
+    flex: 1; display: flex; min-height: 0;
+    gap: 1px; background: var(--border);
+  }
+
+  /* — Dialogue panel (left) — */
+  .dialogue {
+    flex: 0 0 40%;
+    display: flex; flex-direction: column;
+    background: var(--surface);
+    min-width: 0;
+  }
+  .dialogue-header {
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    font-size: 14px; font-weight: 600;
+    color: var(--fg); flex-shrink: 0;
+  }
+  .dialogue-body {
+    flex: 1; overflow-y: auto; padding: 20px;
+    display: flex; flex-direction: column; gap: 16px;
+  }
+  .dialogue-body::-webkit-scrollbar { width: 6px; }
+  .dialogue-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  .msg { max-width: 88%; }
+  .msg.user { align-self: flex-end; }
+  .msg.agent { align-self: flex-start; }
+  .msg .bubble { padding: 12px 16px; border-radius: 16px; font-size: 14px; line-height: 1.6; }
+  .msg.user .bubble { background: var(--accent); color: #fff; border-bottom-right-radius: 6px; }
+  .msg.agent .bubble { background: var(--bg); border: 1px solid var(--border); border-bottom-left-radius: 6px; color: var(--fg); }
+  .msg .agent-name { font-size: 11px; font-weight: 600; color: var(--accent); margin-bottom: 4px; letter-spacing: 0.02em; }
+  .msg .time { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .msg.system { align-self: center; font-size: 12px; color: var(--muted); background: var(--bg); padding: 6px 16px; border-radius: 100px; }
+
+  .dialogue-input {
+    padding: 12px 16px; border-top: 1px solid var(--border);
+    display: flex; gap: 8px; flex-shrink: 0; background: var(--surface);
+  }
+  .dialogue-input input {
+    flex: 1; padding: 10px 14px;
+    border: 1px solid var(--border); border-radius: 12px;
+    font-size: 14px; font-family: var(--font-body);
+    color: var(--fg); background: var(--bg);
+    outline: none; transition: border-color 0.2s;
+  }
+  .dialogue-input input:focus { border-color: var(--accent); }
+  .dialogue-input input::placeholder { color: oklch(65% 0.01 70); }
+  .btn-send {
+    padding: 10px 20px; border: none; border-radius: 12px;
+    background: var(--accent); color: #fff;
+    font-size: 14px; font-weight: 600; font-family: var(--font-body);
+    cursor: pointer; transition: background 0.2s; white-space: nowrap;
+  }
+  .btn-send:hover { background: oklch(58% 0.13 28); }
+
+  /* — Right panel — */
+  .right-panel {
+    flex: 1; display: flex; flex-direction: column;
+    background: var(--dark-bg); min-width: 0;
+  }
+
+  /* Panel tab bar */
+  .panel-tabbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 16px;
+    background: var(--dark-surface);
+    border-bottom: 1px solid var(--dark-border);
+    flex-shrink: 0;
+  }
+  .panel-tabs { display: flex; gap: 0; }
+  .panel-tab {
+    padding: 10px 18px;
+    font-size: 13px; font-weight: 500;
+    color: var(--dark-muted); cursor: pointer;
+    border: none; background: none; font-family: var(--font-body);
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    transition: color 0.15s;
+  }
+  .panel-tab:hover { color: var(--dark-fg); }
+  .panel-tab.active { color: #fff; border-bottom-color: var(--accent); }
+
+  .btn-download {
+    display: flex; align-items: center; gap: 6px;
+    padding: 6px 14px; border-radius: 8px;
+    font-size: 12px; font-weight: 600; font-family: var(--font-body);
+    color: #fff; cursor: pointer;
+    border: none; background: var(--accent);
+    transition: background 0.2s, transform 0.15s;
+  }
+  .btn-download:hover { background: oklch(58% 0.13 28); }
+  .btn-download svg { width: 14px; height: 14px; }
+
+  .progress {
+    height: 3px; background: var(--dark-border); flex-shrink: 0;
+  }
+  .progress-fill {
+    height: 100%; background: var(--accent);
+    width: 65%; transition: width 0.3s;
+  }
+
+  /* — Preview view — */
+  .view { flex: 1; overflow: hidden; display: none; }
+  .view.active { display: flex; flex-direction: column; }
+
+  .preview-toolbar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 16px;
+    background: var(--dark-surface);
+    border-bottom: 1px solid var(--dark-border);
+    flex-shrink: 0;
+  }
+  .device-btn {
+    padding: 5px 12px; border-radius: 6px;
+    font-size: 12px; font-family: var(--font-body);
+    color: var(--dark-muted); cursor: pointer;
+    border: 1px solid var(--dark-border); background: transparent;
+    transition: color 0.15s, border-color 0.15s, background 0.15s;
+  }
+  .device-btn:hover { color: var(--dark-fg); border-color: oklch(45% 0.012 60); }
+  .device-btn.active { color: #fff; background: oklch(30% 0.012 60); border-color: oklch(45% 0.012 60); }
+  .preview-canvas {
+    flex: 1; background: #fff; display: flex;
+    align-items: center; justify-content: center;
+    overflow: auto;
+  }
+
+  /* — preview mock todo app — */
+  .todo-mock {
+    width: 420px; max-width: 100%;
+    padding: 32px 24px; font-family: var(--font-body);
+    color: oklch(22% 0.02 50);
+  }
+  .todo-mock h1 {
+    font-size: 28px; font-weight: 600;
+    margin-bottom: 4px; letter-spacing: -0.02em;
+  }
+  .todo-mock .sub { font-size: 13px; color: oklch(55% 0.02 50); margin-bottom: 24px; }
+  .todo-input-row {
+    display: flex; gap: 8px; margin-bottom: 24px;
+  }
+  .todo-input-row input {
+    flex: 1; padding: 10px 14px;
+    border: 1px solid oklch(88% 0.01 60); border-radius: 10px;
+    font-size: 14px; outline: none;
+  }
+  .todo-input-row button {
+    padding: 10px 20px; border: none; border-radius: 10px;
+    background: oklch(64% 0.13 28); color: #fff;
+    font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  .todo-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 14px; border-radius: 10px;
+    background: oklch(97% 0.018 70); margin-bottom: 8px;
+  }
+  .todo-item .check {
+    width: 20px; height: 20px; border-radius: 6px;
+    border: 2px solid oklch(80% 0.014 60);
+    flex-shrink: 0; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .todo-item.done .check {
+    background: oklch(60% 0.14 155); border-color: oklch(60% 0.14 155);
+  }
+  .todo-item .check::after {
+    content: ''; width: 6px; height: 10px;
+    border: solid #fff; border-width: 0 2px 2px 0;
+    transform: rotate(45deg); opacity: 0;
+  }
+  .todo-item.done .check::after { opacity: 1; }
+  .todo-item .text {
+    flex: 1; font-size: 14px;
+  }
+  .todo-item.done .text {
+    text-decoration: line-through; color: oklch(65% 0.01 60);
+  }
+  .todo-item .del {
+    width: 24px; height: 24px; border-radius: 6px;
+    border: none; background: transparent;
+    color: oklch(55% 0.01 50); cursor: pointer;
+    font-size: 16px; display: flex; align-items: center; justify-content: center;
+    opacity: 0; transition: opacity 0.15s;
+  }
+  .todo-item:hover .del { opacity: 1; }
+
+  /* — Code view (file tree + content) — */
+  .code-layout {
+    display: flex; flex: 1; min-height: 0;
+  }
+  /* file tree sidebar */
+  .file-tree {
+    width: 200px; flex-shrink: 0;
+    background: var(--dark-surface);
+    border-right: 1px solid var(--dark-border);
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  .file-tree-header {
+    padding: 10px 14px;
+    font-size: 11px; font-weight: 600; letter-spacing: 0.03em;
+    color: var(--dark-muted);
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--dark-border);
+    flex-shrink: 0;
+  }
+  .file-tree-body {
+    flex: 1; overflow-y: auto; padding: 6px 0;
+  }
+  .file-tree-body::-webkit-scrollbar { width: 4px; }
+  .file-tree-body::-webkit-scrollbar-thumb { background: oklch(35% 0.012 60); border-radius: 2px; }
+
+  .tree-folder { }
+  .tree-folder-name {
+    display: flex; align-items: center; gap: 6px;
+    padding: 6px 14px;
+    font-size: 12px; font-weight: 600;
+    color: var(--dark-muted);
+    cursor: pointer; user-select: none;
+    transition: color 0.15s;
+  }
+  .tree-folder-name:hover { color: var(--dark-fg); }
+  .tree-folder-name svg { width: 12px; height: 12px; transition: transform 0.15s; flex-shrink: 0; }
+  .tree-folder.open > .tree-folder-name svg { transform: rotate(90deg); }
+  .tree-folder .tree-children { display: none; }
+  .tree-folder.open > .tree-children { display: block; }
+
+  .tree-file {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 14px 6px 34px;
+    font-size: 12px; color: var(--dark-muted);
+    cursor: pointer; user-select: none;
+    transition: color 0.15s, background 0.15s;
+  }
+  .tree-file:hover { color: var(--dark-fg); background: var(--dark-hover); }
+  .tree-file.active { color: #fff; background: var(--dark-hover); }
+  .tree-file-icon {
+    width: 14px; height: 14px; border-radius: 3px;
+    font-size: 9px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .tree-file-icon.html { background: oklch(50% 0.12 35); color: #fff; }
+  .tree-file-icon.css  { background: oklch(50% 0.12 260); color: #fff; }
+  .tree-file-icon.js   { background: oklch(50% 0.12 100); color: #000; }
+
+  /* code content area */
+  .code-main {
+    flex: 1; display: flex; flex-direction: column; min-width: 0;
+  }
+  .code-filename {
+    padding: 8px 16px;
+    font-size: 12px; color: var(--dark-muted);
+    background: var(--dark-surface);
+    border-bottom: 1px solid var(--dark-border);
+    flex-shrink: 0;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .code-filename .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+  }
+  .code-filename .dot.html-dot { background: oklch(60% 0.14 35); }
+  .code-filename .dot.css-dot  { background: oklch(60% 0.14 260); }
+  .code-filename .dot.js-dot   { background: oklch(60% 0.14 100); }
+  .code-editor {
+    flex: 1; overflow-y: auto; padding: 16px 20px;
+    font-family: 'JetBrains Mono', ui-monospace, 'IBM Plex Mono', Menlo, monospace;
+    font-size: 13px; line-height: 1.7; white-space: pre;
+    color: var(--dark-fg); tab-size: 2;
+  }
+  .code-editor::-webkit-scrollbar { width: 8px; height: 8px; }
+  .code-editor::-webkit-scrollbar-thumb { background: oklch(38% 0.012 60); border-radius: 4px; }
+  .code-editor::-webkit-scrollbar-track { background: var(--dark-bg); }
+
+  /* syntax tokens */
+  .tn { color: oklch(75% 0.06 260); }
+  .kw { color: oklch(70% 0.14 310); }
+  .st { color: oklch(65% 0.1 155); }
+  .fn { color: oklch(72% 0.12 70); }
+  .cm { color: oklch(50% 0.01 70); font-style: italic; }
+  .at { color: oklch(72% 0.08 40); }
+  .pn { color: oklch(72% 0.06 280); }
+  .cs { color: oklch(72% 0.08 180); }
+  .nu { color: oklch(68% 0.12 70); }
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-left">
+    <a href="history.html" class="nav-back">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 19l-7-7 7-7"/></svg>
+    </a>
+    <span class="nav-title">开发一个待办清单应用，支持增删改查</span>
+  </div>
+  <div class="nav-user">
+    <span class="nav-status"><span class="status-dot"></span>智能体工作中…</span>
+    <span class="nav-avatar">U</span>
+  </div>
+</nav>
+
+<div class="split">
+
+  <!-- ===== Dialogue ===== -->
+  <div class="dialogue">
+    <div class="dialogue-header">AI 对话</div>
+    <div class="dialogue-body">
+      <div class="msg system">智能体已启动，正在分析你的需求…</div>
+      <div class="msg user">
+        <div class="bubble">开发一个待办清单应用，支持添加、删除、标记完成，界面简洁美观。</div>
+        <div class="time">14:30</div>
+      </div>
+      <div class="msg agent">
+        <div class="agent-name">架构师</div>
+        <div class="bubble">好的，我将为你设计一个单页待办清单应用。计划包含：<br><br>&bull; <b>index.html</b> — 主页面，输入框和任务列表<br>&bull; <b>style.css</b> — 现代化简洁风格样式<br>&bull; <b>script.js</b> — 增删改查和本地存储逻辑<br><br>正在生成代码…</div>
+        <div class="time">14:30</div>
+      </div>
+      <div class="msg system">index.html 已生成</div>
+      <div class="msg agent">
+        <div class="agent-name">开发者</div>
+        <div class="bubble">index.html 已就绪。卡片式布局，顶部输入区 + 下方任务列表，支持勾选、编辑、删除。</div>
+        <div class="time">14:31</div>
+      </div>
+      <div class="msg system">style.css 已生成</div>
+      <div class="msg agent">
+        <div class="agent-name">开发者</div>
+        <div class="bubble">style.css 已就绪。悬浮效果、完成动画、响应式布局、柔和配色。<br><br>script.js 生成中…</div>
+        <div class="time">14:32</div>
+      </div>
+    </div>
+    <div class="dialogue-input">
+      <input type="text" placeholder="输入消息继续对话…">
+      <button class="btn-send">发送</button>
+    </div>
+  </div>
+
+  <!-- ===== Right panel ===== -->
+  <div class="right-panel">
+    <div class="progress"><div class="progress-fill"></div></div>
+    <div class="panel-tabbar">
+      <div class="panel-tabs">
+        <button class="panel-tab active" data-view="preview">预览</button>
+        <button class="panel-tab" data-view="code">代码</button>
+      </div>
+      <button class="btn-download" title="打包下载整个工作区">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        代码下载
+      </button>
+    </div>
+
+    <!-- ===== Preview view (default) ===== -->
+    <div class="view active" id="view-preview">
+      <div class="preview-toolbar">
+        <button class="device-btn active">桌面端</button>
+        <button class="device-btn">平板</button>
+        <button class="device-btn">手机</button>
+      </div>
+      <div class="preview-canvas">
+        <div class="todo-mock">
+          <h1>我的待办清单</h1>
+          <p class="sub">保持专注，高效完成</p>
+          <div class="todo-input-row">
+            <input type="text" placeholder="添加新任务…">
+            <button>添加</button>
+          </div>
+          <div class="todo-item done">
+            <span class="check"></span>
+            <span class="text">设计系统配色方案</span>
+            <button class="del">×</button>
+          </div>
+          <div class="todo-item">
+            <span class="check"></span>
+            <span class="text">完成首页布局重构</span>
+            <button class="del">×</button>
+          </div>
+          <div class="todo-item">
+            <span class="check"></span>
+            <span class="text">编写用户认证模块</span>
+            <button class="del">×</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== Code view ===== -->
+    <div class="view" id="view-code">
+      <div class="code-layout">
+        <!-- File tree -->
+        <div class="file-tree">
+          <div class="file-tree-header">工作区</div>
+          <div class="file-tree-body">
+            <div class="tree-folder open">
+              <div class="tree-folder-name" onclick="this.parentElement.classList.toggle('open')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+                todo-app
+              </div>
+              <div class="tree-children">
+                <div class="tree-file active" data-file="index.html" onclick="switchFile(this, 'index.html')">
+                  <span class="tree-file-icon html">H</span> index.html
+                </div>
+                <div class="tree-file" data-file="style.css" onclick="switchFile(this, 'style.css')">
+                  <span class="tree-file-icon css">C</span> style.css
+                </div>
+                <div class="tree-file" data-file="script.js" onclick="switchFile(this, 'script.js')">
+                  <span class="tree-file-icon js">J</span> script.js
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Code content -->
+        <div class="code-main">
+          <div class="code-filename" id="code-filename">
+            <span class="dot html-dot"></span> index.html
+          </div>
+          <div class="code-editor" id="code-editor"><span class="cm">&lt;!doctype html&gt;</span>
+<span class="tn">&lt;html</span> <span class="at">lang</span>=<span class="st">"zh-CN"</span><span class="tn">&gt;</span>
+<span class="tn">&lt;head&gt;</span>
+  <span class="tn">&lt;meta</span> <span class="at">charset</span>=<span class="st">"UTF-8"</span><span class="tn">&gt;</span>
+  <span class="tn">&lt;meta</span> <span class="at">name</span>=<span class="st">"viewport"</span> <span class="at">content</span>=<span class="st">"width=device-width, initial-scale=1.0"</span><span class="tn">&gt;</span>
+  <span class="tn">&lt;title&gt;</span>待办清单<span class="tn">&lt;/title&gt;</span>
+  <span class="tn">&lt;link</span> <span class="at">rel</span>=<span class="st">"stylesheet"</span> <span class="at">href</span>=<span class="st">"style.css"</span><span class="tn">&gt;</span>
+<span class="tn">&lt;/head&gt;</span>
+<span class="tn">&lt;body&gt;</span>
+  <span class="tn">&lt;div</span> <span class="at">class</span>=<span class="st">"container"</span><span class="tn">&gt;</span>
+    <span class="tn">&lt;header&gt;</span>
+      <span class="tn">&lt;h1&gt;</span>我的待办清单<span class="tn">&lt;/h1&gt;</span>
+      <span class="tn">&lt;p</span> <span class="at">class</span>=<span class="st">"subtitle"</span><span class="tn">&gt;</span>保持专注，高效完成<span class="tn">&lt;/p&gt;</span>
+    <span class="tn">&lt;/header&gt;</span>
+
+    <span class="tn">&lt;div</span> <span class="at">class</span>=<span class="st">"input-group"</span><span class="tn">&gt;</span>
+      <span class="tn">&lt;input</span> <span class="at">type</span>=<span class="st">"text"</span> <span class="at">id</span>=<span class="st">"todoInput"</span> <span class="at">placeholder</span>=<span class="st">"添加新任务…"</span><span class="tn">&gt;</span>
+      <span class="tn">&lt;button</span> <span class="at">id</span>=<span class="st">"addBtn"</span><span class="tn">&gt;</span>添加<span class="tn">&lt;/button&gt;</span>
+    <span class="tn">&lt;/div&gt;</span>
+
+    <span class="tn">&lt;ul</span> <span class="at">id</span>=<span class="st">"todoList"</span> <span class="at">class</span>=<span class="st">"todo-list"</span><span class="tn">&gt;</span>
+      <span class="cm">&lt;!-- 动态渲染 --&gt;</span>
+    <span class="tn">&lt;/ul&gt;</span>
+  <span class="tn">&lt;/div&gt;</span>
+  <span class="tn">&lt;script</span> <span class="at">src</span>=<span class="st">"script.js"</span><span class="tn">&gt;</span><span class="tn">&lt;/script&gt;</span>
+<span class="tn">&lt;/body&gt;</span>
+<span class="tn">&lt;/html&gt;</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  // --- Tab switching (preview / code) ---
+  document.querySelectorAll('.panel-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.panel-tab').forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+      document.getElementById('view-' + tab.dataset.view).classList.add('active');
+    });
+  });
+
+  // --- Device preview buttons ---
+  document.querySelectorAll('.device-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.device-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      const canvas = document.querySelector('.preview-canvas');
+      const mock = canvas.querySelector('.todo-mock');
+      if (btn.textContent === '手机') {
+        mock.style.width = '360px';
+      } else if (btn.textContent === '平板') {
+        mock.style.width = '640px';
+      } else {
+        mock.style.width = '420px';
+      }
+    });
+  });
+
+  // --- File tree: switch files ---
+  const codeByFile = {
+    'index.html': `<span class="cm">&lt;!doctype html&gt;</span>
+<span class="tn">&lt;html</span> <span class="at">lang</span>=<span class="st">"zh-CN"</span><span class="tn">&gt;</span>
+<span class="tn">&lt;head&gt;</span>
+  <span class="tn">&lt;meta</span> <span class="at">charset</span>=<span class="st">"UTF-8"</span><span class="tn">&gt;</span>
+  <span class="tn">&lt;meta</span> <span class="at">name</span>=<span class="st">"viewport"</span> <span class="at">content</span>=<span class="st">"width=device-width, initial-scale=1.0"</span><span class="tn">&gt;</span>
+  <span class="tn">&lt;title&gt;</span>待办清单<span class="tn">&lt;/title&gt;</span>
+  <span class="tn">&lt;link</span> <span class="at">rel</span>=<span class="st">"stylesheet"</span> <span class="at">href</span>=<span class="st">"style.css"</span><span class="tn">&gt;</span>
+<span class="tn">&lt;/head&gt;</span>
+<span class="tn">&lt;body&gt;</span>
+  <span class="tn">&lt;div</span> <span class="at">class</span>=<span class="st">"container"</span><span class="tn">&gt;</span>
+    <span class="tn">&lt;header&gt;</span>
+      <span class="tn">&lt;h1&gt;</span>我的待办清单<span class="tn">&lt;/h1&gt;</span>
+      <span class="tn">&lt;p</span> <span class="at">class</span>=<span class="st">"subtitle"</span><span class="tn">&gt;</span>保持专注，高效完成<span class="tn">&lt;/p&gt;</span>
+    <span class="tn">&lt;/header&gt;</span>
+
+    <span class="tn">&lt;div</span> <span class="at">class</span>=<span class="st">"input-group"</span><span class="tn">&gt;</span>
+      <span class="tn">&lt;input</span> <span class="at">type</span>=<span class="st">"text"</span> <span class="at">id</span>=<span class="st">"todoInput"</span> <span class="at">placeholder</span>=<span class="st">"添加新任务…"</span><span class="tn">&gt;</span>
+      <span class="tn">&lt;button</span> <span class="at">id</span>=<span class="st">"addBtn"</span><span class="tn">&gt;</span>添加<span class="tn">&lt;/button&gt;</span>
+    <span class="tn">&lt;/div&gt;</span>
+
+    <span class="tn">&lt;ul</span> <span class="at">id</span>=<span class="st">"todoList"</span> <span class="at">class</span>=<span class="st">"todo-list"</span><span class="tn">&gt;</span>
+      <span class="cm">&lt;!-- 动态渲染 --&gt;</span>
+    <span class="tn">&lt;/ul&gt;</span>
+  <span class="tn">&lt;/div&gt;</span>
+  <span class="tn">&lt;script</span> <span class="at">src</span>=<span class="st">"script.js"</span><span class="tn">&gt;</span><span class="tn">&lt;/script&gt;</span>
+<span class="tn">&lt;/body&gt;</span>
+<span class="tn">&lt;/html&gt;</span>`,
+
+    'style.css': `<span class="cm">/* === 基础重置 === */</span>
+<span class="kw">*</span>, <span class="kw">*::before</span>, <span class="kw">*::after</span> {
+  <span class="at">margin</span>: <span class="nu">0</span>; <span class="at">padding</span>: <span class="nu">0</span>; <span class="at">box-sizing</span>: <span class="cs">border-box</span>;
+}
+<span class="kw">body</span> {
+  <span class="at">font-family</span>: -apple-system, BlinkMacSystemFont, <span class="st">'Segoe UI'</span>, sans-serif;
+  <span class="at">background</span>: <span class="cs">oklch(97% 0.018 70)</span>;
+  <span class="at">color</span>: <span class="cs">oklch(22% 0.02 50)</span>;
+  <span class="at">display</span>: <span class="cs">flex</span>; <span class="at">justify-content</span>: <span class="cs">center</span>;
+  <span class="at">padding</span>: <span class="nu">40px</span> <span class="nu">20px</span>;
+}
+
+<span class="cm">/* === 容器 === */</span>
+<span class="cs">.container</span> {
+  <span class="at">width</span>: <span class="nu">100%</span>; <span class="at">max-width</span>: <span class="nu">480px</span>;
+}
+<span class="cs">.container h1</span> {
+  <span class="at">font-size</span>: <span class="nu">28px</span>; <span class="at">font-weight</span>: <span class="nu">600</span>;
+  <span class="at">margin-bottom</span>: <span class="nu">4px</span>;
+}
+<span class="cs">.subtitle</span> {
+  <span class="at">font-size</span>: <span class="nu">13px</span>; <span class="at">color</span>: <span class="cs">oklch(55% 0.02 50)</span>;
+}
+
+<span class="cm">/* === 输入区 === */</span>
+<span class="cs">.input-group</span> {
+  <span class="at">display</span>: <span class="cs">flex</span>; <span class="at">gap</span>: <span class="nu">8px</span>;
+  <span class="at">margin</span>: <span class="nu">24px</span> <span class="nu">0</span>;
+}
+<span class="cs">.input-group input</span> {
+  <span class="at">flex</span>: <span class="nu">1</span>; <span class="at">padding</span>: <span class="nu">10px</span> <span class="nu">14px</span>;
+  <span class="at">border</span>: <span class="nu">1px</span> <span class="cs">solid</span> <span class="cs">oklch(88% 0.01 60)</span>;
+  <span class="at">border-radius</span>: <span class="nu">10px</span>;
+  <span class="at">font-size</span>: <span class="nu">14px</span>; <span class="at">outline</span>: <span class="cs">none</span>;
+}
+<span class="cs">.input-group button</span> {
+  <span class="at">padding</span>: <span class="nu">10px</span> <span class="nu">20px</span>; <span class="at">border</span>: <span class="cs">none</span>;
+  <span class="at">border-radius</span>: <span class="nu">10px</span>;
+  <span class="at">background</span>: <span class="cs">oklch(64% 0.13 28)</span>;
+  <span class="at">color</span>: <span class="cs">#fff</span>; <span class="at">font-weight</span>: <span class="nu">600</span>;
+  <span class="at">cursor</span>: <span class="cs">pointer</span>;
+}
+
+<span class="cm">/* === 任务项 === */</span>
+<span class="cs">.todo-item</span> {
+  <span class="at">display</span>: <span class="cs">flex</span>; <span class="at">align-items</span>: <span class="cs">center</span>;
+  <span class="at">gap</span>: <span class="nu">10px</span>; <span class="at">padding</span>: <span class="nu">12px</span> <span class="nu">14px</span>;
+  <span class="at">border-radius</span>: <span class="nu">10px</span>;
+  <span class="at">background</span>: <span class="cs">oklch(97% 0.018 70)</span>;
+}
+<span class="cs">.todo-item.done .text</span> {
+  <span class="at">text-decoration</span>: <span class="cs">line-through</span>;
+  <span class="at">color</span>: <span class="cs">oklch(65% 0.01 60)</span>;
+}`,
+
+    'script.js': `<span class="cm">// === 待办清单核心逻辑 ===</span>
+<span class="kw">const</span> <span class="fn">$</span> = <span class="fn">id</span> => <span class="kw">document</span>.<span class="fn">getElementById</span>(id);
+
+<span class="kw">let</span> <span class="fn">todos</span> = <span class="fn">JSON</span>.<span class="fn">parse</span>(<span class="fn">localStorage</span>.<span class="fn">getItem</span>(<span class="st">'todos'</span>)) || [];
+
+<span class="kw">function</span> <span class="fn">saveAndRender</span>() {
+  <span class="fn">localStorage</span>.<span class="fn">setItem</span>(<span class="st">'todos'</span>, <span class="fn">JSON</span>.<span class="fn">stringify</span>(todos));
+  <span class="fn">render</span>();
+}
+
+<span class="kw">function</span> <span class="fn">addTodo</span>(<span class="fn">text</span>) {
+  <span class="kw">if</span> (!text.<span class="fn">trim</span>()) <span class="kw">return</span>;
+  todos.<span class="fn">push</span>({ <span class="at">id</span>: <span class="fn">Date</span>.<span class="fn">now</span>(), text, <span class="at">done</span>: <span class="kw">false</span> });
+  <span class="fn">saveAndRender</span>();
+}
+
+<span class="kw">function</span> <span class="fn">toggleTodo</span>(<span class="fn">id</span>) {
+  <span class="kw">const</span> todo = todos.<span class="fn">find</span>(<span class="fn">t</span> => t.id === id);
+  <span class="kw">if</span> (todo) { todo.done = !todo.done; <span class="fn">saveAndRender</span>(); }
+}
+
+<span class="kw">function</span> <span class="fn">deleteTodo</span>(<span class="fn">id</span>) {
+  todos = todos.<span class="fn">filter</span>(<span class="fn">t</span> => t.id !== id);
+  <span class="fn">saveAndRender</span>();
+}
+
+<span class="fn">$</span>(<span class="st">'addBtn'</span>).<span class="fn">addEventListener</span>(<span class="st">'click'</span>, () => {
+  <span class="kw">const</span> input = <span class="fn">$</span>(<span class="st">'todoInput'</span>);
+  <span class="fn">addTodo</span>(input.value);
+  input.value = <span class="st">''</span>; input.<span class="fn">focus</span>();
+});
+
+<span class="fn">$</span>(<span class="st">'todoInput'</span>).<span class="fn">addEventListener</span>(<span class="st">'keypress'</span>, <span class="fn">e</span> => {
+  <span class="kw">if</span> (e.key === <span class="st">'Enter'</span>) <span class="fn">$</span>(<span class="st">'addBtn'</span>).<span class="fn">click</span>();
+});
+
+<span class="fn">render</span>();`
+  };
+
+  const codeEditor = document.getElementById('code-editor');
+  const codeFilename = document.getElementById('code-filename');
+
+  window.switchFile = function(el, filename) {
+    document.querySelectorAll('.tree-file').forEach(f => f.classList.remove('active'));
+    el.classList.add('active');
+
+    const ext = filename.split('.').pop();
+    const dotClass = ext === 'html' ? 'html-dot' : ext === 'css' ? 'css-dot' : 'js-dot';
+    const extLabel = ext === 'html' ? 'index.html' : ext === 'css' ? 'style.css' : 'script.js';
+    codeFilename.innerHTML = `<span class="dot ${dotClass}"></span> ${extLabel}`;
+    codeEditor.innerHTML = codeByFile[filename];
+  };
+
+  // --- Download button: create & trigger zip-like download ---
+  document.querySelector('.btn-download').addEventListener('click', () => {
+    // For a real app this would zip via JSZip. Here we simulate by downloading
+    // a manifest + each file. A simple approach: download a combined text bundle.
+    const files = [
+      { name: 'todo-app/index.html', content: document.createElement('div') },
+      { name: 'todo-app/style.css', content: document.createElement('div') },
+      { name: 'todo-app/script.js', content: document.createElement('div') }
+    ];
+    files[0].content.innerHTML = codeByFile['index.html'].replace(/<[^>]+>/g, '');
+    files[1].content.innerHTML = codeByFile['style.css'].replace(/<[^>]+>/g, '');
+    files[2].content.innerHTML = codeByFile['script.js'].replace(/<[^>]+>/g, '');
+
+    const bundle = files.map(f =>
+      `=== ${f.name} ===\n${f.content.textContent.trim()}\n`
+    ).join('\n');
+
+    const blob = new Blob([bundle], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'todo-app-source.txt';
+    a.click();
+    URL.revokeObjectURL(url);
+
+    // Visual feedback
+    const btn = document.querySelector('.btn-download');
+    const originalHTML = btn.innerHTML;
+    btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg> 已下载`;
+    setTimeout(() => { btn.innerHTML = originalHTML; }, 2000);
+  });
+</script>
+
+</body>
+</html>

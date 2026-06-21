@@ -13,6 +13,7 @@ node_modules/
 
 # Python
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *$py.class
 *.so
@@ -35,3 +36,4 @@ ENV/
 
 # 日志
 *.log
+logs/
