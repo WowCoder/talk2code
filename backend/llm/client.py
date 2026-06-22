@@ -16,9 +16,11 @@ from datetime import datetime
 import requests
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_PROVIDER
-from harness.observability.logger import get_logger
 
-logger = get_logger(__name__)
+# 注意：llm.client 是底层模块，不能在模块顶层 import harness（harness 依赖 llm.client，
+# 会形成循环导入）。日志用标准 logging，harness 的日志系统会在应用启动时统一配置 root logger。
+import logging as _logging
+logger = _logging.getLogger(__name__)
 
 # LLM 请求/响应专用日志（独立于应用日志，便于排查问题）
 import logging as _logging
@@ -232,7 +234,8 @@ class LLMClient:
     def _request_openai(
         self,
         messages: List[Dict[str, str]],
-        stream: bool = False
+        stream: bool = False,
+        max_tokens: Optional[int] = None
     ) -> Generator[str, None, None]:
         """发送 OpenAI 兼容 API 请求（带重试）"""
         headers = {
@@ -245,7 +248,7 @@ class LLMClient:
             'messages': messages,
             'stream': stream,
             'temperature': self.temperature,
-            'max_tokens': self.max_tokens
+            'max_tokens': max_tokens if max_tokens is not None else self.max_tokens
         }
 
         url = f'{self.base_url}/chat/completions'
@@ -305,7 +308,8 @@ class LLMClient:
     def _request_anthropic(
         self,
         messages: List[Dict[str, str]],
-        stream: bool = False
+        stream: bool = False,
+        max_tokens: Optional[int] = None
     ) -> Generator[str, None, None]:
         """发送 Anthropic 兼容 API 请求（带重试）"""
         headers = {
@@ -327,7 +331,7 @@ class LLMClient:
             'model': self.model,
             'messages': api_messages,
             'stream': stream,
-            'max_tokens': self.max_tokens
+            'max_tokens': max_tokens if max_tokens is not None else self.max_tokens
         }
         if system_prompt:
             data['system'] = system_prompt
@@ -395,19 +399,20 @@ class LLMClient:
     def _do_request(
         self,
         messages: List[Dict[str, str]],
-        stream: bool = False
+        stream: bool = False,
+        max_tokens: Optional[int] = None
     ) -> Generator[str, None, None]:
         """根据 provider 分发到对应的请求方法"""
         if self.provider == 'anthropic_compatible':
-            yield from self._request_anthropic(messages, stream)
+            yield from self._request_anthropic(messages, stream, max_tokens=max_tokens)
         else:
-            yield from self._request_openai(messages, stream)
+            yield from self._request_openai(messages, stream, max_tokens=max_tokens)
 
     def chat(
         self,
         prompt: str,
         system_prompt: Optional[str] = None,
-        use_memory: bool = True,
+        use_memory: bool = False,
         max_tokens: Optional[int] = None,
         timeout: Optional[int] = None
     ) -> LLMResponse:
@@ -417,42 +422,42 @@ class LLMClient:
         Args:
             prompt: 用户输入
             system_prompt: 系统提示词
-            use_memory: 是否使用会话记忆
+            use_memory: 是否使用会话记忆（默认 False：单例客户端被多线程共享，
+                开启记忆会导致跨请求串扰，仅在单线程场景显式开启）
             max_tokens: 最大生成 token 数（覆盖默认值）
             timeout: 超时时间（覆盖默认值）
 
         Returns:
             LLMResponse 对象
         """
-        # 临时覆盖参数
-        old_max_tokens = self.max_tokens
-        old_timeout = self.timeout
-        if max_tokens:
-            self.max_tokens = max_tokens
-        if timeout:
-            self.timeout = timeout
+        # 解析本次调用的有效参数（不修改实例状态，保证线程安全）
+        effective_max_tokens = max_tokens or self.max_tokens
+        effective_timeout = timeout or self.timeout
 
         messages = self._build_messages(prompt, system_prompt, use_memory)
-        logger.debug(f"LLM 请求：messages_count={len(messages)}, max_tokens={self.max_tokens}")
+        logger.debug(f"LLM 请求：messages_count={len(messages)}, max_tokens={effective_max_tokens}")
 
         # 带重试的请求
         content = ""
         error = None
         for attempt in range(self.max_retries + 1):
             try:
-                # 使用超时保护（仅 Unix）
+                # 使用超时保护（仅 Unix 主线程）
                 def handler(signum, frame):
-                    raise TimeoutError(f"LLM 调用超时（{self.timeout}秒）")
+                    raise TimeoutError(f"LLM 调用超时（{effective_timeout}秒）")
 
                 old_handler = None
                 try:
                     old_handler = signal.signal(signal.SIGALRM, handler)
-                    signal.alarm(self.timeout)
+                    signal.alarm(effective_timeout)
                 except (ValueError, OSError):
                     pass  # 非主线程或 Windows
 
                 try:
-                    for chunk in self._do_request(messages, stream=False):
+                    for chunk in self._do_request(
+                        messages, stream=False,
+                        max_tokens=effective_max_tokens,
+                    ):
                         content = chunk
                 finally:
                     try:
@@ -471,10 +476,6 @@ class LLMClient:
                 logger.error(f"LLM 请求异常：{error}")
                 if attempt >= self.max_retries:
                     content = f"[错误] 请求失败：{error}"
-
-        # 恢复参数
-        self.max_tokens = old_max_tokens
-        self.timeout = old_timeout
 
         # 保存到记忆
         if use_memory and content:
@@ -538,9 +539,8 @@ class LLMClient:
         Returns:
             LLMResponse 含 tool_calls 字段
         """
-        old_max_tokens = self.max_tokens
-        if max_tokens:
-            self.max_tokens = max_tokens
+        # 线程安全：不修改 self.max_tokens，按调用解析有效值
+        effective_max_tokens = max_tokens or self.max_tokens
 
         content = ""
         tool_calls = None
@@ -551,9 +551,11 @@ class LLMClient:
         for attempt in range(self.max_retries + 1):
             try:
                 if self.provider == 'anthropic_compatible':
-                    content, tool_calls, usage = self._request_anthropic_with_tools(messages, tools)
+                    content, tool_calls, usage = self._request_anthropic_with_tools(
+                        messages, tools, max_tokens=effective_max_tokens)
                 else:
-                    content, tool_calls, usage = self._request_openai_with_tools(messages, tools, tool_choice)
+                    content, tool_calls, usage = self._request_openai_with_tools(
+                        messages, tools, tool_choice, max_tokens=effective_max_tokens)
                 break
             except Exception as e:
                 error = str(e)
@@ -561,11 +563,11 @@ class LLMClient:
                 if attempt >= self.max_retries:
                     content = f"[错误] 工具调用失败：{error}"
 
-        self.max_tokens = old_max_tokens
         return LLMResponse(content=content, usage=usage, finish_reason=finish_reason,
                            error=error, tool_calls=tool_calls)
 
-    def _request_openai_with_tools(self, messages: list, tools: list, tool_choice: str):
+    def _request_openai_with_tools(self, messages: list, tools: list, tool_choice: str,
+                                    max_tokens: Optional[int] = None):
         """OpenAI function calling 协议"""
         import uuid
         headers = {
@@ -576,7 +578,7 @@ class LLMClient:
             'model': self.model,
             'messages': messages,
             'temperature': self.temperature,
-            'max_tokens': self.max_tokens,
+            'max_tokens': max_tokens if max_tokens is not None else self.max_tokens,
             'tools': tools,
             'tool_choice': tool_choice,
         }
@@ -625,7 +627,8 @@ class LLMClient:
 
         return content, (tool_calls or None), usage_data
 
-    def _request_anthropic_with_tools(self, messages: list, tools: list):
+    def _request_anthropic_with_tools(self, messages: list, tools: list,
+                                       max_tokens: Optional[int] = None):
         """Anthropic tool use 协议"""
         headers = {
             'x-api-key': self.api_key,
@@ -654,7 +657,7 @@ class LLMClient:
         data = {
             'model': self.model,
             'messages': api_messages,
-            'max_tokens': self.max_tokens,
+            'max_tokens': max_tokens if max_tokens is not None else self.max_tokens,
             'tools': anthropic_tools,
         }
         if system_prompt:

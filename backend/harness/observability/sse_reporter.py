@@ -47,6 +47,16 @@ class SSEReporter:
             "hook_name": hook_name, "passed": passed, "message": message
         })
 
+    def preview(self, requirement_id: int, report: dict):
+        """推送无头浏览器运行验证结果（console.error / JS 异常 / 资源加载失败）"""
+        self._send(requirement_id, "preview", {
+            "available": report.get("available", True),
+            "passed": len(report.get("errors", [])) == 0,
+            "errors": report.get("errors", []),
+            "logs": report.get("logs", []),
+            "url": report.get("url", ""),
+        })
+
     def permission_request(self, requirement_id: int, tool_name: str, arguments: dict, reason: str):
         self._send(requirement_id, "permission_request", {
             "tool_name": tool_name, "arguments": arguments, "reason": reason
