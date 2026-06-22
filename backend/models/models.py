@@ -100,6 +100,18 @@ class AgentTrace(Base):
     created_at = Column(DateTime, default=func.now())
 
 
+class CheckpointRecord(Base):
+    """工作流检查点表 —— 支持断点恢复（每个 requirement 保留最近一条）"""
+    __tablename__ = "agent_checkpoints"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    checkpoint_id = Column(String(64), unique=True, nullable=False, index=True)
+    requirement_id = Column(Integer, nullable=False, index=True)
+    node_name = Column(String(64), nullable=False)  # planner / tool_coder / tool_executor
+    state_json = Column(Text, nullable=False)  # JSON 序列化的 AgentState
+    created_at = Column(DateTime, default=func.now())
+
+
 # 初始化数据库（创建所有表）
 def init_db():
     """初始化数据库，创建所有表"""

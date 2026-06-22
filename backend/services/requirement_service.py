@@ -65,9 +65,10 @@ class RequirementService:
             permissions = PermissionManager()
             # 初始生成流程：用户已提交需求，写入权限自动授予
             permissions.grant(requirement_id, 'write')
-            checkpoint = CheckpointManager()
-            tracer = Tracer()
+            # 注入 db_session：记忆/检查点/追踪跨重启持久化
+            checkpoint = CheckpointManager(db_session=db)
             cost_tracker = CostTracker()
+            tracer = Tracer(db_session=db, cost_tracker=cost_tracker)
 
             # SSE reporter
             sse = SSEReporter(sse_manager)
@@ -82,6 +83,7 @@ class RequirementService:
                 cost_tracker=cost_tracker,
                 sse_reporter=sse,
                 permission_manager=permissions,
+                checkpoint=checkpoint,
             )
 
             # 构建初始状态
@@ -224,6 +226,12 @@ class RequirementService:
                 trace_data = tracer.get_trace(trace_id)
                 if trace_data:
                     sse.trace_summary(requirement_id, trace_data.to_dict())
+
+            # 任务成功完成，清除检查点（避免下次误恢复已完成任务）
+            try:
+                checkpoint.clear(requirement_id)
+            except Exception as e:
+                logger.warning(f"清除检查点失败（不阻断）：{e}")
 
             self._send_complete(requirement_id)
             return True

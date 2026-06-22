@@ -437,7 +437,7 @@ def chat_with_requirement(req_id):
         permissions = PermissionManager()
         permissions.grant(req_id, 'write')  # chat 中自动授权写入
         sse = SSEReporter(sse_manager)
-        tracer = Tracer()
+        tracer = Tracer(db_session=db)
         cost_tracker = CostTracker()
 
         # 构建对话历史（保留已有对话 + 新消息）

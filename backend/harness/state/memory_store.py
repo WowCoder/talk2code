@@ -1,11 +1,18 @@
 # -*- coding: utf-8 -*-
-from __future__ import annotations
 """
 MemoryStore —— LLM 驱动的长期记忆提取和两阶段检索
+
+持久化：注入 db_session 时，记忆落 AgentMemory 表，跨重启保留。
+       不注入时退化为内存字典（保持与现有无参构造测试兼容）。
 """
 
+from __future__ import annotations
+
+import logging
 import time
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryStore:
@@ -20,7 +27,11 @@ class MemoryStore:
     def __init__(self, db_session=None, llm_client=None):
         self._db = db_session
         self._llm = llm_client
-        self._cache: dict[int, list[dict]] = {}  # user_id → [memories]
+        self._cache: dict[int, list[dict]] = {}  # user_id → [memories]（无 db 时回退）
+
+    @property
+    def _persisted(self) -> bool:
+        return self._db is not None
 
     def extract_memories(self, dialogue_context: list, requirement_id: int, user_id: int) -> list:
         """用 LLM 扫描对话，提取值得长期记忆的事实"""
@@ -79,24 +90,34 @@ class MemoryStore:
         """写入新记忆，处理冲突"""
         existing = self._find_similar(user_id, fact)
         if existing:
-            existing["importance"] = min(1.0, existing.get("importance", 0.5) + 0.05)
-            existing["last_accessed_at"] = time.time()
+            if self._persisted:
+                self._update_db_memory(existing["id"], importance, bump=0.05)
+            else:
+                existing["importance"] = min(1.0, existing.get("importance", 0.5) + 0.05)
+                existing["last_accessed_at"] = time.time()
         else:
-            if user_id not in self._cache:
-                self._cache[user_id] = []
-            self._cache[user_id].append({
-                "fact": fact,
-                "memory_type": memory_type,
-                "importance": importance,
-                "requirement_id": requirement_id,
-                "created_at": time.time(),
-                "last_accessed_at": time.time(),
-                "access_count": 0,
-            })
+            if self._persisted:
+                self._create_db_memory(user_id, fact, memory_type, importance, requirement_id)
+            else:
+                if user_id not in self._cache:
+                    self._cache[user_id] = []
+                self._cache[user_id].append({
+                    "id": None,
+                    "fact": fact,
+                    "memory_type": memory_type,
+                    "importance": importance,
+                    "requirement_id": requirement_id,
+                    "created_at": time.time(),
+                    "last_accessed_at": time.time(),
+                    "access_count": 0,
+                })
 
     def decay(self):
         """时间衰减 + 清理"""
         now = time.time()
+        if self._persisted:
+            self._decay_db(now)
+            return
         for user_id in list(self._cache.keys()):
             kept = []
             for m in self._cache[user_id]:
@@ -107,6 +128,8 @@ class MemoryStore:
             self._cache[user_id] = kept
 
     def _get_user_memories(self, user_id: int) -> list:
+        if self._persisted:
+            return self._load_db_memories(user_id)
         return self._cache.get(user_id, [])
 
     def _find_similar(self, user_id: int, fact: str) -> Optional[dict]:
@@ -118,6 +141,76 @@ class MemoryStore:
             if len(fact_words & m_words) / max(len(fact_words | m_words), 1) > 0.5:
                 return m
         return None
+
+    # ---------- 持久化实现 ----------
+
+    def _load_db_memories(self, user_id: int) -> list[dict]:
+        try:
+            from models.models import AgentMemory
+            rows = self._db.query(AgentMemory).filter_by(user_id=user_id).all()
+            return [{
+                "id": r.id,
+                "fact": r.fact,
+                "memory_type": r.memory_type,
+                "importance": r.importance,
+                "requirement_id": r.requirement_id,
+                "created_at": r.created_at.timestamp() if r.created_at else time.time(),
+                "last_accessed_at": (r.last_accessed_at.timestamp()
+                                     if r.last_accessed_at else time.time()),
+                "access_count": r.access_count or 0,
+            } for r in rows]
+        except Exception as e:
+            logger.warning("加载持久化记忆失败，回退内存：%s", e)
+            return self._cache.get(user_id, [])
+
+    def _create_db_memory(self, user_id, fact, memory_type, importance, requirement_id):
+        try:
+            from models.models import AgentMemory
+            row = AgentMemory(
+                user_id=user_id,
+                requirement_id=requirement_id,
+                memory_type=memory_type,
+                fact=fact,
+                importance=importance,
+                access_count=0,
+            )
+            self._db.add(row)
+            self._db.commit()
+        except Exception as e:
+            logger.warning("写入持久化记忆失败：%s", e)
+            self._db.rollback()
+
+    def _update_db_memory(self, mem_id, importance, bump=0.05):
+        try:
+            from models.models import AgentMemory
+            row = self._db.query(AgentMemory).filter_by(id=mem_id).first()
+            if row:
+                row.importance = min(1.0, (row.importance or 0.5) + bump)
+                self._db.commit()
+        except Exception as e:
+            logger.warning("更新持久化记忆失败：%s", e)
+            self._db.rollback()
+
+    def _decay_db(self, now):
+        try:
+            from models.models import AgentMemory
+            from datetime import datetime, timedelta
+            rows = self._db.query(AgentMemory).all()
+            cutoff = datetime.utcnow() - timedelta(days=30)
+            for r in rows:
+                if r.last_accessed_at and r.last_accessed_at < cutoff:
+                    self._db.delete(r)
+                else:
+                    r.importance = (r.importance or 0.5) * 0.95
+                    # 低重要性记忆自动清理（与内存版 decay 保持一致）
+                    if r.importance < 0.1:
+                        self._db.delete(r)
+            self._db.commit()
+        except Exception as e:
+            logger.warning("持久化记忆衰减失败：%s", e)
+            self._db.rollback()
+
+    # ---------- 通用辅助 ----------
 
     def _llm_filter(self, memories: list, query: str, top_k: int) -> list:
         """用 LLM 从候选记忆中筛选最相关的"""

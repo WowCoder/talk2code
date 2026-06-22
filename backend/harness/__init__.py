@@ -28,8 +28,15 @@ __all__ = [
 ]
 
 
-def create_harness(requirement_id: int, user_id: int):
-    """创建完整的 Harness 实例，初始化所有 6 层"""
+def create_harness(requirement_id: int, user_id: int, db_session=None):
+    """创建完整的 Harness 实例，初始化所有 6 层。
+
+    Args:
+        requirement_id: 需求 ID
+        user_id: 用户 ID
+        db_session: 可选的 SQLAlchemy session；注入后记忆/检查点/追踪将持久化到 DB，
+                    不注入时退化为内存（保持向后兼容）。
+    """
     from harness.state.workspace import WorkspaceFS
     from harness.state.versioning import GitVersioning
     from harness.state.checkpoint import CheckpointManager
@@ -48,12 +55,12 @@ def create_harness(requirement_id: int, user_id: int):
     tools = create_tool_registry()
     hooks = create_default_hook_manager()
     permissions = PermissionManager()
-    checkpoint = CheckpointManager()
-    memory = MemoryStore(llm_client=get_client())
+    checkpoint = CheckpointManager(db_session=db_session)
+    memory = MemoryStore(db_session=db_session, llm_client=get_client())
     assembler = ContextAssembler(memory_store=memory)
     compactor = ContextCompactor()
-    tracer = Tracer()
     cost_tracker = CostTracker()
+    tracer = Tracer(db_session=db_session, cost_tracker=cost_tracker)
 
     return {
         "workspace": workspace,

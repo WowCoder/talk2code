@@ -1,13 +1,20 @@
 # -*- coding: utf-8 -*-
-from __future__ import annotations
 """
 Tracer —— 链路追踪管理器
+
+持久化：注入 db_session 时，end_trace() 把整条 trace（含 spans/tokens/cost）落 agent_traces 表。
+       不注入时退化为内存字典（保持与现有无参构造测试兼容）。
 """
 
+from __future__ import annotations
+
+import logging
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -50,6 +57,7 @@ class Trace:
         return {
             "trace_id": self.trace_id,
             "requirement_id": self.requirement_id,
+            "user_id": self.user_id,
             "total_duration_ms": round((self.end_time - self.start_time) * 1000, 1) if self.end_time else None,
             "span_count": len(self.spans),
             "spans": [s.to_dict() for s in self.spans],
@@ -61,9 +69,15 @@ class Trace:
 class Tracer:
     """链路追踪管理器"""
 
-    def __init__(self):
+    def __init__(self, db_session=None, cost_tracker=None):
+        self._db = db_session
+        self._cost_tracker = cost_tracker
         self._traces: dict[str, Trace] = {}
         self._recent: list[Trace] = []
+
+    @property
+    def _persisted(self) -> bool:
+        return self._db is not None
 
     def start_trace(self, requirement_id: int, user_id: int) -> Trace:
         trace = Trace(
@@ -96,14 +110,33 @@ class Tracer:
 
     def end_trace(self, trace_id: str):
         trace = self._traces.get(trace_id)
-        if trace:
-            trace.end_time = time.time()
-            trace.total_tokens = sum(
-                s.metadata.get("tokens", 0) for s in trace.spans
-            )
+        if not trace:
+            return
+        trace.end_time = time.time()
+        trace.total_tokens = sum(
+            s.metadata.get("tokens", 0) for s in trace.spans
+        )
+        if self._cost_tracker:
+            report = self._cost_tracker.get_report(trace_id)
+            trace.total_cost = report.total_cost
+
+        # 持久化整条 trace（跨重启可查）
+        if self._persisted:
+            self._persist_trace(trace)
+
+        self._recent.append(trace)
+        if len(self._recent) > 100:
+            self._recent = self._recent[-100:]
 
     def get_trace(self, trace_id: str) -> Optional[Trace]:
-        return self._traces.get(trace_id)
+        # 内存命中
+        trace = self._traces.get(trace_id)
+        if trace:
+            return trace
+        # 持久化回查
+        if self._persisted:
+            return self._load_db_trace(trace_id)
+        return None
 
     def recent_traces(self, limit: int = 20) -> list[dict]:
         traces = sorted(
@@ -112,3 +145,49 @@ class Tracer:
             reverse=True
         )[:limit]
         return [t.to_dict() for t in traces]
+
+    # ---------- 持久化实现 ----------
+
+    def _persist_trace(self, trace: Trace):
+        try:
+            from models.models import AgentTrace
+            duration_ms = int((trace.end_time - trace.start_time) * 1000) if trace.end_time else 0
+            # upsert：同 trace_id 覆盖
+            existing = self._db.query(AgentTrace).filter_by(trace_id=trace.trace_id).first()
+            if existing:
+                row = existing
+            else:
+                row = AgentTrace(trace_id=trace.trace_id,
+                                 requirement_id=trace.requirement_id,
+                                 user_id=trace.user_id)
+                self._db.add(row)
+            row.data = trace.to_dict()
+            row.total_tokens = trace.total_tokens
+            row.total_cost = trace.total_cost
+            row.duration_ms = duration_ms
+            self._db.commit()
+        except Exception as e:
+            logger.warning("持久化 trace 失败：%s", e)
+            self._db.rollback()
+
+    def _load_db_trace(self, trace_id: str) -> Optional[Trace]:
+        try:
+            from models.models import AgentTrace
+            row = self._db.query(AgentTrace).filter_by(trace_id=trace_id).first()
+            if not row or not row.data:
+                return None
+            d = row.data
+            spans = [Span(**s) for s in d.get("spans", [])]
+            return Trace(
+                trace_id=row.trace_id,
+                requirement_id=row.requirement_id,
+                user_id=row.user_id,
+                start_time=d.get("start_time", time.time()),
+                end_time=d.get("end_time"),
+                spans=spans,
+                total_tokens=row.total_tokens or 0,
+                total_cost=row.total_cost or 0.0,
+            )
+        except Exception as e:
+            logger.warning("加载持久化 trace 失败：%s", e)
+            return None
