@@ -12,6 +12,7 @@ from harness.tools.registry import ToolRegistry
 from harness.tools.file_tools import FileToolHandler
 from harness.tools.code_tools import CodeToolHandler
 from harness.tools.preview_tools import PreviewToolHandler
+from harness.tools.edit_tools import EditToolHandler
 from llm.client import get_client
 from harness.observability.logger import get_logger
 
@@ -44,6 +45,7 @@ class ToolCallLoop:
         self._file_handler = FileToolHandler(workspace)
         self._code_handler = CodeToolHandler(workspace)
         self._preview_handler = PreviewToolHandler(workspace)
+        self._edit_handler = EditToolHandler(workspace)
 
     def run(self, state: AgentState) -> AgentState:
         client = get_client()
@@ -103,16 +105,27 @@ class ToolCallLoop:
                         result.success, result.content[:500] if result.success else "",
                         result.error[:500] if not result.success else "",
                     )
-                    # write_file 成功后推送 code 事件，让前端实时更新代码面板
+                    # write_file/edit_file 成功后推送 code 事件，让前端实时更新代码面板
                     if tc.name == "write_file" and result.success:
                         self.sse.code(state["requirement_id"], [{
                             "filename": tc.arguments.get("filename", "unknown"),
                             "content": tc.arguments.get("content", "")
                         }])
+                    elif tc.name == "edit_file" and result.success:
+                        # edit_file 推送修改后的完整文件内容（前端需最新全量）
+                        edited_name = tc.arguments.get("filename", "unknown")
+                        try:
+                            edited_content = self.workspace.read(edited_name)
+                        except Exception:
+                            edited_content = ""
+                        self.sse.code(state["requirement_id"], [{
+                            "filename": edited_name,
+                            "content": edited_content
+                        }])
 
                 # 工具结果摘要（大文件内容截断，避免对话记录膨胀）
                 tool_summary = result.content if result.success else result.error
-                if tc.name in ("read_file", "write_file") and len(tool_summary) > 300:
+                if tc.name in ("read_file", "write_file", "edit_file") and len(tool_summary) > 300:
                     tool_summary = tool_summary[:300] + "..."
                 state["dialogue_history"].append({
                     "role": "tool_call",
@@ -121,9 +134,9 @@ class ToolCallLoop:
                 })
 
                 # Git 自动 commit
-                if self.git and tc.name == "write_file" and result.success:
+                if self.git and tc.name in ("write_file", "edit_file") and result.success:
                     filename = tc.arguments.get("filename", "unknown")
-                    self.git.commit(f"[tool] write_file: {filename}")
+                    self.git.commit(f"[tool] {tc.name}: {filename}")
 
             # 检查是否达到最大迭代
             if iteration >= self.MAX_ITERATIONS - 1:
@@ -154,7 +167,8 @@ class ToolCallLoop:
             if all_problems:
                 state.setdefault("metadata", {})["repair_count"] = repair_count + 1
                 repair_prompt = (
-                    "代码已生成，但验证发现以下问题，请立即用 write_file 修复：\n"
+                    "代码已生成，但验证发现以下问题，请立即修复（已有文件用 edit_file 局部修改，"
+                    "不要重写整个文件）：\n"
                     + "\n".join(f"- {p}" for p in all_problems)
                 )
                 state["dialogue_history"].append({
@@ -203,6 +217,7 @@ class ToolCallLoop:
         handler_map = {
             "read_file": lambda: self._file_handler.read_file(**tool_call.arguments),
             "write_file": lambda: self._file_handler.write_file(**tool_call.arguments),
+            "edit_file": lambda: self._edit_handler.edit_file(**tool_call.arguments),
             "list_files": lambda: self._file_handler.list_files(),
             "delete_file": lambda: self._file_handler.delete_file(**tool_call.arguments),
             "validate_html": lambda: self._code_handler.validate_html(**tool_call.arguments),
