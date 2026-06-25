@@ -79,8 +79,18 @@ class ToolCallLoop:
             tc_names = [tc.name for tc in response.tool_calls] if response.tool_calls else []
             _log.debug(f"[ToolLoop] 迭代 {iteration + 1}: tool_calls={tc_names}")
 
-            # 无工具调用 → 任务完成
+            # 无工具调用 → 任务完成（但需检查目标文件是否全部生成）
             if not response.tool_calls:
+                missing = self._check_missing_files(state)
+                if missing:
+                    state["dialogue_history"].append({
+                        "role": "user", "name": "System",
+                        "content": f"你还没有创建所有必需的文件，缺少：{', '.join(missing)}。"
+                                 f"请继续用 write_file 创建剩余文件，不要停止。"
+                    })
+                    state["no_progress_count"] = 0
+                    continue
+                state["current_step"] = "task_complete"
                 state["current_step"] = "task_complete"
                 state["dialogue_history"].append({
                     "role": "agent", "name": "Coder",
@@ -387,12 +397,18 @@ class ToolCallLoop:
 - 每个文件内容不少于100行"""
         return prompt
 
+    def _check_missing_files(self, state: AgentState) -> list[str]:
+        """检查目标文件是否全部生成。返回缺失文件名列表。"""
+        existing = set(self.workspace.list())
+        target = {"index.html", "style.css", "script.js"}
+        return sorted(target - existing)
+
     def _check_no_progress(self, state: AgentState) -> bool:
         """检查连续无进展（前 3 轮豁免，给 LLM 足够的探索空间）"""
         if state.get("tool_call_count", 0) <= 3:
             return False
         current_files = set(self.workspace.list())
-        last_files = set(state.get("last_file_list", []))
+        last_files = set(state.get("last_file_list") or [])
         state["last_file_list"] = list(current_files)
         if current_files == last_files:
             state["no_progress_count"] = state.get("no_progress_count", 0) + 1

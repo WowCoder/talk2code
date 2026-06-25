@@ -25,7 +25,7 @@ class TestToolCallLoopBasic:
         mock_get_client.return_value = mock_client
 
         workspace = Mock()
-        workspace.list.return_value = []
+        workspace.list.return_value = ["index.html", "style.css", "script.js"]
         workspace.path = None  # required by git
 
         git = Mock()

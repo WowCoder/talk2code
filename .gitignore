@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+# Eval 运行产物（基线报告不纳入版本控制，保持 results/ 为生成态）
+eval/results/
+
 # 数据库文件
 *.db
 *.sqlite

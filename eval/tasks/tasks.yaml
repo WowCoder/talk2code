@@ -1,0 +1,198 @@
+# Eval 任务集 —— 20 个固定需求，从简单到复杂
+# 每个任务包含 id / name / requirement（用户原话）/ 断言列表。
+# 断言类型：
+#   file_exists:        指定文件存在
+#   content_contains:   某文件包含某字符串（大小写敏感）
+#   content_not_contains: 某文件不含某字符串（反模式：innerHTML/eval 等）
+#   html_has_element:   index.html 包含某 CSS 选择器对应的元素
+#   preview_no_error:   Playwright 运行 index.html 无 pageerror/console.error
+#   file_min_lines:     某文件行数 ≥ N（防偷懒空文件）
+#
+# 难度分级：L1 单页静态(5) / L2 交互+本地存储(7) / L3 复杂多状态(5) / L4 综合(3)
+# 编号约定：t01..t20，按难度递增
+
+tasks:
+  # ===== L1: 单页静态展示（5）=====
+  - id: t01
+    name: 个人名片页
+    level: 1
+    requirement: "做一个个人名片页面，显示姓名、职位、一句话简介，背景用渐变色"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: file_min_lines, filename: index.html, min: 20}
+      - {type: content_contains, filename: style.css, text: "gradient"}
+      - {type: preview_no_error}
+
+  - id: t02
+    name: 产品着陆页
+    level: 1
+    requirement: "做一个 SaaS 产品着陆页，包含 hero 区、三个特性卡片、底部 CTA 按钮"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: html_has_element, selector: "button"}
+      - {type: content_not_contains, filename: index.html, text: "lorem ipsum"}
+      - {type: preview_no_error}
+
+  - id: t03
+    name: 文章排版页
+    level: 1
+    requirement: "做一个博客文章页面，有标题、正文段落、引用块、作者信息"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: html_has_element, selector: "blockquote"}
+      - {type: preview_no_error}
+
+  - id: t04
+    name: 定价表
+    level: 1
+    requirement: "做一个定价对比表，三个套餐（基础/专业/企业），中间套餐高亮，每个有价格和功能列表"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: html_has_element, selector: "ul"}
+      - {type: preview_no_error}
+
+  - id: t05
+    name: 图片画廊
+    level: 1
+    requirement: "做一个响应式图片画廊，3 列网格，hover 时图片放大"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: content_contains, filename: style.css, text: "hover"}
+      - {type: preview_no_error}
+
+  # ===== L2: 交互 + localStorage（7）=====
+  - id: t06
+    name: 待办清单
+    level: 2
+    requirement: "做一个待办清单应用，可以添加、勾选完成、删除任务，用 localStorage 持久化"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: content_contains, filename: script.js, text: "localStorage"}
+      - {type: content_not_contains, filename: script.js, text: "eval"}
+      - {type: content_not_contains, filename: script.js, text: "innerHTML"}
+      - {type: preview_no_error}
+
+  - id: t07
+    name: 计数器
+    level: 2
+    requirement: "做一个计数器应用，有加、减、重置按钮，数字实时更新，localStorage 保存当前值"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: html_has_element, selector: "button"}
+      - {type: content_contains, filename: script.js, text: "localStorage"}
+      - {type: preview_no_error}
+
+  - id: t08
+    name: 简单计算器
+    level: 2
+    requirement: "做一个简单计算器，支持加减乘除，有数字按钮和运算符按钮，显示计算结果"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: preview_no_error}
+
+  - id: t09
+    name: 颜色选择器
+    level: 2
+    requirement: "做一个颜色选择器，拖动 RGB 三个滑块实时预览颜色，显示十六进制色值"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: html_has_element, selector: "input"}
+      - {type: preview_no_error}
+
+  - id: t10
+    name: 留言板
+    level: 2
+    requirement: "做一个留言板，输入昵称和留言内容后提交，留言列表显示在下方，用 localStorage 保存"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: content_contains, filename: script.js, text: "localStorage"}
+      - {type: preview_no_error}
+
+  - id: t11
+    name: 标签页切换
+    level: 2
+    requirement: "做一个标签页（Tab）切换组件，三个标签对应三块内容，点击标签切换显示"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: preview_no_error}
+
+  - id: t12
+    name: 番茄钟
+    level: 2
+    requirement: "做一个番茄钟计时器，25 分钟倒计时，开始/暂停按钮，倒计时结束提示"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: preview_no_error}
+
+  # ===== L3: 复杂多状态（5）=====
+  - id: t13
+    name: 购物车
+    level: 3
+    requirement: "做一个购物车，有商品列表（3个商品带图片占位），可增减数量，实时计算总价，localStorage 保存"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: content_contains, filename: script.js, text: "localStorage"}
+      - {type: preview_no_error}
+
+  - id: t14
+    name: 天气展示卡
+    level: 3
+    requirement: "做一个天气展示卡片，切换城市显示不同天气（预设数据），有图标、温度、湿度、风速"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: preview_no_error}
+
+  - id: t15
+    name: 表单验证
+    level: 3
+    requirement: "做一个注册表单，含邮箱、密码、确认密码字段，实时验证格式，错误提示显示在输入框下方"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: content_contains, filename: script.js, text: "email"}
+      - {type: preview_no_error}
+
+  - id: t16
+    name: 排序可视化
+    level: 3
+    requirement: "做一个数组排序可视化，生成随机数字柱状图，点击按钮逐步执行冒泡排序，每步高亮交换的柱子"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: html_has_element, selector: "button"}
+      - {type: preview_no_error}
+
+  - id: t17
+    name: 搜索过滤列表
+    level: 3
+    requirement: "做一个可搜索的产品列表，输入框实时过滤产品名称，无结果时显示空状态提示"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: html_has_element, selector: "input"}
+      - {type: preview_no_error}
+
+  # ===== L4: 综合（3）=====
+  - id: t18
+    name: 个人仪表盘
+    level: 4
+    requirement: "做一个个人仪表盘，顶部导航栏，左侧侧边栏菜单，主区域显示欢迎卡片和今日任务列表，深色主题"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: file_min_lines, filename: index.html, min: 50}
+      - {type: preview_no_error}
+
+  - id: t19
+    name: 笔记应用
+    level: 4
+    requirement: "做一个笔记应用，左侧笔记列表，右侧编辑区，新建/删除笔记，内容实时保存到 localStorage"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: content_contains, filename: script.js, text: "localStorage"}
+      - {type: preview_no_error}
+
+  - id: t20
+    name: 看板
+    level: 4
+    requirement: "做一个看板（Kanban）板，三列（待办/进行中/已完成），可以添加任务卡片到各列，localStorage 持久化"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: content_contains, filename: script.js, text: "localStorage"}
+      - {type: preview_no_error}

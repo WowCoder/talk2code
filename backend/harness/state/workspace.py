@@ -21,10 +21,11 @@ class WorkspaceFS:
 
     BASE_DIR = Path("/tmp/talk2code/workspaces")
 
-    def __init__(self, user_id: int, requirement_id: int):
+    def __init__(self, user_id: int, requirement_id: int, base_dir: Path = None):
         self.user_id = user_id
         self.req_id = requirement_id
-        self.path = self.BASE_DIR / str(user_id) / str(requirement_id)
+        root = base_dir if base_dir is not None else self.BASE_DIR
+        self.path = root / str(user_id) / str(requirement_id)
 
     def _validate(self, filename: str):
         """防止路径穿越：拒绝 ../ 上级目录和绝对路径"""
