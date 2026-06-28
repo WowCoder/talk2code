@@ -44,14 +44,7 @@ talk2code/
 │   │   ├── retry.py        # 指数退避重试
 │   │   └── rate_limiter.py # 限流器
 │   └── tests/              # 测试
-├── frontend/
-│   ├── login.html          # 登录/注册页
-│   ├── index.html          # 首页 — 需求输入
-│   ├── detail.html         # 需求详情页（AI 对话 + 代码编辑器 + 预览）
-│   ├── history.html        # 历史对话 — 项目列表
-│   ├── settings.html       # 设置 — 个人资料/外观/账户/关于
-│   └── js/
-│       └── security.js     # XSS 防护工具
+├── frontend-vue/             # Vue 3 + TypeScript 前端
 └── openspec/               # OpenSpec 规范驱动开发
 ```
 

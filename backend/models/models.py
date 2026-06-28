@@ -5,7 +5,7 @@
 """
 
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, JSON, Float
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, ForeignKey, JSON, Float, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.sql import func
@@ -54,6 +54,10 @@ class Requirement(Base):
     status = Column(String(20), default='pending')  # pending/processing/finished/failed
     create_time = Column(DateTime, default=datetime.utcnow)
     update_time = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # 软删除（回收站）
+    is_deleted = Column(Boolean, default=False)
+    deleted_at = Column(DateTime, nullable=True)
 
     # AI 对话历史 (JSON 格式)
     # 结构：[{"role": "user/agent", "name": "研究员/产品经理/...", "content": "...", "timestamp": "..."}]
@@ -114,8 +118,31 @@ class CheckpointRecord(Base):
 
 # 初始化数据库（创建所有表）
 def init_db():
-    """初始化数据库，创建所有表"""
+    """初始化数据库，创建所有表并执行迁移"""
     Base.metadata.create_all(engine)
+
+    # 迁移：为已有 requirements 表添加软删除列
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE requirements ADD COLUMN is_deleted BOOLEAN DEFAULT 0"))
+            conn.commit()
+    except Exception:
+        pass  # 列已存在
+
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE requirements ADD COLUMN deleted_at DATETIME"))
+            conn.commit()
+    except Exception:
+        pass  # 列已存在
+
+    # 修复已有数据：将 NULL 的 is_deleted 统一设为 0（非删除状态）
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("UPDATE requirements SET is_deleted = 0 WHERE is_deleted IS NULL"))
+            conn.commit()
+    except Exception:
+        pass
 
 
 # 获取数据库会话

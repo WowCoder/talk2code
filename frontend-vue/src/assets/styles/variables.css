@@ -1,0 +1,42 @@
+/* ===== Warm Soft Design System ===== */
+:root {
+  /* Light theme */
+  --bg: oklch(97% 0.018 70);
+  --surface: oklch(99% 0.008 70);
+  --fg: oklch(22% 0.02 50);
+  --muted: oklch(50% 0.018 50);
+  --border: oklch(90% 0.014 70);
+  --accent: oklch(64% 0.13 28);
+  --accent-soft: oklch(88% 0.04 38);
+
+  /* Typography */
+  --font-display: 'Tiempos Headline', 'Newsreader', 'Iowan Old Style', Georgia, serif;
+  --font-body: 'Söhne', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'IBM Plex Mono', Menlo, monospace;
+
+  /* Right panel (detail page) — lighter in light mode, true dark in dark mode */
+  --dark-bg: oklch(95% 0.008 60);
+  --dark-surface: oklch(97% 0.005 60);
+  --dark-border: oklch(88% 0.01 60);
+  --dark-fg: oklch(22% 0.02 50);
+  --dark-muted: oklch(50% 0.018 50);
+  --dark-hover: oklch(91% 0.01 60);
+}
+
+/* Dark mode overrides */
+html.dark {
+  --bg: oklch(20% 0.015 60);
+  --surface: oklch(22% 0.012 60);
+  --fg: oklch(90% 0.005 70);
+  --muted: oklch(58% 0.01 60);
+  --border: oklch(28% 0.012 60);
+  --accent-soft: oklch(30% 0.04 38);
+
+  /* Right panel — true dark */
+  --dark-bg: oklch(22% 0.015 60);
+  --dark-surface: oklch(18% 0.012 60);
+  --dark-border: oklch(32% 0.012 60);
+  --dark-fg: oklch(90% 0.005 70);
+  --dark-muted: oklch(58% 0.01 60);
+  --dark-hover: oklch(28% 0.012 60);
+}

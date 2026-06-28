@@ -79,9 +79,11 @@ class ToolCallLoop:
             tc_names = [tc.name for tc in response.tool_calls] if response.tool_calls else []
             _log.debug(f"[ToolLoop] 迭代 {iteration + 1}: tool_calls={tc_names}")
 
-            # 无工具调用 → 任务完成（但需检查目标文件是否全部生成）
+            # 无工具调用 → 任务完成（初始生成流程需检查目标文件是否全部生成；
+            # chat 模式只做增量修改，不要求补齐所有文件）
             if not response.tool_calls:
-                missing = self._check_missing_files(state)
+                is_chat = state.get("metadata", {}).get("is_chat", False)
+                missing = [] if is_chat else self._check_missing_files(state)
                 if missing:
                     state["dialogue_history"].append({
                         "role": "user", "name": "System",
@@ -98,9 +100,17 @@ class ToolCallLoop:
                 })
                 break
 
-            # 发布 thinking
-            if self.sse and response.content:
-                self.sse.thinking(state["requirement_id"], response.content)
+            # 发布 thinking（优先用 reasoning_content，其次 content）
+            thinking_text = response.reasoning_content or response.content
+            if thinking_text:
+                if self.sse:
+                    self.sse.thinking(state["requirement_id"], thinking_text)
+                # 存入对话历史，让前端刷新后仍可展示
+                state["dialogue_history"].append({
+                    "role": "thinking",
+                    "name": "Thinking",
+                    "content": thinking_text
+                })
 
             # 执行所有工具调用
             for tc in response.tool_calls:
@@ -133,14 +143,26 @@ class ToolCallLoop:
                             "content": edited_content
                         }])
 
-                # 工具结果摘要（大文件内容截断，避免对话记录膨胀）
+                # 工具结果摘要（超大文件截断，避免对话记录膨胀）
+                # read_file 需要足够上下文让 LLM 构造 edit_file 的精确 SEARCH 块
                 tool_summary = result.content if result.success else result.error
-                if tc.name in ("read_file", "write_file", "edit_file") and len(tool_summary) > 300:
-                    tool_summary = tool_summary[:300] + "..."
+                if tc.name == "read_file":
+                    max_len = 3000  # 必须覆盖到文件关键区域（h1 可能在行 400+ 字符处）
+                elif tc.name in ("write_file", "edit_file"):
+                    max_len = 500
+                else:
+                    max_len = 300
+                if len(tool_summary) > max_len:
+                    tool_summary = tool_summary[:max_len] + "\n... (文件较长，已截断，如需查看完整内容请再次 read_file)"
+
+                # 前端展示用简短摘要（不暴露大段文件内容）
+                display_readable = self._tool_display_label(tc.name, tc.arguments, result)
                 state["dialogue_history"].append({
                     "role": "tool_call",
                     "name": tc.name,
-                    "content": tool_summary
+                    "content": tool_summary,
+                    "arguments": tc.arguments,  # 保留原始参数，供前端详情展示
+                    "readable": display_readable,  # 前端展示用简短标签
                 })
 
                 # Git 自动 commit
@@ -194,6 +216,35 @@ class ToolCallLoop:
             self.git.commit("[agent] task complete")
 
         return state
+
+    def _tool_display_label(self, tool_name: str, arguments: dict, result) -> str:
+        """生成前端展示用的简短工具标签（不暴露大段文件内容）"""
+        filename = arguments.get("filename", "")
+        if tool_name == "read_file":
+            lines = result.content.count('\n') + 1 if result.success and result.content else 0
+            return f"📖 读取 {filename} ({lines} 行)"
+        elif tool_name == "write_file":
+            lines = result.content.count('\n') + 1 if result.success and result.content else 0
+            return f"📝 创建 {filename} ({lines} 行)"
+        elif tool_name == "edit_file":
+            edits = arguments.get("edit", arguments.get("edits", ""))
+            block_count = edits.count("<<<< SEARCH") if isinstance(edits, str) else 1
+            return f"✏️ 编辑 {filename} ({block_count} 处修改)"
+        elif tool_name == "list_files":
+            files = (result.content or "").strip()
+            count = len(files.split('\n')) if files else 0
+            return f"📋 文件列表 ({count} 个文件)"
+        elif tool_name == "delete_file":
+            return f"🗑 删除 {filename}"
+        elif tool_name in ("validate_html", "lint_css", "lint_js"):
+            return f"🔍 检查 {filename}"
+        elif tool_name == "execute_code":
+            return f"▶ 运行代码验证"
+        elif tool_name == "search_docs":
+            return f"🔎 搜索: {arguments.get('query', '')}"
+        elif tool_name == "fetch_cdn_library":
+            return f"📦 CDN: {arguments.get('library', '')}"
+        return f"🔧 {tool_name}"
 
     def _execute_tool(self, state: AgentState, tool_call) -> "ToolResult":
         from harness.tools.registry import ToolResult
@@ -332,11 +383,9 @@ class ToolCallLoop:
             content = str(msg.get("content", ""))
             if role == "tool_call":
                 tool_name = msg.get("name", "")
-                tool_result = msg.get("result", "")
-                messages.append({
-                    "role": "assistant",
-                    "content": f"[调用工具 {tool_name}]\n参数: {json.dumps(msg.get('content', {}), ensure_ascii=False)}"
-                })
+                tool_result = msg.get("content", "")
+                # 只保留工具结果，不伪造 assistant 消息（伪造的 "已执行工具 xx"
+                # 会让 LLM 误以为已完成操作，导致跳过实际工具调用）
                 messages.append({
                     "role": "user",
                     "content": f"[工具 {tool_name} 返回结果]\n{tool_result}"

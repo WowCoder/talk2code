@@ -44,13 +44,11 @@ LLM 配置：复制 `backend/.env.example` 为 `backend/.env`，填入 API Key�
 | 5 - Constraints | `constraints/hooks.py`, `checks.py` | Hook 管理器 + 统一约束检查（Craft 规则、安全、质量） |
 | 6 - Observability | `observability/` | 链路追踪 (`tracer.py`)、成本统计、SSE 事件上报 (`sse_reporter.py`)、日志系统 (`logger.py`) |
 
-**前端结构** (`frontend/`):
-- `login.html`: 登录/注册页
-- `index.html`: 首页，需求输入和列表
-- `detail.html`: 需求详情页，AI 对话 + CodeMirror 编辑器
-- `history.html`: 历史记录页
-- `settings.html`: 设置页
-- `js/`: 前端 JavaScript 模块
+**前端结构** (`frontend-vue/`):
+- Vue 3 + TypeScript + Vite 构建
+- `src/components/`: 组件（detail/PanelTabs、Preview、CodeView 等）
+- `src/views/`: 页面视图
+- 构建产物输出到 `frontend-vue/dist/`，由 Flask 直接托管
 
 ## 关键设计
 

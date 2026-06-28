@@ -1,0 +1,67 @@
+/* ===== Vue Transitions ===== */
+
+/* Fade */
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.3s ease;
+}
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
+/* Slide down */
+.slide-down-enter-active,
+.slide-down-leave-active {
+  transition: all 0.3s ease;
+}
+.slide-down-enter-from,
+.slide-down-leave-to {
+  opacity: 0;
+  transform: translateY(-10px);
+}
+
+/* Toast animation */
+.toast-enter-active {
+  transition: all 0.3s ease;
+}
+.toast-leave-active {
+  transition: all 0.2s ease;
+}
+.toast-enter-from {
+  opacity: 0;
+  transform: translateX(-50%) translateY(-20px);
+}
+.toast-leave-to {
+  opacity: 0;
+}
+
+/* Pulse for status dot */
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+/* Pulse border for pending tool cards */
+@keyframes pulse-border {
+  0%, 100% { border-left-color: var(--accent); }
+  50% { border-left-color: var(--accent-soft); }
+}
+
+/* Fade in */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* Loading bounce */
+@keyframes lb-bounce {
+  from {
+    opacity: 0.2;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}

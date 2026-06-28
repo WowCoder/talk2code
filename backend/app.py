@@ -27,7 +27,7 @@ setup_logger('sqlalchemy.engine', level=30)  # WARNING 级别
 
 # ==================== 应用初始化 ====================
 
-app = Flask(__name__, static_folder='../frontend', static_url_path='')
+app = Flask(__name__, static_folder=None)
 
 # CORS 配置
 CORS(app)
@@ -130,34 +130,27 @@ atexit.register(cleanup)
 
 # ==================== 前端页面路由 ====================
 
-@app.route('/')
-def index():
-    """首页 - 重定向到登录页"""
-    return send_from_directory(app.static_folder, 'login.html')
+# Vue SPA 静态文件目录
+SPA_DIST = os.path.join(os.path.dirname(__file__), '..', 'frontend-vue', 'dist')
 
 
-@app.route('/login.html')
-def login_page():
-    """登录/注册页面"""
-    return send_from_directory(app.static_folder, 'login.html')
-
-
-@app.route('/index.html')
-def home_page():
-    """首页 - 需求输入页"""
-    return send_from_directory(app.static_folder, 'index.html')
-
-
-@app.route('/detail.html')
-def detail_page():
-    """需求详情页"""
-    return send_from_directory(app.static_folder, 'detail.html')
-
-
-@app.route('/<path:filename>')
-def static_files(filename):
-    """静态文件服务"""
-    return send_from_directory(app.static_folder, filename)
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve_spa(path):
+    """SPA fallback — 非 API 路径返回 index.html，由 Vue Router 处理"""
+    if path.startswith('api/'):
+        return jsonify({'error': 'Not found'}), 404
+    # 尝试返回静态文件（js/css/assets）
+    if path:
+        try:
+            return send_from_directory(SPA_DIST, path)
+        except Exception:
+            pass
+    # 否则返回 index.html，由 Vue Router 处理路由
+    try:
+        return send_from_directory(SPA_DIST, 'index.html')
+    except Exception:
+        return jsonify({'error': 'Frontend not built. Run: cd frontend-vue && npm run build'}), 503
 
 
 # ==================== 用户认证 API ====================
@@ -335,15 +328,24 @@ def create_requirement():
 @app.route('/api/requirements', methods=['GET'])
 @jwt_required()
 def list_requirements():
-    """获取需求列表"""
+    """获取需求列表（支持 ?trash=true 查询回收站）"""
     from models import Requirement, SessionLocal
 
     current_user_id = get_jwt_identity()
+    show_trash = request.args.get('trash', '').lower() == 'true'
+
     db = SessionLocal()
     try:
-        requirements = db.query(Requirement).filter(
-            Requirement.user_id == current_user_id
-        ).order_by(Requirement.create_time.desc()).all()
+        query = db.query(Requirement).filter(
+            Requirement.user_id == current_user_id,
+            Requirement.is_deleted == show_trash
+        )
+        if show_trash:
+            query = query.order_by(Requirement.deleted_at.desc())
+        else:
+            query = query.order_by(Requirement.create_time.desc())
+
+        requirements = query.all()
 
         return jsonify({
             'requirements': [
@@ -351,7 +353,9 @@ def list_requirements():
                     'id': r.id,
                     'title': r.title,
                     'status': r.status,
-                    'create_time': r.create_time.isoformat() if r.create_time else None
+                    'create_time': r.create_time.isoformat() if r.create_time else None,
+                    'is_deleted': r.is_deleted,
+                    'deleted_at': r.deleted_at.isoformat() if r.deleted_at else None,
                 }
                 for r in requirements
             ]
@@ -377,7 +381,17 @@ def get_requirement(req_id):
         if not requirement:
             return jsonify({'error': '需求不存在'}), 404
 
-        return jsonify({
+        # 查询 trace 数据（已完成需求加载时前端可展示执行详情面板）
+        trace_data = None
+        if requirement.status == 'finished':
+            from models.models import AgentTrace
+            trace_row = db.query(AgentTrace).filter(
+                AgentTrace.requirement_id == req_id
+            ).order_by(AgentTrace.id.desc()).first()
+            if trace_row and trace_row.data:
+                trace_data = trace_row.data
+
+        result = {
             'requirement': {
                 'id': requirement.id,
                 'title': requirement.title,
@@ -386,9 +400,106 @@ def get_requirement(req_id):
                 'dialogue_history': requirement.dialogue_history or [],
                 'code_files': requirement.code_files or [],
                 'create_time': requirement.create_time.isoformat() if requirement.create_time else None,
-                'update_time': requirement.update_time.isoformat() if requirement.update_time else None
+                'update_time': requirement.update_time.isoformat() if requirement.update_time else None,
+                'is_deleted': requirement.is_deleted,
+                'deleted_at': requirement.deleted_at.isoformat() if requirement.deleted_at else None,
             }
-        }), 200
+        }
+        if trace_data:
+            result['trace'] = trace_data
+        return jsonify(result), 200
+    finally:
+        db.close()
+
+
+@app.route('/api/requirements/<int:req_id>/trash', methods=['PUT'])
+@jwt_required()
+def trash_requirement(req_id):
+    """软删除需求（移入回收站）"""
+    from models import Requirement, SessionLocal
+    from datetime import datetime
+
+    current_user_id = get_jwt_identity()
+    db = SessionLocal()
+    try:
+        requirement = db.query(Requirement).filter(
+            Requirement.id == req_id,
+            Requirement.user_id == current_user_id
+        ).first()
+
+        if not requirement:
+            return jsonify({'error': '需求不存在'}), 404
+
+        requirement.is_deleted = True
+        requirement.deleted_at = datetime.utcnow()
+        db.commit()
+
+        logger.info(f"需求 {req_id} 已移入回收站")
+        return jsonify({'message': '已移入回收站', 'requirement_id': req_id}), 200
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': f'操作失败：{str(e)}'}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/requirements/<int:req_id>/restore', methods=['PUT'])
+@jwt_required()
+def restore_requirement(req_id):
+    """从回收站恢复需求"""
+    from models import Requirement, SessionLocal
+
+    current_user_id = get_jwt_identity()
+    db = SessionLocal()
+    try:
+        requirement = db.query(Requirement).filter(
+            Requirement.id == req_id,
+            Requirement.user_id == current_user_id
+        ).first()
+
+        if not requirement:
+            return jsonify({'error': '需求不存在'}), 404
+        if not requirement.is_deleted:
+            return jsonify({'error': '该需求不在回收站中'}), 400
+
+        requirement.is_deleted = False
+        requirement.deleted_at = None
+        db.commit()
+
+        logger.info(f"需求 {req_id} 已从回收站恢复")
+        return jsonify({'message': '已恢复', 'requirement_id': req_id}), 200
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': f'操作失败：{str(e)}'}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/requirements/<int:req_id>', methods=['DELETE'])
+@jwt_required()
+def delete_requirement(req_id):
+    """彻底删除需求"""
+    from models import Requirement, SessionLocal
+
+    current_user_id = get_jwt_identity()
+    db = SessionLocal()
+    try:
+        requirement = db.query(Requirement).filter(
+            Requirement.id == req_id,
+            Requirement.user_id == current_user_id
+        ).first()
+
+        if not requirement:
+            return jsonify({'error': '需求不存在'}), 404
+
+        db.delete(requirement)
+        db.commit()
+
+        logger.info(f"需求 {req_id} 已彻底删除")
+        return jsonify({'message': '已彻底删除', 'requirement_id': req_id}), 200
+    except Exception as e:
+        db.rollback()
+        return jsonify({'error': f'删除失败：{str(e)}'}), 500
     finally:
         db.close()
 
@@ -507,6 +618,10 @@ def chat_with_requirement(req_id):
             'hook_failures': {},
         }
 
+        # 更新状态为 processing，让前端通过 SSE 显示处理中
+        requirement.status = 'processing'
+        db.commit()
+
         final_state = tool_loop.run(state)
 
         # 获取更新后的文件
@@ -516,6 +631,7 @@ def chat_with_requirement(req_id):
         final_dialogue = final_state.get('dialogue_history', [])
         requirement.dialogue_history = final_dialogue
         requirement.code_files = updated_files
+        requirement.status = 'finished'
         db.commit()
 
         return jsonify({
@@ -528,6 +644,15 @@ def chat_with_requirement(req_id):
     except Exception as e:
         logger.error(f"处理对话失败：{e}", exc_info=True)
         db.rollback()
+        # 单独更新状态为 failed（避免在过期对象上操作）
+        try:
+            from models import Requirement
+            db.query(Requirement).filter(Requirement.id == req_id).update(
+                {'status': 'failed'}, synchronize_session=False
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
         return jsonify({'error': f'处理失败：{str(e)}'}), 500
     finally:
         db.close()

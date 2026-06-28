@@ -112,6 +112,7 @@ class ToolCall:
 class LLMResponse:
     """LLM 响应对象"""
     content: str
+    reasoning_content: Optional[str] = None  # DeepSeek 等模型的思考链
     usage: Optional[Dict[str, int]] = None
     finish_reason: Optional[str] = None
     error: Optional[str] = None
@@ -548,13 +549,14 @@ class LLMClient:
         finish_reason = None
         error = None
 
+        reasoning_content = None
         for attempt in range(self.max_retries + 1):
             try:
                 if self.provider == 'anthropic_compatible':
-                    content, tool_calls, usage = self._request_anthropic_with_tools(
+                    content, reasoning_content, tool_calls, usage = self._request_anthropic_with_tools(
                         messages, tools, max_tokens=effective_max_tokens)
                 else:
-                    content, tool_calls, usage = self._request_openai_with_tools(
+                    content, reasoning_content, tool_calls, usage = self._request_openai_with_tools(
                         messages, tools, tool_choice, max_tokens=effective_max_tokens)
                 break
             except Exception as e:
@@ -563,7 +565,8 @@ class LLMClient:
                 if attempt >= self.max_retries:
                     content = f"[错误] 工具调用失败：{error}"
 
-        return LLMResponse(content=content, usage=usage, finish_reason=finish_reason,
+        return LLMResponse(content=content, reasoning_content=reasoning_content,
+                           usage=usage, finish_reason=finish_reason,
                            error=error, tool_calls=tool_calls)
 
     def _request_openai_with_tools(self, messages: list, tools: list, tool_choice: str,
@@ -597,6 +600,7 @@ class LLMClient:
         choice = result.get('choices', [{}])[0]
         msg = choice.get('message', {})
         content = msg.get('content', '') or ''
+        reasoning_content = msg.get('reasoning_content', '') or None
         usage_data = result.get('usage')
 
         # 解析 tool_calls
@@ -625,7 +629,7 @@ class LLMClient:
                 arguments=parsed_args
             ))
 
-        return content, (tool_calls or None), usage_data
+        return content, reasoning_content, (tool_calls or None), usage_data
 
     def _request_anthropic_with_tools(self, messages: list, tools: list,
                                        max_tokens: Optional[int] = None):
@@ -689,7 +693,7 @@ class LLMClient:
                     arguments=block.get('input', {})
                 ))
 
-        return content, (tool_calls or None), usage_data
+        return content, None, (tool_calls or None), usage_data
 
 
 # 全局客户端实例（延迟初始化）

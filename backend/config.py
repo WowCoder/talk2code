@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     """应用配置"""
 
     model_config = SettingsConfigDict(
-        env_file='.env',
+        env_file=os.path.join(os.path.dirname(__file__), '.env'),
         env_file_encoding='utf-8',
         case_sensitive=False,
         extra='ignore'  # 忽略额外字段

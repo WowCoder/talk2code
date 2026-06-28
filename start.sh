@@ -9,6 +9,7 @@ cd "$SCRIPT_DIR"
 
 VENV_DIR="$SCRIPT_DIR/venv"
 BACKEND_DIR="$SCRIPT_DIR/backend"
+FRONTEND_DIR="$SCRIPT_DIR/frontend-vue"
 ENV_FILE="$BACKEND_DIR/.env"
 MODE="${1:-dev}"
 
@@ -55,7 +56,29 @@ if lsof -i ":$PORT" &>/dev/null; then
     sleep 1
 fi
 
-# ---- 5. 启动 ----
+# ---- 5. 构建前端 ----
+log "构建 Vue 前端..."
+
+if [ ! -d "$FRONTEND_DIR/node_modules" ]; then
+    log "安装前端依赖..."
+    cd "$FRONTEND_DIR"
+    npm install --silent 2>/dev/null
+fi
+
+cd "$FRONTEND_DIR"
+if [ "$MODE" = "dev" ]; then
+    log "开发模式跳过前端构建 (启动前端请运行: cd frontend-vue && npm run dev)"
+
+    if [ ! -f "$FRONTEND_DIR/dist/index.html" ]; then
+        warn "Vue dist 不存在，请运行: cd frontend-vue && npm run build"
+    fi
+else
+    log "编译 Vue 前端..."
+    npm run build --silent 2>&1
+    log "前端构建完成"
+fi
+
+# ---- 6. 启动 ----
 log "启动 Talk2Code 服务..."
 
 if [ "$MODE" = "dev" ]; then
