@@ -189,29 +189,6 @@ Agent 运行时框架，统一管理 AI 智能体全生命周期：
 - 支持恢复操作
 - 历史页面可通过 Tab 切换查看正常需求 / 回收站
 
-## API 接口
-
-| 接口 | 方法 | 说明 |
-|------|------|------|
-| /api/register | POST | 用户注册 |
-| /api/login | POST | 用户登录 |
-| /api/user/info | GET | 获取当前用户信息 |
-| /api/requirements | POST | 创建需求（启动 AI 生成） |
-| /api/requirements | GET | 获取需求列表（?trash=true 查询回收站） |
-| /api/requirements/<id\> | GET | 获取需求详情（含对话历史、代码文件） |
-| /api/requirements/<id\> | DELETE | 永久删除需求 |
-| /api/requirements/<id\>/trash | PUT | 移入回收站（软删除） |
-| /api/requirements/<id\>/restore | PUT | 从回收站恢复 |
-| /api/requirements/<id\>/chat | POST | 发送对话消息（持续对话 / Chat 模式） |
-| /api/requirements/<id\>/clarify | POST | 提交澄清答案（交互式澄清） |
-| /api/requirements/<id\>/code | POST | 保存单个代码文件 |
-| /api/requirements/<id\>/code/all | PUT | 批量保存所有代码文件 |
-| /api/requirements/<id\>/permission | POST | 提交权限审批决定 |
-| /api/sse/<id\> | GET | SSE 实时推送连接 |
-| /api/health | GET | 健康检查（含 LLM 配置状态） |
-| /api/health/live | GET | 存活检查 |
-| /api/health/ready | GET | 就绪检查（含 DB 连通性） |
-| /api/metrics | GET | 运行指标 |
 
 ## 支持的应用类型
 
