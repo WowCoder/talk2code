@@ -4,7 +4,7 @@
 
 ## 技术栈
 
-- **前端**: HTML5 + CSS3 + JavaScript + Warm Soft 设计系统 (OKLch)
+- **前端**: Vue 3 + TypeScript + Vite + Warm Soft 设计系统 (OKLch)
 - **后端**: Python 3.11+ + Flask
 - **数据库**: SQLite
 - **实时通信**: SSE (Server-Sent Events)
@@ -17,35 +17,36 @@
 ```
 talk2code/
 ├── backend/
-│   ├── app.py              # Flask 主程序（API、SSE 推送）
-│   ├── config.py           # Pydantic 配置（数据库、JWT、SSE、LLM）
-│   ├── models.py           # 数据库模型（User, Requirement）
-│   ├── prompts.py          # 智能体提示词模板
-│   ├── requirements.txt    # Python 依赖
-│   ├── .env.example        # LLM 配置模板
+│   ├── app.py                          # Flask 主程序（API 路由、SSE 推送）
+│   ├── config.py                       # Pydantic 配置（数据库、JWT、SSE、LLM）
+│   ├── requirements.txt                # Python 依赖
+│   ├── .env.example                    # LLM 配置模板
+│   ├── models/                         # SQLAlchemy 数据模型 + Schema
 │   ├── llm/
-│   │   └── client.py       # 统一 LLM 客户端（支持 OpenAI/Anthropic 双协议）
-│   ├── agents/
-│   │   ├── state.py        # LangGraph AgentState 定义
-│   │   ├── nodes.py        # 智能体节点（Planner / Coder）
-│   │   └── workflow.py     # LangGraph 工作流定义
-│   ├── services/
-│   │   ├── requirement_service.py  # 需求处理服务
-│   │   ├── sse_manager.py          # SSE 管理器
-│   │   └── task_queue.py           # 任务队列
-│   ├── craft/              # 设计质量规则（anti-slop/accessibility/typography/color）
-│   ├── craft_loader.py     # Craft 规则加载器
-│   ├── skills/             # 可插拔应用模板（todo/calculator/note/calendar/generic）
-│   ├── skill_loader.py     # Skill 匹配引擎
-│   ├── utils/
-│   │   ├── logger.py       # 日志工具
-│   │   ├── security.py     # 密码加密
-│   │   ├── sse.py          # SSE 消息格式化
-│   │   ├── retry.py        # 指数退避重试
-│   │   └── rate_limiter.py # 限流器
-│   └── tests/              # 测试
-├── frontend-vue/             # Vue 3 + TypeScript 前端
-└── openspec/               # OpenSpec 规范驱动开发
+│   │   └── client.py                   # 统一 LLM 客户端（OpenAI/Anthropic 双协议）
+│   ├── harness/                        # Agent 运行时框架（6 层架构）
+│   │   ├── runtime.py                  # ReAct 工具调用循环 — Agent 执行引擎
+│   │   ├── graph.py                    # LangGraph 工作流定义
+│   │   ├── instructions/               # 提示词模板、节点函数、上下文组装/压缩
+│   │   ├── tools/                      # 工具注册表、文件操作、代码生成/验证
+│   │   ├── environment/                # 权限管理、沙箱执行
+│   │   ├── state/                      # AgentState、WorkspaceFS、Git 版本化、记忆存储
+│   │   ├── constraints/                # Hook 管理器 + 约束检查（Craft 规则、安全、质量）
+│   │   └── observability/              # 链路追踪、成本统计、SSE 事件上报、日志
+│   ├── agents/                         # 向后兼容重导出层
+│   ├── services/                       # SSE 传输、任务调度、应用胶水层
+│   ├── skills/                         # 可插拔应用模板（Skill 定义）
+│   └── utils/                          # 限流、重试、安全、SSE 格式化
+├── frontend-vue/                       # Vue 3 + TypeScript 前端
+│   ├── src/
+│   │   ├── components/                 # 组件（auth/common/detail/history/home/layout/settings）
+│   │   ├── views/                      # 页面视图
+│   │   ├── composables/                # 组合式函数（useApi/useSSE/useDarkMode/useToast）
+│   │   ├── stores/                     # Pinia 状态管理（auth/requirement/settings）
+│   │   └── router/                     # Vue Router 路由
+│   └── dist/                           # 构建产物（由 Flask 托管）
+├── start.sh                            # 一键启动脚本
+└── openspec/                           # OpenSpec 规范驱动开发
 ```
 
 ## 快速开始
@@ -84,11 +85,23 @@ LLM_API_KEY=your-api-key-here
 
 ### 3. 启动服务
 
+**方式一：一键启动**
+
 ```bash
+./start.sh
+```
+
+**方式二：手动启动**
+
+```bash
+# 构建前端
+cd frontend-vue && npm install && npm run build && cd ..
+
+# 启动后端
 cd backend && python app.py
 ```
 
-访问 http://localhost:5001/login.html
+访问 http://localhost:5001
 
 ### 4. 测试账号
 
@@ -104,10 +117,10 @@ cd backend && python app.py
    - 示例：`创建一个笔记应用`
 3. **需求澄清**（自动触发）- 需求不明确时 AI 生成问题表单补充信息
 4. **查看生成** - 进入详情页：
-   - **左侧**: 观看 AI 智能体（Planner → Coder）协同讨论
-   - **右侧**: 实时查看代码生成（支持代码/预览 TAB 切换、桌面/平板/手机设备预览）
-5. **持续对话** - 生成完成后，可在左侧 AI 对话面板底部继续与 AI 对话
-6. **历史管理** - 在「历史对话」页面查看所有项目，支持搜索和状态筛选
+   - **左侧**: AI 对话面板 — 观看 Planner → Coder 协同讨论，底部输入框可继续对话
+   - **右侧**: 代码/预览面板 — 文件树 + 代码编辑器 + 设备预览（桌面/平板/手机）
+5. **持续对话** - 生成完成后，可在对话面板底部继续与 AI 交互，做增量修改
+6. **历史管理** - 在「历史对话」页面查看所有项目，支持搜索、状态筛选、回收站
 
 ## 核心功能
 
@@ -129,7 +142,20 @@ cd backend && python app.py
 ```
 
 - **Planner**: 分析需求，产出结构化的开发计划（功能清单、技术栈、数据模型、文件结构）；模糊需求时自动生成澄清问题
-- **Coder**: 根据 Plan 生成完整的代码文件（HTML/CSS/JS），注入 Craft 设计质量规则，支持失败自动重试和 Fallback 模板
+- **Coder**: 根据 Plan 生成完整的代码文件，注入 Craft 设计质量规则，支持失败自动重试和 Fallback 模板
+
+### Harness 框架（6 层架构）
+
+Agent 运行时框架，统一管理 AI 智能体全生命周期：
+
+| 层级 | 模块 | 职责 |
+|------|------|------|
+| 1 - Instructions | 提示词/节点/组装/压缩 | 提示词模板、Planner/Coder 节点、上下文管理、Skill 加载 |
+| 2 - Tools | 工具注册/文件操作/代码生成 | 工具注册表、read_file/write_file/edit_file、代码验证 |
+| 3 - Environment | 权限/沙箱 | 权限控制、沙箱安全执行 |
+| 4 - State | 状态/工作区/记忆 | AgentState 定义、WorkspaceFS、Git 版本化、MemoryStore |
+| 5 - Constraints | Hook/检查 | Hook 管理器 + Craft 规则/安全/质量统一检查 |
+| 6 - Observability | 追踪/成本/上报/日志 | 链路追踪、Token 成本统计、SSE 事件上报 |
 
 ### 设计质量规则（Craft 层）
 
@@ -152,16 +178,16 @@ cd backend && python app.py
 - 需求过短或缺少功能关键词时，AI 自动生成结构化问题表单
 - 用户补充后重新进入生成流程，最多 1 轮澄清
 
-### 代码编辑器
-- 自建代码编辑器（文件树侧边栏 + 内容预览 + contenteditable 编辑）
-- 多文件切换（HTML/CSS/JS）
-- 实时预览（iframe 沙箱隔离 + CSP + device preview）
-- 代码下载功能
+### 增量编辑
 
-### 数据持久化
-- SQLite 存储用户数据
-- 对话历史完整保存
-- 代码文件完整保存
+- 生成完成后支持持续对话（Chat 模式），AI 通过 `edit_file` 工具做精确增量修改
+- 基于 search-replace 协议，避免重写整个文件
+
+### 需求回收站
+
+- 软删除机制：删除的需求进入回收站，`30 天后`自动清理
+- 支持恢复操作
+- 历史页面可通过 Tab 切换查看正常需求 / 回收站
 
 ## API 接口
 
@@ -169,14 +195,23 @@ cd backend && python app.py
 |------|------|------|
 | /api/register | POST | 用户注册 |
 | /api/login | POST | 用户登录 |
-| /api/requirements | POST | 创建需求 |
-| /api/requirements | GET | 获取需求列表 |
-| /api/requirements/<id> | GET | 获取需求详情 |
-| /api/requirements/<id>/chat | POST | 发送对话消息（持续对话） |
-| /api/requirements/<id>/clarify | POST | 提交澄清答案（交互式澄清） |
-| /api/requirements/<id>/code | POST | 保存代码修改 |
-| /api/sse/<id> | GET | SSE 实时推送连接 |
+| /api/user/info | GET | 获取当前用户信息 |
+| /api/requirements | POST | 创建需求（启动 AI 生成） |
+| /api/requirements | GET | 获取需求列表（?trash=true 查询回收站） |
+| /api/requirements/<id\> | GET | 获取需求详情（含对话历史、代码文件） |
+| /api/requirements/<id\> | DELETE | 永久删除需求 |
+| /api/requirements/<id\>/trash | PUT | 移入回收站（软删除） |
+| /api/requirements/<id\>/restore | PUT | 从回收站恢复 |
+| /api/requirements/<id\>/chat | POST | 发送对话消息（持续对话 / Chat 模式） |
+| /api/requirements/<id\>/clarify | POST | 提交澄清答案（交互式澄清） |
+| /api/requirements/<id\>/code | POST | 保存单个代码文件 |
+| /api/requirements/<id\>/code/all | PUT | 批量保存所有代码文件 |
+| /api/requirements/<id\>/permission | POST | 提交权限审批决定 |
+| /api/sse/<id\> | GET | SSE 实时推送连接 |
 | /api/health | GET | 健康检查（含 LLM 配置状态） |
+| /api/health/live | GET | 存活检查 |
+| /api/health/ready | GET | 就绪检查（含 DB 连通性） |
+| /api/metrics | GET | 运行指标 |
 
 ## 支持的应用类型
 
@@ -186,35 +221,6 @@ cd backend && python app.py
 - **日历 App** (输入包含"日历"、"日程"或"calendar")
 - **通用应用** (其他需求 — AI 自主设计)
 
-## 界面预览
-
-### 登录页面
-![登录页面](docs/images/login.png)
-
-### 首页
-![首页](docs/images/index.png)
-
-### 需求详情页（代码视图）
-![详情页](docs/images/detail.png)
-
-### 需求详情页（预览视图）
-![预览页](docs/images/detail_preview.png)
-
-### 历史对话
-![历史对话](docs/images/history.png)
-
-### 设置
-![设置](docs/images/settings.png)
-
----
-
-**页面说明**:
-- **登录页**: Warm Soft 暖色设计，登录/注册双 Tab 切换，测试账号提示
-- **首页**: Hero 衬线标题 + 需求输入卡片（径向渐变装饰）+ 示例快捷填充，毛玻璃导航栏
-- **详情页**: 左侧气泡式 AI 对话 + 右侧暗色代码面板（文件树+编辑器），代码/预览 TAB 切换
-- **历史对话**: 项目列表 + 实时搜索 + 彩色状态徽章（已完成/生成中/排队中/失败）
-- **设置**: 侧边栏布局，个人资料/外观偏好/账户安全/关于 四个分区
-
 ## 注意事项
 
 1. 这是一个 Demo 项目，AI 智能体使用预设的 prompt 模板
@@ -222,3 +228,4 @@ cd backend && python app.py
 3. 生产环境请配置 `JWT_SECRET_KEY`、`LLM_API_KEY` 等敏感信息
 4. 建议使用现代浏览器（Chrome/Edge/Safari）
 5. LangGraph 工作流支持错误降级和 fallback 机制
+6. 前端开发模式：`cd frontend-vue && npm run dev` 启动 Vite 热更新开发服务器
