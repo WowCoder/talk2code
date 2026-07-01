@@ -54,6 +54,10 @@ export interface SSEQuestionFormData {
     type: 'radio' | 'text'
     options?: string[]
   }>
+  /** 是否已提交（刷新页面后后端标记） */
+  submitted?: boolean
+  /** 已提交的答案 */
+  answers?: Record<string, string>
 }
 
 export interface SSEToolCallData {

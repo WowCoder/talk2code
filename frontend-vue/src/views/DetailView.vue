@@ -143,21 +143,42 @@ watch(reqId, (newId, oldId) => {
 
 // Chat send handler
 async function onSendMessage(message: string) {
-  // Add user message locally
-  store.addDialogueMessage({
-    role: 'user',
-    name: '用户',
-    content: message,
-  })
+  // 消息以 [用户补充说明] 开头说明是澄清后的合成消息，
+  // 不重复添加到对话（store.sendChatMessage 会用服务端响应替换）
+  const isClarifyFollowUp = message.startsWith('[用户补充说明]')
+
+  if (!isClarifyFollowUp) {
+    store.addDialogueMessage({
+      role: 'user',
+      name: '用户',
+      content: message,
+    })
+  }
 
   store.isGenerating = true
 
+  // 确保 SSE 已连接，否则后端推送的实时事件无法被接收
+  connect()
+
   try {
-    await store.sendChatMessage(message)
+    const result = await store.sendChatMessage(message)
+    if (result?.needs_clarification) {
+      // 修改意见模糊，暂停执行等待用户补充信息
+      store.pendingChatClarification = { originalMessage: message }
+      store.isGenerating = false
+      return
+    }
   } catch (err: any) {
     show(err.message || '发送失败', 'error')
+    // 失败时保留用户消息，不清除 isGenerating 状态
+    store.addDialogueMessage({
+      role: 'system',
+      content: `发送失败：${err.message || '未知错误'}`,
+    })
   } finally {
-    store.isGenerating = false
+    if (!store.pendingChatClarification) {
+      store.isGenerating = false
+    }
   }
 }
 

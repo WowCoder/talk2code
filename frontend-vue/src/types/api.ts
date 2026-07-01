@@ -1,3 +1,5 @@
+import type { SSEQuestionFormData } from './sse'
+
 // ===== User Types =====
 export interface User {
   id: number
@@ -43,6 +45,9 @@ export interface DialogueMessage {
   hook_name?: string
   // thinking specific
   // (uses content)
+  // clarification
+  question_form?: SSEQuestionFormData
+  status?: string
 }
 
 export interface Requirement {

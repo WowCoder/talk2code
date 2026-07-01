@@ -5,6 +5,7 @@ import type {
   DialogueMessage,
   CodeFile,
 } from '@/types/api'
+import type { SSEQuestionFormData } from '@/types/sse'
 import { useAuthStore } from './auth'
 
 export const useRequirementStore = defineStore('requirement', () => {
@@ -15,6 +16,9 @@ export const useRequirementStore = defineStore('requirement', () => {
   const activeFile = ref<string>('index.html')
   const isGenerating = ref(false)
   const progress = ref({ currentAgent: '', percent: 0 })
+  const questionForm = ref<SSEQuestionFormData | null>(null)
+  // chat 模式下的澄清上下文（暂存原始消息，表单提交后拼接重新发送）
+  const pendingChatClarification = ref<{ originalMessage: string } | null>(null)
 
   // ===== Actions =====
   async function api<T>(url: string, options: RequestInit = {}): Promise<T> {
@@ -45,6 +49,23 @@ export const useRequirementStore = defineStore('requirement', () => {
     // Restore dialogue
     if (data.requirement.dialogue_history?.length) {
       dialogueMessages.value = data.requirement.dialogue_history
+
+      // 恢复 question_form：仅当 pending 状态且表单未被提交过
+      if (data.requirement.status === 'pending') {
+        for (const msg of data.requirement.dialogue_history) {
+          if ((msg as any).question_form) {
+            const qf = (msg as any).question_form
+            // 如果后端已标记 submitted，说明用户已经提交过，不再恢复可编辑表单
+            if (!qf.submitted) {
+              questionForm.value = qf
+            } else {
+              // 已提交：仅保留一份只读展示（answers 已在后端注入）
+              questionForm.value = { ...qf, submitted: true }
+            }
+            break
+          }
+        }
+      }
     }
 
     // Restore code files
@@ -93,25 +114,41 @@ export const useRequirementStore = defineStore('requirement', () => {
   }
 
   async function sendChatMessage(message: string) {
-    if (!currentRequirement.value) return
+    if (!currentRequirement.value) return null
     const data = await api<{
-      dialogue_history: DialogueMessage[]
-      code_files: CodeFile[]
+      needs_clarification?: boolean
+      question_form?: SSEQuestionFormData
+      dialogue_history?: DialogueMessage[]
+      code_files?: CodeFile[]
+      updated_files?: string[]
     }>(`/api/requirements/${currentRequirement.value.id}/chat`, {
       method: 'POST',
       body: JSON.stringify({ message }),
     })
 
-    if (data.dialogue_history) {
+    // 如果后端返回澄清需求，只更新对话历史，不更新代码文件
+    if (data.needs_clarification) {
+      if (data.dialogue_history?.length) {
+        dialogueMessages.value = data.dialogue_history
+      }
+      if (data.question_form) {
+        questionForm.value = data.question_form
+      }
+      return data
+    }
+
+    // 服务端响应是权威的最终状态，直接替换本地数据
+    // （SSE 在请求期间已实时推送增量更新，此处确保数据与服务端一致）
+    if (data.dialogue_history?.length) {
       dialogueMessages.value = data.dialogue_history
     }
     if (data.code_files) {
-      // Reset code files from chat response
       Object.keys(codeFiles).forEach((k) => delete codeFiles[k])
       data.code_files.forEach((f: CodeFile) => {
         codeFiles[f.filename] = f.content
       })
     }
+    return data
   }
 
   async function submitClarification(answers: Record<string, string>) {
@@ -142,6 +179,33 @@ export const useRequirementStore = defineStore('requirement', () => {
     await api(`/api/requirements/${id}`, { method: 'DELETE' })
   }
 
+  async function sendChatClarification(answers: Record<string, string>) {
+    /** 将澄清答案拼接到原始消息后，重新发送 chat 请求 */
+    if (!pendingChatClarification.value || !currentRequirement.value) return
+
+    const { originalMessage } = pendingChatClarification.value
+    pendingChatClarification.value = null
+    questionForm.value = null
+
+    // 拼接答案
+    const answerText = Object.entries(answers)
+      .filter(([, v]) => v)
+      .map(([q, a]) => `${q}: ${a}`)
+      .join('；')
+
+    const enrichedMessage = `[用户补充说明]\n${answerText}\n\n原始修改意见：${originalMessage}`
+
+    // 将用户答案作为对话消息展示
+    addDialogueMessage({
+      role: 'user',
+      name: '用户',
+      content: answerText || '已确认',
+    })
+
+    // 重新发送
+    return sendChatMessage(enrichedMessage)
+  }
+
   function reset() {
     currentRequirement.value = null
     dialogueMessages.value = []
@@ -149,6 +213,8 @@ export const useRequirementStore = defineStore('requirement', () => {
     activeFile.value = 'index.html'
     isGenerating.value = false
     progress.value = { currentAgent: '', percent: 0 }
+    questionForm.value = null
+    pendingChatClarification.value = null
   }
 
   return {
@@ -158,12 +224,15 @@ export const useRequirementStore = defineStore('requirement', () => {
     activeFile,
     isGenerating,
     progress,
+    questionForm,
+    pendingChatClarification,
     loadRequirement,
     addDialogueMessage,
     updateCodeFiles,
     setActiveFile,
     saveCodeFile,
     sendChatMessage,
+    sendChatClarification,
     submitClarification,
     submitPermission,
     trashRequirement,

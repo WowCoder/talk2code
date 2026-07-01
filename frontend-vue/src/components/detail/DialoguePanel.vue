@@ -10,6 +10,7 @@
       <QuestionForm
         v-if="questionForm"
         :form-data="questionForm"
+        :mode="questionFormMode"
         @submitted="onQuestionSubmitted"
       />
       <PermissionRequest
@@ -56,12 +57,47 @@ const messages = computed(() => store.dialogueMessages.filter(
 const isLoading = computed(() => store.isGenerating)
 
 // Access SSE-triggered state from the store
-const questionForm = computed(() => (store as any)._questionForm as SSEQuestionFormData | null)
+const questionForm = computed(() => store.questionForm)
+const questionFormMode = computed(() =>
+  store.pendingChatClarification ? 'chat' : 'requirement'
+)
 const permissionRequest = computed(() => (store as any)._permissionRequest as (SSEPermissionData & { timestamp: number }) | null)
 const traceSummary = computed(() => (store as any)._traceSummary as SSETraceSummaryData | null)
 
-function onQuestionSubmitted() {
-  (store as any)._questionForm = null
+async function onQuestionSubmitted(answers?: Record<string, string>) {
+  if (store.pendingChatClarification && answers) {
+    // Chat 模式澄清：拼接答案后重新发送
+    if (answers._skip) {
+      // 用户跳过，用原始消息继续
+      const { originalMessage } = store.pendingChatClarification
+      store.pendingChatClarification = null
+      store.questionForm = null
+      emit('send-message', originalMessage)
+    } else {
+      // 拼接答案到原始消息
+      const answerText = Object.entries(answers)
+        .filter(([, v]) => v)
+        .map(([q, a]) => `${q}: ${a}`)
+        .join('；')
+      const { originalMessage } = store.pendingChatClarification
+      const enrichedMessage = `[用户补充说明]\n${answerText}\n\n原始修改意见：${originalMessage}`
+
+      store.pendingChatClarification = null
+      store.questionForm = null
+
+      // 将答案作为对话消息展示
+      store.addDialogueMessage({
+        role: 'user',
+        name: '用户',
+        content: answerText || '已确认',
+      })
+
+      emit('send-message', enrichedMessage)
+    }
+  } else {
+    // 新需求 SOP 模式：QuestionForm 内部已调用 /clarify + 保留为已提交卡片
+    // 不做任何清除，让 QuestionForm 展示 submitted 状态
+  }
 }
 
 function onPermissionResolved() {

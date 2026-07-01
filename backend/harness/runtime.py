@@ -6,6 +6,7 @@ ToolCallLoop —— Agent ReAct 工具调用循环
 
 import time
 import json
+import re
 
 from harness.state.agent_state import AgentState
 from harness.tools.registry import ToolRegistry
@@ -112,6 +113,14 @@ class ToolCallLoop:
                     "content": thinking_text
                 })
 
+            # 保存 assistant 回复到对话历史（让下一轮 Agent 记得自己的规划，避免重复探索）
+            if response.content and response.tool_calls:
+                state["dialogue_history"].append({
+                    "role": "assistant",
+                    "name": "Coder",
+                    "content": response.content[:1500]
+                })
+
             # 执行所有工具调用
             for tc in response.tool_calls:
                 result = self._execute_tool(state, tc)
@@ -146,14 +155,22 @@ class ToolCallLoop:
                 # 工具结果摘要（超大文件截断，避免对话记录膨胀）
                 # read_file 需要足够上下文让 LLM 构造 edit_file 的精确 SEARCH 块
                 tool_summary = result.content if result.success else result.error
+                is_chat = state.get("metadata", {}).get("is_chat", False)
                 if tc.name == "read_file":
-                    max_len = 3000  # 必须覆盖到文件关键区域（h1 可能在行 400+ 字符处）
+                    # Chat/编辑模式：需要完整文件内容构造精确 SEARCH 块
+                    # 生成模式：3000 字符足够覆盖文件关键区域
+                    max_len = 16000 if is_chat else 3000
                 elif tc.name in ("write_file", "edit_file"):
-                    max_len = 500
+                    max_len = 1500  # 足够让 Agent 在下一轮记得文件主要内容
                 else:
                     max_len = 300
                 if len(tool_summary) > max_len:
-                    tool_summary = tool_summary[:max_len] + "\n... (文件较长，已截断，如需查看完整内容请再次 read_file)"
+                    cut_hint = (
+                        "\n... (文件较长，已截断。请用 read_file 指定范围查看后续内容)"
+                        if is_chat else
+                        "\n... (文件较长，已截断，如需查看完整内容请再次 read_file)"
+                    )
+                    tool_summary = tool_summary[:max_len] + cut_hint
 
                 # 前端展示用简短摘要（不暴露大段文件内容）
                 display_readable = self._tool_display_label(tc.name, tc.arguments, result)
@@ -377,8 +394,11 @@ class ToolCallLoop:
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
 
-        # 对话历史
-        for msg in state.get("dialogue_history", [])[-20:]:
+        # 对话历史：先过滤掉 thinking 消息（不发给 LLM，但会占用 [-20:] 槽位），
+        # 再截断最近 20 条有效消息
+        all_history = state.get("dialogue_history", [])
+        relevant = [m for m in all_history if m.get("role") != "thinking"]
+        for msg in relevant[-20:]:
             role = msg.get("role", "user")
             content = str(msg.get("content", ""))
             if role == "tool_call":
@@ -396,12 +416,12 @@ class ToolCallLoop:
         return messages
 
     def _build_system_prompt(self, state: AgentState) -> str:
-        """构建 Coder 系统提示词"""
+        """构建 Coder 系统提示词（含文件内容概要，避免 Agent 重复 read_file）"""
         requirement = state.get("requirement_content", "")
         plan = state.get("plan")
 
         existing_files = self.workspace.list()
-        existing_text = "\n".join(f"- {f}" for f in existing_files) if existing_files else "(空目录)"
+        existing_text = self._build_file_summaries(existing_files)
 
         target_files = ["style.css", "script.js", "index.html"]
         missing = [f for f in target_files if f not in existing_files]
@@ -420,7 +440,7 @@ class ToolCallLoop:
 
 {plan_section}
 
-## 当前已有文件
+## 当前已有文件及内容概要
 {existing_text}
 
 ## 尚未创建的文件（按顺序）
@@ -432,7 +452,7 @@ class ToolCallLoop:
 - 创建完成后在下一次响应中继续创建下一个
 - 只创建"尚未创建"的文件，不要重复创建已有文件
 - 全部文件创建完成后立即停止，告诉我"任务完成"
-- 绝对不要调用 list_files 工具，直接看上面的已有文件列表
+- **已有文件的概要已在上方列出，不要调用 list_files 或 read_file 查看已有文件**
 
 ## 验证
 - 全部文件创建完成后，系统会自动在无头浏览器中运行 index.html 验证 JS 是否报错；
@@ -445,6 +465,92 @@ class ToolCallLoop:
 - 代码完整可运行，不省略不写TODO
 - 每个文件内容不少于100行"""
         return prompt
+
+    def _build_file_summaries(self, existing_files: list) -> str:
+        """为已有文件生成内容概要，让 Agent 无需 read_file 就知道文件结构"""
+        if not existing_files:
+            return "(空目录)"
+
+        lines = []
+        for fname in existing_files:
+            try:
+                content = self.workspace.read(fname)
+            except Exception:
+                lines.append(f"- {fname}: (无法读取)")
+                continue
+
+            # 提取文件关键信息：前几行 + HTML/CSS/JS 结构特征
+            content_lines = [l.strip() for l in content.split('\n') if l.strip()]
+            preview_lines = content_lines[:8]  # 前 8 行
+
+            # 提取结构性信息
+            structural = []
+            if fname.endswith('.html'):
+                # 提取标题、主要容器、引入的文件
+                for l in content_lines:
+                    if '<title>' in l:
+                        structural.append(l.strip()[:120])
+                        break
+                ids = set()
+                for l in content_lines:
+                    if 'id="' in l:
+                        import re
+                        ids.update(re.findall(r'id="([^"]+)"', l))
+                    if "id='" in l:
+                        ids.update(re.findall(r"id='([^']+)'", l))
+                if ids:
+                    structural.append(f"元素 id: {', '.join(sorted(ids)[:15])}")
+                classes = set()
+                for l in content_lines:
+                    if 'class="' in l:
+                        import re
+                        classes.update(re.findall(r'class="([^"]+)"', l))
+                    if "class='" in l:
+                        classes.update(re.findall(r"class='([^']+)'", l))
+                if classes:
+                    structural.append(f"CSS class: {', '.join(sorted(classes)[:20])}")
+
+            elif fname.endswith('.css'):
+                # 提取选择器列表
+                selectors = []
+                for l in content_lines:
+                    l = l.strip()
+                    if l.endswith('{') and not l.startswith('@') and not l.startswith('/*'):
+                        sel = l[:-1].strip()
+                        if sel and len(sel) < 60:
+                            selectors.append(sel)
+                if selectors:
+                    structural.append(f"选择器: {', '.join(selectors[:20])}")
+
+            elif fname.endswith('.js'):
+                # 提取函数名和 DOM 引用
+                funcs = []
+                import re
+                for l in content_lines:
+                    m = re.match(r'(?:async\s+)?function\s+(\w+)', l)
+                    if m:
+                        funcs.append(m.group(1))
+                    m = re.match(r'(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(', l)
+                    if m:
+                        funcs.append(m.group(1))
+                if funcs:
+                    structural.append(f"函数: {', '.join(funcs[:15])}")
+                # DOM 查询
+                dom_refs = set()
+                for l in content_lines:
+                    for m in re.findall(r"(?:querySelector|getElementById|querySelectorAll)\(['\"]([^'\"]+)['\"]\)", l):
+                        dom_refs.add(m)
+                if dom_refs:
+                    structural.append(f"DOM 引用: {', '.join(sorted(dom_refs)[:15])}")
+
+            # 组装摘要
+            preview = ' | '.join(preview_lines)[:300]
+            parts = [f"- {fname} ({len(content_lines)} 行): {preview}"]
+            if structural:
+                parts.append("  " + " | ".join(structural))
+            lines.append('\n'.join(parts))
+
+        return '\n'.join(lines)
 
     def _check_missing_files(self, state: AgentState) -> list[str]:
         """检查目标文件是否全部生成。返回缺失文件名列表。"""

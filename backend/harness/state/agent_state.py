@@ -3,7 +3,8 @@
 AgentState —— 从 backend/agents/state.py 迁移并增强
 """
 
-from typing import TypedDict, List, Optional
+from typing import TypedDict, List, Optional, Annotated
+from operator import add
 
 
 class AgentState(TypedDict, total=False):
@@ -32,8 +33,8 @@ class AgentState(TypedDict, total=False):
     # 错误信息
     error: Optional[str]
 
-    # 对话历史
-    dialogue_history: List[dict]
+    # 对话历史（使用 add reducer，节点返回的列表会追加而非替换）
+    dialogue_history: Annotated[List[dict], add]
 
     # 元数据
     metadata: dict

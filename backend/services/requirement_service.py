@@ -165,7 +165,14 @@ class RequirementService:
             final_state = event
 
             if final_state.get('current_step') == 'needs_clarification':
+                # 优先从 metadata 获取 question_form，fallback 到 dialogue_history
                 question_form = final_state.get('metadata', {}).get('question_form', {})
+                if not question_form:
+                    # 从 dialogue_history 中提取（持久化恢复场景）
+                    for msg in (final_state.get('dialogue_history') or []):
+                        if msg.get('question_form'):
+                            question_form = msg['question_form']
+                            break
                 if question_form:
                     self._send_question_form(requirement_id, question_form)
                 break

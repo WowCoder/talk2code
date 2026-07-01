@@ -121,6 +121,7 @@ import { ref, computed, watch, onMounted, reactive } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useRequirementStore } from '@/stores/requirement'
+import { useApi } from '@/composables/useApi'
 import { useToast } from '@/composables/useToast'
 import AppNav from '@/components/layout/AppNav.vue'
 import SearchBar from '@/components/history/SearchBar.vue'
@@ -132,6 +133,7 @@ import type { RequirementSummary } from '@/types/api'
 const router = useRouter()
 const authStore = useAuthStore()
 const reqStore = useRequirementStore()
+const { api } = useApi()
 const { show } = useToast()
 
 const activeTab = ref<'active' | 'trash'>('active')
@@ -196,18 +198,16 @@ async function loadAll() {
 
 async function loadProjects() {
   try {
-    const resp = await fetch('/api/requirements', { headers: authStore.getAuthHeaders() })
-    if (!resp.ok) throw new Error('加载失败')
-    projects.value = (await resp.json()).requirements || []
-  } catch (err: any) { show(err.message || '加载失败', 'error') }
+    const data = await api<{ requirements: (RequirementSummary & { content?: string; file_count?: number })[] }>('/api/requirements')
+    projects.value = data.requirements || []
+  } catch (err: any) { /* 401 handled by useApi */ }
 }
 
 async function loadTrash() {
   try {
-    const resp = await fetch('/api/requirements?trash=true', { headers: authStore.getAuthHeaders() })
-    if (!resp.ok) throw new Error('加载失败')
-    trashProjects.value = (await resp.json()).requirements || []
-  } catch (err: any) { show(err.message || '加载失败', 'error') }
+    const data = await api<{ requirements: (RequirementSummary & { content?: string; file_count?: number })[] }>('/api/requirements?trash=true')
+    trashProjects.value = data.requirements || []
+  } catch (err: any) { /* 401 handled by useApi */ }
 }
 
 function switchTab(tab: 'active' | 'trash') {

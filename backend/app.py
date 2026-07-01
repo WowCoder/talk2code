@@ -17,13 +17,16 @@ from models import init_db
 from services.sse_manager import sse_manager
 from services.task_queue import task_queue
 from services.requirement_service import process_requirement_async
-from harness.observability.logger import setup_logger, get_logger
+from harness.observability.logger import setup_logger, get_logger, setup_logging
 from utils.rate_limiter import get_user_identity, rate_limit_handler, RATE_LIMITS
 
 # ==================== 日志配置 ====================
 
-logger = get_logger(__name__)
+# 初始化根 logger 的文件处理器（app.log / agent.log / llm.log）
+setup_logging(log_dir="logs", level=os.environ.get("LOG_LEVEL", "INFO"))
 setup_logger('sqlalchemy.engine', level=30)  # WARNING 级别
+logger = get_logger(__name__)
+logger.info("日志系统已初始化")
 
 # ==================== 应用初始化 ====================
 
@@ -35,7 +38,7 @@ CORS(app)
 # JWT 配置
 app.config['JWT_SECRET_KEY'] = JWT_SECRET_KEY
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = JWT_ACCESS_TOKEN_EXPIRES
-app.config['JWT_TOKEN_LOCATION'] = ['headers', 'json']
+app.config['JWT_TOKEN_LOCATION'] = ['headers']
 app.config['JWT_HEADER_NAME'] = 'Authorization'
 app.config['JWT_HEADER_TYPE'] = 'Bearer'
 
@@ -539,6 +542,55 @@ def chat_with_requirement(req_id):
 
         user_message = data.get('message', '').strip()
 
+        # 如果消息包含 [用户补充说明]，说明已经过澄清，跳过检测
+        from harness.instructions.nodes import _is_vague_requirement, _generate_clarify_questions
+        from llm.client import get_client as _get_llm_client
+
+        if _is_vague_requirement(user_message):
+            # 模糊修改意见 → 生成澄清问题，暂不执行代码修改
+            try:
+                client = _get_llm_client()
+                questions = _generate_clarify_questions(client, user_message)
+                if not questions:
+                    questions = [
+                        {"id": "q1", "type": "text", "label": "请更具体地描述你想要的修改效果"},
+                        {"id": "visual_style", "type": "radio",
+                         "label": "修改后你偏好哪种视觉风格？",
+                         "options": ["保持现有风格", "极简白", "暖柔风格", "暗黑科技", "活泼多彩", "无偏好"]},
+                    ]
+
+                from sqlalchemy.orm.attributes import flag_modified
+                dialogue_list = list(requirement.dialogue_history or [])
+                dialogue_list.append({
+                    'role': 'user', 'name': '用户',
+                    'content': user_message,
+                    'timestamp': get_current_timestamp()
+                })
+                dialogue_list.append({
+                    'role': 'system', 'name': 'Planner',
+                    'content': '修改意见不够明确，需要补充一些信息',
+                    'status': 'needs_clarification',
+                    'question_form': {'questions': questions},
+                })
+                requirement.dialogue_history = dialogue_list
+                flag_modified(requirement, 'dialogue_history')
+                requirement.status = 'finished'  # 恢复为 finished，等待澄清后重新修改
+                db.commit()
+
+                # 通过 SSE 推送澄清表单
+                from utils.sse import SSEMessage
+                msg = SSEMessage.format_event('question-form', {'questions': questions})
+                sse_manager.broadcast(str(req_id), msg)
+
+                logger.info(f"需求 {req_id} 的修改意见模糊，生成 {len(questions)} 个澄清问题")
+                return jsonify({
+                    'needs_clarification': True,
+                    'question_form': {'questions': questions},
+                    'dialogue_history': dialogue_list,
+                }), 200
+            except Exception as e:
+                logger.warning(f"[Chat] 澄清问题生成失败：{e}，继续正常流程")
+
         # 初始化 harness 层
         workspace = WorkspaceFS(current_user_id, req_id)
         workspace.init(requirement.code_files)
@@ -551,13 +603,18 @@ def chat_with_requirement(req_id):
         tracer = Tracer(db_session=db)
         cost_tracker = CostTracker()
 
-        # 构建对话历史（保留已有对话 + 新消息）
-        existing_dialogue = list(requirement.dialogue_history or [])
-        existing_dialogue.append({
+        # 保存用户消息到数据库（立即持久化，防止崩溃丢失）
+        from sqlalchemy.orm.attributes import flag_modified
+        dialogue_list = list(requirement.dialogue_history or [])
+        dialogue_list.append({
             'role': 'user', 'name': '用户',
             'content': user_message,
             'timestamp': get_current_timestamp()
         })
+        requirement.dialogue_history = dialogue_list
+        flag_modified(requirement, 'dialogue_history')  # 确保 JSON 列变更被检测到
+        requirement.status = 'processing'
+        db.commit()
 
         # 构建代码上下文
         existing_files = workspace.list()
@@ -569,8 +626,10 @@ def chat_with_requirement(req_id):
             hooks=hooks, tracer=tracer, cost_tracker=cost_tracker,
             sse_reporter=sse, permission_manager=permissions,
         )
+        # Chat 模式下降低迭代上限（修改任务应该在 3-5 轮内完成）
+        tool_loop.MAX_ITERATIONS = 4
+
         # 临时替换 system prompt 为修改模式
-        original_build = tool_loop._build_system_prompt
         def _chat_prompt(state):
             return f"""你是资深前端工程师。用户想要修改代码。
 
@@ -580,14 +639,16 @@ def chat_with_requirement(req_id):
 ## 当前文件列表
 {file_list_text}
 
-## 工作方式（增量编辑，禁止整文件重写）
-1. 分析用户要求，判断需要修改哪个文件（通常只需改1个）
-2. 用 read_file 读取该文件（只读1次）
-3. 用 edit_file 做局部修改 —— 只改需要改的部分，绝不重写整个文件
-4. 告诉我改了什么
+## 工作方式（必须在 2 轮内完成所有修改）
+第1轮：一次性读取所有需要改的文件（可并行 read_file），分析修改范围
+第2轮：执行修改 —— 然后立即停止（不要再读文件验证）
 
-## edit_file 用法
-在 edit 参数中提供 SEARCH/REPLACE 块（可多块）：
+## 修改方式选择
+- 如果只需修改几处特定内容 → 用 edit_file 局部修改
+- 如果修改遍布整个文件（全局换色、主题切换）→ 用 write_file 重写整个文件
+
+## edit_file 用法（最多 5 处修改，超过则用 write_file）
+在 edit 参数中提供 SEARCH/REPLACE 块：
 
 <<<< SEARCH
 要替换的原始代码片段（必须逐字符精确匹配现有内容，含缩进）
@@ -596,11 +657,9 @@ def chat_with_requirement(req_id):
 >>>>
 
 规则：
-- SEARCH 片段必须在文件中唯一且精确匹配（含空格/缩进/换行）
-- 一次请求可修改多个文件，也可在一个文件里用多个块改多处
-- 读文件只读1次，读完立刻改
-- 不要重复读同一个文件
-- 只有新建文件才用 write_file，已有文件的修改一律用 edit_file"""
+- 读完立刻改，改完立刻停止
+- 如果修改点超过 5 处，直接用 write_file 重写更高效
+- 修改完就停止，不要反复读取验证"""
         tool_loop._build_system_prompt = _chat_prompt
 
         state = {
@@ -610,17 +669,13 @@ def chat_with_requirement(req_id):
             'plan': {},
             'current_step': 'tool_coder_ready',
             'code_files': requirement.code_files or [],
-            'dialogue_history': existing_dialogue,
+            'dialogue_history': dialogue_list,
             'metadata': {'trace_id': '', 'is_chat': True},
             'tool_call_count': 0,
             'no_progress_count': 0,
             'last_file_list': existing_files,
             'hook_failures': {},
         }
-
-        # 更新状态为 processing，让前端通过 SSE 显示处理中
-        requirement.status = 'processing'
-        db.commit()
 
         final_state = tool_loop.run(state)
 
@@ -683,19 +738,48 @@ def clarify_requirement(req_id):
         answer_text = '；'.join(f'{q}: {a}' for q, a in answers.items())
         original_content = req_record.content
         req_record.content = f'{original_content}\n\n[用户补充说明]\n{answer_text}'
-        req_record.status = 'pending'
-        req_record.dialogue_history = req_record.dialogue_history or []
-        req_record.dialogue_history.append({
+        req_record.status = 'pending'  # 保持 pending，由 submitted 标记区分是否已提交
+
+        # 重建 dialogue_history 并用 flag_modified 确保 SQLAlchemy 持久化嵌套修改
+        from sqlalchemy.orm.attributes import flag_modified
+        dialogue_list = list(req_record.dialogue_history or [])
+
+        # 标记已有的 question_form 消息为"已提交"（防止前端刷新后恢复成未提交状态）
+        for i, msg in enumerate(dialogue_list):
+            if isinstance(msg, dict) and msg.get('question_form'):
+                dialogue_list[i] = {
+                    **msg,
+                    'question_form': {
+                        **msg['question_form'],
+                        'submitted': True,
+                        'answers': answers,
+                    }
+                }
+                break
+
+        dialogue_list.append({
             'role': 'user',
             'name': '用户',
             'content': answer_text,
             'timestamp': get_current_timestamp()
         })
+        req_record.dialogue_history = dialogue_list
+        flag_modified(req_record, 'dialogue_history')
         db.commit()
 
-        # 重新提交到任务队列
-        task_queue.submit(req_id, process_requirement_async, req_id)
-        logger.info(f"需求 {req_id} 收到澄清答案，重新处理")
+        # 重新提交到任务队列；若已有任务在处理，启动独立线程兜底
+        task_id = task_queue.submit(req_id, process_requirement_async, req_id)
+        if task_id is None:
+            import threading
+            thread = threading.Thread(
+                target=process_requirement_async,
+                args=(req_id,),
+                daemon=False
+            )
+            thread.start()
+            logger.info(f"需求 {req_id} 已有任务在处理，启动独立线程")
+        else:
+            logger.info(f"需求 {req_id} 收到澄清答案，重新处理：{task_id}")
 
         return jsonify({'message': '澄清答案已提交', 'requirement_id': req_id})
     except Exception as e:

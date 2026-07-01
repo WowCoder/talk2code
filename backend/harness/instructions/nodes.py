@@ -32,14 +32,25 @@ def _is_vague_requirement(text: str) -> bool:
 
 
 def _generate_clarify_questions(client, requirement: str) -> list:
-    """生成澄清问题——LLM 根据已有信息自主判断还缺什么"""
+    """生成澄清问题——LLM 根据已有信息自主判断还缺什么
+
+    如果需求已经很详细，只问 1-2 个最关键的问题（如视觉风格偏好）；
+    如果需求模糊，问 2-3 个问题帮助明确方向。
+    """
+    is_detailed = not _is_vague_requirement(requirement)
+    detail_hint = (
+        "用户的需求已经很详细了，只需要确认 1-2 个最关键的选择（如视觉风格偏好）。"
+        if is_detailed else
+        "用户的需求比较模糊，请分析缺少哪些关键信息，生成 2-3 个澄清问题帮助明确方向。"
+    )
+
     prompt = f"""用户提出需求："{requirement}"
 
-这个需求还不够具体。请分析用户已经说了什么，判断还缺少哪些关键信息，生成 2-3 个澄清问题。
+{detail_hint}
 
 注意：
 - 用户已经明确说过的信息不要再问（比如用户说了"做一个待办清单"，就不要再问"你想做什么类型的应用"）
-- 如果需求涉及 UI/页面/界面，可以询问视觉风格偏好
+- 如果需求涉及 UI/页面/界面，必须询问视觉风格偏好
 - 只问真正能影响实现方案的关键问题
 
 视觉风格问题的选项固定为（如果需要问的话）：
@@ -58,7 +69,7 @@ def _generate_clarify_questions(client, requirement: str) -> list:
 
     response = client.chat(
         prompt=prompt,
-        system_prompt="你是一位产品经理，帮助澄清模糊的用户需求。用户已经说过的信息不要再问。",
+        system_prompt="你是一位产品经理，帮助澄清用户需求。用户已经说过的信息不要再问。",
         use_memory=False, max_tokens=500, timeout=20
     )
     if response.is_error or not response.content:
@@ -80,8 +91,9 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
     requirement = state['requirement_content']
     clarify_round = state.get('metadata', {}).get('clarify_round', 0)
 
-    # 模糊需求触发澄清
-    if _is_vague_requirement(requirement) and clarify_round < 1:
+    # SOP: 全新需求（clarify_round == 0）始终触发澄清表单
+    # 但如果需求已包含 [用户补充说明]，说明用户刚提交过澄清，跳过
+    if clarify_round < 1 and '[用户补充说明]' not in requirement:
         try:
             client = get_client()
             questions = _generate_clarify_questions(client, requirement)
@@ -94,13 +106,22 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
                      "options": ["极简白", "暖柔风格", "暗黑科技", "活泼多彩", "无偏好"]},
                 ]
             if questions:
+                # 判断需求是否详细，调整提示文案
+                is_detailed = not _is_vague_requirement(requirement)
+                hint_text = (
+                    '你的需求已经很详细了，确认以下信息后即可开始生成'
+                    if is_detailed else
+                    '需求不够明确，需要你补充一些信息'
+                )
+                # 将 question_form 嵌入 dialogue_history，确保通过 REST API 也能获取
                 return {
                     'plan': {},
                     'current_step': 'needs_clarification',
                     'dialogue_history': [{
                         'role': 'system', 'name': 'Planner',
-                        'content': '需求不够明确，需要你补充一些信息',
-                        'status': 'needs_clarification'
+                        'content': hint_text,
+                        'status': 'needs_clarification',
+                        'question_form': {'questions': questions},
                     }],
                     'metadata': {
                         'planner_success': True,

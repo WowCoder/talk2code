@@ -58,14 +58,13 @@ export function useSSE(reqId: Ref<number | null>) {
 
     es.addEventListener('question-form', (e: MessageEvent) => {
       const data: SSEQuestionFormData = JSON.parse(e.data)
-      // Stored in the component as reactive form data
       store.addDialogueMessage({
         role: 'system',
         name: 'System',
         content: '__QUESTION_FORM__',
+        question_form: data,
       })
-      // We store form data on the requirement store temporarily
-      ;(store as any)._questionForm = data
+      store.questionForm = data
     })
 
     es.addEventListener('tool_call', (e: MessageEvent) => {
