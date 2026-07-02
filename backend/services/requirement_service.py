@@ -25,8 +25,16 @@ from harness.observability.tracer import Tracer
 from harness.observability.cost import CostTracker
 from harness.observability.sse_reporter import SSEReporter
 from harness.runtime import ToolCallLoop
+from harness.instructions.intent_router import IntentRouter, IntentType
+from harness.instructions.orchestrator import RoleOrchestrator
+from harness.experience import ExperiencePool
+from harness.learning import FeedbackLoop
 
 logger = get_logger(__name__)
+
+# 全局经验池（跨请求持久化，进程重启后清空）
+_experience_pool = ExperiencePool()
+_feedback_loop = FeedbackLoop(_experience_pool)
 
 
 class RequirementService:
@@ -35,8 +43,8 @@ class RequirementService:
     def __init__(self):
         self.workflow = get_workflow()
         self._progress_map = {
-            'planner': 40,
-            'coder': 80,
+            'team_leader': 40,
+            'engineer': 80,
         }
 
     def process_requirement(self, requirement_id: int) -> bool:
@@ -56,6 +64,19 @@ class RequirementService:
             db.commit()
             logger.info(f"需求 {requirement_id} 开始处理")
 
+            # ===== 意图路由：非 TASK 请求快速返回，不进入完整工作流 =====
+            if '[用户补充说明]' not in requirement.content:
+                router = IntentRouter()
+                intent_result = router.classify(requirement.content)
+                logger.info(f"需求 {requirement_id} 意图分类: {intent_result.intent.value}")
+
+                if intent_result.intent == IntentType.QUICK:
+                    return self._handle_quick_answer(db, requirement, requirement_id, intent_result)
+                elif intent_result.intent == IntentType.SEARCH:
+                    return self._handle_search_answer(db, requirement, requirement_id, intent_result)
+                elif intent_result.intent == IntentType.AMBIGUOUS:
+                    return self._handle_ambiguous_direct(db, requirement, requirement_id)
+
             # 初始化 harness 各层
             workspace = WorkspaceFS(requirement.user_id, requirement_id)
             workspace.init(requirement.code_files)
@@ -73,6 +94,10 @@ class RequirementService:
             # SSE reporter
             sse = SSEReporter(sse_manager)
 
+            # 经验注入：将历史成功经验注入 ToolCallLoop 的 System Prompt
+            # 通过包装 _build_system_prompt 方法实现（在原始 prompt 后追加 few-shot 示例）
+            _original_builder = None  # 延迟绑定
+
             # ToolCallLoop
             tool_loop = ToolCallLoop(
                 workspace=workspace,
@@ -85,6 +110,16 @@ class RequirementService:
                 permission_manager=permissions,
                 checkpoint=checkpoint,
             )
+
+            # 经验注入：包装 _build_system_prompt，在原始 prompt 后追加 few-shot 示例
+            _original_builder = tool_loop._build_system_prompt
+            _req_content = requirement.content
+
+            def _experience_aware_prompt(state):
+                base = _original_builder(state)
+                return _feedback_loop.inject_experience(_req_content, base)
+
+            tool_loop._build_system_prompt = _experience_aware_prompt
 
             # 构建初始状态
             initial_state: AgentState = {
@@ -104,6 +139,7 @@ class RequirementService:
                 'last_file_list': workspace.list(),
                 'hook_failures': {},
                 'visual_style': '',
+                'intent': 'task',  # 进入此流程的均为 TASK
             }
 
             # 检查断点恢复
@@ -118,7 +154,7 @@ class RequirementService:
 
             sse.progress(requirement_id, 0, '开始处理需求')
 
-            # 执行 LangGraph 工作流 (planner → END)
+            # 执行 LangGraph 工作流 (team_leader → END)
             final_state = self._execute_workflow_with_stream(requirement_id, initial_state)
 
             if final_state is None:
@@ -135,9 +171,27 @@ class RequirementService:
                 db.commit()
                 return True
 
-            # Planner 完成后，执行 ToolCallLoop
-            if final_state.get('current_step') in ('planner_done', 'planner_failed'):
-                final_state = tool_loop.run(final_state)
+            # TeamLeader 完成后，根据复杂度选择执行路径
+            if final_state.get('current_step') in ('team_leader_done', 'team_leader_failed'):
+                complexity = final_state.get('metadata', {}).get('complexity', 'S')
+
+                if complexity in ('M', 'L'):
+                    # M/L: 多角色协作流程 (PM → Architect → Engineer → QA)
+                    logger.info(f"需求 {requirement_id} 复杂度={complexity}，启动多角色协作")
+                    orchestrator = RoleOrchestrator(
+                        workspace=workspace,
+                        sse_reporter=sse,
+                        tools=tools,
+                        tool_loop_factory=None,
+                    )
+                    # 注入 tool_loop 供 FrontendEngineer 使用
+                    final_state["metadata"]["_tool_loop"] = tool_loop
+                    final_state = orchestrator.execute(final_state)
+                else:
+                    # XS/S: 单角色流程（当前行为），设置角色名为 FrontendEngineer
+                    final_state.setdefault("metadata", {})["coder_name"] = "FrontendEngineer"
+                    final_state["metadata"]["thinking_name"] = "FrontendEngineer"
+                    final_state = tool_loop.run(final_state)
 
             # 处理最终状态
             return self._process_final_state(db, requirement, requirement_id, final_state,
@@ -178,10 +232,10 @@ class RequirementService:
                 break
 
             current_step = final_state.get('current_step', '')
-            node_name = 'planner' if 'planner' in current_step else 'coder' if 'coder' in current_step else ''
+            node_name = 'team_leader' if 'team_leader' in current_step else 'engineer' if 'generating' in current_step else ''
             if node_name:
                 progress = self._progress_map.get(node_name, 0)
-                self._send_progress(requirement_id, {'planner': 'Planner', 'coder': 'Coder'}.get(node_name, node_name), progress)
+                self._send_progress(requirement_id, {'team_leader': 'TeamLeader', 'engineer': 'FrontendEngineer'}.get(node_name, node_name), progress)
 
             dialogues = final_state.get('dialogue_history', []) or []
             for dialogue in dialogues[last_dialogue_count:]:
@@ -240,6 +294,40 @@ class RequirementService:
             except Exception as e:
                 logger.warning(f"清除检查点失败（不阻断）：{e}")
 
+            # 经验学习：任务完成后评估并存储经验
+            try:
+                complexity = final_state.get("metadata", {}).get("complexity", "S")
+                qa_data = None
+                # 从多角色流程中提取 QA 审查结果
+                role_outputs = final_state.get("role_outputs", {}) or {}
+                role_history = final_state.get("role_history", []) or []
+                for entry in role_history:
+                    if entry.get("role_name") == "QAReviewer" and entry.get("success"):
+                        # QA 角色已存储 structured_output 到 role_outputs
+                        pass
+                # 从 final_state 的 role_outputs 检查是否有 QA 结果
+                if "QAReviewer" in role_outputs:
+                    import json as _json
+                    qa_raw = role_outputs["QAReviewer"]
+                    try:
+                        qa_data = _json.loads(qa_raw) if isinstance(qa_raw, str) else qa_raw
+                    except _json.JSONDecodeError:
+                        pass
+
+                _feedback_loop.learn_from_result(
+                    requirement=requirement.content,
+                    complexity=complexity,
+                    code_files=code_files,
+                    qa_result=qa_data,
+                )
+                pool_stats = _feedback_loop.stats()
+                logger.info(
+                    f"需求 {requirement_id} 经验学习完成，"
+                    f"经验池总量={pool_stats['total']}, 均分={pool_stats['avg_rating']}"
+                )
+            except Exception as e:
+                logger.warning(f"经验学习失败（不阻断）：{e}")
+
             self._send_complete(requirement_id)
             return True
 
@@ -268,6 +356,130 @@ class RequirementService:
     def _send_complete(self, requirement_id: int):
         message = SSEMessage.complete_message(requirement_id)
         sse_manager.broadcast(str(requirement_id), message)
+
+    # ===== IntentRouter 快速通道处理 =====
+
+    def _handle_quick_answer(self, db, requirement, requirement_id: int,
+                             intent_result) -> bool:
+        """QUICK 意图：LLM 直接回答，SSE 推送，标记完成"""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        sse = SSEReporter(sse_manager)
+        sse.progress(requirement_id, 30, '分析问题')
+
+        router = IntentRouter()
+        answer = router.handle_quick(
+            requirement=requirement.content,
+            history=requirement.dialogue_history or [],
+            is_chat=False,
+        )
+
+        # 保存对话历史
+        dialogue_list = list(requirement.dialogue_history or [])
+        dialogue_list.append({
+            'role': 'agent', 'name': 'AI',
+            'content': answer,
+            'status': 'completed',
+            'timestamp': get_current_timestamp(),
+        })
+        requirement.dialogue_history = dialogue_list
+        flag_modified(requirement, 'dialogue_history')
+        requirement.status = 'finished'
+        db.commit()
+
+        # SSE 推送
+        sse.dialogue(requirement_id, 'agent', 'AI', answer, 'completed')
+        sse.complete(requirement_id)
+        logger.info(f"需求 {requirement_id} QUICK 回答完成")
+        return True
+
+    def _handle_search_answer(self, db, requirement, requirement_id: int,
+                              intent_result) -> bool:
+        """SEARCH 意图：当前降级为增强版 QUICK（提示 LLM 给出时效性说明）"""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        sse = SSEReporter(sse_manager)
+        sse.progress(requirement_id, 30, '搜索信息')
+
+        router = IntentRouter()
+        # 在问题前追加提示，让 LLM 注意时效性
+        enhanced_requirement = (
+            f"[需要最新信息的问题]\n{requirement.content}"
+            f"\n\n注意：如果你没有最新的实时数据，请说明你的知识截止日期，"
+            f"并建议用户查阅官方文档获取最新信息。"
+        )
+        answer = router.handle_quick(
+            requirement=enhanced_requirement,
+            history=requirement.dialogue_history or [],
+            is_chat=False,
+        )
+
+        dialogue_list = list(requirement.dialogue_history or [])
+        dialogue_list.append({
+            'role': 'agent', 'name': 'AI',
+            'content': answer,
+            'status': 'completed',
+            'timestamp': get_current_timestamp(),
+        })
+        requirement.dialogue_history = dialogue_list
+        flag_modified(requirement, 'dialogue_history')
+        requirement.status = 'finished'
+        db.commit()
+
+        sse.dialogue(requirement_id, 'agent', 'AI', answer, 'completed')
+        sse.complete(requirement_id)
+        logger.info(f"需求 {requirement_id} SEARCH 回答完成")
+        return True
+
+    def _handle_ambiguous_direct(self, db, requirement, requirement_id: int) -> bool:
+        """AMBIGUOUS 意图：直接生成澄清问题，不进入 TeamLeader"""
+        from sqlalchemy.orm.attributes import flag_modified
+        from harness.instructions.nodes import _generate_clarify_questions
+        from llm.client import get_client as _get_llm_client
+
+        try:
+            client = _get_llm_client()
+            questions = _generate_clarify_questions(client, requirement.content)
+        except Exception as e:
+            logger.warning(f"澄清问题生成失败: {e}")
+            questions = [
+                {"id": "q1", "type": "text", "label": "请更具体地描述你的需求"},
+                {"id": "visual_style", "type": "radio",
+                 "label": "你偏好哪种视觉风格？",
+                 "options": ["极简白", "暖柔风格", "暗黑科技", "活泼多彩", "无偏好"]},
+            ]
+
+        dialogue_list = list(requirement.dialogue_history or [])
+        dialogue_list.append({
+            'role': 'system', 'name': 'TeamLeader',
+            'content': '需求不够明确，需要补充一些信息',
+            'status': 'needs_clarification',
+            'question_form': {'questions': questions},
+        })
+        requirement.dialogue_history = dialogue_list
+        flag_modified(requirement, 'dialogue_history')
+        requirement.status = 'pending'
+        db.commit()
+
+        # SSE 推送澄清表单
+        message = SSEMessage.question_form_message({'questions': questions})
+        sse_manager.broadcast(str(requirement_id), message)
+        logger.info(f"需求 {requirement_id} 触发澄清（AMBIGUOUS 意图），生成 {len(questions)} 个问题")
+        return True
+
+    def _build_code_context_text(self, code_files: list) -> str:
+        """构建代码上下文文本（供 QUICK 回答使用）"""
+        if not code_files:
+            return ""
+        lines = ["## 项目文件"]
+        for f in code_files:
+            fname = f.get('filename', 'unknown')
+            content = f.get('content', '')
+            line_count = content.count('\n') + 1 if content else 0
+            # 取前 10 行作为概览
+            preview = '\n'.join(content.split('\n')[:10]) if content else '(空)'
+            lines.append(f"\n### {fname} ({line_count} 行)\n```\n{preview}\n```")
+        return '\n'.join(lines)
 
 
 # 全局服务实例

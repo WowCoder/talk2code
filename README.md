@@ -27,8 +27,23 @@ talk2code/
 │   ├── harness/                        # Agent 运行时框架（6 层架构）
 │   │   ├── runtime.py                  # ReAct 工具调用循环 — Agent 执行引擎
 │   │   ├── graph.py                    # LangGraph 工作流定义
-│   │   ├── instructions/               # 提示词模板、节点函数、上下文组装/压缩
+│   │   ├── instructions/               # 提示词模板、节点函数、意图路由、角色执行、上下文组装/压缩
+│   │   │   ├── intent_router.py         #   前置意图分类 (QUICK/SEARCH/TASK/AMBIGUOUS)
+│   │   │   ├── prompts.py               #   TeamLeader/FrontendEngineer 提示词模板
+│   │   │   ├── nodes.py                 #   TeamLeader/FrontendEngineer 节点函数（含复杂度评估）
+│   │   │   ├── orchestrator.py          #   多角色编排引擎
+│   │   │   ├── role_executor.py         #   单一角色执行器
+│   │   │   ├── assembler.py             #   上下文组装（Skill + Craft 规则 + 记忆）
 │   │   ├── tools/                      # 工具注册表、文件操作、代码生成/验证
+│   │   ├── roles/                      # 多角色定义
+│   │   │   ├── __init__.py              #   Role/RoleResult/RoleRegistry
+│   │   │   └── definitions.py           #   5 角色 Prompt + 工具子集 + 路由表
+│   │   ├── communication/               # 消息总线
+│   │   │   └── __init__.py              #   AgentBus 四分支路由
+│   │   ├── experience/                  # 经验池
+│   │   │   └── __init__.py              #   ExperiencePool + TF-IDF 检索
+│   │   ├── learning/                    # 持续学习
+│   │   │   └── __init__.py              #   Evaluator + FeedbackLoop
 │   │   ├── environment/                # 权限管理、沙箱执行
 │   │   ├── state/                      # AgentState、WorkspaceFS、Git 版本化、记忆存储
 │   │   ├── constraints/                # Hook 管理器 + 约束检查（Craft 规则、安全、质量）
@@ -111,15 +126,18 @@ cd backend && python app.py
 ## 使用流程
 
 1. **登录** - 使用测试账号或注册新账号
-2. **输入需求** - 在首页输入框描述你的需求
-   - 示例：`开发一个待办清单 App，支持增删改查`
-   - 示例：`做一个计算器应用`
-   - 示例：`创建一个笔记应用`
-3. **需求澄清**（自动触发）- 需求不明确时 AI 生成问题表单补充信息
+2. **输入需求** - 在首页输入框输入你的需求
+   - 开发任务示例：`开发一个待办清单 App，支持增删改查`
+   - 简单问答示例：`什么是 CSS Grid 布局？`（AI 直接回答，不触发代码生成）
+   - 代码示例：`写一个冒泡排序函数`
+3. **意图分流**（自动）- AI 判断用户意图：
+   - 常识问答/代码解释 → 秒级直接回复
+   - 开发任务 → 进入 TeamLeader → FrontendEngineer 生成流水线
+   - 模糊需求 → 自动生成澄清问题表单
 4. **查看生成** - 进入详情页：
-   - **左侧**: AI 对话面板 — 观看 Planner → Coder 协同讨论，底部输入框可继续对话
+   - **左侧**: AI 对话面板 — 观看 TeamLeader → FrontendEngineer 协同讨论，底部输入框可继续对话
    - **右侧**: 代码/预览面板 — 文件树 + 代码编辑器 + 设备预览（桌面/平板/手机）
-5. **持续对话** - 生成完成后，可在对话面板底部继续与 AI 交互，做增量修改
+5. **持续对话** - 生成完成后，可在对话面板底部继续与 AI 交互，做增量修改或提问
 6. **历史管理** - 在「历史对话」页面查看所有项目，支持搜索、状态筛选、回收站
 
 ## 核心功能
@@ -131,31 +149,84 @@ cd backend && python app.py
 
 ### AI 智能体协同
 
-基于 **LangGraph** 实现的工作流编排，2 个智能体按顺序协同：
+基于 **LangGraph** 实现的工作流编排，前置意图分类器做四路分流：
 
 ```
-┌──────────────┐     ┌──────────────┐
-│   Planner    │────▶│    Coder     │
-│  需求分析    │     │  代码生成    │
-│  架构设计    │     │              │
-└──────────────┘     └──────────────┘
+用户输入
+  │
+  └─ IntentRouter (前置分流)
+       ├─ QUICK     → LLM 直接回答（常识问答/代码解释/问候）
+       ├─ SEARCH    → 增强回答 + 时效性提示
+       ├─ AMBIGUOUS → 澄清表单，引导用户补充信息
+       └─ TASK      → 进入生成流水线
+                         │
+                         ├─ TeamLeader (需求分析 + 复杂度评估)
+                         │    └─ 输出: features, complexity[XS|S|M|L], tech_stack, ...
+                         │
+                         ├─ XS/S: 直接 FrontendEngineer (单角色，等同 v2.2)
+                         │
+                         └─ M/L: 多角色协作
+                              │  AgentBus 消息总线 (四分支路由)
+                              ├─ ProductManager (Alice) — PRD 生成
+                              ├─ Architect (Bob) — 架构设计
+                              ├─ FrontendEngineer (Alex) — 代码生成
+                              └─ QAReviewer (David) — 审查 + 修复循环
+                                    │
+                                    ▼ ExperiencePool
+                                      成功案例→few-shot注入 | 失败案例→警告注入
 ```
 
-- **Planner**: 分析需求，产出结构化的开发计划（功能清单、技术栈、数据模型、文件结构）；模糊需求时自动生成澄清问题
-- **Coder**: 根据 Plan 生成完整的代码文件，注入 Craft 设计质量规则，支持失败自动重试和 Fallback 模板
+| 组件 | 职责 |
+|------|------|
+| **IntentRouter** | 前置意图分类（QUICK/SEARCH/TASK/AMBIGUOUS），轻量 LLM 调用（~200 tokens），非开发请求直接返回 |
+| **TeamLeader** | 需求分析+复杂度评估+调度中枢：XS/S 直接派给 Engineer，M/L 按 SOP 路由 PM→Arch→Engineer→QA，收集产出、整合汇报 |
+| **ProductManager** | 需求分析、PRD 生成（功能清单、数据模型、交互流程），M/L 流程第一步 |
+| **Architect** | 技术选型、组件树设计、数据流设计、文件结构规划，M/L 流程第二步 |
+| **FrontendEngineer** | 代码生成（write_file/edit_file）、验证修复。XS/S 单角色全权负责，M/L 基于 PM+Arch 上下文编码 |
+| **QAReviewer** | M/L 复杂度下的代码审查：5 维度评分 + 问题识别 + 修复建议，触发 Engineer 修复循环 |
+| **AgentBus** | 消息总线：四分支路由解耦角色通信，统一 SSE 推送，消息历史可追溯 |
+| **ExperiencePool** | 经验池：TF-IDF 语义检索成功案例作为 few-shot，失败案例生成警告，越用越好 |
 
-### Harness 框架（6 层架构）
+**复杂度自适应行为**：
 
-Agent 运行时框架，统一管理 AI 智能体全生命周期：
+| 维度 | XS（极简） | S（标准） | M（多功能） | L（复杂） |
+|------|-----------|----------|------------|----------|
+| 典型场景 | 个人主页、计数器 | 待办清单、番茄钟 | 任务看板、博客 | 电商、后台系统 |
+| 角色序列 | Engineer | PM → Engineer | PM → Arch → Engineer → QA | PM → Arch → Eng → QA → Eng → QA |
+| 文件结构 | 自由（≥1 个文件） | 3 文件强制 | Plan 建议 + 子目录 | Plan 建议 + 多模块 |
+| 最大迭代 | 5 轮 | 15 轮 | 15 轮 | 20 轮 |
+| 验证深度 | 跳过 | lint + preview | lint + execute + preview | 全量验证 + QA 审查 |
+| QA 修复循环 | 无 | 无 | 1 轮 | 2 轮 |
+
+**设计原则**：
+- 简单需求快速产出（XS/S 单角色），复杂需求多角色协作保证质量（M/L）
+- 角色间通过 AgentBus 消息总线通信，四分支路由解耦
+- 每次成功/失败自动存入 ExperiencePool（TF-IDF 语义检索），后续相似需求注入 few-shot 示例
+- 越用越好：经验池积累 → Prompt 自动增强 → 生成质量持续提升
+- 所有角色的行为规则写在其 System Prompt 中，改行为 = 改 Prompt，无需改代码
+- 同一 LLM 实例切换 System Prompt 实现角色分化，无需额外模型部署
+
+### Harness 框架
+
+Agent 运行时，统一管理 AI 智能体全生命周期。
+
+```
+IntentRouter → TeamLeader → RoleOrchestrator (AgentBus)
+                                └─ ExperiencePool ← FeedbackLoop
+```
 
 | 层级 | 模块 | 职责 |
 |------|------|------|
-| 1 - Instructions | 提示词/节点/组装/压缩 | 提示词模板、Planner/Coder 节点、上下文管理、Skill 加载 |
-| 2 - Tools | 工具注册/文件操作/代码生成 | 工具注册表、read_file/write_file/edit_file、代码验证 |
+| 0 - Routing | `intent_router.py` | 前置意图分类，四路分流 |
+| — | `communication/` | AgentBus 消息总线，四分支路由 |
+| 1 - Instructions | 提示词/角色/编排 | TeamLeader/FrontendEngineer 节点、角色定义、编排引擎 |
+| 2 - Tools | 工具注册/代码生成 | 工具注册表、read/write/edit_file、验证 |
 | 3 - Environment | 权限/沙箱 | 权限控制、沙箱安全执行 |
-| 4 - State | 状态/工作区/记忆 | AgentState 定义、WorkspaceFS、Git 版本化、MemoryStore |
-| 5 - Constraints | Hook/检查 | Hook 管理器 + Craft 规则/安全/质量统一检查 |
-| 6 - Observability | 追踪/成本/上报/日志 | 链路追踪、Token 成本统计、SSE 事件上报 |
+| 4 - State | 状态/工作区/记忆 | AgentState、WorkspaceFS、Git 版本化、role_history/outputs |
+| 5 - Constraints | Hook/检查 | Hook 管理器 + Craft 规则/安全/质量 + QA 集成 |
+| 6 - Observability | 追踪/成本/上报 | 链路追踪、Token 成本统计、SSE |
+| — | `experience/` | TF-IDF 语义检索 + 经验存储 |
+| — | `learning/` | Evaluator 评分分析 + FeedbackLoop 回灌 |
 
 ### 设计质量规则（Craft 层）
 
@@ -212,13 +283,33 @@ Agent 运行时框架，统一管理 AI 智能体全生命周期：
 **页面说明**:
 - **登录页**: Warm Soft 暖色设计，登录/注册双 Tab 切换，测试账号提示
 - **首页**: 自然语言输入框 + 示例需求快捷填入
-- **详情页**: 左侧气泡式 AI 对话（Planner → Coder 协同），右侧代码/预览面板（文件树 + 代码编辑器），支持桌面/平板/手机设备预览
+- **详情页**: 左侧气泡式 AI 对话（TeamLeader → FrontendEngineer 协同），右侧代码/预览面板（文件树 + 代码编辑器），支持桌面/平板/手机设备预览
 - **历史对话**: 项目列表 + 实时搜索 + 状态筛选 + 回收站 Tab
 - **设置**: 个人资料/外观偏好/关于 分区设置
 
+## 架构总览
+
+```
+用户输入 → IntentRouter (四分流)
+  ├─ QUICK/SEARCH → 秒级回复
+  └─ TASK → TeamLeader (分析 + 复杂度 + 调度)
+              ├─ XS/S → FrontendEngineer 单角色编码
+              └─ M/L → AgentBus 消息总线
+                        ├─ ProductManager (PRD)
+                        ├─ Architect (架构设计)
+                        ├─ FrontendEngineer (编码)
+                        └─ QAReviewer (审查 + 修复闭环)
+                              │
+                              ▼
+                        ExperiencePool ← FeedbackLoop
+                        成功案例→few-shot   失败→警告
+```
+
+项目仍在积极迭代中，欢迎 Issue / PR 一同共创。
+
 ## 注意事项
 
-1. 这是一个 Demo 项目，AI 智能体使用预设的 prompt 模板
+1. 项目仍在迭代中，欢迎 Issue / PR 一同共创
 2. 需要在 `.env` 中配置 `LLM_API_KEY` 才能使用 AI 功能
 3. 生产环境请配置 `JWT_SECRET_KEY`、`LLM_API_KEY` 等敏感信息
 4. 建议使用现代浏览器（Chrome/Edge/Safari）

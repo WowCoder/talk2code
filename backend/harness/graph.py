@@ -1,27 +1,27 @@
 # -*- coding: utf-8 -*-
 """
 LangGraph 工作流定义（从 agents/workflow.py 迁移到 harness/graph.py）
-图结构: planner → END
+图结构: team_leader → END
 ToolCallLoop 由 requirement_service 在 workflow 完成后显式调用
 """
 
 from langgraph.graph import StateGraph, END
 
 from harness.state.agent_state import AgentState
-from harness.instructions.nodes import planner_node
+from harness.instructions.nodes import team_leader_node
 from harness.observability.logger import get_logger
 
 logger = get_logger(__name__)
 
 
 def create_workflow_v2() -> StateGraph:
-    """planner → END"""
+    """team_leader → END"""
     workflow = StateGraph(AgentState)
-    workflow.add_node("planner", planner_node)
-    workflow.set_entry_point("planner")
-    workflow.add_edge("planner", END)
+    workflow.add_node("team_leader", team_leader_node)
+    workflow.set_entry_point("team_leader")
+    workflow.add_edge("team_leader", END)
     app = workflow.compile()
-    logger.info("LangGraph 工作流 v2 已创建 (planner → END, ToolCallLoop 在外部执行)")
+    logger.info("LangGraph 工作流 v2 已创建 (team_leader → END, ToolCallLoop 在外部执行)")
     return app
 
 

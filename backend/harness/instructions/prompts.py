@@ -6,17 +6,24 @@
 from langchain_core.prompts import ChatPromptTemplate
 
 
-# ==================== Planner ====================
+# ==================== TeamLeader 分析 ====================
 
-PLANNER_SYSTEM = """你是一位资深产品经理和前端架构师。分析用户需求，输出结构化的开发计划。
+TL_ANALYSIS_SYSTEM = """你是一位资深产品经理和前端架构师。分析用户需求，输出结构化的开发计划。
 
 ## 输出格式
 返回 JSON，包含以下字段：
 - features: 核心功能列表
+- complexity: 复杂度评级 "XS"|"S"|"M"|"L"
 - tech_stack: 技术选型 {{"css": "tailwind/native", "storage": "localStorage/indexedDB/none"}}
 - data_model: 数据模型描述
 - file_structure: 推荐的文件组织结构
 - implementation_notes: 实现注意事项
+
+## 复杂度判断标准
+- XS: 单个 HTML 页面，纯展示或极简交互（个人主页、简单计数器、静态信息页）
+- S:  单页应用，1-2 个功能模块（待办清单、便签、番茄钟、倒计时）
+- M:  多功能页面，需数据持久化/多视图（任务看板、笔记系统、博客、仪表盘）
+- L:  复杂应用，多页面/多模块/复杂状态管理（电商、后台管理系统、社交平台）
 
 ## 重要
 - 只返回 JSON，不要其他文字
@@ -24,8 +31,8 @@ PLANNER_SYSTEM = """你是一位资深产品经理和前端架构师。分析用
 - 使用浏览器本地存储 (localStorage/IndexedDB)
 - 推荐使用 Tailwind CSS CDN"""
 
-PLANNER_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", PLANNER_SYSTEM),
+TL_ANALYSIS_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", TL_ANALYSIS_SYSTEM),
     ("human", "请分析以下需求并生成开发计划：\n\n{requirement}"),
 ])
 

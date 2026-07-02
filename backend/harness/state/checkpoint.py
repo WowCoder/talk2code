@@ -20,7 +20,7 @@ class Checkpoint:
     """工作流检查点"""
     id: str
     requirement_id: int
-    node_name: str  # planner / tool_coder / tool_executor
+    node_name: str  # team_leader / tool_coder / tool_executor
     state_json: str  # JSON 序列化的 AgentState
     created_at: float
 

@@ -8,14 +8,14 @@ from operator import add
 
 
 class AgentState(TypedDict, total=False):
-    """智能体工作流状态（Planner + ReAct Coder 范式）"""
+    """智能体工作流状态（TeamLeader + FrontendEngineer 范式）"""
 
     # 基础信息
     requirement_id: int
     requirement_content: str
     user_id: int
 
-    # Planner 输出的结构化设计
+    # TeamLeader 输出的结构化设计
     plan: Optional[dict]
 
     # 当前步骤
@@ -54,3 +54,13 @@ class AgentState(TypedDict, total=False):
 
     # 视觉风格偏好
     visual_style: Optional[str]
+
+    # 意图分类结果 (quick/search/task/ambiguous)
+    intent: Optional[str]
+
+    # === 多角色协作字段（二期） ===
+    # 角色执行历史 [{role_name, success, content, ...}]
+    role_history: Optional[List[dict]]
+
+    # 各角色产出 {role_name: output_text}
+    role_outputs: Optional[dict]

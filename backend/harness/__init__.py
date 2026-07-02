@@ -15,14 +15,14 @@ Graph:                    LangGraph 工作流定义 (harness.graph)
 
 from harness.runtime import ToolCallLoop
 from harness.graph import create_workflow, create_workflow_v2, get_workflow
-from harness.instructions.nodes import planner_node, tool_coder_node
+from harness.instructions.nodes import team_leader_node, tool_coder_node
 
 __all__ = [
     'ToolCallLoop',
     'create_workflow',
     'create_workflow_v2',
     'get_workflow',
-    'planner_node',
+    'team_leader_node',
     'tool_coder_node',
     'create_harness',
 ]

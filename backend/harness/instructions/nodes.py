@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 LangGraph 智能体节点函数（从 agents/nodes.py 迁移到 harness/instructions/nodes.py）
-- planner_node: 需求分析 + 结构化 Plan
+- team_leader_node: 需求分析 + 结构化 Plan
 - tool_coder_node: 内部执行 ToolCallLoop 完成所有工具调用
 """
 
@@ -11,7 +11,7 @@ from typing import Dict, Any
 
 from harness.state.agent_state import AgentState
 from llm.client import get_client
-from harness.instructions.prompts import PLANNER_PROMPT
+from harness.instructions.prompts import TL_ANALYSIS_PROMPT
 from harness.observability.logger import get_logger
 
 logger = get_logger(__name__)
@@ -86,14 +86,16 @@ def _generate_clarify_questions(client, requirement: str) -> list:
     return []
 
 
-def planner_node(state: AgentState) -> Dict[str, Any]:
-    """Planner 节点：需求分析 → 澄清 / 结构化 Plan"""
+def team_leader_node(state: AgentState) -> Dict[str, Any]:
+    """TeamLeader 节点：需求分析 → 澄清 / 结构化 Plan"""
     requirement = state['requirement_content']
     clarify_round = state.get('metadata', {}).get('clarify_round', 0)
 
-    # SOP: 全新需求（clarify_round == 0）始终触发澄清表单
-    # 但如果需求已包含 [用户补充说明]，说明用户刚提交过澄清，跳过
-    if clarify_round < 1 and '[用户补充说明]' not in requirement:
+    # SOP: 全新需求（clarify_round == 0）触发澄清表单
+    # 但如果需求已包含 [用户补充说明] 或 IntentRouter 已判定为 TASK（需求足够明确），跳过
+    intent = state.get('intent', '')
+    if (clarify_round < 1 and '[用户补充说明]' not in requirement
+            and intent not in ('task',)):
         try:
             client = get_client()
             questions = _generate_clarify_questions(client, requirement)
@@ -118,23 +120,23 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
                     'plan': {},
                     'current_step': 'needs_clarification',
                     'dialogue_history': [{
-                        'role': 'system', 'name': 'Planner',
+                        'role': 'system', 'name': 'TeamLeader',
                         'content': hint_text,
                         'status': 'needs_clarification',
                         'question_form': {'questions': questions},
                     }],
                     'metadata': {
-                        'planner_success': True,
+                        'team_leader_success': True,
                         'question_form': {'questions': questions},
                         'clarify_round': clarify_round
                     }
                 }
         except Exception as e:
-            logger.warning(f"[Planner] 澄清问题生成失败：{e}")
+            logger.warning(f"[TeamLeader] 澄清问题生成失败：{e}")
 
     try:
         client = get_client()
-        messages = PLANNER_PROMPT.format_messages(requirement=requirement)
+        messages = TL_ANALYSIS_PROMPT.format_messages(requirement=requirement)
         system_prompt = next((m.content for m in messages if m.type == 'system'), None)
         user_prompt = next((m.content for m in messages if m.type == 'human'), None)
 
@@ -160,41 +162,47 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
         visual_style = state.get('visual_style', '') or \
             state.get('metadata', {}).get('visual_style', '')
 
+        # 提取复杂度评级（默认 S）
+        complexity = plan.get('complexity', 'S') if isinstance(plan, dict) else 'S'
+        if complexity not in ('XS', 'S', 'M', 'L'):
+            complexity = 'S'
+
         return {
             'plan': plan,
-            'current_step': 'planner_done',
+            'current_step': 'team_leader_done',
             'dialogue_history': [{
-                'role': 'agent', 'name': 'Planner',
+                'role': 'agent', 'name': 'TeamLeader',
                 'content': '已完成需求分析和架构设计',
                 'status': 'completed'
             }],
             'metadata': {
-                'planner_success': True,
+                'team_leader_success': True,
                 'visual_style': visual_style,
+                'complexity': complexity,
             }
         }
 
     except Exception as e:
-        logger.error(f"[Planner] 执行失败：{e}")
+        logger.error(f"[TeamLeader] 执行失败：{e}")
         return {
             'plan': {},
-            'current_step': 'planner_failed',
-            'error': f"Planner 失败：{e}",
+            'current_step': 'team_leader_failed',
+            'error': f"TeamLeader 失败：{e}",
             'dialogue_history': [{
-                'role': 'agent', 'name': 'Planner',
+                'role': 'agent', 'name': 'TeamLeader',
                 'content': f"分析失败: {requirement[:50]}...",
                 'status': 'failed'
             }],
-            'metadata': {'planner_success': False}
+            'metadata': {'team_leader_success': False}
         }
 
 
 def tool_coder_node(state: AgentState) -> Dict[str, Any]:
     """
-    Coder 节点：内部执行完整的 ToolCallLoop
+    FrontendEngineer 节点：内部执行完整的 ToolCallLoop
 
     不再依赖 LangGraph 的迭代机制，而是在本节点内一次性跑完所有工具调用。
-    工作流简化为 planner → tool_coder → END，消除死循环。
+    工作流简化为 team_leader → END，消除死循环。
     """
     tool_loop = state.get('metadata', {}).get('_tool_loop')
     if not tool_loop:
@@ -215,7 +223,7 @@ def tool_coder_node(state: AgentState) -> Dict[str, Any]:
             'current_step': 'done',
             'error': f"代码生成失败：{e}",
             'dialogue_history': state.get('dialogue_history', []) + [{
-                'role': 'agent', 'name': 'Coder',
+                'role': 'agent', 'name': 'FrontendEngineer',
                 'content': f'生成过程出错: {e}',
                 'status': 'failed'
             }],

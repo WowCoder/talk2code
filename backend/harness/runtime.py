@@ -52,7 +52,21 @@ class ToolCallLoop:
         client = get_client()
         trace_id = state.get("metadata", {}).get("trace_id", "")
 
-        for iteration in range(self.MAX_ITERATIONS):
+        # 可配置的角色名称（多角色协作用，默认兼容旧行为）
+        meta = state.get("metadata", {})
+        coder_name = meta.get("coder_name", "FrontendEngineer")
+        thinking_name = meta.get("thinking_name", "FrontendEngineer")
+
+        # 根据复杂度调整迭代上限
+        complexity = state.get("metadata", {}).get("complexity", "S")
+        effective_max_iterations = {
+            "XS": 5,
+            "S": self.MAX_ITERATIONS,
+            "M": self.MAX_ITERATIONS,
+            "L": self.MAX_ITERATIONS + 5,
+        }.get(complexity, self.MAX_ITERATIONS)
+
+        for iteration in range(effective_max_iterations):
             state["tool_call_count"] = iteration + 1
 
             # 调用 LLM with tools
@@ -96,7 +110,7 @@ class ToolCallLoop:
                 state["current_step"] = "task_complete"
                 state["current_step"] = "task_complete"
                 state["dialogue_history"].append({
-                    "role": "agent", "name": "Coder",
+                    "role": "agent", "name": coder_name,
                     "content": response.content or "任务完成"
                 })
                 break
@@ -109,7 +123,7 @@ class ToolCallLoop:
                 # 存入对话历史，让前端刷新后仍可展示
                 state["dialogue_history"].append({
                     "role": "thinking",
-                    "name": "Thinking",
+                    "name": thinking_name,
                     "content": thinking_text
                 })
 
@@ -117,7 +131,7 @@ class ToolCallLoop:
             if response.content and response.tool_calls:
                 state["dialogue_history"].append({
                     "role": "assistant",
-                    "name": "Coder",
+                    "name": coder_name,
                     "content": response.content[:1500]
                 })
 
@@ -188,7 +202,7 @@ class ToolCallLoop:
                     self.git.commit(f"[tool] {tc.name}: {filename}")
 
             # 检查是否达到最大迭代
-            if iteration >= self.MAX_ITERATIONS - 1:
+            if iteration >= effective_max_iterations - 1:
                 state["current_step"] = "max_iterations"
                 break
 
@@ -416,16 +430,20 @@ class ToolCallLoop:
         return messages
 
     def _build_system_prompt(self, state: AgentState) -> str:
-        """构建 Coder 系统提示词（含文件内容概要，避免 Agent 重复 read_file）"""
+        """构建 Coder 系统提示词（含文件内容概要，避免 Agent 重复 read_file）
+
+        根据复杂度 (XS/S/M/L) 切换提示词策略：
+        - XS: 自由文件结构，跳过强制文件列表和验证
+        - S:  当前默认行为（3 文件 + lint 验证）
+        - M:  架构先导 + 子目录组织 + 完整验证
+        - L:  多模块拆分 + 架构设计 + 多轮验证 + Repair
+        """
         requirement = state.get("requirement_content", "")
         plan = state.get("plan")
+        complexity = state.get("metadata", {}).get("complexity", "S")
 
         existing_files = self.workspace.list()
         existing_text = self._build_file_summaries(existing_files)
-
-        target_files = ["style.css", "script.js", "index.html"]
-        missing = [f for f in target_files if f not in existing_files]
-        missing_text = ", ".join(missing) if missing else "全部已创建"
 
         plan_section = ""
         if plan:
@@ -433,7 +451,51 @@ class ToolCallLoop:
             plan_section = f"""## 实现计划（请严格遵循）
 {plan_text}"""
 
-        prompt = f"""你是一个资深前端工程师。请使用 write_file 工具创建所有缺失的文件。
+        # ---- 根据复杂度选择不同的提示词 ----
+
+        if complexity == "XS":
+            return self._build_xs_prompt(requirement, plan_section, existing_text, existing_files)
+
+        elif complexity in ("M", "L"):
+            return self._build_ml_prompt(requirement, plan_section, existing_text, existing_files, complexity)
+
+        else:  # S (默认)
+            return self._build_s_prompt(requirement, plan_section, existing_text, existing_files)
+
+    def _build_xs_prompt(self, requirement: str, plan_section: str,
+                         existing_text: str, existing_files: list) -> str:
+        """XS 复杂度：自由文件结构，极简流程"""
+        return f"""你是一个资深前端工程师。请使用 write_file 工具创建所需的文件。
+
+## 用户需求
+{requirement}
+
+{plan_section}
+
+## 当前已有文件及内容概要
+{existing_text}
+
+## 要求
+- 根据需求自由创建文件，不强制要求 3 文件结构
+- 简单需求可能只需要 1 个 HTML 文件即可
+- 每次响应只创建一个文件
+- 全部文件创建完成后立即停止，告诉我"任务完成"
+- 不需要调用 list_files 或 read_file 查看已有文件（概要已在上方）
+
+## 代码规范
+- 使用 <script src="https://cdn.tailwindcss.com"></script> 引入 Tailwind CSS
+- 需要持久化数据时用 localStorage
+- 禁止: innerHTML, eval, document.write
+- 代码完整可运行，不省略不写TODO"""
+
+    def _build_s_prompt(self, requirement: str, plan_section: str,
+                        existing_text: str, existing_files: list) -> str:
+        """S 复杂度：当前默认行为（3 文件 + lint 验证）"""
+        target_files = ["index.html", "style.css", "script.js"]
+        missing = [f for f in target_files if f not in existing_files]
+        missing_text = ", ".join(missing) if missing else "全部已创建"
+
+        return f"""你是一个资深前端工程师。请使用 write_file 工具创建所有缺失的文件。
 
 ## 用户需求
 {requirement}
@@ -464,7 +526,55 @@ class ToolCallLoop:
 - 禁止: innerHTML, eval, document.write
 - 代码完整可运行，不省略不写TODO
 - 每个文件内容不少于100行"""
-        return prompt
+
+    def _build_ml_prompt(self, requirement: str, plan_section: str,
+                         existing_text: str, existing_files: list,
+                         complexity: str) -> str:
+        """M/L 复杂度：架构先导 + 模块化 + 严格验证"""
+        # 从 plan 中提取推荐的文件结构
+        file_hint = ""
+        plan_obj = json.loads(plan_section.split("\n", 1)[1]) if plan_section and "\n" in plan_section else {}
+        if isinstance(plan_obj, dict):
+            file_structure = plan_obj.get("file_structure", [])
+            if file_structure:
+                file_hint = "## 推荐文件结构\n" + "\n".join(f"- {f}" for f in file_structure)
+
+        return f"""你是一个资深前端工程师和架构师。请按照架构设计创建高质量代码。
+
+## 用户需求
+{requirement}
+
+{plan_section}
+
+{file_hint}
+
+## 当前已有文件及内容概要
+{existing_text}
+
+## 工作流程
+1. 先创建入口文件 index.html（引入所有依赖）
+2. 按模块逐层创建 CSS/JS 文件（使用子目录组织，如 css/、js/、components/）
+3. 每个模块单一职责，文件间通过 import/export 或全局命名空间通信
+4. 每创建 2-3 个文件后验证一次
+
+## 要求
+- **每次响应只创建一个文件**
+- 按推荐文件结构创建，不使用构建工具
+- 全部文件创建完成后用 validate_html / lint_css / lint_js 验证
+- 验证完成后立即停止，告诉我"任务完成"
+
+## 验证与修复
+- 全部文件创建完成后系统会自动运行无头浏览器验证
+- 报错会反馈给你，请据此用 edit_file 局部修复（不要重写整个文件）
+- 最多修复 {self.MAX_REPAIR_ROUNDS + 1} 轮
+
+## 代码规范
+- index.html 引入 <script src="https://cdn.tailwindcss.com"></script>
+- 数据持久化用 localStorage（5MB 内）或 IndexedDB（大量数据）
+- 禁止: innerHTML, eval, document.write
+- 代码完整可运行，不省略不写TODO
+- 每个文件内容充实，组件拆分合理
+- 复杂度 {complexity}：需要考虑可维护性和扩展性"""
 
     def _build_file_summaries(self, existing_files: list) -> str:
         """为已有文件生成内容概要，让 Agent 无需 read_file 就知道文件结构"""
@@ -553,7 +663,18 @@ class ToolCallLoop:
         return '\n'.join(lines)
 
     def _check_missing_files(self, state: AgentState) -> list[str]:
-        """检查目标文件是否全部生成。返回缺失文件名列表。"""
+        """检查目标文件是否全部生成。返回缺失文件名列表。
+
+        XS 复杂度不检查强制文件列表（允许单文件项目）。
+        """
+        complexity = state.get("metadata", {}).get("complexity", "S")
+        if complexity == "XS":
+            # XS: 只要工作区有文件就认为满足
+            if self.workspace.list():
+                return []
+            return ["至少一个文件"]
+
+        # S/M/L: 检查是否有入口文件
         existing = set(self.workspace.list())
         target = {"index.html", "style.css", "script.js"}
         return sorted(target - existing)

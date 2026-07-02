@@ -32,7 +32,7 @@
     </div>
     <DialogueInput
       :disabled="isLoading"
-      @send="$emit('send-message', $event)"
+      @send="emit('send-message', $event)"
     />
   </div>
 </template>
@@ -47,6 +47,10 @@ import PermissionRequest from './PermissionRequest.vue'
 import ExecutionPanel from './ExecutionPanel.vue'
 import type { DialogueMessage as DialogueMessageType } from '@/types/api'
 import type { SSEQuestionFormData, SSEPermissionData, SSETraceSummaryData } from '@/types/sse'
+
+const emit = defineEmits<{
+  (e: 'send-message', message: string): void
+}>()
 
 const bodyRef = ref<HTMLElement | null>(null)
 const store = useRequirementStore()

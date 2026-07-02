@@ -11,9 +11,12 @@
     </div>
   </div>
 
-  <!-- Agent message -->
+  <!-- Agent message (Planner/Coder/TeamLeader/PM/Architect/Engineer/QA) -->
   <div v-else-if="msg.role === 'agent'" class="msg agent">
-    <div class="agent-name">{{ msg.name || 'AI' }}</div>
+    <div class="agent-name" :style="{ color: roleColor }">
+      <span v-if="roleIcon" class="role-icon">{{ roleIcon }}</span>
+      {{ displayName }}
+    </div>
     <div class="bubble agent-bubble">
       {{ msg.content }}
     </div>
@@ -39,10 +42,13 @@
     />
   </div>
 
-  <!-- Thinking — 普通气泡展示 -->
+  <!-- Thinking — 显示实际角色名，不再是通用的"Thinking" -->
   <div v-else-if="msg.role === 'thinking'" class="msg agent">
-    <div class="agent-name">💭 Thinking</div>
-    <div class="bubble agent-bubble">
+    <div class="agent-name" :style="{ color: roleColor }">
+      <span class="role-icon">{{ roleIcon || '💭' }}</span>
+      {{ displayName }}
+    </div>
+    <div class="bubble agent-bubble thinking-bubble">
       {{ msg.content }}
     </div>
   </div>
@@ -58,7 +64,10 @@
 
   <!-- Default: agent-like -->
   <div v-else class="msg agent">
-    <div class="agent-name">{{ msg.name || 'AI' }}</div>
+    <div class="agent-name" :style="{ color: roleColor }">
+      <span v-if="roleIcon" class="role-icon">{{ roleIcon }}</span>
+      {{ displayName }}
+    </div>
     <div class="bubble agent-bubble">
       {{ msg.content }}
     </div>
@@ -66,13 +75,46 @@
 </template>
 
 <script setup lang="ts">
+import { computed } from 'vue'
 import type { DialogueMessage as DialogueMessageType } from '@/types/api'
 import ToolCallCard from './ToolCallCard.vue'
 import HookCheckCard from './HookCheckCard.vue'
 
-defineProps<{
+const props = defineProps<{
   msg: DialogueMessageType
 }>()
+
+// 角色 → 图标映射（仅实际 Agent）
+const ROLE_ICONS: Record<string, string> = {
+  'TeamLeader': '🎯',   'Mike': '🎯',
+  'ProductManager': '📋', 'Alice': '📋',
+  'Architect': '🏗️',    'Bob': '🏗️',
+  'FrontendEngineer': '⚙️', 'Alex': '⚙️',
+  'QAReviewer': '🔍',   'David': '🔍',
+}
+
+// 角色 → 颜色映射（仅实际 Agent）
+const ROLE_COLORS: Record<string, string> = {
+  'TeamLeader': '#7c3aed',   'Mike': '#7c3aed',
+  'ProductManager': '#2563eb', 'Alice': '#2563eb',
+  'Architect': '#059669',    'Bob': '#059669',
+  'FrontendEngineer': '#ea580c', 'Alex': '#ea580c',
+  'QAReviewer': '#dc2626',   'David': '#dc2626',
+}
+
+const roleIcon = computed(() => {
+  const name = props.msg.name || ''
+  return ROLE_ICONS[name] || ROLE_ICONS[name.split(' ')[0]] || ''
+})
+
+const roleColor = computed(() => {
+  const name = props.msg.name || ''
+  return ROLE_COLORS[name] || ROLE_COLORS[name.split(' ')[0]] || 'var(--accent)'
+})
+
+const displayName = computed(() => {
+  return props.msg.name || 'AI'
+})
 </script>
 
 <style scoped>
@@ -128,5 +170,16 @@ defineProps<{
   color: var(--accent);
   margin-bottom: 4px;
   letter-spacing: 0.02em;
+}
+
+.role-icon {
+  margin-right: 3px;
+  font-size: 13px;
+}
+
+.thinking-bubble {
+  opacity: 0.85;
+  font-style: italic;
+  border-left: 2px solid var(--muted);
 }
 </style>

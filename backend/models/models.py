@@ -111,7 +111,7 @@ class CheckpointRecord(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     checkpoint_id = Column(String(64), unique=True, nullable=False, index=True)
     requirement_id = Column(Integer, nullable=False, index=True)
-    node_name = Column(String(64), nullable=False)  # planner / tool_coder / tool_executor
+    node_name = Column(String(64), nullable=False)  # team_leader / tool_coder / tool_executor
     state_json = Column(Text, nullable=False)  # JSON 序列化的 AgentState
     created_at = Column(DateTime, default=func.now())
 

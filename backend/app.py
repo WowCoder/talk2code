@@ -523,6 +523,7 @@ def chat_with_requirement(req_id):
     from harness.observability.tracer import Tracer
     from harness.observability.cost import CostTracker
     from harness.runtime import ToolCallLoop
+    from harness.instructions.intent_router import IntentRouter, IntentType
 
     current_user_id = get_jwt_identity()
     data = request.get_json()
@@ -541,6 +542,26 @@ def chat_with_requirement(req_id):
             return jsonify({'error': '需求不存在'}), 404
 
         user_message = data.get('message', '').strip()
+
+        # ===== 意图路由：Chat 模式下区分"提问"和"修改指令" =====
+        if '[用户补充说明]' not in user_message:
+            chat_router = IntentRouter()
+            chat_intent = chat_router.classify(
+                user_message, is_chat=True,
+                history=requirement.dialogue_history or [],
+            )
+            logger.info(f"Chat 意图分类: {chat_intent.intent.value} (req_id={req_id})")
+
+            if chat_intent.intent == IntentType.QUICK:
+                return _handle_chat_quick(
+                    req_id, requirement, user_message,
+                    chat_router, db
+                )
+            elif chat_intent.intent == IntentType.AMBIGUOUS:
+                return _handle_chat_ambiguous(
+                    req_id, requirement, user_message, db
+                )
+            # TASK: 继续以下流程
 
         # 如果消息包含 [用户补充说明]，说明已经过澄清，跳过检测
         from harness.instructions.nodes import _is_vague_requirement, _generate_clarify_questions
@@ -567,7 +588,7 @@ def chat_with_requirement(req_id):
                     'timestamp': get_current_timestamp()
                 })
                 dialogue_list.append({
-                    'role': 'system', 'name': 'Planner',
+                    'role': 'system', 'name': 'TeamLeader',
                     'content': '修改意见不够明确，需要补充一些信息',
                     'status': 'needs_clarification',
                     'question_form': {'questions': questions},
@@ -620,7 +641,7 @@ def chat_with_requirement(req_id):
         existing_files = workspace.list()
         file_list_text = "\n".join(f"- {f}" for f in existing_files) if existing_files else "(空)"
 
-        # 进入 Coder ReAct 循环（跳过 Planner），使用修改专用 prompt
+        # 进入 FrontendEngineer ReAct 循环（跳过 TeamLeader），使用修改专用 prompt
         tool_loop = ToolCallLoop(
             workspace=workspace, git=git, tools=tools,
             hooks=hooks, tracer=tracer, cost_tracker=cost_tracker,
@@ -1157,6 +1178,117 @@ def metrics():
 
 from utils.sse import SSEMessage
 from utils.sse import get_current_timestamp
+
+
+# ==================== Chat 意图路由辅助函数 ====================
+
+def _handle_chat_quick(req_id, requirement, user_message, chat_router, db):
+    """Chat 模式 QUICK 意图：直接回答用户关于代码的问题，不修改代码"""
+    from sqlalchemy.orm.attributes import flag_modified
+    from harness.observability.sse_reporter import SSEReporter
+
+    # 构建代码上下文
+    code_context = ""
+    if requirement.code_files:
+        lines = ["## 当前项目文件"]
+        for f in requirement.code_files:
+            fname = f.get('filename', 'unknown')
+            content = f.get('content', '')
+            line_count = content.count('\n') + 1 if content else 0
+            preview = '\n'.join(content.split('\n')[:15]) if content else '(空)'
+            lines.append(f"\n### {fname} ({line_count} 行)\n```\n{preview}\n```")
+        code_context = '\n'.join(lines)
+
+    sse_reporter = SSEReporter(sse_manager)
+
+    answer = chat_router.handle_quick(
+        requirement=user_message,
+        history=requirement.dialogue_history or [],
+        code_context=code_context,
+        is_chat=True,
+    )
+
+    # 保存对话历史
+    dialogue_list = list(requirement.dialogue_history or [])
+    dialogue_list.append({
+        'role': 'user', 'name': '用户',
+        'content': user_message,
+        'timestamp': get_current_timestamp(),
+    })
+    dialogue_list.append({
+        'role': 'agent', 'name': 'AI',
+        'content': answer,
+        'status': 'completed',
+        'timestamp': get_current_timestamp(),
+    })
+    requirement.dialogue_history = dialogue_list
+    flag_modified(requirement, 'dialogue_history')
+    requirement.status = 'finished'
+    db.commit()
+
+    # SSE 推送
+    sse_reporter.dialogue(req_id, 'user', '用户', user_message)
+    sse_reporter.dialogue(req_id, 'agent', 'AI', answer, 'completed')
+    sse_reporter.complete(req_id)
+
+    logger.info(f"Chat QUICK 回答完成 (req_id={req_id})")
+    return jsonify({
+        'message': 'success',
+        'intent': 'quick',
+        'answer': answer,
+        'dialogue_history': dialogue_list,
+    }), 200
+
+
+def _handle_chat_ambiguous(req_id, requirement, user_message, db):
+    """Chat 模式 AMBIGUOUS 意图：生成澄清问题"""
+    from sqlalchemy.orm.attributes import flag_modified
+    from harness.instructions.nodes import _generate_clarify_questions
+    from llm.client import get_client as _get_llm_client
+
+    try:
+        client = _get_llm_client()
+        questions = _generate_clarify_questions(client, user_message)
+        if not questions:
+            questions = [
+                {"id": "q1", "type": "text", "label": "请更具体地描述你想要的修改效果"},
+                {"id": "visual_style", "type": "radio",
+                 "label": "修改后你偏好哪种视觉风格？",
+                 "options": ["保持现有风格", "极简白", "暖柔风格", "暗黑科技", "活泼多彩", "无偏好"]},
+            ]
+    except Exception as e:
+        logger.warning(f"Chat 澄清问题生成失败: {e}")
+        questions = [
+            {"id": "q1", "type": "text", "label": "请更具体地描述你想要的修改"},
+        ]
+
+    dialogue_list = list(requirement.dialogue_history or [])
+    dialogue_list.append({
+        'role': 'user', 'name': '用户',
+        'content': user_message,
+        'timestamp': get_current_timestamp(),
+    })
+    dialogue_list.append({
+        'role': 'system', 'name': 'TeamLeader',
+        'content': '修改意见不够明确，需要补充一些信息',
+        'status': 'needs_clarification',
+        'question_form': {'questions': questions},
+    })
+    requirement.dialogue_history = dialogue_list
+    flag_modified(requirement, 'dialogue_history')
+    requirement.status = 'finished'
+    db.commit()
+
+    # SSE 推送澄清表单
+    msg = SSEMessage.format_event('question-form', {'questions': questions})
+    sse_manager.broadcast(str(req_id), msg)
+
+    logger.info(f"Chat 触发澄清 (AMBIGUOUS), req_id={req_id}")
+    return jsonify({
+        'needs_clarification': True,
+        'question_form': {'questions': questions},
+        'dialogue_history': dialogue_list,
+    }), 200
 
 
 # ==================== 主程序入口 ====================
