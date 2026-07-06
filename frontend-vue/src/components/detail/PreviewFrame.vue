@@ -9,18 +9,30 @@
       >
         {{ d.label }}
       </button>
+      <div class="toolbar-spacer"></div>
+      <button class="device-btn" @click="refreshPreview" title="刷新预览">
+        ↻ 刷新
+      </button>
+      <!-- 预览验证状态指示灯 -->
+      <span
+        v-if="previewStatus !== null"
+        :class="['status-dot', previewStatus]"
+        :title="previewTooltip"
+      ></span>
     </div>
     <div class="preview-canvas">
       <div v-if="!hasContent" class="preview-empty">
         等待代码生成…
       </div>
-      <iframe
-        v-else
-        :src="iframeSrc"
-        :style="{ width: iframeWidth + 'px', maxWidth: '100%' }"
-        class="preview-iframe"
-        sandbox="allow-scripts allow-same-origin allow-forms"
-      ></iframe>
+      <div v-else class="preview-wrapper">
+        <iframe
+          :key="previewKey"
+          :src="iframeSrc"
+          :style="{ width: iframeWidth + 'px', maxWidth: '100%' }"
+          class="preview-iframe"
+          sandbox="allow-scripts allow-same-origin allow-forms"
+        ></iframe>
+      </div>
     </div>
   </div>
 </template>
@@ -44,50 +56,33 @@ const devices: Device[] = [
 ]
 
 const activeDevice = ref(localStorage.getItem('previewDevice') || 'desktop')
+const previewKey = ref(0)
 
 const iframeWidth = computed(() =>
   devices.find((d) => d.key === activeDevice.value)?.width || 1024
 )
 
 const hasContent = computed(() => {
-  return Object.keys(store.codeFiles).length > 0
+  // 不仅 key 存在，内容也必须非空（生成中可能是空字符串）
+  const html = store.codeFiles['index.html']
+  return !!html && html.trim().length > 0
 })
 
-function buildPreviewHTML(): string {
-  const html = store.codeFiles['index.html'] || ''
-  const css = store.codeFiles['style.css'] || ''
-  const js = store.codeFiles['script.js'] || ''
+// 预览 URL 指向后端文件服务端点，相对路径自动解析
+const iframeSrc = computed(() => {
+  const reqId = store.currentRequirement?.id
+  if (!reqId) return ''
+  return `/api/preview/${reqId}/index.html`
+})
 
-  if (!html && !css && !js) return ''
-
-  return `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com;script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com;style-src 'self' 'unsafe-inline';img-src 'self' data: https:">
-  <title>Preview</title>
-  <style>${css}</style>
-</head>
-<body>${html}
-<script>${js}<\/script>
-</body></html>`
-}
-
-const iframeSrc = ref('')
+// 预览验证状态
+type PreviewStatusType = 'passed' | 'failed' | 'unavailable' | null
+const previewStatus = ref<PreviewStatusType>(null)
+const previewTooltip = ref('')
+const previewErrors = ref<string[]>([])
 
 function refreshPreview() {
-  const html = buildPreviewHTML()
-  if (!html) {
-    iframeSrc.value = ''
-    return
-  }
-  const blob = new Blob([html], { type: 'text/html' })
-  // Revoke old URL to prevent memory leaks
-  if (iframeSrc.value) {
-    URL.revokeObjectURL(iframeSrc.value)
-  }
-  iframeSrc.value = URL.createObjectURL(blob)
+  previewKey.value++
 }
 
 function setDevice(key: string) {
@@ -95,14 +90,24 @@ function setDevice(key: string) {
   localStorage.setItem('previewDevice', key)
 }
 
-// Watch codeFiles for changes
+// 监听 codeFiles 变化，自动刷新预览
 watch(
-  () => ({ ...store.codeFiles }),
+  () => store.codeFiles['index.html'],
   () => {
     refreshPreview()
-  },
-  { deep: true }
+  }
 )
+
+// 暴露方法供 SSE composable 调用，更新验证状态
+;(window as any).__previewUpdateStatus = function (
+  status: PreviewStatusType,
+  errors: string[],
+  tooltip: string
+) {
+  previewStatus.value = status
+  previewErrors.value = errors
+  previewTooltip.value = tooltip || (errors.length > 0 ? errors.join('; ') : '')
+}
 </script>
 
 <style scoped>
@@ -121,6 +126,10 @@ watch(
   background: var(--dark-surface);
   border-bottom: 1px solid var(--dark-border);
   flex-shrink: 0;
+}
+
+.toolbar-spacer {
+  flex: 1;
 }
 
 .device-btn {
@@ -146,6 +155,29 @@ watch(
   border-color: oklch(45% 0.012 60);
 }
 
+/* 预览验证状态指示灯 */
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  margin-left: 4px;
+}
+
+.status-dot.passed {
+  background: #4caf50;
+  box-shadow: 0 0 4px rgba(76, 175, 80, 0.5);
+}
+
+.status-dot.failed {
+  background: #f44336;
+  box-shadow: 0 0 4px rgba(244, 67, 54, 0.5);
+}
+
+.status-dot.unavailable {
+  background: #9e9e9e;
+}
+
 .preview-canvas {
   flex: 1;
   background: #fff;
@@ -153,6 +185,13 @@ watch(
   align-items: center;
   justify-content: center;
   overflow: auto;
+}
+
+.preview-wrapper {
+  height: 100%;
+  width: 100%;
+  display: flex;
+  justify-content: center;
 }
 
 .preview-empty {

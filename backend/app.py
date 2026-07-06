@@ -641,11 +641,24 @@ def chat_with_requirement(req_id):
         existing_files = workspace.list()
         file_list_text = "\n".join(f"- {f}" for f in existing_files) if existing_files else "(空)"
 
+        # Chat 模式增量持久化回调
+        def _persist_dialogue(state):
+            try:
+                dialogue = state.get('dialogue_history', [])
+                if dialogue:
+                    requirement.dialogue_history = dialogue
+                    from sqlalchemy.orm.attributes import flag_modified
+                    flag_modified(requirement, 'dialogue_history')
+                    db.commit()
+            except Exception as e:
+                logger.warning(f"增量持久化对话失败（不阻断）：{e}")
+
         # 进入 FrontendEngineer ReAct 循环（跳过 TeamLeader），使用修改专用 prompt
         tool_loop = ToolCallLoop(
             workspace=workspace, git=git, tools=tools,
             hooks=hooks, tracer=tracer, cost_tracker=cost_tracker,
             sse_reporter=sse, permission_manager=permissions,
+            on_iteration=_persist_dialogue,
         )
         # Chat 模式下降低迭代上限（修改任务应该在 3-5 轮内完成）
         tool_loop.MAX_ITERATIONS = 4
@@ -707,7 +720,12 @@ def chat_with_requirement(req_id):
         final_dialogue = final_state.get('dialogue_history', [])
         requirement.dialogue_history = final_dialogue
         requirement.code_files = updated_files
-        requirement.status = 'finished'
+        # 检查 current_step：只有真正完成才标记 finished
+        current_step = final_state.get('current_step', '')
+        if current_step in ('no_progress', 'max_iterations'):
+            requirement.status = 'failed'
+        else:
+            requirement.status = 'finished'
         db.commit()
 
         return jsonify({
@@ -1289,6 +1307,111 @@ def _handle_chat_ambiguous(req_id, requirement, user_message, db):
         'question_form': {'questions': questions},
         'dialogue_history': dialogue_list,
     }), 200
+
+
+# ==================== 预览文件服务 ====================
+
+# MIME 类型映射，用于预览端点返回正确的 Content-Type
+_PREVIEW_MIME_TYPES = {
+    '.html': 'text/html; charset=utf-8',
+    '.htm': 'text/html; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.js': 'application/javascript; charset=utf-8',
+    '.mjs': 'application/javascript; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.svg': 'image/svg+xml',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.ico': 'image/x-icon',
+    '.woff': 'font/woff',
+    '.woff2': 'font/woff2',
+    '.ttf': 'font/ttf',
+    '.txt': 'text/plain; charset=utf-8',
+}
+
+
+def _get_mime_type(filepath: str) -> str:
+    """根据文件扩展名返回 MIME 类型"""
+    import os as _os
+    _, ext = _os.path.splitext(filepath)
+    return _PREVIEW_MIME_TYPES.get(
+        ext.lower(), 'application/octet-stream'
+    )
+
+
+@app.route('/api/preview/<int:req_id>/<path:filepath>')
+def preview_serve(req_id: int, filepath: str):
+    """
+    预览文件服务端点
+
+    为前端 iframe 提供生成的代码文件，支持子目录路径（如 css/style.css）。
+    相对路径引用（<link href="css/style.css">、<script src="js/game.js">）
+    通过此端点自动解析。
+
+    数据源优先级：
+    1. Workspace 磁盘文件（实时生成中，SSE 推送后立即可用）
+    2. 数据库 code_files（已完成的任务，作为持久化兜底）
+
+    安全：拒绝路径穿越（.. / ~）。
+    """
+    # 安全校验：拒绝路径穿越
+    if '..' in filepath or filepath.startswith('/') or filepath.startswith('~'):
+        logger.warning(f"预览请求拒绝非法路径: req_id={req_id}, path={filepath}")
+        return _preview_error_html('非法文件路径', 403)
+
+    from models import Requirement, SessionLocal
+
+    db = SessionLocal()
+    try:
+        requirement = db.query(Requirement).filter_by(id=req_id).first()
+        if not requirement:
+            return _preview_error_html('需求不存在', 404)
+
+        # 优先从 workspace 读取（实时生成时更及时）
+        from harness.state.workspace import WorkspaceFS
+        user_id = requirement.user_id
+        workspace = WorkspaceFS(user_id, req_id)
+        if workspace.exists(filepath):
+            content = workspace.read(filepath)
+            if content.strip():  # 非空才返回
+                mime = _get_mime_type(filepath)
+                return Response(content, mimetype=mime)
+
+        # 回退到数据库 code_files（已完成的任务）
+        if requirement.code_files:
+            for f in requirement.code_files:
+                if f.get('filename') == filepath:
+                    content = f.get('content', '')
+                    if content.strip():  # 非空才返回
+                        mime = _get_mime_type(filepath)
+                        return Response(content, mimetype=mime)
+
+        # 文件不存在（返回 HTML 而非 JSON，iframe 可友好展示）
+        return _preview_error_html(f'文件尚未生成: {filepath}', 404)
+
+    finally:
+        db.close()
+
+
+def _preview_error_html(message: str, status: int = 404):
+    """生成预览错误页面（HTML 格式，iframe 友好）"""
+    html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<style>
+  body {{ display:flex; align-items:center; justify-content:center; min-height:100vh;
+         margin:0; font-family:system-ui,-apple-system,sans-serif;
+         background:#f8f9fa; color:#6b7280; }}
+  .box {{ text-align:center; padding:40px; }}
+  .code {{ font-size:64px; font-weight:200; color:#d1d5db; margin-bottom:12px; }}
+  .msg {{ font-size:15px; }}
+</style></head>
+<body><div class="box">
+<div class="code">{status}</div><div class="msg">{message}</div>
+</div></body></html>"""
+    return Response(html, status=status, mimetype='text/html; charset=utf-8')
 
 
 # ==================== 主程序入口 ====================

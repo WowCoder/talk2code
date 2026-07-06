@@ -18,7 +18,11 @@ Playwright/浏览器缺失时优雅降级（返回可用性提示而非崩溃）
 
 from __future__ import annotations
 
+import logging
+
 from harness.tools.registry import ToolDefinition, ToolResult
+
+logger = logging.getLogger(__name__)
 
 
 def register_preview_tools(registry):
@@ -54,8 +58,14 @@ class PreviewToolHandler:
         try:
             from harness.tools.preview_runner import run_preview_in_browser
         except ImportError as e:
+            logger.warning(
+                "run_preview 不可用（playwright 未安装）：%s。"
+                "运行 `pip install playwright && playwright install chromium` 以启用真实浏览器验证。",
+                e,
+            )
             return ToolResult(
-                content=f"预览验证不可用（playwright 未安装）：{e}。可跳过此步。",
+                content=f"预览验证不可用（playwright 未安装）：{e}。"
+                        "运行 `pip install playwright && playwright install chromium` 以启用。",
                 metadata={"available": False, "errors": []},
             )
 
@@ -77,6 +87,7 @@ class PreviewToolHandler:
             )
         except Exception as e:
             # 浏览器未安装等情况：降级，不阻断流程
+            logger.warning("run_preview 异常（降级跳过）: %s", e)
             return ToolResult(
                 content=f"预览验证跳过（浏览器不可用）：{e}",
                 metadata={"available": False, "errors": [], "skip_reason": str(e)},

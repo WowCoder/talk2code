@@ -182,39 +182,63 @@ async function onSendMessage(message: string) {
   }
 }
 
-// Download handler
+// Download handler: 将 index.html 及相关资源打包为独立 HTML
 function onDownload() {
   const files = { ...store.codeFiles }
-  const html = files['index.html'] || ''
-  const css = files['style.css'] || ''
-  const js = files['script.js'] || ''
+  const indexHtml = files['index.html'] || ''
 
-  if (!html && !css && !js) {
+  if (!indexHtml) {
     show('没有可下载的代码', 'error')
     return
   }
 
-  const blob = new Blob([buildDownloadHTML(html, css, js)], { type: 'text/html' })
+  // 如果 index.html 包含完整 DOCTYPE，直接内联所有 CSS/JS 引用
+  const content = buildStandaloneHTML(files)
+  const blob = new Blob([content], { type: 'text/html' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
   a.download = 'app.html'
   a.click()
   URL.revokeObjectURL(url)
+  show('下载完成', 'success')
 }
 
-function buildDownloadHTML(html: string, css: string, js: string): string {
-  return `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Generated App</title>
-  <style>${css}</style>
-</head>
-<body>${html}
-<script>${js}<\/script>
-</body></html>`
+function buildStandaloneHTML(files: Record<string, string>): string {
+  let html = files['index.html'] || ''
+
+  // 替换 <link rel="stylesheet" href="..."> 为内联 <style>
+  html = html.replace(
+    /<link\s+[^>]*rel=["']stylesheet["'][^>]*href=["']([^"']+)["'][^>]*>/gi,
+    (match: string, href: string) => {
+      // 查找相对于 index.html 的 CSS 文件
+      const candidates = [href, href.replace(/^\.\//, '')]
+      for (const key of candidates) {
+        if (files[key]) {
+          return `<style>/* ${key} */\n${files[key]}\n</style>`
+        }
+      }
+      return match // 未找到则保留原始标签
+    }
+  )
+
+  // 替换 <script src="..."> 为内联 <script>
+  html = html.replace(
+    /<script\s+[^>]*src=["']([^"']+)["'][^>]*>/gi,
+    (match: string, src: string) => {
+      const candidates = [src, src.replace(/^\.\//, '')]
+      for (const key of candidates) {
+        if (files[key]) {
+          return `<script>/* ${key} */
+${files[key]}
+</${'script'}>`
+        }
+      }
+      return match // 未找到则保留原始标签（如 CDN 外部引用）
+    }
+  )
+
+  return html
 }
 </script>
 

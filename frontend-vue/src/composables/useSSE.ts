@@ -13,6 +13,7 @@ import type {
   SSEPermissionData,
   SSETraceSummaryData,
   SSEErrorData,
+  SSEPreviewData,
 } from '@/types/sse'
 
 export function useSSE(reqId: Ref<number | null>) {
@@ -96,7 +97,7 @@ export function useSSE(reqId: Ref<number | null>) {
       const data: SSEThinkingData = JSON.parse(e.data)
       store.addDialogueMessage({
         role: 'thinking',
-        name: 'Thinking',
+        name: data.name || 'Thinking',
         content: data.content,
       })
     })
@@ -136,6 +137,27 @@ export function useSSE(reqId: Ref<number | null>) {
       const data: SSETraceSummaryData = JSON.parse(e.data)
       lastTraceSummary.value = data
       ;(store as any)._traceSummary = data
+    })
+
+    es.addEventListener('preview', (e: MessageEvent) => {
+      const data: SSEPreviewData = JSON.parse(e.data)
+      // 更新预览面板的验证状态指示灯
+      let status: 'passed' | 'failed' | 'unavailable' = 'unavailable'
+      let tooltip = ''
+      if (!data.available) {
+        status = 'unavailable'
+        tooltip = '预览验证不可用（浏览器未安装）'
+      } else if (data.passed) {
+        status = 'passed'
+        tooltip = '预览验证通过，无运行时错误'
+      } else {
+        status = 'failed'
+        tooltip = `运行时错误: ${(data.errors || []).length} 个问题`
+      }
+      const win = window as any
+      if (win.__previewUpdateStatus) {
+        win.__previewUpdateStatus(status, data.errors || [], tooltip)
+      }
     })
 
     es.addEventListener('error', (e: MessageEvent) => {
