@@ -31,7 +31,7 @@ class ToolCallLoop:
 
     def __init__(self, workspace, git=None, tools: ToolRegistry = None,
                  hooks=None, tracer=None, cost_tracker=None, sse_reporter=None,
-                 permission_manager=None, checkpoint=None):
+                 permission_manager=None, checkpoint=None, on_iteration=None):
         self.workspace = workspace
         self.git = git
         self.tools = tools
@@ -41,6 +41,7 @@ class ToolCallLoop:
         self.sse = sse_reporter
         self.permission_manager = permission_manager
         self.checkpoint = checkpoint
+        self.on_iteration = on_iteration  # 可选回调，每轮迭代后调用以增量持久化
 
         # 创建工具处理器
         self._file_handler = FileToolHandler(workspace)
@@ -52,18 +53,24 @@ class ToolCallLoop:
         client = get_client()
         trace_id = state.get("metadata", {}).get("trace_id", "")
 
+        # 每次进入 run() 重置运行时计数器，避免多轮调用（如修复循环）间状态污染
+        state["no_progress_count"] = 0
+        state["repeat_call_count"] = 0
+        state["last_tool_signatures"] = set()
+        state["tool_call_count"] = 0
+
         # 可配置的角色名称（多角色协作用，默认兼容旧行为）
         meta = state.get("metadata", {})
         coder_name = meta.get("coder_name", "FrontendEngineer")
         thinking_name = meta.get("thinking_name", "FrontendEngineer")
 
-        # 根据复杂度调整迭代上限
+        # 根据复杂度调整迭代上限（M/L 多角色流程需要更多轮次覆盖文件创建和 QA 修复）
         complexity = state.get("metadata", {}).get("complexity", "S")
         effective_max_iterations = {
             "XS": 5,
             "S": self.MAX_ITERATIONS,
-            "M": self.MAX_ITERATIONS,
-            "L": self.MAX_ITERATIONS + 5,
+            "M": self.MAX_ITERATIONS + 5,  # M 也有多文件模块，需要更多轮次
+            "L": self.MAX_ITERATIONS + 10,  # L 文件更多，QA 修复更复杂
         }.get(complexity, self.MAX_ITERATIONS)
 
         for iteration in range(effective_max_iterations):
@@ -119,7 +126,7 @@ class ToolCallLoop:
             thinking_text = response.reasoning_content or response.content
             if thinking_text:
                 if self.sse:
-                    self.sse.thinking(state["requirement_id"], thinking_text)
+                    self.sse.thinking(state["requirement_id"], thinking_text, thinking_name)
                 # 存入对话历史，让前端刷新后仍可展示
                 state["dialogue_history"].append({
                     "role": "thinking",
@@ -172,17 +179,17 @@ class ToolCallLoop:
                 is_chat = state.get("metadata", {}).get("is_chat", False)
                 if tc.name == "read_file":
                     # Chat/编辑模式：需要完整文件内容构造精确 SEARCH 块
-                    # 生成模式：3000 字符足够覆盖文件关键区域
-                    max_len = 16000 if is_chat else 3000
+                    # 生成模式：8000 字符覆盖文件主要区域（配合文件摘要避免误判截断为损坏）
+                    max_len = 16000 if is_chat else 8000
                 elif tc.name in ("write_file", "edit_file"):
-                    max_len = 1500  # 足够让 Agent 在下一轮记得文件主要内容
+                    max_len = 8000  # 让 Agent 看到完整文件内容，避免写入后再 read_file 验证
                 else:
                     max_len = 300
                 if len(tool_summary) > max_len:
                     cut_hint = (
-                        "\n... (文件较长，已截断。请用 read_file 指定范围查看后续内容)"
+                        "\n... (文件较长已截断，文件本身完整未损坏。如需特定片段请指定行号范围读取)"
                         if is_chat else
-                        "\n... (文件较长，已截断，如需查看完整内容请再次 read_file)"
+                        "\n... (文件较长已截断，文件本身完整无损。文件摘要已在系统提示中，继续基于摘要工作，不要重复读取)"
                     )
                     tool_summary = tool_summary[:max_len] + cut_hint
 
@@ -201,6 +208,25 @@ class ToolCallLoop:
                     filename = tc.arguments.get("filename", "unknown")
                     self.git.commit(f"[tool] {tc.name}: {filename}")
 
+            # 检测重复工具调用（连续相同 tool+filename 视为卡住）
+            current_signatures = set()
+            for tc in (response.tool_calls or []):
+                fname = tc.arguments.get("filename", "") if isinstance(tc.arguments, dict) else ""
+                current_signatures.add(f"{tc.name}:{fname}")
+            last_signatures = state.get("last_tool_signatures", set())
+            if current_signatures and current_signatures == last_signatures:
+                state["repeat_call_count"] = state.get("repeat_call_count", 0) + 1
+            else:
+                state["repeat_call_count"] = 0
+            state["last_tool_signatures"] = current_signatures
+            # 连续 3 轮相同工具调用 → 判定为卡住
+            if state.get("repeat_call_count", 0) >= 3:
+                logger.warning(
+                    f"[ToolLoop] 连续 {state['repeat_call_count']} 轮重复调用相同工具: {current_signatures}，判定为无进展"
+                )
+                state["current_step"] = "no_progress"
+                break
+
             # 检查是否达到最大迭代
             if iteration >= effective_max_iterations - 1:
                 state["current_step"] = "max_iterations"
@@ -210,6 +236,13 @@ class ToolCallLoop:
             if self._check_no_progress(state):
                 state["current_step"] = "no_progress"
                 break
+
+            # 增量持久化：每轮迭代后回调，保存对话历史到数据库
+            if self.on_iteration:
+                try:
+                    self.on_iteration(state)
+                except Exception as e:
+                    logger.warning(f"on_iteration 回调失败（不阻断）：{e}")
 
             # 每 3 轮保存检查点，支持崩溃/重启后断点恢复
             if self.checkpoint and (iteration + 1) % 3 == 0:
@@ -225,6 +258,7 @@ class ToolCallLoop:
         repair_count = state.get("metadata", {}).get("repair_count", 0)
         if state["current_step"] == "task_complete" and repair_count < self.MAX_REPAIR_ROUNDS:
             failures = self._trigger_hooks(state) if self.hooks else []
+            # 修复循环中也运行 preview 验证（之前跳过，现在修复）
             preview_errors = self._run_preview_validation(state)
             all_problems = failures + preview_errors
             if all_problems:
@@ -338,9 +372,12 @@ class ToolCallLoop:
             failures = self.hooks.trigger(HookPoint.POST_TOOL_USE, ctx)
             if failures:
                 state.setdefault("hook_failures", {})
+                state.setdefault("_recent_hook_failures", [])
                 for f in failures:
                     hook_name = f.split(":")[0] if ":" in f else "unknown"
                     state["hook_failures"][hook_name] = state["hook_failures"].get(hook_name, 0) + 1
+                    # 存入 _recent_hook_failures，下一轮 _build_messages 时注入 LLM 上下文
+                    state["_recent_hook_failures"].append(f)
                     if self.sse:
                         self.sse.hook_check(state["requirement_id"], hook_name, False, f)
 
@@ -408,11 +445,11 @@ class ToolCallLoop:
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
 
-        # 对话历史：先过滤掉 thinking 消息（不发给 LLM，但会占用 [-20:] 槽位），
-        # 再截断最近 20 条有效消息
+        # 对话历史：先过滤掉 thinking 消息（不发给 LLM，但会占用槽位），
+        # 再截断最近 30 条有效消息（保留足够上下文避免重复 read_file）
         all_history = state.get("dialogue_history", [])
         relevant = [m for m in all_history if m.get("role") != "thinking"]
-        for msg in relevant[-20:]:
+        for msg in relevant[-30:]:
             role = msg.get("role", "user")
             content = str(msg.get("content", ""))
             if role == "tool_call":
@@ -426,6 +463,22 @@ class ToolCallLoop:
                 })
             elif role in ("user", "agent", "assistant"):
                 messages.append({"role": "user" if role == "user" else "assistant", "content": content})
+
+        # ---- 注入最近的 Hook 失败（让 LLM 看到验证错误并修复） ----
+        recent_failures = state.get("_recent_hook_failures", [])
+        if recent_failures:
+            failure_text = (
+                "## 最近验证失败（请立即修复这些问题）\n"
+                + "\n".join(f"- {f}" for f in recent_failures[-5:])
+            )
+            messages.append({"role": "user", "content": failure_text})
+            # 消费后保留一份在持久化字段中，但清空 _recent 避免重复注入
+            state["_recent_hook_failures"] = []
+
+        # ---- 分层上下文压缩（替换简单截断） ----
+        from harness.instructions.compactor import ContextCompactor
+        compactor = ContextCompactor(budget=56000)
+        messages = compactor.maybe_compact(messages)
 
         return messages
 
@@ -481,6 +534,7 @@ class ToolCallLoop:
 - 每次响应只创建一个文件
 - 全部文件创建完成后立即停止，告诉我"任务完成"
 - 不需要调用 list_files 或 read_file 查看已有文件（概要已在上方）
+- **write_file 的返回结果已包含你刚写入的文件完整内容，不要再用 read_file 重新读取**
 
 ## 代码规范
 - 使用 <script src="https://cdn.tailwindcss.com"></script> 引入 Tailwind CSS
@@ -515,6 +569,7 @@ class ToolCallLoop:
 - 只创建"尚未创建"的文件，不要重复创建已有文件
 - 全部文件创建完成后立即停止，告诉我"任务完成"
 - **已有文件的概要已在上方列出，不要调用 list_files 或 read_file 查看已有文件**
+- **write_file 的返回结果已包含你刚写入的文件完整内容，不要再用 read_file 重新读取刚写入的文件**
 
 ## 验证
 - 全部文件创建完成后，系统会自动在无头浏览器中运行 index.html 验证 JS 是否报错；
@@ -562,6 +617,8 @@ class ToolCallLoop:
 - 按推荐文件结构创建，不使用构建工具
 - 全部文件创建完成后用 validate_html / lint_css / lint_js 验证
 - 验证完成后立即停止，告诉我"任务完成"
+- **write_file 的返回结果已包含你刚写入的文件完整内容，不要再用 read_file 重新读取刚写入的文件**
+- **read_file 截断不等于文件损坏——文件本身是完整的，不需要删除重写**
 
 ## 验证与修复
 - 全部文件创建完成后系统会自动运行无头浏览器验证
@@ -589,9 +646,13 @@ class ToolCallLoop:
                 lines.append(f"- {fname}: (无法读取)")
                 continue
 
-            # 提取文件关键信息：前几行 + HTML/CSS/JS 结构特征
-            content_lines = [l.strip() for l in content.split('\n') if l.strip()]
-            preview_lines = content_lines[:8]  # 前 8 行
+            # 提取文件关键信息：前 30 行 + 尾部 10 行 + HTML/CSS/JS 结构特征
+            all_lines = [l for l in content.split('\n')]
+            content_lines = [l.strip() for l in all_lines if l.strip()]
+            # 前 30 行（覆盖头部 + 主要结构）
+            head_lines = content_lines[:30]
+            # 尾部 10 行（覆盖底部 JS 逻辑、闭合标签）
+            tail_lines = content_lines[-10:] if len(content_lines) > 30 else []
 
             # 提取结构性信息
             structural = []
@@ -653,9 +714,12 @@ class ToolCallLoop:
                 if dom_refs:
                     structural.append(f"DOM 引用: {', '.join(sorted(dom_refs)[:15])}")
 
-            # 组装摘要
-            preview = ' | '.join(preview_lines)[:300]
-            parts = [f"- {fname} ({len(content_lines)} 行): {preview}"]
+            # 组装摘要：前 30 行 + 尾部 10 行 + 结构特征
+            head_preview = ' | '.join(head_lines)[:400]
+            parts = [f"- {fname} ({len(content_lines)} 行): {head_preview}"]
+            if tail_lines:
+                tail_preview = ' | '.join(tail_lines)[:200]
+                parts.append(f"  ... 尾部: {tail_preview}")
             if structural:
                 parts.append("  " + " | ".join(structural))
             lines.append('\n'.join(parts))
@@ -665,19 +729,43 @@ class ToolCallLoop:
     def _check_missing_files(self, state: AgentState) -> list[str]:
         """检查目标文件是否全部生成。返回缺失文件名列表。
 
-        XS 复杂度不检查强制文件列表（允许单文件项目）。
+        优先从架构设计的 file_structure 读取目标文件列表，
+        避免硬编码与架构设计冲突（如 css/style.css vs style.css）。
         """
         complexity = state.get("metadata", {}).get("complexity", "S")
+        existing = set(self.workspace.list())
+
         if complexity == "XS":
-            # XS: 只要工作区有文件就认为满足
-            if self.workspace.list():
+            if existing:
                 return []
             return ["至少一个文件"]
 
-        # S/M/L: 检查是否有入口文件
-        existing = set(self.workspace.list())
-        target = {"index.html", "style.css", "script.js"}
-        return sorted(target - existing)
+        # 从 plan（TeamLeader/Architect 产出）中提取目标文件结构
+        plan = state.get("plan")
+        plan_files = []
+        if isinstance(plan, dict):
+            file_structure = plan.get("file_structure", [])
+            if file_structure and isinstance(file_structure, list):
+                plan_files = [f for f in file_structure if isinstance(f, str)]
+
+        if plan_files:
+            # 使用架构设计中的文件列表，支持子目录路径
+            return sorted(f for f in plan_files if f not in existing)
+
+        # Fallback: S 复杂度只需确认有入口文件即可
+        if complexity == "S":
+            # 检查是否有 index.html（可能在根目录或子目录）
+            has_html = any(f.endswith("index.html") or f.endswith(".html") for f in existing)
+            if has_html:
+                return []
+            return ["index.html"]
+
+        # M/L: 回退为只检查入口文件存在
+        has_html = any(f.endswith("index.html") for f in existing)
+        missing = []
+        if not has_html:
+            missing.append("index.html")
+        return missing
 
     def _check_no_progress(self, state: AgentState) -> bool:
         """检查连续无进展（前 3 轮豁免，给 LLM 足够的探索空间）"""

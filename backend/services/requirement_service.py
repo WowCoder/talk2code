@@ -12,6 +12,7 @@ from harness.observability.logger import get_logger
 from utils.sse import SSEMessage, get_current_timestamp
 from services.sse_manager import sse_manager
 from harness.graph import get_workflow
+from harness.harness_context import set_all as set_harness_components
 from harness.state.agent_state import AgentState
 from harness.state.workspace import WorkspaceFS
 from harness.state.versioning import GitVersioning
@@ -27,6 +28,8 @@ from harness.observability.sse_reporter import SSEReporter
 from harness.runtime import ToolCallLoop
 from harness.instructions.intent_router import IntentRouter, IntentType
 from harness.instructions.orchestrator import RoleOrchestrator
+from harness.instructions.role_executor import RoleExecutor
+from harness.roles.definitions import create_role_registry as _create_role_registry
 from harness.experience import ExperiencePool
 from harness.learning import FeedbackLoop
 
@@ -43,7 +46,14 @@ class RequirementService:
     def __init__(self):
         self.workflow = get_workflow()
         self._progress_map = {
-            'team_leader': 40,
+            'team_leader': 20,
+            'pm': 35,
+            'architect': 50,
+            'simple_coder': 80,
+            'file_by_file_coder': 80,
+            'qa_reviewer': 90,
+            'summarize': 95,
+            'repair': 85,
             'engineer': 80,
         }
 
@@ -99,6 +109,18 @@ class RequirementService:
             _original_builder = None  # 延迟绑定
 
             # ToolCallLoop
+            # 增量持久化回调：每轮迭代后将对话历史保存到数据库
+            def _persist_dialogue(state):
+                try:
+                    dialogue = state.get('dialogue_history', [])
+                    if dialogue:
+                        requirement.dialogue_history = dialogue
+                        from sqlalchemy.orm.attributes import flag_modified
+                        flag_modified(requirement, 'dialogue_history')
+                        db.commit()
+                except Exception as e:
+                    logger.warning(f"增量持久化对话失败（不阻断）：{e}")
+
             tool_loop = ToolCallLoop(
                 workspace=workspace,
                 git=git,
@@ -109,6 +131,7 @@ class RequirementService:
                 sse_reporter=sse,
                 permission_manager=permissions,
                 checkpoint=checkpoint,
+                on_iteration=_persist_dialogue,
             )
 
             # 经验注入：包装 _build_system_prompt，在原始 prompt 后追加 few-shot 示例
@@ -140,6 +163,16 @@ class RequirementService:
                 'hook_failures': {},
                 'visual_style': '',
                 'intent': 'task',  # 进入此流程的均为 TASK
+                # 三期新增字段
+                'tasks': [],
+                'interfaces': {},
+                'implementation_order': [],
+                'code_errors': [],
+                'qa_passed': True,
+                'summarize_passed': True,
+                'repair_count': 0,
+                'role_history': [],
+                'role_outputs': {},
             }
 
             # 检查断点恢复
@@ -154,7 +187,30 @@ class RequirementService:
 
             sse.progress(requirement_id, 0, '开始处理需求')
 
-            # 执行 LangGraph 工作流 (team_leader → END)
+            # 将 harness 组件注入 state metadata + 模块级缓存（双路径）
+            # metadata 可能被 LangGraph 节点整体替换，模块级缓存作为兜底
+            role_executor = RoleExecutor(
+                workspace=workspace,
+                sse_reporter=sse,
+                tools=tools,
+            )
+            role_registry = _create_role_registry()
+
+            initial_state["metadata"]["_tool_loop"] = tool_loop
+            initial_state["metadata"]["_role_executor"] = role_executor
+            initial_state["metadata"]["_role_registry"] = role_registry
+            initial_state["metadata"]["_workspace"] = workspace
+
+            # 设置模块级缓存（防止 metadata 被节点覆盖后丢失）
+            set_harness_components(
+                tool_loop=tool_loop,
+                role_executor=role_executor,
+                role_registry=role_registry,
+                workspace=workspace,
+            )
+
+            # 执行 LangGraph 工作流（三期：多节点编排图）
+            # 图内已包含所有路由逻辑：team_leader → [conditional] → coder → qa → summarize → END
             final_state = self._execute_workflow_with_stream(requirement_id, initial_state)
 
             if final_state is None:
@@ -170,28 +226,6 @@ class RequirementService:
                 requirement.status = 'pending'
                 db.commit()
                 return True
-
-            # TeamLeader 完成后，根据复杂度选择执行路径
-            if final_state.get('current_step') in ('team_leader_done', 'team_leader_failed'):
-                complexity = final_state.get('metadata', {}).get('complexity', 'S')
-
-                if complexity in ('M', 'L'):
-                    # M/L: 多角色协作流程 (PM → Architect → Engineer → QA)
-                    logger.info(f"需求 {requirement_id} 复杂度={complexity}，启动多角色协作")
-                    orchestrator = RoleOrchestrator(
-                        workspace=workspace,
-                        sse_reporter=sse,
-                        tools=tools,
-                        tool_loop_factory=None,
-                    )
-                    # 注入 tool_loop 供 FrontendEngineer 使用
-                    final_state["metadata"]["_tool_loop"] = tool_loop
-                    final_state = orchestrator.execute(final_state)
-                else:
-                    # XS/S: 单角色流程（当前行为），设置角色名为 FrontendEngineer
-                    final_state.setdefault("metadata", {})["coder_name"] = "FrontendEngineer"
-                    final_state["metadata"]["thinking_name"] = "FrontendEngineer"
-                    final_state = tool_loop.run(final_state)
 
             # 处理最终状态
             return self._process_final_state(db, requirement, requirement_id, final_state,
@@ -210,7 +244,7 @@ class RequirementService:
             db.close()
 
     def _execute_workflow_with_stream(self, requirement_id: int, initial_state: AgentState) -> Optional[AgentState]:
-        """流式执行 LangGraph 工作流"""
+        """流式执行 LangGraph 工作流（三期：多节点编排）"""
         final_state = None
         last_dialogue_count = len(initial_state.get('dialogue_history', []) or [])
         last_code_count = 0
@@ -232,14 +266,28 @@ class RequirementService:
                 break
 
             current_step = final_state.get('current_step', '')
-            node_name = 'team_leader' if 'team_leader' in current_step else 'engineer' if 'generating' in current_step else ''
+            # 多节点进度映射
+            node_name = self._detect_node_name(current_step)
             if node_name:
                 progress = self._progress_map.get(node_name, 0)
-                self._send_progress(requirement_id, {'team_leader': 'TeamLeader', 'engineer': 'FrontendEngineer'}.get(node_name, node_name), progress)
+                display_name = {
+                    'team_leader': 'TeamLeader',
+                    'pm': 'ProductManager',
+                    'architect': 'Architect',
+                    'simple_coder': 'FrontendEngineer',
+                    'file_by_file_coder': 'FrontendEngineer',
+                    'qa_reviewer': 'QAReviewer',
+                    'summarize': 'Summarize',
+                    'repair': 'FrontendEngineer',
+                    'engineer': 'FrontendEngineer',
+                }.get(node_name, node_name)
+                self._send_progress(requirement_id, display_name, progress)
 
             dialogues = final_state.get('dialogue_history', []) or []
             for dialogue in dialogues[last_dialogue_count:]:
-                self._send_dialogue(requirement_id, dialogue.get('name', 'AI'), dialogue.get('content', ''))
+                self._send_dialogue(requirement_id, dialogue.get('name', 'AI'),
+                                    dialogue.get('content', ''),
+                                    dialogue.get('role', 'agent'))
             last_dialogue_count = len(dialogues)
 
             code_files = final_state.get('code_files', []) or []
@@ -247,18 +295,73 @@ class RequirementService:
                 self._send_code(requirement_id, file_data.get('filename', 'unknown.txt'), file_data.get('content', ''))
             last_code_count = len(code_files)
 
-            if final_state.get('error'):
-                logger.error(f"工作流执行错误：{final_state['error']}")
+            # 错误不会立即中断（让图走到 END），除非是严重错误
+            if final_state.get('error') and 'ToolCallLoop 未注入' in str(final_state.get('error', '')):
+                logger.error(f"工作流执行严重错误：{final_state['error']}")
                 break
 
         return final_state
 
+    @staticmethod
+    def _detect_node_name(current_step: str) -> str:
+        """根据 current_step 检测当前节点名称"""
+        step_to_node = {
+            'team_leader_done': 'team_leader',
+            'team_leader_failed': 'team_leader',
+            'pm_done': 'pm',
+            'architect_done': 'architect',
+            'generating': 'engineer',
+            'coding_done': 'file_by_file_coder',
+            'coding_error': 'file_by_file_coder',
+            'qa_done': 'qa_reviewer',
+            'qa_skipped': 'qa_reviewer',
+            'summarize_done': 'summarize',
+            'repair_done': 'repair',
+            'repair_error': 'repair',
+            'task_complete': 'engineer',
+        }
+        return step_to_node.get(current_step, '')
+
     def _process_final_state(self, db, requirement, requirement_id, final_state, workspace, git, tracer, sse) -> bool:
-        """处理最终状态"""
+        """处理最终状态（三期：兼容多节点工作流）"""
         try:
+            current_step = final_state.get('current_step', '')
+
+            # 成功状态列表
+            success_steps = ('task_complete', 'summarize_done', 'coding_done', 'repair_done')
+
+            # 安全网：如果 current_step 明确表示任务完成，忽略可能残留的 error
+            if current_step in success_steps:
+                if final_state.get('error'):
+                    logger.info(f"需求 {requirement_id} current_step={current_step}，忽略残留 error: {final_state['error']}")
+                    final_state['error'] = None
+
             if final_state.get('error'):
                 requirement.status = 'failed'
                 db.commit()
+                return False
+
+            # 检查 current_step 是否为真正的成功状态
+            # "no_progress" / "max_iterations" / "coding_error" 表示 Agent 卡住或超限，不应标记为完成
+            if current_step in ('no_progress', 'max_iterations', 'coding_error', 'repair_error'):
+                logger.warning(
+                    f"需求 {requirement_id} 因 {current_step} 终止，标记为 failed"
+                )
+                requirement.status = 'failed'
+                # 保存已有的对话历史和代码产物（部分产物可能有用）
+                dialogue_history = final_state.get('dialogue_history', [])
+                if dialogue_history:
+                    requirement.dialogue_history = dialogue_history
+                    from sqlalchemy.orm.attributes import flag_modified
+                    flag_modified(requirement, 'dialogue_history')
+                code_files = workspace.snapshot()
+                if code_files:
+                    requirement.code_files = code_files
+                    logger.info(f"需求 {requirement_id} 失败但保存了 {len(code_files)} 个部分产物")
+                    for file_data in code_files:
+                        self._send_code(requirement_id, file_data['filename'], file_data['content'])
+                db.commit()
+                self._send_complete(requirement_id)
                 return False
 
             # 从 workspace 获取最终文件
@@ -345,8 +448,8 @@ class RequirementService:
         message = SSEMessage.progress_message(agent_name, progress, 'processing')
         sse_manager.broadcast(str(requirement_id), message)
 
-    def _send_dialogue(self, requirement_id: int, name: str, content: str):
-        message = SSEMessage.dialogue_message('agent', name, content, get_current_timestamp())
+    def _send_dialogue(self, requirement_id: int, name: str, content: str, role: str = 'agent'):
+        message = SSEMessage.dialogue_message(role, name, content, get_current_timestamp())
         sse_manager.broadcast(str(requirement_id), message)
 
     def _send_code(self, requirement_id: int, filename: str, content: str):

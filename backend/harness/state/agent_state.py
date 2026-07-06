@@ -64,3 +64,26 @@ class AgentState(TypedDict, total=False):
 
     # 各角色产出 {role_name: output_text}
     role_outputs: Optional[dict]
+
+    # === 任务分解字段（三期：逐文件编码） ===
+    # 文件级任务列表（按依赖顺序）
+    # [{file, description, exports, imports, dependencies}]
+    tasks: Optional[List[dict]]
+
+    # 文件间接口契约 {file_path: {exports: {name: signature}}}
+    interfaces: Optional[dict]
+
+    # 拓扑排序后的实施顺序
+    implementation_order: Optional[List[str]]
+
+    # 编码阶段收集的错误（用于后续文件的上下文注入）
+    code_errors: Optional[List[str]]
+
+    # QA 审查通过标记
+    qa_passed: Optional[bool]
+
+    # SummarizeCode 通过标记
+    summarize_passed: Optional[bool]
+
+    # 修复轮次计数
+    repair_count: Optional[int]

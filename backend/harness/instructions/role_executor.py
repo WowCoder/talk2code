@@ -207,7 +207,9 @@ class RoleExecutor:
                 role_name=role.name,
                 success=final_state.get("current_step") == "task_complete",
                 content="代码生成完成",
-                error=final_state.get("error", ""),
+                error=final_state.get("error", "")
+                      or ("" if final_state.get("current_step") == "task_complete"
+                          else f"Agent 因 {final_state.get('current_step', 'unknown')} 终止"),
             )
 
         except Exception as e:
@@ -219,11 +221,24 @@ class RoleExecutor:
         """
         执行审查角色（QAReviewer）。
 
-        使用工具调用模式：先 read_file 查看代码，然后给出审查报告。
+        支持两种模式：
+        - 逐文件审查（有 implementation_order 时）
+        - 整体审查（旧行为兼容）
+
+        每个文件限制行数，避免 prompt 过长。
         """
         requirement = state.get("requirement_content", "")
         files = self.workspace.list() if self.workspace else []
+        implementation_order = state.get("implementation_order") or []
 
+        # 逐文件审查模式（优先）
+        if implementation_order and len(implementation_order) > 1:
+            return self._execute_qa_per_file(
+                role, state, task_package, extra_context,
+                requirement, implementation_order
+            )
+
+        # 整体审查模式（回退）
         # 读取所有代码文件内容用于审查
         code_sections = []
         if self.workspace:
@@ -253,6 +268,51 @@ class RoleExecutor:
 
 请审查以上代码，按照你的输出格式给出评分和建议。"""
 
+        return self._call_qa_llm(role, state, prompt)
+
+    def _execute_qa_per_file(self, role, state, task_package, extra_context,
+                              requirement, implementation_order):
+        """逐文件 QA 审查：对每个文件生成简要评估，汇总为整体评分"""
+        files = self.workspace.list() if self.workspace else []
+
+        # 对每个文件收集摘要
+        file_summaries = []
+        for fname in implementation_order:
+            if fname not in files:
+                file_summaries.append(f"### {fname}\n(文件未创建)")
+                continue
+            try:
+                content = self.workspace.read(fname)
+                line_count = content.count('\n') + 1
+                # 限制每个文件最多 200 行
+                lines = content.split('\n')
+                if len(lines) > 200:
+                    content = '\n'.join(lines[:200]) + f"\n... (共 {len(lines)} 行)"
+                file_summaries.append(
+                    f"### {fname} ({line_count} 行)\n```\n{content}\n```"
+                )
+            except Exception:
+                file_summaries.append(f"### {fname}\n(无法读取)")
+
+        files_text = "\n\n".join(file_summaries)
+
+        prompt = f"""## 审查任务
+{task_package}
+
+## 用户原始需求
+{requirement}
+
+## 代码文件（按依赖顺序）
+{files_text}
+
+{extra_context if extra_context else ''}
+
+请审查以上代码，按照你的输出格式给出评分和建议。"""
+
+        return self._call_qa_llm(role, state, prompt)
+
+    def _call_qa_llm(self, role, state, prompt):
+        """调用 LLM 执行 QA 审查并解析结果"""
         client = get_client()
         response = client.chat(
             prompt=prompt,

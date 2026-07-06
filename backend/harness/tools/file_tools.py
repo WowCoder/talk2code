@@ -80,8 +80,13 @@ class FileToolHandler:
         try:
             lines = content.count('\n') + 1
             self.workspace.write(filename, content)
+            # 返回完整文件内容（上限 8000 字符），让 Agent 知道刚写入的文件内容，
+            # 避免写完后再 read_file 读回来验证
+            content_preview = content[:8000]
+            if len(content) > 8000:
+                content_preview += f"\n\n... (文件共 {len(content)} 字符，以上为前 8000 字符)"
             return ToolResult(
-                content=f"已写入 {filename} ({lines} 行)",
+                content=f"已写入 {filename} ({lines} 行，{len(content)} 字符)\n\n--- 文件内容 ---\n{content_preview}",
                 metadata={"filename": filename, "lines": lines}
             )
         except Exception as e:

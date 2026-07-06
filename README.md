@@ -1,6 +1,6 @@
 # Talk2Code
 
-一个 AI 驱动的代码生成平台，用户输入自然语言需求 → AI 多智能体协同处理 → 实时生成可运行的产品代码。
+一个 AI 驱动的一站式网站生成平台，用户输入自然语言需求 → AI 多智能体协同处理 → 实时生成可运行的产品代码。
 
 ## 技术栈
 
@@ -26,18 +26,22 @@ talk2code/
 │   │   └── client.py                   # 统一 LLM 客户端（OpenAI/Anthropic 双协议）
 │   ├── harness/                        # Agent 运行时框架（6 层架构）
 │   │   ├── runtime.py                  # ReAct 工具调用循环 — Agent 执行引擎
-│   │   ├── graph.py                    # LangGraph 工作流定义
+│   │   ├── graph.py                    # LangGraph 多节点编排工作流（v3）
 │   │   ├── instructions/               # 提示词模板、节点函数、意图路由、角色执行、上下文组装/压缩
 │   │   │   ├── intent_router.py         #   前置意图分类 (QUICK/SEARCH/TASK/AMBIGUOUS)
 │   │   │   ├── prompts.py               #   TeamLeader/FrontendEngineer 提示词模板
-│   │   │   ├── nodes.py                 #   TeamLeader/FrontendEngineer 节点函数（含复杂度评估）
-│   │   │   ├── orchestrator.py          #   多角色编排引擎
-│   │   │   ├── role_executor.py         #   单一角色执行器
+│   │   │   ├── nodes.py                 #   LangGraph 节点函数（TeamLeader/PM/Architect/QA/Repair）
+│   │   │   ├── file_coder.py            #   逐文件编码循环 + LGTM/LBTM 审查（期三新增）
+│   │   │   ├── simple_coder.py          #   XS/S 简单编码节点（期三新增）
+│   │   │   ├── summarize.py             #   整体代码审查节点 / SummarizeCode（期三新增）
+│   │   │   ├── orchestrator.py          #   多角色编排引擎（保留兼容）
+│   │   │   ├── role_executor.py         #   单一角色执行器（含逐文件 QA）
+│   │   │   ├── compactor.py             #   P0-P3 分层上下文压缩
 │   │   │   ├── assembler.py             #   上下文组装（Skill + Craft 规则 + 记忆）
 │   │   ├── tools/                      # 工具注册表、文件操作、代码生成/验证
 │   │   ├── roles/                      # 多角色定义
 │   │   │   ├── __init__.py              #   Role/RoleResult/RoleRegistry
-│   │   │   └── definitions.py           #   5 角色 Prompt + 工具子集 + 路由表
+│   │   │   └── definitions.py           #   6 角色 Prompt + 工具子集 + 路由表
 │   │   ├── communication/               # 消息总线
 │   │   │   └── __init__.py              #   AgentBus 四分支路由
 │   │   ├── experience/                  # 经验池
@@ -132,10 +136,10 @@ cd backend && python app.py
    - 代码示例：`写一个冒泡排序函数`
 3. **意图分流**（自动）- AI 判断用户意图：
    - 常识问答/代码解释 → 秒级直接回复
-   - 开发任务 → 进入 TeamLeader → FrontendEngineer 生成流水线
+   - 开发任务 → 进入 LangGraph 多节点编排流水线（TeamLeader → 逐文件编码 → LGTM/LBTM 审查 → SummarizeCode）
    - 模糊需求 → 自动生成澄清问题表单
 4. **查看生成** - 进入详情页：
-   - **左侧**: AI 对话面板 — 观看 TeamLeader → FrontendEngineer 协同讨论，底部输入框可继续对话
+   - **左侧**: AI 对话面板 — 观看 TeamLeader → PM → Architect → FrontendEngineer(逐文件编码) → QA → Summarize 全流程协同讨论
    - **右侧**: 代码/预览面板 — 文件树 + 代码编辑器 + 设备预览（桌面/平板/手机）
 5. **持续对话** - 生成完成后，可在对话面板底部继续与 AI 交互，做增量修改或提问
 6. **历史管理** - 在「历史对话」页面查看所有项目，支持搜索、状态筛选、回收站
@@ -149,7 +153,7 @@ cd backend && python app.py
 
 ### AI 智能体协同
 
-基于 **LangGraph** 实现的工作流编排，前置意图分类器做四路分流：
+基于 **LangGraph** 实现的多节点工作流编排，前置意图分类器做四路分流：
 
 ```
 用户输入
@@ -160,31 +164,51 @@ cd backend && python app.py
        ├─ AMBIGUOUS → 澄清表单，引导用户补充信息
        └─ TASK      → 进入生成流水线
                          │
-                         ├─ TeamLeader (需求分析 + 复杂度评估)
-                         │    └─ 输出: features, complexity[XS|S|M|L], tech_stack, ...
+                    TeamLeader (需求分析 + 任务分解)
+                      输出: features, complexity[XS|S|M|L], tasks[], interfaces, implementation_order
                          │
-                         ├─ XS/S: 直接 FrontendEngineer (单角色，等同 v2.2)
-                         │
-                         └─ M/L: 多角色协作
-                              │  AgentBus 消息总线 (四分支路由)
-                              ├─ ProductManager (Alice) — PRD 生成
-                              ├─ Architect (Bob) — 架构设计
-                              ├─ FrontendEngineer (Alex) — 代码生成
-                              └─ QAReviewer (David) — 审查 + 修复循环
-                                    │
-                                    ▼ ExperiencePool
-                                      成功案例→few-shot注入 | 失败案例→警告注入
+                    [复杂度路由]
+                    ───┴───
+                   │       │
+              XS/S        M/L
+               │           │
+          simple_coder    pm (ProductManager — PRD)
+          (单文件          │
+           ToolCallLoop)  architect (Architect — 架构设计)
+               │           │
+               │      file_by_file_coder (逐文件编码循环)
+               │           │  对每个文件:
+               │           │    ├─ 构建 CodingContext (设计+任务+已完成文件+接口契约)
+               │           │    ├─ ToolCallLoop 生成代码 (≤5 轮/文件)
+               │           │    └─ CodeReview (LGTM/LBTM, 6 维度审查)
+               │           │       LBTM → 重写 (最多 3 次)
+               │           │
+               │      qa_reviewer (QA — 逐文件代码审查)
+               │           │
+               │       ┌──[pass]──→ summarize (整体审查/SummarizeCode)
+               │       │               │
+               │       │           ┌──[pass]──→ END ✅
+               │       │           │
+               │       └──[fail]──→ repair ──→ qa_reviewer (修复循环, ≤3 轮)
+               │
+               └──→ END ✅
+
+    全程: Hook 失败反馈 → LLM 上下文中注入验证错误
+          ContextCompactor P0-P3 分层压缩 → 防上下文溢出
+          ExperiencePool → few-shot 注入 + 失败警告
 ```
 
 | 组件 | 职责 |
 |------|------|
 | **IntentRouter** | 前置意图分类（QUICK/SEARCH/TASK/AMBIGUOUS），轻量 LLM 调用（~200 tokens），非开发请求直接返回 |
-| **TeamLeader** | 需求分析+复杂度评估+调度中枢：XS/S 直接派给 Engineer，M/L 按 SOP 路由 PM→Arch→Engineer→QA，收集产出、整合汇报 |
+| **TeamLeader** | 需求分析 + 复杂度评估 + **任务分解**（文件级 tasks[] + 接口契约 interfaces + 依赖排序 implementation_order） |
 | **ProductManager** | 需求分析、PRD 生成（功能清单、数据模型、交互流程），M/L 流程第一步 |
 | **Architect** | 技术选型、组件树设计、数据流设计、文件结构规划，M/L 流程第二步 |
-| **FrontendEngineer** | 代码生成（write_file/edit_file）、验证修复。XS/S 单角色全权负责，M/L 基于 PM+Arch 上下文编码 |
-| **QAReviewer** | M/L 复杂度下的代码审查：5 维度评分 + 问题识别 + 修复建议，触发 Engineer 修复循环 |
-| **AgentBus** | 消息总线：四分支路由解耦角色通信，统一 SSE 推送，消息历史可追溯 |
+| **FrontendEngineer** | **两种模式**：XS/S 简单模式（simple_coder），M/L 逐文件编码模式（file_by_file_coder）+ LGTM/LBTM 审查 |
+| **CodeReviewer** | **逐文件 LGTM/LBTM 审查**（6 维度：需求实现、逻辑正确、接口遵循、功能完整、依赖正确、代码质量） |
+| **QAReviewer** | 多文件整体代码审查：5 维度评分 + 问题识别 + 修复建议 |
+| **Summarize** | **整体代码审查**：跨文件调用流、功能遗漏、边界情况、代码一致性 |
+| **Repair** | **定向修复**：接收 QA/Summarize 问题反馈，调用 ToolCallLoop 修复特定文件 |
 | **ExperiencePool** | 经验池：TF-IDF 语义检索成功案例作为 few-shot，失败案例生成警告，越用越好 |
 
 **复杂度自适应行为**：
@@ -192,40 +216,46 @@ cd backend && python app.py
 | 维度 | XS（极简） | S（标准） | M（多功能） | L（复杂） |
 |------|-----------|----------|------------|----------|
 | 典型场景 | 个人主页、计数器 | 待办清单、番茄钟 | 任务看板、博客 | 电商、后台系统 |
-| 角色序列 | Engineer | PM → Engineer | PM → Arch → Engineer → QA | PM → Arch → Eng → QA → Eng → QA |
-| 文件结构 | 自由（≥1 个文件） | 3 文件强制 | Plan 建议 + 子目录 | Plan 建议 + 多模块 |
-| 最大迭代 | 5 轮 | 15 轮 | 15 轮 | 20 轮 |
-| 验证深度 | 跳过 | lint + preview | lint + execute + preview | 全量验证 + QA 审查 |
-| QA 修复循环 | 无 | 无 | 1 轮 | 2 轮 |
+| LangGraph 路径 | TL → simple_coder | TL → simple_coder | TL → PM → Arch → FileCoder → QA → Summarize | TL → PM → Arch → FileCoder → QA → Summarize |
+| 编码模式 | 单文件 ToolCallLoop | 单文件 ToolCallLoop | 逐文件 + LGTM/LBTM 审查 | 逐文件 + LGTM/LBTM 审查 |
+| 每文件迭代 | 5 轮 | 15 轮 | ≤5 轮 | ≤5 轮 |
+| 审查重试 | 无 | 无 | 3 次/文件 | 3 次/文件 |
+| QA 修复循环 | 无 | 无 | ≤3 轮 | ≤3 轮 |
+| 整体审查 | 无 | 无 | SummarizeCode | SummarizeCode |
 
 **设计原则**：
-- 简单需求快速产出（XS/S 单角色），复杂需求多角色协作保证质量（M/L）
-- 角色间通过 AgentBus 消息总线通信，四分支路由解耦
+- 简单需求快速产出（XS/S 单节点），复杂需求多节点协作保证质量（M/L）
+- 所有路由逻辑内置于 LangGraph conditional edges，不依赖外部硬编码分支
+- 逐文件编码 + CodeReview：每个文件生成后自动 LGTM/LBTM 审查，不通过则重写
+- Hook 失败结果实时注入 LLM 上下文，Agent 能"看到"自己的验证错误并主动修复
+- ContextCompactor P0-P3 分层压缩：长对话自动压缩旧消息，防止上下文溢出
 - 每次成功/失败自动存入 ExperiencePool（TF-IDF 语义检索），后续相似需求注入 few-shot 示例
-- 越用越好：经验池积累 → Prompt 自动增强 → 生成质量持续提升
 - 所有角色的行为规则写在其 System Prompt 中，改行为 = 改 Prompt，无需改代码
-- 同一 LLM 实例切换 System Prompt 实现角色分化，无需额外模型部署
 
 ### Harness 框架
 
 Agent 运行时，统一管理 AI 智能体全生命周期。
 
 ```
-IntentRouter → TeamLeader → RoleOrchestrator (AgentBus)
-                                └─ ExperiencePool ← FeedbackLoop
+IntentRouter → TeamLeader → LangGraph 多节点编排
+                ├─ XS/S: simple_coder
+                └─ M/L: pm → architect → file_by_file_coder → qa → summarize
+                           ↑ fail                                  ↓ fail
+                           └────────── repair ─────────────────────┘
+                └─ ExperiencePool ← FeedbackLoop (全程注入)
+                └─ ContextCompactor P0-P3 (全程压缩)
 ```
 
 | 层级 | 模块 | 职责 |
 |------|------|------|
 | 0 - Routing | `intent_router.py` | 前置意图分类，四路分流 |
-| — | `communication/` | AgentBus 消息总线，四分支路由 |
-| 1 - Instructions | 提示词/角色/编排 | TeamLeader/FrontendEngineer 节点、角色定义、编排引擎 |
-| 2 - Tools | 工具注册/代码生成 | 工具注册表、read/write/edit_file、验证 |
+| 1 - Instructions | 提示词/角色/节点 | 8 个 LangGraph 节点 + 6 角色定义 + 逐文件编码 + LGTM/LBTM 审查 + SummarizeCode + 上下文压缩 |
+| 2 - Tools | 工具注册/代码生成 | 工具注册表、read/write/edit_file、lint/validate/preview |
 | 3 - Environment | 权限/沙箱 | 权限控制、沙箱安全执行 |
-| 4 - State | 状态/工作区/记忆 | AgentState、WorkspaceFS、Git 版本化、role_history/outputs |
-| 5 - Constraints | Hook/检查 | Hook 管理器 + Craft 规则/安全/质量 + QA 集成 |
-| 6 - Observability | 追踪/成本/上报 | 链路追踪、Token 成本统计、SSE |
-| — | `experience/` | TF-IDF 语义检索 + 经验存储 |
+| 4 - State | 状态/工作区/记忆 | AgentState（含 tasks/interfaces/implementation_order）、WorkspaceFS、Git 版本化、Checkpoint |
+| 5 - Constraints | Hook/检查 | Hook 管理器 + Craft 规则/安全/质量 + Hook 失败反馈链路 |
+| 6 - Observability | 追踪/成本/上报 | 链路追踪、Token 成本统计、SSE 事件上报 |
+| — | `experience/` | TF-IDF 语义检索 + 经验存储 + few-shot 注入 |
 | — | `learning/` | Evaluator 评分分析 + FeedbackLoop 回灌 |
 
 ### 设计质量规则（Craft 层）
@@ -292,20 +322,34 @@ IntentRouter → TeamLeader → RoleOrchestrator (AgentBus)
 ```
 用户输入 → IntentRouter (四分流)
   ├─ QUICK/SEARCH → 秒级回复
-  └─ TASK → TeamLeader (分析 + 复杂度 + 调度)
-              ├─ XS/S → FrontendEngineer 单角色编码
-              └─ M/L → AgentBus 消息总线
-                        ├─ ProductManager (PRD)
-                        ├─ Architect (架构设计)
-                        ├─ FrontendEngineer (编码)
-                        └─ QAReviewer (审查 + 修复闭环)
-                              │
-                              ▼
-                        ExperiencePool ← FeedbackLoop
-                        成功案例→few-shot   失败→警告
+  └─ TASK → LangGraph 多节点编排 (v3)
+              │
+              TeamLeader (需求分析 + 任务分解)
+              输出: tasks[], interfaces, implementation_order
+              │
+         [复杂度路由]
+         ────┴────
+        │         │
+    XS/S         M/L
+        │         │
+   simple_coder  pm → architect → file_by_file_coder
+    (单文件        │                  │
+     ToolCallLoop) │          逐文件编码循环:
+        │         │          每个文件 → CodeReview (LGTM/LBTM)
+        │         │                        │
+        │         │                   LBTM → 重写 ≤3次
+        │         │
+        │         qa_reviewer → summarize → END ✅
+        │              ↑ fail      ↓ fail
+        │              └── repair ──┘
+        │
+        END ✅
+
+  全域: Hook 失败反馈 → LLM 自动修复
+       ContextCompactor P0-P3 → 防溢出
+       ExperiencePool → few-shot + 警告注入
 ```
 
-项目仍在积极迭代中，欢迎 Issue / PR 一同共创。
 
 ## 注意事项
 
@@ -313,5 +357,5 @@ IntentRouter → TeamLeader → RoleOrchestrator (AgentBus)
 2. 需要在 `.env` 中配置 `LLM_API_KEY` 才能使用 AI 功能
 3. 生产环境请配置 `JWT_SECRET_KEY`、`LLM_API_KEY` 等敏感信息
 4. 建议使用现代浏览器（Chrome/Edge/Safari）
-5. LangGraph 工作流支持错误降级和 fallback 机制
+5. LangGraph v3 多节点编排工作流支持条件路由和修复循环
 6. 前端开发模式：`cd frontend-vue && npm run dev` 启动 Vite 热更新开发服务器

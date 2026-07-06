@@ -39,8 +39,8 @@ class SSEReporter:
             "summary": summary, "error": error
         })
 
-    def thinking(self, requirement_id: int, content: str):
-        self._send(requirement_id, "thinking", {"content": content})
+    def thinking(self, requirement_id: int, content: str, name: str = ""):
+        self._send(requirement_id, "thinking", {"content": content, "name": name})
 
     def hook_check(self, requirement_id: int, hook_name: str, passed: bool, message: str = ""):
         self._send(requirement_id, "hook_check", {

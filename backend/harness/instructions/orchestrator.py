@@ -202,6 +202,10 @@ class RoleOrchestrator:
             qa_data = qa_result.structured_output or {}
             if qa_data.get("passed", True) and qa_data.get("overall_rating", 0) >= 6:
                 logger.info(f"[Orchestrator] 修复循环 {loop_i + 1} 通过")
+                # 清除之前 Engineer 失败遗留的错误（修复成功后任务应视为完成）
+                if state.get("error"):
+                    logger.info(f"[Orchestrator] 清除遗留错误: {state['error']}")
+                    state["error"] = None
                 break
 
         return state

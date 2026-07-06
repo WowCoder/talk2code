@@ -75,6 +75,7 @@ export interface SSEToolResultData {
 
 export interface SSEThinkingData {
   content: string
+  name?: string
 }
 
 export interface SSEHookCheckData {

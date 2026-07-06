@@ -164,11 +164,17 @@ class EditToolHandler:
         match_tags = ["normalized"] if any(
             _match(s, content)[1] == "normalized" for s, _ in blocks
         ) else []
+        # 返回完整修改后的文件内容（上限 8000 字符），让 Agent 知道修改后的文件状态，
+        # 避免编辑后再 read_file 验证
+        modified_preview = new_content[:8000]
+        if len(new_content) > 8000:
+            modified_preview += f"\n\n... (文件共 {len(new_content)} 字符，以上为前 8000 字符)"
         return ToolResult(
             content=(
                 f"已更新 {filename}：应用 {len(blocks)} 处修改 "
                 f"({old_lines} → {new_lines} 行)"
                 + (f"（通过空白归一匹配）" if match_tags else "")
+                + f"\n\n--- 修改后的完整文件 ---\n{modified_preview}"
             ),
             metadata={
                 "filename": filename,
