@@ -27,7 +27,7 @@ export interface CodeFile {
 }
 
 export interface DialogueMessage {
-  role: 'user' | 'agent' | 'system' | 'tool_call' | 'tool_result' | 'thinking' | 'hook_check'
+  role: 'user' | 'agent' | 'assistant' | 'system' | 'tool_call' | 'tool_result' | 'thinking' | 'hook_check'
   name?: string
   content: string
   timestamp?: string
@@ -48,6 +48,12 @@ export interface DialogueMessage {
   // clarification
   question_form?: SSEQuestionFormData
   status?: string
+  // hidden: 内部系统提示，不展示在前端
+  hidden?: boolean
+  // grouped tool_calls (virtual message)
+  _grouped?: boolean
+  label?: string
+  items?: DialogueMessage[]
 }
 
 export interface Requirement {

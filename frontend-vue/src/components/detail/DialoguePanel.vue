@@ -55,9 +55,59 @@ const emit = defineEmits<{
 const bodyRef = ref<HTMLElement | null>(null)
 const store = useRequirementStore()
 
-const messages = computed(() => store.dialogueMessages.filter(
-  (m: DialogueMessageType) => m.content !== '__QUESTION_FORM__'
-))
+const messages = computed(() => {
+  const raw = store.dialogueMessages.filter(
+    (m: DialogueMessageType) =>
+      m.content !== '__QUESTION_FORM__' && !(m as any).hidden
+  )
+
+  // 合并连续的 tool_call 消息为一个可展开组，减少视觉噪音
+  const grouped: DialogueMessageType[] = []
+  let toolBatch: DialogueMessageType[] = []
+
+  for (const msg of raw) {
+    if (msg.role === 'tool_call') {
+      toolBatch.push(msg)
+    } else {
+      if (toolBatch.length > 0) {
+        if (toolBatch.length === 1) {
+          grouped.push(toolBatch[0])
+        } else {
+          // 计算批次标签
+          const names = [...new Set(toolBatch.map(t => t.readable || t.tool_name || t.name))]
+          grouped.push({
+            role: 'tool_call',
+            name: '工具调用',
+            content: '',
+            _grouped: true,
+            label: `📝 工具调用`,
+            items: toolBatch,
+          } as any)
+        }
+        toolBatch = []
+      }
+      grouped.push(msg)
+    }
+  }
+
+  // 尾部残余
+  if (toolBatch.length > 0) {
+    if (toolBatch.length === 1) {
+      grouped.push(toolBatch[0])
+    } else {
+      grouped.push({
+        role: 'tool_call',
+        name: '工具调用',
+        content: '',
+        _grouped: true,
+        label: `📝 工具调用`,
+        items: toolBatch,
+      } as any)
+    }
+  }
+
+  return grouped
+})
 const isLoading = computed(() => store.isGenerating)
 
 // Access SSE-triggered state from the store

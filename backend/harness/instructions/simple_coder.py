@@ -29,8 +29,8 @@ def simple_coder_node(state: AgentState) -> Dict[str, Any]:
         }
 
     # 设置角色名称
-    state.setdefault("metadata", {})["coder_name"] = "FrontendEngineer"
-    state["metadata"]["thinking_name"] = "FrontendEngineer"
+    state.setdefault("metadata", {})["coder_name"] = "Henry（开发）"
+    state["metadata"]["thinking_name"] = "Henry（开发）"
 
     # 注入 Hook 失败历史到对话历史（关键改进！）
     # 让 LLM 在开始编码前就知道历史上有哪些验证失败

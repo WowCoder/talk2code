@@ -61,8 +61,8 @@ class ToolCallLoop:
 
         # 可配置的角色名称（多角色协作用，默认兼容旧行为）
         meta = state.get("metadata", {})
-        coder_name = meta.get("coder_name", "FrontendEngineer")
-        thinking_name = meta.get("thinking_name", "FrontendEngineer")
+        coder_name = meta.get("coder_name", "Henry（开发）")
+        thinking_name = meta.get("thinking_name", "Henry（开发）")
 
         # 根据复杂度调整迭代上限（M/L 多角色流程需要更多轮次覆盖文件创建和 QA 修复）
         complexity = state.get("metadata", {}).get("complexity", "S")
@@ -108,9 +108,10 @@ class ToolCallLoop:
                 missing = [] if is_chat else self._check_missing_files(state)
                 if missing:
                     state["dialogue_history"].append({
-                        "role": "user", "name": "System",
+                        "role": "system", "name": "System",
                         "content": f"你还没有创建所有必需的文件，缺少：{', '.join(missing)}。"
-                                 f"请继续用 write_file 创建剩余文件，不要停止。"
+                                 f"请继续用 write_file 创建剩余文件，不要停止。",
+                        "hidden": True,
                     })
                     state["no_progress_count"] = 0
                     continue
@@ -269,8 +270,9 @@ class ToolCallLoop:
                     + "\n".join(f"- {p}" for p in all_problems)
                 )
                 state["dialogue_history"].append({
-                    "role": "user", "name": "System",
-                    "content": repair_prompt
+                    "role": "system", "name": "System",
+                    "content": repair_prompt,
+                    "hidden": True,
                 })
                 state["current_step"] = "repairing"
                 state["no_progress_count"] = 0
@@ -450,7 +452,7 @@ class ToolCallLoop:
         all_history = state.get("dialogue_history", [])
         relevant = [m for m in all_history if m.get("role") != "thinking"]
         for msg in relevant[-30:]:
-            role = msg.get("role", "user")
+            role = msg.get("role", "agent")
             content = str(msg.get("content", ""))
             if role == "tool_call":
                 tool_name = msg.get("name", "")

@@ -293,8 +293,8 @@ def _review_single_file(file_path: str, workspace, state: AgentState,
 def _legacy_coder(state: AgentState, tool_loop) -> dict:
     """回退到旧行为：直接 ToolCallLoop（兼容没有 tasks 的情况）"""
     logger.info("[FileCoder] 无 tasks 数据，回退到旧版编码模式")
-    state.setdefault("metadata", {})["coder_name"] = "FrontendEngineer"
-    state["metadata"]["thinking_name"] = "FrontendEngineer"
+    state.setdefault("metadata", {})["coder_name"] = "Henry（开发）"
+    state["metadata"]["thinking_name"] = "Henry（开发）"
     result = tool_loop.run(state)
     state["dialogue_history"] = result.get("dialogue_history", [])
     state["current_step"] = "coding_done"
@@ -322,8 +322,8 @@ def file_by_file_coder_node(state: AgentState) -> Dict[str, Any]:
     workspace = tool_loop.workspace
 
     # 设置角色名称
-    state.setdefault("metadata", {})["coder_name"] = "FrontendEngineer"
-    state["metadata"]["thinking_name"] = "FrontendEngineer"
+    state.setdefault("metadata", {})["coder_name"] = "Henry（开发）"
+    state["metadata"]["thinking_name"] = "Henry（开发）"
 
     # 如果没有 tasks，回退到旧行为（兼容）
     if not tasks or not implementation_order:
@@ -367,7 +367,7 @@ def file_by_file_coder_node(state: AgentState) -> Dict[str, Any]:
             if attempt > 0 and context.get("review_feedback"):
                 state.setdefault("dialogue_history", []).append({
                     "role": "user",
-                    "name": "CodeReviewer",
+                    "name": "Eve（代码审查）",
                     "content": (
                         f"文件 {file_path} 审查未通过（第 {attempt} 次），请修复以下问题：\n"
                         + "\n".join(f"- {i}" for i in context["review_feedback"])
@@ -421,7 +421,7 @@ def file_by_file_coder_node(state: AgentState) -> Dict[str, Any]:
         # 清除对话历史中的临时审查反馈，避免污染下一个文件的上下文
         state["dialogue_history"] = [
             m for m in (state.get("dialogue_history") or [])
-            if m.get("name") != "CodeReviewer"
+            if m.get("name") != "Eve（代码审查）"
         ]
 
     # 保存审查结果到 state

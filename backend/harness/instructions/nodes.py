@@ -100,52 +100,11 @@ def _generate_clarify_questions(client, requirement: str) -> list:
 
 
 def team_leader_node(state: AgentState) -> Dict[str, Any]:
-    """TeamLeader 节点：需求分析 → 澄清 / 结构化 Plan"""
-    requirement = state['requirement_content']
-    clarify_round = state.get('metadata', {}).get('clarify_round', 0)
+    """TeamLeader 节点：需求分析 → 结构化 Plan
 
-    # SOP: 全新需求（clarify_round == 0）触发澄清表单
-    # 但如果需求已包含 [用户补充说明] 或 IntentRouter 已判定为 TASK（需求足够明确），跳过
-    intent = state.get('intent', '')
-    if (clarify_round < 1 and '[用户补充说明]' not in requirement
-            and intent not in ('task',)):
-        try:
-            client = get_client()
-            questions = _generate_clarify_questions(client, requirement)
-            if not questions:
-                # LLM 没生成问题，用兜底问题
-                questions = [
-                    {"id": "q1", "type": "radio", "label": "你想做什么类型的应用？",
-                     "options": ["工具类应用", "展示类页面", "数据管理类", "小游戏"]},
-                    {"id": "visual_style", "type": "radio", "label": "你偏好哪种视觉风格？",
-                     "options": ["极简白", "暖柔风格", "暗黑科技", "活泼多彩", "无偏好"]},
-                ]
-            if questions:
-                # 判断需求是否详细，调整提示文案
-                is_detailed = not _is_vague_requirement(requirement)
-                hint_text = (
-                    '你的需求已经很详细了，确认以下信息后即可开始生成'
-                    if is_detailed else
-                    '需求不够明确，需要你补充一些信息'
-                )
-                # 将 question_form 嵌入 dialogue_history，确保通过 REST API 也能获取
-                return {
-                    'plan': {},
-                    'current_step': 'needs_clarification',
-                    'dialogue_history': [{
-                        'role': 'system', 'name': 'TeamLeader',
-                        'content': hint_text,
-                        'status': 'needs_clarification',
-                        'question_form': {'questions': questions},
-                    }],
-                    'metadata': {
-                        'team_leader_success': True,
-                        'question_form': {'questions': questions},
-                        'clarify_round': clarify_round
-                    }
-                }
-        except Exception as e:
-            logger.warning(f"[TeamLeader] 澄清问题生成失败：{e}")
+    澄清由上游 IntentRouter 统一处理（进入此节点前 intent 已固定为 'task'）。
+    """
+    requirement = state['requirement_content']
 
     try:
         client = get_client()
@@ -184,7 +143,7 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
             'plan': plan,
             'current_step': 'team_leader_done',
             'dialogue_history': [{
-                'role': 'agent', 'name': 'TeamLeader',
+                'role': 'agent', 'name': 'Leon（负责人）',
                 'content': '已完成需求分析和架构设计',
                 'status': 'completed'
             }],
@@ -206,7 +165,7 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
             'current_step': 'team_leader_failed',
             'error': f"TeamLeader 失败：{e}",
             'dialogue_history': [{
-                'role': 'agent', 'name': 'TeamLeader',
+                'role': 'agent', 'name': 'Leon（负责人）',
                 'content': f"分析失败: {requirement[:50]}...",
                 'status': 'failed'
             }],
@@ -240,7 +199,7 @@ def tool_coder_node(state: AgentState) -> Dict[str, Any]:
             'current_step': 'done',
             'error': f"代码生成失败：{e}",
             'dialogue_history': state.get('dialogue_history', []) + [{
-                'role': 'agent', 'name': 'FrontendEngineer',
+                'role': 'agent', 'name': 'Henry（开发）',
                 'content': f'生成过程出错: {e}',
                 'status': 'failed'
             }],
@@ -282,7 +241,7 @@ def pm_node(state: AgentState) -> Dict[str, Any]:
     result = role_executor.execute(role, state, task_package=task_package)
 
     dialogue_add = [{
-        "role": "agent", "name": "ProductManager",
+        "role": "agent", "name": "Catherine（产品经理）",
         "content": f"PRD 生成完成 ({len(result.content)} 字符)" if result.success else f"PRD 生成失败: {result.error}",
         "status": "completed" if result.success else "failed",
     }]
@@ -336,7 +295,7 @@ def architect_node(state: AgentState) -> Dict[str, Any]:
     )
 
     dialogue_add = [{
-        "role": "agent", "name": "Architect",
+        "role": "agent", "name": "Bob（架构师）",
         "content": f"架构设计完成 ({len(result.content)} 字符)" if result.success else f"架构设计失败: {result.error}",
         "status": "completed" if result.success else "failed",
     }]
@@ -510,8 +469,8 @@ def repair_node(state: AgentState) -> Dict[str, Any]:
     })
 
     # 设置角色
-    state.setdefault("metadata", {})["coder_name"] = "FrontendEngineer"
-    state["metadata"]["thinking_name"] = "FrontendEngineer"
+    state.setdefault("metadata", {})["coder_name"] = "Henry（开发）"
+    state["metadata"]["thinking_name"] = "Henry（开发）"
 
     # 限制修复迭代次数
     saved_max = tool_loop.MAX_ITERATIONS

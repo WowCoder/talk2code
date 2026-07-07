@@ -94,8 +94,6 @@ class RequirementService:
             tools = create_tool_registry()
             hooks = create_default_hook_manager()
             permissions = PermissionManager()
-            # 初始生成流程：用户已提交需求，写入权限自动授予
-            permissions.grant(requirement_id, 'write')
             # 注入 db_session：记忆/检查点/追踪跨重启持久化
             checkpoint = CheckpointManager(db_session=db)
             cost_tracker = CostTracker()
@@ -271,23 +269,32 @@ class RequirementService:
             if node_name:
                 progress = self._progress_map.get(node_name, 0)
                 display_name = {
-                    'team_leader': 'TeamLeader',
-                    'pm': 'ProductManager',
-                    'architect': 'Architect',
-                    'simple_coder': 'FrontendEngineer',
-                    'file_by_file_coder': 'FrontendEngineer',
-                    'qa_reviewer': 'QAReviewer',
-                    'summarize': 'Summarize',
-                    'repair': 'FrontendEngineer',
-                    'engineer': 'FrontendEngineer',
+                    'team_leader': 'Leon（负责人）',
+                    'pm': 'Catherine（产品经理）',
+                    'architect': 'Bob（架构师）',
+                    'simple_coder': 'Henry（开发）',
+                    'file_by_file_coder': 'Henry（开发）',
+                    'qa_reviewer': 'Annie（测试）',
+                    'summarize': 'Annie（测试）',
+                    'repair': 'Henry（开发）',
+                    'engineer': 'Henry（开发）',
                 }.get(node_name, node_name)
                 self._send_progress(requirement_id, display_name, progress)
 
+            # 只发送真正的对话消息（agent/assistant/system/user），
+            # thinking/tool_call/hook_check 等内部消息已有专用 SSE 通道推送
+            _SKIP_DIALOGUE_ROLES = {'thinking', 'tool_call', 'tool_result', 'hook_check'}
             dialogues = final_state.get('dialogue_history', []) or []
             for dialogue in dialogues[last_dialogue_count:]:
+                role = dialogue.get('role', 'agent')
+                if role in _SKIP_DIALOGUE_ROLES:
+                    continue
+                # 跳过标记为 hidden 的内部系统提示
+                if dialogue.get('hidden'):
+                    continue
                 self._send_dialogue(requirement_id, dialogue.get('name', 'AI'),
                                     dialogue.get('content', ''),
-                                    dialogue.get('role', 'agent'))
+                                    role)
             last_dialogue_count = len(dialogues)
 
             code_files = final_state.get('code_files', []) or []
@@ -554,7 +561,7 @@ class RequirementService:
 
         dialogue_list = list(requirement.dialogue_history or [])
         dialogue_list.append({
-            'role': 'system', 'name': 'TeamLeader',
+            'role': 'system', 'name': 'Leon（负责人）',
             'content': '需求不够明确，需要补充一些信息',
             'status': 'needs_clarification',
             'question_form': {'questions': questions},

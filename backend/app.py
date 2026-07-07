@@ -561,56 +561,8 @@ def chat_with_requirement(req_id):
                 return _handle_chat_ambiguous(
                     req_id, requirement, user_message, db
                 )
-            # TASK: 继续以下流程
-
-        # 如果消息包含 [用户补充说明]，说明已经过澄清，跳过检测
-        from harness.instructions.nodes import _is_vague_requirement, _generate_clarify_questions
-        from llm.client import get_client as _get_llm_client
-
-        if _is_vague_requirement(user_message):
-            # 模糊修改意见 → 生成澄清问题，暂不执行代码修改
-            try:
-                client = _get_llm_client()
-                questions = _generate_clarify_questions(client, user_message)
-                if not questions:
-                    questions = [
-                        {"id": "q1", "type": "text", "label": "请更具体地描述你想要的修改效果"},
-                        {"id": "visual_style", "type": "radio",
-                         "label": "修改后你偏好哪种视觉风格？",
-                         "options": ["保持现有风格", "极简白", "暖柔风格", "暗黑科技", "活泼多彩", "无偏好"]},
-                    ]
-
-                from sqlalchemy.orm.attributes import flag_modified
-                dialogue_list = list(requirement.dialogue_history or [])
-                dialogue_list.append({
-                    'role': 'user', 'name': '用户',
-                    'content': user_message,
-                    'timestamp': get_current_timestamp()
-                })
-                dialogue_list.append({
-                    'role': 'system', 'name': 'TeamLeader',
-                    'content': '修改意见不够明确，需要补充一些信息',
-                    'status': 'needs_clarification',
-                    'question_form': {'questions': questions},
-                })
-                requirement.dialogue_history = dialogue_list
-                flag_modified(requirement, 'dialogue_history')
-                requirement.status = 'finished'  # 恢复为 finished，等待澄清后重新修改
-                db.commit()
-
-                # 通过 SSE 推送澄清表单
-                from utils.sse import SSEMessage
-                msg = SSEMessage.format_event('question-form', {'questions': questions})
-                sse_manager.broadcast(str(req_id), msg)
-
-                logger.info(f"需求 {req_id} 的修改意见模糊，生成 {len(questions)} 个澄清问题")
-                return jsonify({
-                    'needs_clarification': True,
-                    'question_form': {'questions': questions},
-                    'dialogue_history': dialogue_list,
-                }), 200
-            except Exception as e:
-                logger.warning(f"[Chat] 澄清问题生成失败：{e}，继续正常流程")
+            # TASK: 继续以下流程（意图分类统一由 IntentRouter 处理，
+            # 不再重复调用 _is_vague_requirement 做二次检测）
 
         # 初始化 harness 层
         workspace = WorkspaceFS(current_user_id, req_id)
@@ -619,7 +571,6 @@ def chat_with_requirement(req_id):
         tools = create_tool_registry()
         hooks = create_default_hook_manager()
         permissions = PermissionManager()
-        permissions.grant(req_id, 'write')  # chat 中自动授权写入
         sse = SSEReporter(sse_manager)
         tracer = Tracer(db_session=db)
         cost_tracker = CostTracker()
@@ -1287,7 +1238,7 @@ def _handle_chat_ambiguous(req_id, requirement, user_message, db):
         'timestamp': get_current_timestamp(),
     })
     dialogue_list.append({
-        'role': 'system', 'name': 'TeamLeader',
+        'role': 'system', 'name': 'Leon（负责人）',
         'content': '修改意见不够明确，需要补充一些信息',
         'status': 'needs_clarification',
         'question_form': {'questions': questions},

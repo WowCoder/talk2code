@@ -1,8 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-PermissionManager —— 工具调用权限分级管理
+PermissionManager —— 工具调用权限分级管理（单例模式）
+
+权限模型：
+Level 0 (只读): 自动放行
+Level 1 (写入): 首次请求时一次性授权，后续自动放行
+Level 2 (执行): 每次调用都需要用户审批
 """
 
+import threading
 from enum import Enum
 
 
@@ -20,15 +26,27 @@ class PermissionResult:
 
 class PermissionManager:
     """
-    工具调用权限管理器
+    工具调用权限管理器（单例）。
 
-    权限模型：
-    Level 0 (只读): 自动放行
-    Level 1 (写入): 首次请求时一次性授权，后续自动放行
-    Level 2 (执行): 每次调用都需要用户审批
+    确保 app.py 审批端点创建的实例和 ToolCallLoop 使用的是同一实例，
+    用户的审批决定能正确生效。
     """
 
+    _instance: 'PermissionManager | None' = None
+    _lock = threading.Lock()
+
+    def __new__(cls) -> 'PermissionManager':
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+
     def __init__(self):
+        if self._initialized:
+            return
+        self._initialized = True
         self._write_granted: dict[int, bool] = {}  # requirement_id → granted
 
     def check(self, requirement_id: int, tool_name: str, permission: str) -> str:

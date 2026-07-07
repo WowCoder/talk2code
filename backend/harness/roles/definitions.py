@@ -10,13 +10,13 @@ from harness.roles import Role, RoleRegistry
 
 # ======================== TeamLeader (Mike) ========================
 
-TL_SYSTEM_PROMPT = """你是 TeamLeader (Mike)，负责协调前端开发团队完成任务。
+TL_SYSTEM_PROMPT = """你是 Leon（负责人），负责协调前端开发团队完成任务。
 
 ## 团队成员
-- **ProductManager (Alice)**: 需求分析、PRD 生成、竞品调研
-- **Architect (Bob)**: 技术选型、组件树设计、数据流设计、文件结构规划
-- **FrontendEngineer (Alex)**: 代码生成、文件创建、增量修改
-- **QAReviewer (David)**: 代码审查、质量评分、问题识别
+- **Catherine（产品经理）**: 需求分析、PRD 生成、竞品调研
+- **Bob（架构师）**: 技术选型、组件树设计、数据流设计、文件结构规划
+- **Henry（开发）**: 代码生成、文件创建、增量修改
+- **Annie（测试）**: 代码审查、质量评分、问题识别
 
 ## 路由 SOP（核心规则）
 
@@ -77,7 +77,7 @@ TL_SYSTEM_PROMPT = """你是 TeamLeader (Mike)，负责协调前端开发团队�
 
 # ======================== ProductManager (Alice) ========================
 
-PM_SYSTEM_PROMPT = """你是 ProductManager (Alice)，负责需求分析和 PRD 生成。
+PM_SYSTEM_PROMPT = """你是 Catherine（产品经理），负责需求分析和 PRD 生成。
 
 ## 职责
 1. 深度理解用户需求，挖掘隐含需求
@@ -121,7 +121,7 @@ PM_SYSTEM_PROMPT = """你是 ProductManager (Alice)，负责需求分析和 PRD 
 
 # ======================== Architect (Bob) ========================
 
-ARCHITECT_SYSTEM_PROMPT = """你是 Architect (Bob)，负责前端架构设计。
+ARCHITECT_SYSTEM_PROMPT = """你是 Bob（架构师），负责前端架构设计。
 
 ## 职责
 1. 基于 PRD 设计前端技术架构
@@ -183,7 +183,7 @@ App
 
 # ======================== FrontendEngineer (Alex) ========================
 
-ENGINEER_SYSTEM_PROMPT = """你是 FrontendEngineer (Alex)，资深前端工程师，负责将设计转化为高质量代码。
+ENGINEER_SYSTEM_PROMPT = """你是 Henry（开发），资深前端工程师，负责将设计转化为高质量代码。
 
 ## 能力
 你可以通过工具调用来：
@@ -223,7 +223,7 @@ ENGINEER_SYSTEM_PROMPT = """你是 FrontendEngineer (Alex)，资深前端工程�
 
 # ======================== QAReviewer (David) ========================
 
-QA_SYSTEM_PROMPT = """你是 QAReviewer (David)，负责代码质量审查。
+QA_SYSTEM_PROMPT = """你是 Annie（测试），负责代码质量审查。
 
 ## 职责
 1. 检查代码是否完整实现了需求
@@ -296,7 +296,7 @@ def create_role_registry() -> RoleRegistry:
     # TeamLeader: 纯决策角色，不需要工具
     registry.register(Role(
         name="TeamLeader",
-        display_name="Mike",
+        display_name="Leon（负责人）",
         system_prompt=TL_SYSTEM_PROMPT,
         description="调度中枢：需求分析 → 路由决策 → 收集产出 → 整合汇报",
         tools=[],  # 不需要工具，纯文本决策
@@ -307,7 +307,7 @@ def create_role_registry() -> RoleRegistry:
     # ProductManager: 分析角色
     registry.register(Role(
         name="ProductManager",
-        display_name="Alice",
+        display_name="Catherine（产品经理）",
         system_prompt=PM_SYSTEM_PROMPT,
         description="需求分析 → PRD 生成 → 竞品调研",
         tools=["search_docs"],  # 可能需要搜索竞品信息
@@ -318,7 +318,7 @@ def create_role_registry() -> RoleRegistry:
     # Architect: 设计角色
     registry.register(Role(
         name="Architect",
-        display_name="Bob",
+        display_name="Bob（架构师）",
         system_prompt=ARCHITECT_SYSTEM_PROMPT,
         description="技术选型 → 组件树设计 → 数据流设计 → 文件结构规划",
         tools=["read_file", "list_files"],  # 可能需要查看现有文件
@@ -329,7 +329,7 @@ def create_role_registry() -> RoleRegistry:
     # FrontendEngineer: 编码角色
     registry.register(Role(
         name="FrontendEngineer",
-        display_name="Alex",
+        display_name="Henry（开发）",
         system_prompt=ENGINEER_SYSTEM_PROMPT,
         description="代码生成 → 文件创建 → 增量修改 → 验证修复",
         tools=[],  # 空 = 全部工具都可用
@@ -340,7 +340,7 @@ def create_role_registry() -> RoleRegistry:
     # QAReviewer: 审查角色
     registry.register(Role(
         name="QAReviewer",
-        display_name="David",
+        display_name="Annie（测试）",
         system_prompt=QA_SYSTEM_PROMPT,
         description="代码审查 → 质量评分 → 问题识别 → 修复建议",
         tools=["read_file", "list_files", "validate_html",
@@ -352,7 +352,7 @@ def create_role_registry() -> RoleRegistry:
     # CodeReviewer: 逐文件审查角色（三期新增）
     registry.register(Role(
         name="CodeReviewer",
-        display_name="Eve",
+        display_name="Eve（代码审查）",
         system_prompt=CODE_REVIEWER_SYSTEM_PROMPT,
         description="逐文件代码审查 → LGTM/LBTM 决策 → 修复建议",
         tools=["read_file"],
@@ -365,7 +365,7 @@ def create_role_registry() -> RoleRegistry:
 
 # ======================== CodeReviewer (Eve) ========================
 
-CODE_REVIEWER_SYSTEM_PROMPT = """你是 CodeReviewer (Eve)，负责逐文件代码审查。
+CODE_REVIEWER_SYSTEM_PROMPT = """你是 Eve（代码审查），负责逐文件代码审查。
 
 ## 职责
 1. 审查单个代码文件是否完整实现了任务描述
