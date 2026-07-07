@@ -44,12 +44,15 @@ talk2code/
 │   │   │   └── definitions.py           #   6 角色 Prompt + 工具子集 + 路由表
 │   │   ├── communication/               # 消息总线
 │   │   │   └── __init__.py              #   AgentBus 四分支路由
-│   │   ├── experience/                  # 经验池
+│   │   ├── experience/                  # 经验池 (DEPRECATED → memory.py)
 │   │   │   └── __init__.py              #   ExperiencePool + TF-IDF 检索
-│   │   ├── learning/                    # 持续学习
+│   │   ├── learning/                    # 持续学习 (DEPRECATED → memory.py)
 │   │   │   └── __init__.py              #   Evaluator + FeedbackLoop
 │   │   ├── environment/                # 权限管理、沙箱执行
 │   │   ├── state/                      # AgentState、WorkspaceFS、Git 版本化、记忆存储
+│   │   │   ├── memory.py               #   MemoryManager — 统一记忆管理（BGE-M3 混合检索 + LLM 反思）
+│   │   │   ├── memory_retriever.py      #   BGEM3Retriever — Dense+Sparse 混合检索 + 降级回退
+│   │   │   ├── memory_store.py          #   MemoryStore (DEPRECATED → memory.py)
 │   │   ├── constraints/                # Hook 管理器 + 约束检查（Craft 规则、安全、质量）
 │   │   └── observability/              # 链路追踪、成本统计、SSE 事件上报、日志
 │   ├── agents/                         # 向后兼容重导出层
@@ -195,7 +198,7 @@ cd backend && python app.py
 
     全程: Hook 失败反馈 → LLM 上下文中注入验证错误
           ContextCompactor P0-P3 分层压缩 → 防上下文溢出
-          ExperiencePool → few-shot 注入 + 失败警告
+          MemoryManager (BGE-M3 Hybrid + LLM 反思) → few-shot 注入 + 经验积累
 ```
 
 | 组件 | 职责 |
@@ -209,7 +212,7 @@ cd backend && python app.py
 | **QAReviewer** | 多文件整体代码审查：5 维度评分 + 问题识别 + 修复建议 |
 | **Summarize** | **整体代码审查**：跨文件调用流、功能遗漏、边界情况、代码一致性 |
 | **Repair** | **定向修复**：接收 QA/Summarize 问题反馈，调用 ToolCallLoop 修复特定文件 |
-| **ExperiencePool** | 经验池：TF-IDF 语义检索成功案例作为 few-shot，失败案例生成警告，越用越好 |
+| **MemoryManager** | 记忆管理器：BGE-M3 混合检索（Dense+Sparse）+ LLM 3 问反思（reflection/lesson/pattern），任务完成后自动学习，持久化到 SQLite，越用越好 |
 
 **复杂度自适应行为**：
 
@@ -229,7 +232,7 @@ cd backend && python app.py
 - 逐文件编码 + CodeReview：每个文件生成后自动 LGTM/LBTM 审查，不通过则重写
 - Hook 失败结果实时注入 LLM 上下文，Agent 能"看到"自己的验证错误并主动修复
 - ContextCompactor P0-P3 分层压缩：长对话自动压缩旧消息，防止上下文溢出
-- 每次成功/失败自动存入 ExperiencePool（TF-IDF 语义检索），后续相似需求注入 few-shot 示例
+- 每次成功/失败自动存入 MemoryManager（BGE-M3 混合检索 + LLM 反思），后续相似需求注入 few-shot 示例 + 历史教训
 - 所有角色的行为规则写在其 System Prompt 中，改行为 = 改 Prompt，无需改代码
 
 ### Harness 框架
@@ -242,7 +245,7 @@ IntentRouter → TeamLeader → LangGraph 多节点编排
                 └─ M/L: pm → architect → file_by_file_coder → qa → summarize
                            ↑ fail                                  ↓ fail
                            └────────── repair ─────────────────────┘
-                └─ ExperiencePool ← FeedbackLoop (全程注入)
+                └─ MemoryManager (BGE-M3 + LLM 反思, 全程注入)
                 └─ ContextCompactor P0-P3 (全程压缩)
 ```
 
@@ -255,8 +258,10 @@ IntentRouter → TeamLeader → LangGraph 多节点编排
 | 4 - State | 状态/工作区/记忆 | AgentState（含 tasks/interfaces/implementation_order）、WorkspaceFS、Git 版本化、Checkpoint |
 | 5 - Constraints | Hook/检查 | Hook 管理器 + Craft 规则/安全/质量 + Hook 失败反馈链路 |
 | 6 - Observability | 追踪/成本/上报 | 链路追踪、Token 成本统计、SSE 事件上报 |
-| — | `experience/` | TF-IDF 语义检索 + 经验存储 + few-shot 注入 |
-| — | `learning/` | Evaluator 评分分析 + FeedbackLoop 回灌 |
+| — | `state/memory.py` | BGE-M3 混合检索 + LLM 反思 (reflection/lesson/pattern) + 经验存储 + few-shot 注入 |
+| — | `state/memory_retriever.py` | BGE-M3 Dense(1024维)+BM25 Sparse 混合检索 + TF-IDF 降级回退 |
+| — | `experience/` | (DEPRECATED) TF-IDF 语义检索 + 经验存储 |
+| — | `learning/` | (DEPRECATED) Evaluator + FeedbackLoop |
 
 ### 设计质量规则（Craft 层）
 
@@ -347,7 +352,7 @@ IntentRouter → TeamLeader → LangGraph 多节点编排
 
   全域: Hook 失败反馈 → LLM 自动修复
        ContextCompactor P0-P3 → 防溢出
-       ExperiencePool → few-shot + 警告注入
+       MemoryManager (BGE-M3 + LLM 反思) → few-shot + 教训注入
 ```
 
 
