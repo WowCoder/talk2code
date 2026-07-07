@@ -89,6 +89,40 @@ class AgentMemory(Base):
     last_accessed_at = Column(DateTime, onupdate=func.now())
 
 
+class AgentMemoryV2(Base):
+    """Agent 结构化记忆表 v2 —— LLM 反思后的任务经验
+
+    每条记忆对应一个已完成的任务，包含 LLM 的事后反思（3 问自答）。
+    支持持久化（跨进程重启保留）和合并（定期去重）。
+    """
+    __tablename__ = "agent_memories_v2"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    requirement = Column(Text, nullable=False)
+    complexity = Column(String(8), default="S")
+    code_summary = Column(Text, default="")
+    rating = Column(Float, default=7.0)
+
+    # LLM 反思字段（3 问自答）
+    reflection = Column(Text, default="")       # "这次和预期有什么不同？为什么？"
+    lesson = Column(Text, default="")           # "下次做类似任务，我会怎么做？"
+    reusable_pattern = Column(Text, default="") # "有没有可复用的代码模式？"
+
+    # 元数据
+    tags = Column(JSON, default=list)           # ["localStorage", "CRUD", "表单"]
+    importance = Column(Float, default=0.5)     # LLM 判断的重要性 0-1
+    access_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=func.now())
+
+    # 生命周期管理
+    merged_from = Column(JSON, default=list)    # 合并来源记忆 ID 列表
+    superseded = Column(Boolean, default=False) # 是否被更新的记忆替代
+
+    def __repr__(self):
+        return f"<MemoryV2 {self.id}: {self.requirement[:50]}... rating={self.rating}>"
+
+
 class AgentTrace(Base):
     """Agent 链路追踪表"""
     __tablename__ = "agent_traces"

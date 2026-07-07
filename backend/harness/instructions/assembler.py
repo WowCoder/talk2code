@@ -21,8 +21,9 @@ class AssembledContext:
 class ContextAssembler:
     """根据需求类型动态组装 LLM 上下文"""
 
-    def __init__(self, memory_store=None):
-        self.memory_store = memory_store
+    def __init__(self, memory_store=None, memory_manager=None):
+        self.memory_store = memory_store       # deprecated, 保留兼容
+        self.memory_manager = memory_manager   # 新的 MemoryManager
 
     def assemble(self, requirement: str, user_id: int, metadata: dict = None) -> AssembledContext:
         if metadata is None:
@@ -34,9 +35,20 @@ class ContextAssembler:
         # 2. 按需选择 Craft 规则
         required_crafts = self._select_crafts(requirement)
 
-        # 3. 检索长期记忆
+        # 3. 检索长期记忆（优先用 MemoryManager，降级到 MemoryStore）
         memories = ""
-        if self.memory_store:
+        if self.memory_manager:
+            # MemoryManager 的 before_task 直接注入 few-shot 格式
+            # 这里只需要检索原始记忆列表用于组装
+            recalled = self._recall_from_manager(requirement, user_id)
+            if recalled:
+                memories = "\n".join(
+                    f"- [domain_knowledge] {m.get('requirement', m.get('fact', ''))}"
+                    for m in recalled
+                )
+                if memories:
+                    memories = f"\n\n## 用户偏好与项目背景\n{memories}"
+        elif self.memory_store:
             recalled = self.memory_store.recall(requirement, user_id, top_k=5)
             if recalled:
                 memories = "\n".join(
@@ -108,3 +120,24 @@ class ContextAssembler:
             return load_craft_rules(craft_names) or ""
         except Exception:
             return ""
+
+    def _recall_from_manager(self, requirement: str, user_id: int) -> list:
+        """从 MemoryManager 检索记忆（返回兼容 MemoryStore 格式的 dict 列表）"""
+        try:
+            memories = self.memory_manager._get_active_memories()
+            if not memories:
+                return []
+
+            self.memory_manager._retriever.index([m.to_text() for m in memories])
+            results = self.memory_manager._retriever.search(requirement, top_k=5)
+            if not results:
+                return []
+
+            selected = [memories[i] for i, _ in results]
+            return [m.to_dict() if hasattr(m, 'to_dict') else {
+                "memory_type": "domain_knowledge",
+                "fact": m.requirement,
+                "importance": m.importance,
+            } for m in selected]
+        except Exception:
+            return []

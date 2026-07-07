@@ -1,6 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-持续学习模块 —— 评分聚合 + 经验回灌
+持续学习模块 —— 评分聚合 + 经验回灌 (DEPRECATED)
+
+⚠️  已废弃！请使用 harness.state.memory.MemoryManager 的 after_task() 方法替代。
+
+MemoryManager 提供统一的任务后学习入口:
+- LLM 3 问反思 → reflection / lesson / reusable_pattern
+- 持久化到 agent_memories_v2 表
+- 定期 LLM 合并和淘汰
 
 QAReviewer 评分 → Evaluator 聚合分析 → FeedbackLoop 回灌经验池
 → 下次相似需求自动注入 few-shot 示例 + 警告

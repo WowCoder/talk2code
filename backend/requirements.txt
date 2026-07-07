@@ -10,6 +10,9 @@ langgraph>=0.1.0
 pydantic>=2.0.0
 pydantic-settings>=2.0.0
 
+# Embedding (BGE-M3 混合检索)
+sentence-transformers>=2.7.0
+
 # Testing
 pytest>=7.0.0
 pytest-cov>=4.0.0

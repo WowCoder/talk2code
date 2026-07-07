@@ -40,7 +40,8 @@ def create_harness(requirement_id: int, user_id: int, db_session=None):
     from harness.state.workspace import WorkspaceFS
     from harness.state.versioning import GitVersioning
     from harness.state.checkpoint import CheckpointManager
-    from harness.state.memory_store import MemoryStore
+    from harness.state.memory_store import MemoryStore  # deprecated, 保留兼容
+    from harness.state.memory import MemoryManager
     from harness.tools.registry import create_tool_registry
     from harness.constraints.hooks import create_default_hook_manager
     from harness.environment.permissions import PermissionManager
@@ -56,8 +57,9 @@ def create_harness(requirement_id: int, user_id: int, db_session=None):
     hooks = create_default_hook_manager()
     permissions = PermissionManager()
     checkpoint = CheckpointManager(db_session=db_session)
-    memory = MemoryStore(db_session=db_session, llm_client=get_client())
-    assembler = ContextAssembler(memory_store=memory)
+    memory = MemoryStore(db_session=db_session, llm_client=get_client())  # deprecated
+    memory_manager = MemoryManager(llm_client=get_client())
+    assembler = ContextAssembler(memory_store=memory, memory_manager=memory_manager)
     compactor = ContextCompactor()
     cost_tracker = CostTracker()
     tracer = Tracer(db_session=db_session, cost_tracker=cost_tracker)
@@ -69,7 +71,8 @@ def create_harness(requirement_id: int, user_id: int, db_session=None):
         "hooks": hooks,
         "permissions": permissions,
         "checkpoint": checkpoint,
-        "memory": memory,
+        "memory": memory,           # deprecated
+        "memory_manager": memory_manager,
         "assembler": assembler,
         "compactor": compactor,
         "tracer": tracer,

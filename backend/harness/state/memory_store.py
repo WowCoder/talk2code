@@ -1,6 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-MemoryStore —— LLM 驱动的长期记忆提取和两阶段检索
+MemoryStore —— LLM 驱动的长期记忆提取和两阶段检索 (DEPRECATED)
+
+⚠️  已废弃！请使用 harness.state.memory.MemoryManager 替代。
+
+MemoryManager 提供:
+- BGE-M3 混合检索（Dense+Sparse）替代关键词检索
+- 结构化记忆（reflection + lesson + reusable_pattern）
+- agent_memories_v2 表持久化
+- LLM 定期合并和淘汰
 
 持久化：注入 db_session 时，记忆落 AgentMemory 表，跨重启保留。
        不注入时退化为内存字典（保持与现有无参构造测试兼容）。

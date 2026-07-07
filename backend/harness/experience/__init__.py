@@ -1,6 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-ExperiencePool —— 经验池
+ExperiencePool —— 经验池 (DEPRECATED)
+
+⚠️  已废弃！请使用 harness.state.memory.MemoryManager 替代。
+
+MemoryManager 提供:
+- BGE-M3 混合检索（语义 + 词法）替代 TF-IDF
+- LLM 3 问反思（reflection + lesson + reusable_pattern）
+- 持久化到 agent_memories_v2 表，跨进程重启保留
+- 定期 LLM 合并和淘汰
+
+旧的 ExperiencePool + FeedbackLoop 仍可导入，但不会再有新功能。
 
 缓存成功的 (需求特征, 代码方案) 对，相似需求直接复用或作为 few-shot 示例注入 Prompt。
 

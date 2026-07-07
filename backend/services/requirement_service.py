@@ -30,14 +30,21 @@ from harness.instructions.intent_router import IntentRouter, IntentType
 from harness.instructions.orchestrator import RoleOrchestrator
 from harness.instructions.role_executor import RoleExecutor
 from harness.roles.definitions import create_role_registry as _create_role_registry
-from harness.experience import ExperiencePool
-from harness.learning import FeedbackLoop
+from harness.state.memory import MemoryManager
+from llm.client import get_client
 
 logger = get_logger(__name__)
 
-# 全局经验池（跨请求持久化，进程重启后清空）
-_experience_pool = ExperiencePool()
-_feedback_loop = FeedbackLoop(_experience_pool)
+# 全局记忆管理器（持久化到 agent_memories_v2 表，跨进程重启保留）
+_memory_manager: Optional[MemoryManager] = None
+
+
+def _get_memory_manager() -> MemoryManager:
+    """懒初始化全局 MemoryManager（首次调用时加载模型）"""
+    global _memory_manager
+    if _memory_manager is None:
+        _memory_manager = MemoryManager(llm_client=get_client())
+    return _memory_manager
 
 
 class RequirementService:
@@ -132,15 +139,16 @@ class RequirementService:
                 on_iteration=_persist_dialogue,
             )
 
-            # 经验注入：包装 _build_system_prompt，在原始 prompt 后追加 few-shot 示例
+            # 记忆注入：将历史成功经验作为 few-shot 示例追加到 System Prompt
             _original_builder = tool_loop._build_system_prompt
             _req_content = requirement.content
+            _mgr = _get_memory_manager()
 
-            def _experience_aware_prompt(state):
+            def _memory_aware_prompt(state):
                 base = _original_builder(state)
-                return _feedback_loop.inject_experience(_req_content, base)
+                return _mgr.before_task(_req_content, base)
 
-            tool_loop._build_system_prompt = _experience_aware_prompt
+            tool_loop._build_system_prompt = _memory_aware_prompt
 
             # 构建初始状态
             initial_state: AgentState = {
@@ -424,16 +432,18 @@ class RequirementService:
                     except _json.JSONDecodeError:
                         pass
 
-                _feedback_loop.learn_from_result(
+                _mgr = _get_memory_manager()
+                _mgr.after_task(
                     requirement=requirement.content,
                     complexity=complexity,
                     code_files=code_files,
                     qa_result=qa_data,
+                    user_id=requirement.user_id,
                 )
-                pool_stats = _feedback_loop.stats()
+                pool_stats = _mgr.stats()
                 logger.info(
-                    f"需求 {requirement_id} 经验学习完成，"
-                    f"经验池总量={pool_stats['total']}, 均分={pool_stats['avg_rating']}"
+                    f"需求 {requirement_id} 记忆学习完成，"
+                    f"记忆总量={pool_stats['total']}, 均分={pool_stats['avg_rating']}"
                 )
             except Exception as e:
                 logger.warning(f"经验学习失败（不阻断）：{e}")
