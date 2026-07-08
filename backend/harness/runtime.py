@@ -484,6 +484,25 @@ class ToolCallLoop:
 
         return messages
 
+    def _get_craft_context(self, requirement: str = '') -> tuple:
+        """渐进式加载 Skills，注入到编码 Prompt 中。
+
+        同一任务只做一次 LLM 选择，后续轮次复用缓存。
+
+        Returns:
+            (rules_text: str, _unused: str)
+        """
+        try:
+            from harness.instructions.prompts.skills import load_for_task
+            if not hasattr(self, '_skill_cache'):
+                self._skill_cache = {}
+            cache_key = requirement[:200]  # 用需求前 200 字做缓存键
+            if cache_key not in self._skill_cache:
+                self._skill_cache[cache_key] = load_for_task(requirement) if requirement else ''
+            return self._skill_cache[cache_key], ''
+        except Exception:
+            return '', ''
+
     def _build_system_prompt(self, state: AgentState) -> str:
         """构建 Coder 系统提示词（含文件内容概要，避免 Agent 重复 read_file）
 
@@ -520,74 +539,38 @@ class ToolCallLoop:
     def _build_xs_prompt(self, requirement: str, plan_section: str,
                          existing_text: str, existing_files: list) -> str:
         """XS 复杂度：自由文件结构，极简流程"""
-        return f"""你是一个资深前端工程师。请使用 write_file 工具创建所需的文件。
-
-## 用户需求
-{requirement}
-
-{plan_section}
-
-## 当前已有文件及内容概要
-{existing_text}
-
-## 要求
-- 根据需求自由创建文件，不强制要求 3 文件结构
-- 简单需求可能只需要 1 个 HTML 文件即可
-- 每次响应只创建一个文件
-- 全部文件创建完成后立即停止，告诉我"任务完成"
-- 不需要调用 list_files 或 read_file 查看已有文件（概要已在上方）
-- **write_file 的返回结果已包含你刚写入的文件完整内容，不要再用 read_file 重新读取**
-
-## 代码规范
-- 使用 <script src="https://cdn.tailwindcss.com"></script> 引入 Tailwind CSS
-- 需要持久化数据时用 localStorage
-- 禁止: innerHTML, eval, document.write
-- 代码完整可运行，不省略不写TODO"""
+        from harness.instructions.prompts import load_prompt_template
+        craft_rules, skill_instructions = self._get_craft_context(requirement)
+        return load_prompt_template("coding/coder_xs.md",
+            requirement=requirement,
+            plan_section=plan_section,
+            existing_text=existing_text,
+            craft_rules=craft_rules,
+            skill_instructions=skill_instructions,
+        )
 
     def _build_s_prompt(self, requirement: str, plan_section: str,
                         existing_text: str, existing_files: list) -> str:
         """S 复杂度：当前默认行为（3 文件 + lint 验证）"""
+        from harness.instructions.prompts import load_prompt_template
         target_files = ["index.html", "style.css", "script.js"]
         missing = [f for f in target_files if f not in existing_files]
         missing_text = ", ".join(missing) if missing else "全部已创建"
-
-        return f"""你是一个资深前端工程师。请使用 write_file 工具创建所有缺失的文件。
-
-## 用户需求
-{requirement}
-
-{plan_section}
-
-## 当前已有文件及内容概要
-{existing_text}
-
-## 尚未创建的文件（按顺序）
-{missing_text}
-
-## 要求
-- 从上面"尚未创建"列表中选第一个文件，用 write_file 创建它
-- **每次响应只创建一个文件**，不要在一次响应中同时创建多个文件
-- 创建完成后在下一次响应中继续创建下一个
-- 只创建"尚未创建"的文件，不要重复创建已有文件
-- 全部文件创建完成后立即停止，告诉我"任务完成"
-- **已有文件的概要已在上方列出，不要调用 list_files 或 read_file 查看已有文件**
-- **write_file 的返回结果已包含你刚写入的文件完整内容，不要再用 read_file 重新读取刚写入的文件**
-
-## 验证
-- 全部文件创建完成后，系统会自动在无头浏览器中运行 index.html 验证 JS 是否报错；
-  若报错会反馈给你，请据此用 write_file 修复并确保代码可真实运行。
-
-## 代码规范
-- index.html 引入 <script src="https://cdn.tailwindcss.com"></script>
-- 数据用 localStorage 持久化
-- 禁止: innerHTML, eval, document.write
-- 代码完整可运行，不省略不写TODO
-- 每个文件内容不少于100行"""
+        craft_rules, skill_instructions = self._get_craft_context(requirement)
+        return load_prompt_template("coding/coder_s.md",
+            requirement=requirement,
+            plan_section=plan_section,
+            existing_text=existing_text,
+            missing_text=missing_text,
+            craft_rules=craft_rules,
+            skill_instructions=skill_instructions,
+        )
 
     def _build_ml_prompt(self, requirement: str, plan_section: str,
                          existing_text: str, existing_files: list,
                          complexity: str) -> str:
         """M/L 复杂度：架构先导 + 模块化 + 严格验证"""
+        from harness.instructions.prompts import load_prompt_template
         # 从 plan 中提取推荐的文件结构
         file_hint = ""
         plan_obj = json.loads(plan_section.split("\n", 1)[1]) if plan_section and "\n" in plan_section else {}
@@ -595,45 +578,17 @@ class ToolCallLoop:
             file_structure = plan_obj.get("file_structure", [])
             if file_structure:
                 file_hint = "## 推荐文件结构\n" + "\n".join(f"- {f}" for f in file_structure)
-
-        return f"""你是一个资深前端工程师和架构师。请按照架构设计创建高质量代码。
-
-## 用户需求
-{requirement}
-
-{plan_section}
-
-{file_hint}
-
-## 当前已有文件及内容概要
-{existing_text}
-
-## 工作流程
-1. 先创建入口文件 index.html（引入所有依赖）
-2. 按模块逐层创建 CSS/JS 文件（使用子目录组织，如 css/、js/、components/）
-3. 每个模块单一职责，文件间通过 import/export 或全局命名空间通信
-4. 每创建 2-3 个文件后验证一次
-
-## 要求
-- **每次响应只创建一个文件**
-- 按推荐文件结构创建，不使用构建工具
-- 全部文件创建完成后用 validate_html / lint_css / lint_js 验证
-- 验证完成后立即停止，告诉我"任务完成"
-- **write_file 的返回结果已包含你刚写入的文件完整内容，不要再用 read_file 重新读取刚写入的文件**
-- **read_file 截断不等于文件损坏——文件本身是完整的，不需要删除重写**
-
-## 验证与修复
-- 全部文件创建完成后系统会自动运行无头浏览器验证
-- 报错会反馈给你，请据此用 edit_file 局部修复（不要重写整个文件）
-- 最多修复 {self.MAX_REPAIR_ROUNDS + 1} 轮
-
-## 代码规范
-- index.html 引入 <script src="https://cdn.tailwindcss.com"></script>
-- 数据持久化用 localStorage（5MB 内）或 IndexedDB（大量数据）
-- 禁止: innerHTML, eval, document.write
-- 代码完整可运行，不省略不写TODO
-- 每个文件内容充实，组件拆分合理
-- 复杂度 {complexity}：需要考虑可维护性和扩展性"""
+        craft_rules, skill_instructions = self._get_craft_context(requirement)
+        return load_prompt_template("coding/coder_ml.md",
+            requirement=requirement,
+            plan_section=plan_section,
+            file_hint=file_hint,
+            existing_text=existing_text,
+            max_repair_rounds=self.MAX_REPAIR_ROUNDS + 1,
+            complexity=complexity,
+            craft_rules=craft_rules,
+            skill_instructions=skill_instructions,
+        )
 
     def _build_file_summaries(self, existing_files: list) -> str:
         """为已有文件生成内容概要，让 Agent 无需 read_file 就知道文件结构"""

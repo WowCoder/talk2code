@@ -81,10 +81,6 @@ cd frontend-vue && npm install && npm run build
 ## 注意事项
 
 - 虚拟环境：`venv/`（Python 3.11+），所有命令在 `source venv/bin/activate` 后运行。
-- 默认 SQLite 数据库（`vcd.db`、`atoms.db`），生产切 PostgreSQL 需要数据迁移。
-- 测试账号：`test / 123456`，访问 http://localhost:5001/login.html。
-- LLM 配置：复制 `backend/.env.example` 为 `backend/.env`，填入 API Key。
-- **LangChain 模板花括号转义**：`prompts.py` 中 `ChatPromptTemplate.from_messages()` 的 JSON 示例需要将 `{` `}` 转义为 `{{` `}}`。
-- **Python f-string 中文引号**：f-string 中不能出现 `"...“...”..."`，中文引号会与 f-string 引号冲突，改用单引号包裹或转义。
-- Agent 保护参数（3 轮迭代 / ToolCallLoop 超时）不要随意调高，会直接增加 LLM 调用费用。
-- 无 linter/formatter 配置，不主动运行 `flake8` 或 `black`。
+- **修改或重构代码时，同步删除不再使用的文件、类、函数、import，保持代码库整洁。** 除非明确要求保留兼容，否则无用代码不保留。
+- **大量代码变动后，检查并同步更新 README.md**（目录结构、模块职责、架构描述等），确保文档与代码一致。
+- **所有 LLM Prompt（角色、意图、审查、记忆、编码模板、任务包、Skills）统一放在 `backend/harness/instructions/prompts/` 下。** 新增 Prompt 时在此目录下创建对应子目录和 `.md` 文件，通过 `load_prompt()` 或 `load_prompt_template()` 加载，不写在 Python 代码内。

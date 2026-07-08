@@ -20,6 +20,7 @@ from typing import Optional
 
 from llm.client import get_client
 from harness.observability.logger import get_logger
+from harness.instructions.prompts import load_prompt
 
 logger = get_logger(__name__)
 
@@ -39,96 +40,12 @@ class IntentResult:
     quick_answer: str = ""   # QUICK/SEARCH 的预生成答案（可选）
 
 
-# ==================== 分类 Prompt ====================
+# ==================== 分类 Prompt（从 .md 文件加载）====================
 
-INTENT_CLASSIFY_SYSTEM = """你是一个意图分类器。分析用户输入，只返回一个词：QUICK / SEARCH / TASK / AMBIGUOUS
-
-## 分类标准
-
-**QUICK** — 可以直接用文字回答的问题：
-- 常识问答、概念解释（"什么是 CSS Grid""React 和 Vue 的区别"）
-- 逻辑推理、数学计算
-- 问候聊天（"你好""谢谢"）
-- 简短代码片段示例（"写一个冒泡排序""Array.map 怎么用"）
-- 对已有代码的提问（"这段代码为什么报错""这个函数做什么"）
-- 纯咨询/知识类问题
-
-**SEARCH** — 需要最新/实时信息：
-- 最新版本特性（"React 19 有哪些新特性"）
-- 时事新闻、天气
-- 需要联网查询的问题
-
-**TASK** — 需要创建完整应用或执行代码修改：
-- 创建完整页面/应用（"做一个待办清单""帮我写一个个人主页"）
-- 修改代码指令（"把背景色改成蓝色""给按钮加个点击事件"）
-- 多步骤开发任务
-
-**AMBIGUOUS** — 需求不清晰，无法确定具体产出：
-- 过于模糊（"帮我优化一下""做个好东西"）
-- 缺少关键信息（"做个网站" — 什么类型的网站？）
-- 范围过大，无法判断用户真正想要什么
-
-## 重要规则
-- 如果用户描述了具体功能（有动词+功能点），即使简短也是 TASK，不是 AMBIGUOUS
-  - "做个计算器" → TASK（功能明确）
-  - "做个工具" → AMBIGUOUS（不明确什么工具）
-- 如果用户在问"怎么做""是什么意思"，是 QUICK，不是 TASK
-- 默认倾向：不确定时返回 TASK（宁可多生成，不要漏掉开发需求）
-
-只返回一个词：QUICK / SEARCH / TASK / AMBIGUOUS"""
-
-INTENT_CLASSIFY_CHAT_SYSTEM = """你是一个意图分类器，用于代码修改对话场景。用户已经有了一个应用，正在对它进行修改或提问。
-
-分析用户输入，只返回一个词：QUICK / TASK / AMBIGUOUS
-
-## 分类标准
-
-**QUICK** — 对现有代码的提问，不需要修改代码：
-- "这个按钮为什么是蓝色的""XX 功能是怎么实现的"
-- "当前有哪些文件""index.html 里有什么"
-- "为什么页面刷新后数据丢失了"
-- "这段代码是什么意思"
-
-**TASK** — 需要修改代码的指令，动作+目标明确：
-- "把背景色改成红色""给按钮加个 loading 状态"
-- "添加一个删除功能""修复 XX 的 bug"
-- "在列表页加一个搜索框""把标题字号改大"
-- 短但明确的指令也是 TASK："改背景色为红色""删掉侧边栏"
-
-**AMBIGUOUS** — 修改意图不明确，缺少具体目标：
-- 动作模糊："帮我优化一下""改好看点""加点功能""调整一下"
-- 目标缺失："改一下"（改什么？）"优化性能"（哪个页面/功能的性能？）
-- 范围过大："重构整个应用""全部改掉"
-- 只有形容词没有具体动作："太丑了""不好用""太慢了"
-
-## 重要规则
-- 包含具体动作（改/加/删/修/优化）+ 具体目标 → TASK
-- 只有动作没有目标，或只有评价没有动作 → AMBIGUOUS
-- 只是问为什么/是什么/怎么实现的 → QUICK
-- 短消息特别判断：如果 ≤15 字且缺少明确目标，倾向于 AMBIGUOUS
-- 不确定时返回 AMBIGUOUS（聊天模式优先澄清，避免盲目修改）
-
-只返回一个词：QUICK / TASK / AMBIGUOUS"""
-
-
-# ==================== Quick 回答 Prompt ====================
-
-QUICK_ANSWER_SYSTEM = """你是一个友好的 AI 编程助手。用户向你提问，请直接、准确地回答。
-
-## 回答原则
-- 直接回答问题，不要绕弯子
-- 如果涉及代码，给出简洁的示例
-- 如果用户只是打招呼，友好回应
-- 回答保持简洁，不要展开不相关的内容
-- 如果不知道答案，诚实说明，不要编造"""
-
-QUICK_ANSWER_CHAT_SYSTEM = """你是一个友好的 AI 编程助手。用户正在开发一个前端应用，对现有代码有疑问。
-
-## 回答原则
-- 根据上下文（文件列表、代码内容）回答用户的问题
-- 如果问题涉及具体代码，引用文件名和行数
-- 给出实用、可操作的建议
-- 保持简洁"""
+INTENT_CLASSIFY_SYSTEM = load_prompt("intent/classify.md")
+INTENT_CLASSIFY_CHAT_SYSTEM = load_prompt("intent/classify_chat.md")
+QUICK_ANSWER_SYSTEM = load_prompt("intent/quick_answer.md")
+QUICK_ANSWER_CHAT_SYSTEM = load_prompt("intent/quick_answer_chat.md")
 
 
 class IntentRouter:

@@ -11,7 +11,7 @@ from typing import Dict, Any
 
 from harness.state.agent_state import AgentState
 from llm.client import get_client
-from harness.instructions.prompts import TL_ANALYSIS_PROMPT
+from harness.instructions.prompts import load_prompt
 from harness.observability.logger import get_logger
 from harness.harness_context import (
     get_role_executor, get_role_registry, get_tool_loop, get_workspace
@@ -108,9 +108,8 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
 
     try:
         client = get_client()
-        messages = TL_ANALYSIS_PROMPT.format_messages(requirement=requirement)
-        system_prompt = next((m.content for m in messages if m.type == 'system'), None)
-        user_prompt = next((m.content for m in messages if m.type == 'human'), None)
+        system_prompt = load_prompt("coding/tl_analysis.md")
+        user_prompt = f"请分析以下需求并生成开发计划：\n\n{requirement}"
 
         response = client.chat(
             prompt=user_prompt, system_prompt=system_prompt,

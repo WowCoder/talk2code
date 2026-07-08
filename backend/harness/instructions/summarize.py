@@ -16,53 +16,10 @@ from typing import Dict, Any
 from harness.state.agent_state import AgentState
 from harness.observability.logger import get_logger
 from harness.harness_context import get_workspace, get_tool_loop
+from harness.instructions.prompts import load_prompt_template
 from llm.client import get_client
 
 logger = get_logger(__name__)
-
-SUMMARIZE_PROMPT = """你是一位资深代码审查专家。审查以下项目的所有代码文件，从整体视角评估代码质量。
-
-## 用户需求
-{requirement}
-
-## 实现计划
-{plan_text}
-
-## 所有代码文件
-{code_blocks}
-
-## 审查维度
-1. **跨文件调用流** — 模块间引用是否正确？依赖链是否完整？是否存在引用未定义函数/变量的情况？
-2. **功能遗漏** — 对比需求描述，是否有未实现的功能点？
-3. **边界情况** — 空状态、错误状态、加载状态是否处理？
-4. **整体一致性** — 代码风格是否统一？命名规范是否一致？
-5. **数据流完整性** — 数据从输入到存储到展示的闭环是否完整？
-
-## 输出格式（严格 JSON）
-```json
-{{
-  "verdict": "PASS",
-  "issues": [],
-  "score": 8.5,
-  "summary": "代码整体质量良好，功能完整..."
-}}
-```
-或
-```json
-{{
-  "verdict": "FAIL",
-  "issues": ["问题1描述", "问题2描述"],
-  "score": 4.0,
-  "summary": "存在以下需要修复的问题..."
-}}
-```
-
-- PASS = 代码整体质量合格，可以交付
-- FAIL = 存在需要修复的严重问题
-- score: 1-10 分，6 分以上为合格
-- issues: 需要修复的问题列表
-- summary: 一句话整体评价
-- 只返回 JSON，不要其他文字"""
 
 
 def summarize_node(state: AgentState) -> Dict[str, Any]:
@@ -131,7 +88,7 @@ def summarize_node(state: AgentState) -> Dict[str, Any]:
     plan = state.get("plan") or {}
     plan_text = json.dumps(plan, ensure_ascii=False, indent=2) if plan else "(无)"
 
-    prompt = SUMMARIZE_PROMPT.format(
+    prompt = load_prompt_template("review/summarize.md",
         requirement=requirement,
         plan_text=plan_text,
         code_blocks=code_text,

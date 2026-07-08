@@ -12,6 +12,7 @@ from typing import Optional
 from harness.roles import Role, RoleResult, RoleRegistry
 from harness.roles.definitions import create_role_registry, COMPLEXITY_ROUTE
 from harness.instructions.role_executor import RoleExecutor
+from harness.instructions.prompts import load_prompt_template
 from harness.state.agent_state import AgentState
 from harness.observability.logger import get_logger
 
@@ -175,14 +176,13 @@ class RoleOrchestrator:
                 )
 
             # 构建修复任务包
-            repair_task = "请修复以下 QA 审查发现的问题：\n"
-            repair_task += "\n".join(f"- [{loop_i + 1}.{i+1}] {issue}"
-                                    for i, issue in enumerate(issues))
-            if suggestions:
-                repair_task += "\n\n## 改进建议\n" + "\n".join(
-                    f"- {s}" for s in suggestions
-                )
-            repair_task += "\n\n用 edit_file 局部修改，不要重写整个文件。修改完立即停止。"
+            issues_text = "\n".join(f"- [{loop_i + 1}.{i+1}] {issue}"
+                                   for i, issue in enumerate(issues))
+            suggestions_text = "\n".join(f"- {s}" for s in suggestions) if suggestions else ""
+            repair_task = load_prompt_template("tasks/repair_task.md",
+                issues=issues_text,
+                suggestions=suggestions_text,
+            )
 
             # 执行修复
             engineer_role = self.registry.get("FrontendEngineer")
@@ -219,21 +219,17 @@ class RoleOrchestrator:
         if role_name == "ProductManager":
             features = plan.get("features", []) if isinstance(plan, dict) else []
             feature_list = "\n".join(f"- {f}" for f in features) if features else requirement
-            return (
-                f"分析以下需求并生成 PRD 文档：\n\n"
-                f"## 用户需求\n{requirement}\n\n"
-                f"## 预分析的功能点\n{feature_list}\n\n"
-                f"## 复杂度\n{complexity}\n\n"
-                f"按照你的 PRD 模板输出完整的分析文档。"
+            return load_prompt_template("tasks/pm_task.md",
+                requirement=requirement,
+                feature_list=feature_list,
+                complexity=complexity,
             )
 
         elif role_name == "Architect":
             pm_output = state.get("role_outputs", {}).get("ProductManager", "")
-            return (
-                f"基于以下 PRD 设计前端架构：\n\n"
-                f"## 用户需求\n{requirement}\n\n"
-                f"## PRD\n{pm_output[:3000] if pm_output else '(PRD 待生成)'}\n\n"
-                f"按照你的架构设计模板输出完整的技术方案。"
+            return load_prompt_template("tasks/architect_task.md",
+                requirement=requirement,
+                pm_output=pm_output[:3000] if pm_output else "(PRD 待生成)",
             )
 
         elif role_name == "FrontendEngineer":
@@ -244,17 +240,14 @@ class RoleOrchestrator:
                 context += f"\n\n## PRD\n{pm_output[:2000]}"
             if arch_output:
                 context += f"\n\n## 架构设计\n{arch_output[:2000]}"
-            return (
-                f"根据设计和需求创建代码文件：\n"
-                f"## 用户需求\n{requirement}{context}\n\n"
-                f"按照架构设计中的文件结构逐个创建文件。"
+            return load_prompt_template("tasks/engineer_task.md",
+                requirement=requirement,
+                context=context,
             )
 
         elif role_name == "QAReviewer":
-            return (
-                f"审查以下需求的代码实现质量：\n\n"
-                f"## 用户需求\n{requirement}\n\n"
-                f"检查代码是否完整实现需求，是否有安全和质量问题。"
+            return load_prompt_template("tasks/qa_task.md",
+                requirement=requirement,
             )
 
         return f"处理用户需求：{requirement}"

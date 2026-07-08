@@ -318,7 +318,7 @@ class TestE2EAllExistingTestsPass:
         # L1
         from harness.instructions.assembler import ContextAssembler
         from harness.instructions.compactor import ContextCompactor
-        from harness.instructions.prompts import PLANNER_SYSTEM, TOOL_CODER_SYSTEM
+        from harness.instructions.prompts import load_prompt, load_prompt_template
 
         # L2
         from harness.tools.registry import create_tool_registry, ToolRegistry, ToolDefinition

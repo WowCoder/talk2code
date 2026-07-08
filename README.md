@@ -28,26 +28,23 @@ talk2code/
 │   │   ├── runtime.py                  # ReAct 工具调用循环 — Agent 执行引擎
 │   │   ├── graph.py                    # LangGraph 多节点编排工作流（v3）
 │   │   ├── instructions/               # 提示词模板、节点函数、意图路由、角色执行、上下文组装/压缩
+│   │   │   ├── prompts/                 #   统一 Prompt 管理（.md 文件 + load_prompt 工具函数）
 │   │   │   ├── intent_router.py         #   前置意图分类 (QUICK/SEARCH/TASK/AMBIGUOUS)
-│   │   │   ├── prompts.py               #   TeamLeader/FrontendEngineer 提示词模板
 │   │   │   ├── nodes.py                 #   LangGraph 节点函数（TeamLeader/PM/Architect/QA/Repair）
-│   │   │   ├── file_coder.py            #   逐文件编码循环 + LGTM/LBTM 审查（期三新增）
-│   │   │   ├── simple_coder.py          #   XS/S 简单编码节点（期三新增）
-│   │   │   ├── summarize.py             #   整体代码审查节点 / SummarizeCode（期三新增）
-│   │   │   ├── orchestrator.py          #   多角色编排引擎（保留兼容）
+│   │   │   ├── file_coder.py            #   逐文件编码循环 + LGTM/LBTM 审查
+│   │   │   ├── simple_coder.py          #   XS/S 简单编码节点
+│   │   │   ├── summarize.py             #   整体代码审查节点 / SummarizeCode
+│   │   │   ├── orchestrator.py          #   多角色编排引擎
 │   │   │   ├── role_executor.py         #   单一角色执行器（含逐文件 QA）
 │   │   │   ├── compactor.py             #   P0-P3 分层上下文压缩
 │   │   │   ├── assembler.py             #   上下文组装（Skill + Craft 规则 + 记忆）
 │   │   ├── tools/                      # 工具注册表、文件操作、代码生成/验证
 │   │   ├── roles/                      # 多角色定义
 │   │   │   ├── __init__.py              #   Role/RoleResult/RoleRegistry
-│   │   │   └── definitions.py           #   6 角色 Prompt + 工具子集 + 路由表
+│   │   │   └── definitions.py           #   5 角色 Prompt（从 prompts/*.md 加载）+ 路由表
 │   │   ├── communication/               # 消息总线
 │   │   │   └── __init__.py              #   AgentBus 四分支路由
-│   │   ├── experience/                  # 经验池 (DEPRECATED → memory.py)
-│   │   │   └── __init__.py              #   ExperiencePool + TF-IDF 检索
-│   │   ├── learning/                    # 持续学习 (DEPRECATED → memory.py)
-│   │   │   └── __init__.py              #   Evaluator + FeedbackLoop
+│   │   ├── experience/                  # 经验池 (DEPRECATED → memory.py, 保留兼容)
 │   │   ├── environment/                # 权限管理、沙箱执行
 │   │   ├── state/                      # AgentState、WorkspaceFS、Git 版本化、记忆存储
 │   │   │   ├── memory.py               #   MemoryManager — 统一记忆管理（BGE-M3 混合检索 + LLM 反思）
@@ -55,6 +52,13 @@ talk2code/
 │   │   │   ├── memory_store.py          #   MemoryStore (DEPRECATED → memory.py)
 │   │   ├── constraints/                # Hook 管理器 + 约束检查（Craft 规则、安全、质量）
 │   │   └── observability/              # 链路追踪、成本统计、SSE 事件上报、日志
+│   ├── skills/                         # 统一技能 + 设计规则（渐进式披露：L0→L1→L2）
+│   │   ├── __init__.py                  #   SkillLoader — 按任务特征匹配
+│   │   ├── anti-ai-slop/SKILL.md        #   L0 始终注入：禁止 AI 刻板设计模式
+│   │   ├── typography/SKILL.md          #   L1 UI 触发：排版字号层级规范
+│   │   ├── color/SKILL.md               #   L1 UI 触发：色彩系统规则
+│   │   ├── accessibility/SKILL.md       #   L2 表单触发：可访问性基础规则
+│   │   └── generic/SKILL.md             #   通用前端开发技能模板
 │   ├── agents/                         # 向后兼容重导出层
 │   ├── services/                       # SSE 传输、任务调度、应用胶水层
 │   ├── skills/                         # 可插拔应用模板（Skill 定义）
@@ -233,7 +237,7 @@ cd backend && python app.py
 - Hook 失败结果实时注入 LLM 上下文，Agent 能"看到"自己的验证错误并主动修复
 - ContextCompactor P0-P3 分层压缩：长对话自动压缩旧消息，防止上下文溢出
 - 每次成功/失败自动存入 MemoryManager（BGE-M3 混合检索 + LLM 反思），后续相似需求注入 few-shot 示例 + 历史教训
-- 所有角色的行为规则写在其 System Prompt 中，改行为 = 改 Prompt，无需改代码
+- 所有角色的行为规则写在 `prompts/*.md` 中，改行为 = 改 Markdown 文件，无需改代码
 
 ### Harness 框架
 
@@ -252,7 +256,7 @@ IntentRouter → TeamLeader → LangGraph 多节点编排
 | 层级 | 模块 | 职责 |
 |------|------|------|
 | 0 - Routing | `intent_router.py` | 前置意图分类，四路分流 |
-| 1 - Instructions | 提示词/角色/节点 | 8 个 LangGraph 节点 + 6 角色定义 + 逐文件编码 + LGTM/LBTM 审查 + SummarizeCode + 上下文压缩 |
+| 1 - Instructions | 提示词/角色/节点 | 8 个 LangGraph 节点 + 5 角色定义 + 逐文件编码 + LGTM/LBTM 审查 + SummarizeCode + 上下文压缩 |
 | 2 - Tools | 工具注册/代码生成 | 工具注册表、read/write/edit_file、lint/validate/preview |
 | 3 - Environment | 权限/沙箱 | 权限控制、沙箱安全执行 |
 | 4 - State | 状态/工作区/记忆 | AgentState（含 tasks/interfaces/implementation_order）、WorkspaceFS、Git 版本化、Checkpoint |
@@ -261,16 +265,22 @@ IntentRouter → TeamLeader → LangGraph 多节点编排
 | — | `state/memory.py` | BGE-M3 混合检索 + LLM 反思 (reflection/lesson/pattern) + 经验存储 + few-shot 注入 |
 | — | `state/memory_retriever.py` | BGE-M3 Dense(1024维)+BM25 Sparse 混合检索 + TF-IDF 降级回退 |
 | — | `experience/` | (DEPRECATED) TF-IDF 语义检索 + 经验存储 |
-| — | `learning/` | (DEPRECATED) Evaluator + FeedbackLoop |
 
-### 设计质量规则（Craft 层）
+### 设计质量规则（Rules 层，渐进式披露）
 
-系统在代码生成时自动注入设计质量约束：
+规则按层级渐进注入，避免 Token 浪费：
 
-- **anti-ai-slop**: 避免 AI 刻板模式（默认 indigo 色系、emoji 图标、圆角卡片+彩色左边框等）
-- **accessibility-baseline**: 颜色对比度、键盘导航、语义化 HTML、ARIA 标签
-- **typography**: 字号层级、行高、字距、行宽、字体配对
-- **color**: 色板结构、主色纪律、语义色、暗色主题
+| 层级 | 触发条件 | 规则 | Token 量 |
+|------|---------|------|---------|
+| **L0** | 始终注入 | anti-ai-slop（禁止 indigo 紫色、emoji 图标等 AI 刻板模式） | ~500 chars |
+| **L1** | 需求含 UI 关键词 | typography（字号层级）+ color（色板结构） | ~2300 chars |
+| **L2** | 需求含交互/表单关键词 | accessibility（对比度、键盘导航、语义HTML） | ~900 chars |
+| **Skill** | 关键词匹配（空=通用） | 领域知识模板（如通用前端模式） | ~900 chars |
+
+以不同任务为例：
+- "做一个计算器" → L0 + Skill = 1766 chars
+- "做一个登录表单" → L0 + L2 + Skill = 2500 chars
+- "做一个博客网站" → L0 + L1 + Skill = 3850 chars
 
 ### 可插拔应用模板（Skill 系统）
 

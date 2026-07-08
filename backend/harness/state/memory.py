@@ -74,79 +74,22 @@ class Memory:
         )
 
 
-# ==================== 反思 Prompt ====================
+from harness.instructions.prompts import load_prompt
 
-REFLECTION_SYSTEM = """你是资深前端工程师，刚完成一个代码生成任务。请复盘并回答 3 个问题。
+# ==================== 反思 Prompt（从 .md 文件加载）====================
 
-回答要简洁（每条 1-2 句），聚焦可复用经验。"""
-
-REFLECTION_PROMPT = """## 任务回顾
-
-用户需求: {requirement}
-
-代码产出: {code_summary}
-
-QA 评分: {rating}/10
-
-## 请回答以下 3 个问题
-
-1. **reflection**: 这次实现过程中有什么和预期不同的？为什么会出现这种情况？
-2. **lesson**: 如果下次有人提出类似需求，你最重要的一个经验教训是什么？
-3. **reusable_pattern**: 这次有没有产生可以复用的代码模式/组件？（没有就说"无"）
-
-另外:
-- tags: 为这段记忆打 2-4 个标签（如 localStorage, CRUD, 表单, 响应式）
-- importance: 重要性 0.0-1.0（会反复遇到的模式给高分，一次性的给低分）
-
-只返回 JSON，不要其他文字。格式:
-{{"reflection": "...", "lesson": "...", "reusable_pattern": "...", "tags": [...], "importance": 0.0}}"""
-
+REFLECTION_SYSTEM = load_prompt("memory/reflection_system.md")
+REFLECTION_PROMPT = load_prompt("memory/reflection_prompt.md")
 
 # ==================== 校验 Prompt (L2) ====================
 
-VERIFY_SYSTEM = """你是经验筛选助手。从候选记忆中选出对当前任务真正有用的。"""
-
-VERIFY_PROMPT = """当前需求: {query}
-
-候选经验:
-{candidates}
-
-请选出对当前任务真正有帮助的经验（最多 3 条），返回它们的序号列表。
-
-选择标准:
-- 技术栈相同或相似（如都用 localStorage）
-- 功能模式可以复用（如 CRUD、表单验证模式）
-- 包含需要避免的坑（如"localStorage 必须 JSON.stringify"）
-
-不需要选的经验:
-- 技术栈完全不同
-- 仅因为关键词巧合匹配
-- 已经是基本常识
-
-只返回 JSON 数组: [0, 2]"""
-
+VERIFY_SYSTEM = load_prompt("memory/verify_system.md")
+VERIFY_PROMPT = load_prompt("memory/verify_prompt.md")
 
 # ==================== 合并 Prompt ====================
 
-CONSOLIDATE_SYSTEM = """你是经验整理助手。将相似的经验合并，标记过时的建议。"""
-
-CONSOLIDATE_PROMPT = """以下是最近积累的经验，请整理：
-
-{memories}
-
-请检查:
-1. 有没有多条经验在说同一个事情？如果有，指出需要合并的组（最多合并为一条）
-2. 有没有已经过时的建议？（如"用 X 代替 Y"，但 X 本身已不推荐）
-3. 有没有互相矛盾的经验？
-
-返回 JSON:
-{{
-  "merge_groups": [[0, 3], [1, 5]],
-  "deprecate": [2],
-  "summary": "一句话描述本次整理的变更"
-}}
-
-如果没有需要合并或淘汰的，返回空数组。只返回 JSON。"""
+CONSOLIDATE_SYSTEM = load_prompt("memory/consolidate_system.md")
+CONSOLIDATE_PROMPT = load_prompt("memory/consolidate_prompt.md")
 
 
 # ==================== MemoryManager ====================

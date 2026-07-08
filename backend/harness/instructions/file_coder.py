@@ -16,6 +16,7 @@ from typing import Dict, Any, Optional
 from harness.state.agent_state import AgentState
 from harness.observability.logger import get_logger
 from harness.harness_context import get_tool_loop as _get_tool_loop
+from harness.instructions.prompts import load_prompt, load_prompt_template
 from llm.client import get_client
 
 logger = get_logger(__name__)
@@ -25,43 +26,6 @@ MAX_CODE_REVIEW_ATTEMPTS = 3  # K=2
 
 # 每文件 ToolCallLoop 最大迭代次数
 PER_FILE_MAX_ITERATIONS = 5
-
-# ==================== CodeReview 提示词（仿 MetaGPT WriteCodeReview） ====================
-
-CODE_REVIEW_PROMPT = """你是一位资深代码审查专家。审查以下代码文件，从 6 个维度评估：
-
-## 当前任务
-{task_description}
-
-## 接口契约
-{interface_contract}
-
-## 代码文件: {file_path}
-```{language}
-{code_content}
-```
-
-## 审查维度
-1. **需求实现** — 是否完整实现了任务描述的功能？
-2. **逻辑正确性** — 业务逻辑是否有明显错误？边界情况是否处理？
-3. **接口遵循** — 是否遵循了定义的接口契约（exports/imports）？
-4. **功能完整性** — 是否有遗漏的函数/方法？是否有 TODO 或占位符？
-5. **依赖正确性** — 是否正确引用了其他模块的导出？
-6. **代码质量** — 命名是否规范？是否有重复代码？是否有安全隐患（innerHTML/eval/document.write）？
-
-## 输出格式（严格 JSON）
-```json
-{{"verdict": "LGTM", "issues": [], "score": 8.5}}
-```
-或
-```json
-{{"verdict": "LBTM", "issues": ["问题1描述", "问题2描述"], "score": 5.0}}
-```
-
-- LGTM = Looks Good To Me（代码质量合格，无需重写）
-- LBTM = Looks Bad To Me（存在需要修复的问题）
-- score: 1-10 分，6 分以上为合格
-- 只返回 JSON，不要其他文字"""
 
 
 def _find_task(tasks: list, file_path: str) -> Optional[dict]:
@@ -170,34 +134,21 @@ def _inject_coding_context(tool_loop, context: dict):
 
         exports_text = ""
         if context.get("exports"):
-            exports_text = f"\n\n## 本文件需要导出的接口\n" + "\n".join(
+            exports_text = "\n\n## 本文件需要导出的接口\n" + "\n".join(
                 f"- {e}" for e in context["exports"]
             )
 
-        return f"""你是一个资深前端工程师。你正在实现项目中的一个文件。
-
-## 用户需求
-{context["requirement"]}
-{plan_section}
-
-## 当前文件: {context["file_path"]}
-**任务描述**: {context["task_description"]}
-{exports_text}
-{context["imports_text"]}
-{context["interface_text"]}
-
-{context["completed_text"]}
-
-{context["error_text"]}
-
-## 重要
-- **只创建当前这一个文件**: {context["file_path"]}
-- 如果需要引用其他模块，按照 imports 中定义的接口使用
-- 创建完成后立即停止，告诉我"任务完成"
-- 不要创建其他文件
-- write_file 的返回结果已包含文件完整内容，不要再用 read_file 重新读取
-- 代码完整可运行，不省略不写 TODO
-- 禁止: innerHTML, eval, document.write"""
+        return load_prompt_template("coding/file_aware_coder.md",
+            requirement=context["requirement"],
+            plan_section=plan_section,
+            file_path=context["file_path"],
+            task_description=context["task_description"],
+            exports_text=exports_text,
+            imports_text=context["imports_text"],
+            interface_text=context["interface_text"],
+            completed_text=context["completed_text"],
+            error_text=context["error_text"],
+        )
 
     tool_loop._build_system_prompt = _file_aware_prompt
     return original_builder
@@ -237,12 +188,12 @@ def _review_single_file(file_path: str, workspace, state: AgentState,
     file_interfaces = interfaces.get(file_path, {})
     interface_text = json.dumps(file_interfaces, ensure_ascii=False, indent=2) if file_interfaces else "(无)"
 
-    prompt = CODE_REVIEW_PROMPT.format(
+    prompt = load_prompt_template("review/code_review.md",
         task_description=task.get("description", "实现该文件的功能"),
         interface_contract=interface_text,
         file_path=file_path,
         language=language,
-        code_content=code_content[:8000],  # 截断防止过长
+        code_content=code_content[:8000],
     )
 
     try:
