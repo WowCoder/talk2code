@@ -87,22 +87,68 @@ def _normalize(text: str) -> str:
     return "\n".join(line.rstrip() for line in text.split("\n"))
 
 
-def _match(search: str, content: str) -> tuple[int, str]:
-    """在 content 中匹配 search，返回 (occurrences, best_hint)。
+def _normalize_whitespace(text: str) -> str:
+    """激进空白规范化：折叠所有连续空白为单个空格，行首尾去空白。
 
-    best_hint 用于匹配失败时回灌——它取自 content 中与 search 首行最接近的片段。
+    用于容忍 LLM 在空格/tab/换行上的任意差异。
+    注意：此方法丢失缩进语义，仅在前两级匹配失败后才使用。
     """
-    # 1) 原始精确匹配（优先）
+    lines = []
+    for line in text.split("\n"):
+        collapsed = " ".join(line.split())
+        if collapsed:
+            lines.append(collapsed)
+    return "\n".join(lines)
+
+
+def _normalize_indentation(text: str) -> str:
+    """去除所有前导空白，只保留内容行。
+
+    用于容忍 LLM 在缩进级别上的差异（tab vs 空格，缩进深度不同）。
+    这是最后的模糊匹配手段，会丢失所有缩进信息。
+    """
+    return "\n".join(
+        line.lstrip()
+        for line in text.split("\n")
+    )
+
+
+def _match(search: str, content: str) -> tuple[int, str]:
+    """在 content 中匹配 search，返回 (occurrences, match_mode)。
+
+    match_mode 取值：'exact' | 'normalized' | 'whitespace' | 'indentation' | ''（失败）
+
+    多级模糊匹配回退链:
+      Level 1: 精确逐字节匹配（最可靠）
+      Level 2: 行尾空白规范化（容忍行尾空格/tab 差异）
+      Level 3: 空白折叠匹配（容忍空格/tab/换行差异）
+      Level 4: 缩进弹性匹配（容忍 tab/空格/缩进深度差异）
+    """
+    # Level 1: 原始精确匹配（优先）
     occurrences = content.count(search)
     if occurrences:
-        return occurrences, ""
+        return occurrences, "exact"
 
-    # 2) Normalize 后匹配：容忍行尾空白差异
+    # Level 2: 行尾空白规范化
     normalized_search = _normalize(search)
     normalized_content = _normalize(content)
     occurrences = normalized_content.count(normalized_search)
     if occurrences:
         return occurrences, "normalized"
+
+    # Level 3: 激进空白折叠匹配
+    ws_search = _normalize_whitespace(search)
+    ws_content = _normalize_whitespace(content)
+    occurrences = ws_content.count(ws_search)
+    if occurrences:
+        return occurrences, "whitespace"
+
+    # Level 4: 缩进弹性匹配（去掉所有前导空白）
+    indent_search = _normalize_indentation(search)
+    indent_content = _normalize_indentation(content)
+    occurrences = indent_content.count(indent_search)
+    if occurrences:
+        return occurrences, "indentation"
 
     return 0, ""
 
@@ -133,23 +179,40 @@ class EditToolHandler:
 
         # 逐块匹配；任一失败则整体不修改，返回上下文帮助 LLM 校正
         new_content = content
+        match_modes = set()
         for i, (search, replace) in enumerate(blocks, 1):
             occ, match_mode = _match(search, new_content)
             if occ == 0:
                 return ToolResult(
-                    error=self._no_match_message(filename, i, search, new_content),
+                    error=self._no_match_message(filename, i, search, new_content, blocks),
                 )
             if occ > 1:
                 return ToolResult(
                     error=self._ambiguous_message(filename, i, search, occ),
                 )
-            if match_mode == "normalized":
-                # normalize 匹配成功：在校准后的内容上执行替换，保证后续块的一致
+            match_modes.add(match_mode)
+
+            # 根据匹配层级，在对应规范化的内容上执行替换
+            if match_mode == "indentation":
+                # Level 4: 缩进弹性 → 在去除前导空白的内容上替换
+                indent_content = _normalize_indentation(new_content)
+                indent_search = _normalize_indentation(search)
+                indent_replace = _normalize_indentation(replace)
+                new_content = indent_content.replace(indent_search, indent_replace, 1)
+            elif match_mode == "whitespace":
+                # Level 3: 空白折叠 → 在折叠空白的内容上替换
+                ws_content = _normalize_whitespace(new_content)
+                ws_search = _normalize_whitespace(search)
+                ws_replace = _normalize_whitespace(replace)
+                new_content = ws_content.replace(ws_search, ws_replace, 1)
+            elif match_mode == "normalized":
+                # Level 2: 行尾规范化
                 normalized_content = _normalize(new_content)
                 normalized_search = _normalize(search)
                 normalized_replace = _normalize(replace)
                 new_content = normalized_content.replace(normalized_search, normalized_replace, 1)
             else:
+                # Level 1: 精确匹配
                 new_content = new_content.replace(search, replace, 1)
 
         # 写入
@@ -161,19 +224,30 @@ class EditToolHandler:
         # 统计 diff
         old_lines = content.count("\n") + 1
         new_lines = new_content.count("\n") + 1
-        match_tags = ["normalized"] if any(
-            _match(s, content)[1] == "normalized" for s, _ in blocks
-        ) else []
-        # 返回完整修改后的文件内容（上限 8000 字符），让 Agent 知道修改后的文件状态，
-        # 避免编辑后再 read_file 验证
+
+        # 匹配模式中文标签
+        mode_labels = {
+            "exact": "精确匹配",
+            "normalized": "行尾空白归一",
+            "whitespace": "空白折叠匹配",
+            "indentation": "缩进弹性匹配",
+        }
+        mode_tag = ", ".join(
+            mode_labels.get(m, m) for m in match_modes if m != "exact"
+        )
+        mode_hint = f"（通过{mode_tag}）" if mode_tag else ""
+
+        # 返回完整修改后的文件内容，让 Agent 知道修改后的文件状态
         modified_preview = new_content[:8000]
         if len(new_content) > 8000:
-            modified_preview += f"\n\n... (文件共 {len(new_content)} 字符，以上为前 8000 字符)"
+            modified_preview += (
+                f"\n\n... (文件共 {len(new_content)} 字符，以上为前 8000 字符。"
+                f"如需查看修改后的尾部，请用 read_file 的 start_line 参数)"
+            )
         return ToolResult(
             content=(
                 f"已更新 {filename}：应用 {len(blocks)} 处修改 "
-                f"({old_lines} → {new_lines} 行)"
-                + (f"（通过空白归一匹配）" if match_tags else "")
+                f"({old_lines} → {new_lines} 行){mode_hint}"
                 + f"\n\n--- 修改后的完整文件 ---\n{modified_preview}"
             ),
             metadata={
@@ -181,13 +255,16 @@ class EditToolHandler:
                 "blocks": len(blocks),
                 "old_lines": old_lines,
                 "new_lines": new_lines,
+                "match_modes": list(match_modes),
             },
         )
 
     @staticmethod
-    def _no_match_message(filename: str, block_idx: int, search: str, content: str) -> str:
+    def _no_match_message(filename: str, block_idx: int, search: str, content: str,
+                          blocks: list = None) -> str:
         """匹配失败时回灌文件实际内容，让 LLM 看到真值后重新构造 SEARCH 块"""
         search_preview = search[:200] + ("..." if len(search) > 200 else "")
+        total_blocks = len(blocks) if blocks else 1
 
         # 用搜索块首行定位文件中的近似位置，回灌周围内容
         # 尝试层级：精确 substring > CSS 属性前缀（如 font-size:）> 首词
@@ -223,20 +300,27 @@ class EditToolHandler:
                     f"  {i}: {lines[i - 1]}" for i in range(start + 1, end + 1)
                 )
 
+        fallback_hint = (
+            f"\n\n💡 提示：如果 edit_file 连续失败 2 次，请改用 write_file 重写整个文件。"
+            f"使用 read_file 确认当前文件内容后再构造 SEARCH 块。"
+        )
+
         if context_snippet:
             return (
-                f"第 {block_idx} 个 SEARCH 块在 {filename} 中未找到精确匹配。\n"
+                f"第 {block_idx}/{total_blocks} 个 SEARCH 块在 {filename} 中未找到精确匹配。\n"
                 f"你的 SEARCH 块（前 200 字）：\n{search_preview}\n\n"
                 f"文件 {filename} 从第 {max(1, match_ln - 2)} 行起的实际内容：\n{context_snippet}\n\n"
                 f"⚠️ 请逐字对比 SEARCH 块与上面文件内容的差异。"
                 f"不要用记忆/猜测的值——直接用上面显示的内容片段重新构造 SEARCH 块。"
+                f"{fallback_hint}"
             )
         else:
             return (
-                f"第 {block_idx} 个 SEARCH 块在 {filename} 中未找到精确匹配。\n"
+                f"第 {block_idx}/{total_blocks} 个 SEARCH 块在 {filename} 中未找到精确匹配。\n"
                 f"你的 SEARCH 块（前 200 字）：\n{search_preview}\n\n"
                 f"文件 {filename} 全文（{len(content)} 字）：\n{content[:1000]}\n\n"
                 f"请用 read_file 重新读取文件，确保 SEARCH 片段逐字符匹配。"
+                f"{fallback_hint}"
             )
 
     @staticmethod

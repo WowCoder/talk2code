@@ -30,15 +30,16 @@ defineEmits<{
 
 function fileExt(filename: string): string {
   const ext = filename.split('.').pop() || ''
-  if (['html'].includes(ext)) return 'html'
+  if (['html', 'htm'].includes(ext)) return 'html'
   if (['css'].includes(ext)) return 'css'
-  if (['js'].includes(ext)) return 'js'
+  if (['js', 'mjs'].includes(ext)) return 'js'
+  if (['md'].includes(ext)) return 'md'
   return 'html'
 }
 
 function fileLabel(filename: string): string {
   const ext = filename.split('.').pop() || ''
-  const labels: Record<string, string> = { html: 'H', css: 'C', js: 'J' }
+  const labels: Record<string, string> = { html: 'H', htm: 'H', css: 'C', js: 'J', mjs: 'J', md: 'M' }
   return labels[ext] || ext[0]?.toUpperCase() || '?'
 }
 </script>
@@ -132,5 +133,10 @@ function fileLabel(filename: string): string {
 .tree-file-icon.js {
   background: oklch(50% 0.12 100);
   color: #000;
+}
+
+.tree-file-icon.md {
+  background: oklch(50% 0.08 260);
+  color: #fff;
 }
 </style>

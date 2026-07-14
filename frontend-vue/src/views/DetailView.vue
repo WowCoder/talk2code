@@ -11,7 +11,7 @@
     <!-- Split layout -->
     <div class="split">
       <!-- Left: Dialogue -->
-      <DialoguePanel @send-message="onSendMessage" />
+      <DialoguePanel @send-message="onSendMessage" @stop="onStopGeneration" />
 
       <!-- Right: Preview / Code -->
       <div class="right-panel">
@@ -20,6 +20,19 @@
           v-model:activeTab="activeTab"
           @download="onDownload"
         />
+
+        <!-- Spec view -->
+        <div v-show="activeTab === 'spec'" class="view active">
+          <SpecPanel
+            :spec-data="(store as any)._specData"
+            :evaluator-result="store.evaluatorResult"
+          />
+        </div>
+
+        <!-- Tasks view -->
+        <div v-show="activeTab === 'tasks'" class="view active">
+          <TaskPanel :tasks="(store as any)._taskList || []" />
+        </div>
 
         <!-- Preview view -->
         <div v-show="activeTab === 'preview'" class="view active">
@@ -45,12 +58,15 @@
 import { ref, computed, watch, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useRequirementStore } from '@/stores/requirement'
+import { useAuthStore } from '@/stores/auth'
 import { useToast } from '@/composables/useToast'
 import { useSSE } from '@/composables/useSSE'
 import AppNav from '@/components/layout/AppNav.vue'
 import DialoguePanel from '@/components/detail/DialoguePanel.vue'
 import ProgressBar from '@/components/detail/ProgressBar.vue'
 import PanelTabs from '@/components/detail/PanelTabs.vue'
+import SpecPanel from '@/components/detail/SpecPanel.vue'
+import TaskPanel from '@/components/detail/TaskPanel.vue'
 import PreviewFrame from '@/components/detail/PreviewFrame.vue'
 import CodePanel from '@/components/detail/CodePanel.vue'
 import TokenBar from '@/components/detail/TokenBar.vue'
@@ -85,7 +101,7 @@ const statusText = computed(() => {
 })
 
 const tokenInfo = computed(() => {
-  const trace = (store as any)._traceSummary as SSETraceSummaryData | null
+  const trace = store._traceSummary as SSETraceSummaryData | null
   return {
     totalTokens: trace?.total_tokens || 0,
     totalCost: trace?.total_cost || 0,
@@ -111,7 +127,7 @@ onMounted(async () => {
       store.progress = { currentAgent: '', percent: 100 }
       // 已完成的请求通过 API response 获取 trace 数据
       if ((data as any).trace) {
-        ;(store as any)._traceSummary = (data as any).trace
+        ;store._traceSummary = (data as any).trace
       }
     } else if (req.status === 'processing') {
       // 正在处理中：连接 SSE 并显示处理状态
@@ -127,14 +143,23 @@ onMounted(async () => {
   }
 })
 
+// Auto-switch tabs on SSE events
+watch(() => store.planStatus, (status) => {
+  if (status === 'needs_confirmation') {
+    activeTab.value = 'spec'  // TL 完成后自动切到 Spec Tab
+  } else if (status === 'confirmed') {
+    activeTab.value = 'tasks' // 用户确认后自动切到任务 Tab
+  }
+})
+
 // Handle SSE disconnection when leaving
 watch(reqId, (newId, oldId) => {
   if (oldId) disconnect()
   if (newId) {
     store.reset()
-    store.loadRequirement(newId).then((data) => {
+    store.loadRequirement(newId).then((data: { requirement: any; trace?: any }) => {
       if ((data as any)?.trace) {
-        ;(store as any)._traceSummary = (data as any).trace
+        ;store._traceSummary = (data as any).trace
       }
       connect()
     })
@@ -179,6 +204,31 @@ async function onSendMessage(message: string) {
     if (!store.pendingChatClarification) {
       store.isGenerating = false
     }
+  }
+}
+
+// Stop handler: 取消正在执行的 Agent 任务
+async function onStopGeneration() {
+  if (!store.currentRequirement?.id) return
+
+  try {
+    const authStore = useAuthStore()
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      ...authStore.getAuthHeaders(),
+    }
+    await fetch(`/api/requirements/${store.currentRequirement.id}/cancel`, {
+      method: 'POST',
+      headers,
+    })
+    // SSE cancelled 事件会自动清理 isGenerating 状态
+    // 作为 fallback，也在这里清理
+    store.isGenerating = false
+    store.progress = { currentAgent: '', percent: 0 }
+  } catch (err: any) {
+    // 即使请求失败，也恢复输入状态
+    store.isGenerating = false
+    show('取消失败: ' + (err.message || '未知错误'), 'error')
   }
 }
 
@@ -268,7 +318,7 @@ ${files[key]}
 
 .view {
   flex: 1;
-  overflow: hidden;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
 }

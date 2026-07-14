@@ -55,6 +55,9 @@ class Requirement(Base):
     create_time = Column(DateTime, default=datetime.utcnow)
     update_time = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    # 失败原因（仅 status='failed' 时有值，持久化错误详情供前端展示）
+    error_message = Column(Text, nullable=True)
+
     # 软删除（回收站）
     is_deleted = Column(Boolean, default=False)
     deleted_at = Column(DateTime, nullable=True)
@@ -177,6 +180,14 @@ def init_db():
             conn.commit()
     except Exception:
         pass
+
+    # 迁移：为已有 requirements 表添加 error_message 列
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE requirements ADD COLUMN error_message TEXT"))
+            conn.commit()
+    except Exception:
+        pass  # 列已存在
 
 
 # 获取数据库会话

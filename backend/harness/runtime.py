@@ -9,6 +9,7 @@ import json
 import re
 
 from harness.state.agent_state import AgentState
+from harness.agent_names import DEV_NAME
 from harness.tools.registry import ToolRegistry
 from harness.tools.file_tools import FileToolHandler
 from harness.tools.code_tools import CodeToolHandler
@@ -31,7 +32,7 @@ class ToolCallLoop:
 
     def __init__(self, workspace, git=None, tools: ToolRegistry = None,
                  hooks=None, tracer=None, cost_tracker=None, sse_reporter=None,
-                 permission_manager=None, checkpoint=None, on_iteration=None):
+                 checkpoint=None, on_iteration=None):
         self.workspace = workspace
         self.git = git
         self.tools = tools
@@ -39,7 +40,6 @@ class ToolCallLoop:
         self.tracer = tracer
         self.cost_tracker = cost_tracker
         self.sse = sse_reporter
-        self.permission_manager = permission_manager
         self.checkpoint = checkpoint
         self.on_iteration = on_iteration  # 可选回调，每轮迭代后调用以增量持久化
 
@@ -61,8 +61,8 @@ class ToolCallLoop:
 
         # 可配置的角色名称（多角色协作用，默认兼容旧行为）
         meta = state.get("metadata", {})
-        coder_name = meta.get("coder_name", "Henry（开发）")
-        thinking_name = meta.get("thinking_name", "Henry（开发）")
+        coder_name = meta.get("coder_name", DEV_NAME)
+        thinking_name = meta.get("thinking_name", DEV_NAME)
 
         # 根据复杂度调整迭代上限（M/L 多角色流程需要更多轮次覆盖文件创建和 QA 修复）
         complexity = state.get("metadata", {}).get("complexity", "S")
@@ -76,6 +76,16 @@ class ToolCallLoop:
         for iteration in range(effective_max_iterations):
             state["tool_call_count"] = iteration + 1
 
+            # 检查取消信号
+            req_id = state.get("metadata", {}).get("requirement_id") or state.get("requirement_id")
+            if req_id:
+                from services.requirement_service import RequirementService
+                if RequirementService.is_cancelled(req_id):
+                    logger.info(f"[ToolLoop] 需求 {req_id} 已被取消，终止执行")
+                    state["current_step"] = "cancelled"
+                    state["error"] = "操作已被用户取消"
+                    break
+
             # 调用 LLM with tools
             messages = self._build_messages(state)
             response = client.chat_with_tools(
@@ -83,6 +93,16 @@ class ToolCallLoop:
                 tools=self.tools.get_schemas() if self.tools else [],
                 max_tokens=8000,
             )
+
+            # ---- LLM 调用失败 → 立即终止，不在循环内死磕 ----
+            if response.is_error:
+                logger.error(
+                    f"[ToolLoop] LLM 调用失败 (iter {iteration + 1}): "
+                    f"{response.error or response.content[:200]}"
+                )
+                state["current_step"] = "llm_error"
+                state["error"] = f"LLM 调用失败: {response.error or response.content[:200]}"
+                break
 
             # 追踪 LLM 调用
             if self.tracer and trace_id:
@@ -107,13 +127,23 @@ class ToolCallLoop:
                 is_chat = state.get("metadata", {}).get("is_chat", False)
                 missing = [] if is_chat else self._check_missing_files(state)
                 if missing:
+                    # 连续缺失文件计数器（不重置 no_progress_count，
+                    # 让无进展检测也能并行工作）
+                    missing_rounds = state.get("_missing_files_rounds", 0) + 1
+                    state["_missing_files_rounds"] = missing_rounds
+                    if missing_rounds >= 3:
+                        logger.warning(
+                            f"[ToolLoop] 连续 {missing_rounds} 轮报告文件缺失但无实质进展，"
+                            f"强制终止。缺失文件: {missing}"
+                        )
+                        state["current_step"] = "no_progress"
+                        break
                     state["dialogue_history"].append({
                         "role": "system", "name": "System",
                         "content": f"你还没有创建所有必需的文件，缺少：{', '.join(missing)}。"
                                  f"请继续用 write_file 创建剩余文件，不要停止。",
                         "hidden": True,
                     })
-                    state["no_progress_count"] = 0
                     continue
                 state["current_step"] = "task_complete"
                 state["current_step"] = "task_complete"
@@ -123,47 +153,54 @@ class ToolCallLoop:
                 })
                 break
 
-            # 发布 thinking（优先用 reasoning_content，其次 content）
+            # 保存 thinking 到对话历史（仅 LLM 上下文，hidden 避免前端重复展示）
             thinking_text = response.reasoning_content or response.content
             if thinking_text:
-                if self.sse:
-                    self.sse.thinking(state["requirement_id"], thinking_text, thinking_name)
-                # 存入对话历史，让前端刷新后仍可展示
                 state["dialogue_history"].append({
                     "role": "thinking",
                     "name": thinking_name,
-                    "content": thinking_text
+                    "content": thinking_text,
+                    "hidden": True,
                 })
 
-            # 保存 assistant 回复到对话历史（让下一轮 Agent 记得自己的规划，避免重复探索）
+            # 保存 assistant 回复到对话历史（仅 LLM 上下文，iteration_batch 已包含 agent_text 预览）
+            agent_text = response.content[:1500] if response.content else ""
             if response.content and response.tool_calls:
                 state["dialogue_history"].append({
                     "role": "assistant",
                     "name": coder_name,
-                    "content": response.content[:1500]
+                    "content": agent_text,
+                    "hidden": True,
                 })
 
-            # 执行所有工具调用
+            # ---- 有工具调用 = 有实质进展，重置缺失文件计数器 ----
+            state["_missing_files_rounds"] = 0
+
+            # 执行所有工具调用（收集到 batch_tools，统一发送迭代批量事件）
+            batch_tools = []
             for tc in response.tool_calls:
                 result = self._execute_tool(state, tc)
                 logger.info(f"[ToolLoop] 执行 {tc.name}: success={result.success} content={result.content[:100] if result.success else ''} error={result.error[:100] if not result.success else ''}")
 
-                # 发布工具调用事件
+                # 生成前端展示用简短标签
+                display_readable = self._tool_display_label(tc.name, tc.arguments, result)
+
+                # 收集到批量列表（前端只展示简短标签，不暴露大段内容）
+                batch_tools.append({
+                    "name": tc.name,
+                    "readable": display_readable,
+                    "success": result.success,
+                    "arguments": tc.arguments,
+                })
+
+                # 实时推送 code 事件（代码面板需要实时更新）
                 if self.sse:
-                    self.sse.tool_call(state["requirement_id"], tc.name, tc.arguments)
-                    self.sse.tool_result(
-                        state["requirement_id"], tc.name,
-                        result.success, result.content[:500] if result.success else "",
-                        result.error[:500] if not result.success else "",
-                    )
-                    # write_file/edit_file 成功后推送 code 事件，让前端实时更新代码面板
                     if tc.name == "write_file" and result.success:
                         self.sse.code(state["requirement_id"], [{
                             "filename": tc.arguments.get("filename", "unknown"),
                             "content": tc.arguments.get("content", "")
                         }])
                     elif tc.name == "edit_file" and result.success:
-                        # edit_file 推送修改后的完整文件内容（前端需最新全量）
                         edited_name = tc.arguments.get("filename", "unknown")
                         try:
                             edited_content = self.workspace.read(edited_name)
@@ -174,34 +211,59 @@ class ToolCallLoop:
                             "content": edited_content
                         }])
 
-                # 工具结果摘要（超大文件截断，避免对话记录膨胀）
-                # read_file 需要足够上下文让 LLM 构造 edit_file 的精确 SEARCH 块
+                # 工具结果摘要（超大文件智能截断，保留首尾关键内容）
                 tool_summary = result.content if result.success else result.error
                 is_chat = state.get("metadata", {}).get("is_chat", False)
                 if tc.name == "read_file":
-                    # Chat/编辑模式：需要完整文件内容构造精确 SEARCH 块
-                    # 生成模式：8000 字符覆盖文件主要区域（配合文件摘要避免误判截断为损坏）
-                    max_len = 16000 if is_chat else 8000
+                    # read_file: 保留完整内容，只对超大文件做首尾保留
+                    max_len = 32000 if is_chat else 24000
                 elif tc.name in ("write_file", "edit_file"):
-                    max_len = 8000  # 让 Agent 看到完整文件内容，避免写入后再 read_file 验证
+                    max_len = 8000
                 else:
                     max_len = 300
                 if len(tool_summary) > max_len:
+                    # 保留文件头部 + 尾部，让 Agent 看到关键结构（如 export 语句）
+                    head_len = int(max_len * 0.7)
+                    tail_len = int(max_len * 0.3)
+                    head = tool_summary[:head_len]
+                    tail = tool_summary[-tail_len:]
                     cut_hint = (
-                        "\n... (文件较长已截断，文件本身完整未损坏。如需特定片段请指定行号范围读取)"
-                        if is_chat else
-                        "\n... (文件较长已截断，文件本身完整无损。文件摘要已在系统提示中，继续基于摘要工作，不要重复读取)"
+                        f"\n\n... (文件中间部分省略，共 {len(tool_summary)} 字符。"
+                        f"如需查看特定行范围，请用 read_file 的 start_line/end_line 参数分页读取)"
                     )
-                    tool_summary = tool_summary[:max_len] + cut_hint
+                    tool_summary = head + cut_hint + "\n\n[文件末尾部分]\n" + tail
 
-                # 前端展示用简短摘要（不暴露大段文件内容）
-                display_readable = self._tool_display_label(tc.name, tc.arguments, result)
+                # 存入对话历史（供 LLM 上下文，hidden 避免前端重复展示）
                 state["dialogue_history"].append({
                     "role": "tool_call",
                     "name": tc.name,
                     "content": tool_summary,
-                    "arguments": tc.arguments,  # 保留原始参数，供前端详情展示
-                    "readable": display_readable,  # 前端展示用简短标签
+                    "arguments": tc.arguments,
+                    "readable": display_readable,
+                    "hidden": True,
+                })
+
+            # ---- 推送迭代批量事件（替代逐个 tool_call/tool_result/thinking SSE） ----
+            if self.sse and batch_tools:
+                self.sse.iteration_batch(state["requirement_id"], {
+                    "iteration": iteration + 1,
+                    "coder_name": coder_name,
+                    "thinking_preview": (thinking_text or "")[:100],
+                    "agent_text": agent_text[:300] if agent_text else "",
+                    "tools": batch_tools,
+                    "content": f"第 {iteration + 1} 轮迭代 — {len(batch_tools)} 个操作",
+                })
+
+            # 保存迭代批量消息到对话历史（页面刷新后恢复分组展示）
+            if batch_tools:
+                state["dialogue_history"].append({
+                    "role": "iteration_batch",
+                    "name": coder_name,
+                    "content": f"第 {iteration + 1} 轮迭代 — {len(batch_tools)} 个操作",
+                    "iteration": iteration + 1,
+                    "thinking_preview": (thinking_text or "")[:100],
+                    "agent_text": agent_text[:300] if agent_text else "",
+                    "tools": batch_tools,
                 })
 
                 # Git 自动 commit
@@ -289,7 +351,10 @@ class ToolCallLoop:
         filename = arguments.get("filename", "")
         if tool_name == "read_file":
             lines = result.content.count('\n') + 1 if result.success and result.content else 0
-            return f"📖 读取 {filename} ({lines} 行)"
+            total = result.metadata.get("total_lines", lines) if result.success and result.metadata else lines
+            start = result.metadata.get("start_line", 1) if result.success and result.metadata else 1
+            end = result.metadata.get("end_line", lines) if result.success and result.metadata else lines
+            return f"📖 读取 {filename} (行 {start}-{end} / 共 {total} 行)"
         elif tool_name == "write_file":
             lines = result.content.count('\n') + 1 if result.success and result.content else 0
             return f"📝 创建 {filename} ({lines} 行)"
@@ -316,19 +381,6 @@ class ToolCallLoop:
     def _execute_tool(self, state: AgentState, tool_call) -> "ToolResult":
         from harness.tools.registry import ToolResult
 
-        # 权限检查
-        if self.permission_manager:
-            permission = self.tools.get_permission(tool_call.name)
-            check = self.permission_manager.check(state["requirement_id"], tool_call.name, permission)
-            if check == "needs_approval":
-                if self.sse:
-                    self.sse.permission_request(
-                        state["requirement_id"], tool_call.name,
-                        tool_call.arguments,
-                        f"Agent 请求执行 {tool_call.name}"
-                    )
-                return ToolResult(error="需要用户审批")
-
         # 预处理 Hook
         if self.hooks:
             from harness.constraints.hooks import HookContext, HookPoint
@@ -343,7 +395,11 @@ class ToolCallLoop:
 
         # 分发到对应处理器
         handler_map = {
-            "read_file": lambda: self._file_handler.read_file(**tool_call.arguments),
+            "read_file": lambda: self._file_handler.read_file(
+                filename=tool_call.arguments.get("filename"),
+                start_line=tool_call.arguments.get("start_line"),
+                end_line=tool_call.arguments.get("end_line"),
+            ),
             "write_file": lambda: self._file_handler.write_file(**tool_call.arguments),
             "edit_file": lambda: self._edit_handler.edit_file(**tool_call.arguments),
             "list_files": lambda: self._file_handler.list_files(),
@@ -382,6 +438,26 @@ class ToolCallLoop:
                     state["_recent_hook_failures"].append(f)
                     if self.sse:
                         self.sse.hook_check(state["requirement_id"], hook_name, False, f)
+
+        # ---- write_file 成功后自动更新 CompletionContract + 推送任务状态 ----
+        if tool_call.name == "write_file" and result.success:
+            self._update_contract_on_write(state, tool_call.arguments)
+            # 增量更新文件摘要缓存（避免下次 _build_file_summaries 全量重建）
+            self._update_file_summary_cache(tool_call.arguments)
+            # 推送任务状态更新到前端（全复杂度通用）
+            if self.sse:
+                try:
+                    self.sse.task_update(
+                        state["requirement_id"],
+                        tool_call.arguments.get("filename", ""),
+                        "completed"
+                    )
+                except Exception:
+                    pass
+
+        # ---- edit_file 成功后标记文件为已验证（修复阶段核心操作） ----
+        if tool_call.name == "edit_file" and result.success:
+            self._update_contract_on_edit(state, tool_call.arguments)
 
         return result
 
@@ -591,103 +667,45 @@ class ToolCallLoop:
         )
 
     def _build_file_summaries(self, existing_files: list) -> str:
-        """为已有文件生成内容概要，让 Agent 无需 read_file 就知道文件结构"""
+        """为已有文件生成内容概要，让 Agent 无需 read_file 就知道文件结构
+
+        优先使用增量缓存（_summary_cache），缓存未命中时才读取文件构建摘要。
+        """
         if not existing_files:
             return "(空目录)"
 
+        cache = getattr(self, '_summary_cache', {})
         lines = []
         for fname in existing_files:
+            # 优先使用缓存（write_file 后增量更新）
+            if fname in cache:
+                lines.append(cache[fname])
+                continue
+
             try:
                 content = self.workspace.read(fname)
             except Exception:
                 lines.append(f"- {fname}: (无法读取)")
                 continue
 
-            # 提取文件关键信息：前 30 行 + 尾部 10 行 + HTML/CSS/JS 结构特征
-            all_lines = [l for l in content.split('\n')]
-            content_lines = [l.strip() for l in all_lines if l.strip()]
-            # 前 30 行（覆盖头部 + 主要结构）
-            head_lines = content_lines[:30]
-            # 尾部 10 行（覆盖底部 JS 逻辑、闭合标签）
-            tail_lines = content_lines[-10:] if len(content_lines) > 30 else []
-
-            # 提取结构性信息
-            structural = []
-            if fname.endswith('.html'):
-                # 提取标题、主要容器、引入的文件
-                for l in content_lines:
-                    if '<title>' in l:
-                        structural.append(l.strip()[:120])
-                        break
-                ids = set()
-                for l in content_lines:
-                    if 'id="' in l:
-                        import re
-                        ids.update(re.findall(r'id="([^"]+)"', l))
-                    if "id='" in l:
-                        ids.update(re.findall(r"id='([^']+)'", l))
-                if ids:
-                    structural.append(f"元素 id: {', '.join(sorted(ids)[:15])}")
-                classes = set()
-                for l in content_lines:
-                    if 'class="' in l:
-                        import re
-                        classes.update(re.findall(r'class="([^"]+)"', l))
-                    if "class='" in l:
-                        classes.update(re.findall(r"class='([^']+)'", l))
-                if classes:
-                    structural.append(f"CSS class: {', '.join(sorted(classes)[:20])}")
-
-            elif fname.endswith('.css'):
-                # 提取选择器列表
-                selectors = []
-                for l in content_lines:
-                    l = l.strip()
-                    if l.endswith('{') and not l.startswith('@') and not l.startswith('/*'):
-                        sel = l[:-1].strip()
-                        if sel and len(sel) < 60:
-                            selectors.append(sel)
-                if selectors:
-                    structural.append(f"选择器: {', '.join(selectors[:20])}")
-
-            elif fname.endswith('.js'):
-                # 提取函数名和 DOM 引用
-                funcs = []
-                import re
-                for l in content_lines:
-                    m = re.match(r'(?:async\s+)?function\s+(\w+)', l)
-                    if m:
-                        funcs.append(m.group(1))
-                    m = re.match(r'(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(', l)
-                    if m:
-                        funcs.append(m.group(1))
-                if funcs:
-                    structural.append(f"函数: {', '.join(funcs[:15])}")
-                # DOM 查询
-                dom_refs = set()
-                for l in content_lines:
-                    for m in re.findall(r"(?:querySelector|getElementById|querySelectorAll)\(['\"]([^'\"]+)['\"]\)", l):
-                        dom_refs.add(m)
-                if dom_refs:
-                    structural.append(f"DOM 引用: {', '.join(sorted(dom_refs)[:15])}")
-
-            # 组装摘要：前 30 行 + 尾部 10 行 + 结构特征
-            head_preview = ' | '.join(head_lines)[:400]
-            parts = [f"- {fname} ({len(content_lines)} 行): {head_preview}"]
-            if tail_lines:
-                tail_preview = ' | '.join(tail_lines)[:200]
-                parts.append(f"  ... 尾部: {tail_preview}")
-            if structural:
-                parts.append("  " + " | ".join(structural))
-            lines.append('\n'.join(parts))
+            summary = self._build_single_file_summary(fname, content)
+            if summary:
+                cache[fname] = summary  # 加入缓存
+                lines.append(summary)
+            else:
+                lines.append(f"- {fname}: (空文件)")
 
         return '\n'.join(lines)
 
     def _check_missing_files(self, state: AgentState) -> list[str]:
         """检查目标文件是否全部生成。返回缺失文件名列表。
 
-        优先从架构设计的 file_structure 读取目标文件列表，
+        优先从 CompletionContract 读取（Default-FAIL 硬约束），
+        其次从架构设计的 file_structure 读取目标文件列表，
         避免硬编码与架构设计冲突（如 css/style.css vs style.css）。
+
+        关键修复：当 contract 报告缺失但文件系统中文件已存在时，
+        以文件系统为准，自动修复 contract 状态，避免死循环。
         """
         complexity = state.get("metadata", {}).get("complexity", "S")
         existing = set(self.workspace.list())
@@ -696,6 +714,69 @@ class ToolCallLoop:
             if existing:
                 return []
             return ["至少一个文件"]
+
+        # 优先从 CompletionContract 获取（硬约束检查清单）
+        contract = state.get("_completion_contract")
+        if contract and contract.exists():
+            pending = contract.pending_files()
+            if pending:
+                # ---- 文件系统兜底：contract 说缺失但文件实际存在 → 自动修复 ----
+                actually_missing = []
+                auto_fixed = []
+                for f in pending:
+                    if f in existing:
+                        # 文件实际存在但 contract 未追踪 → 自动标记为已创建
+                        try:
+                            contract.mark_created(f)
+                            auto_fixed.append(f)
+                        except Exception:
+                            pass
+                    else:
+                        # 也检查文件名尾部匹配（处理路径差异如 css/style.css vs style.css）
+                        basename = f.split("/")[-1]
+                        matching = [e for e in existing if e.endswith(basename)]
+                        if matching:
+                            try:
+                                contract.mark_created(f)
+                                auto_fixed.append(f)
+                            except Exception:
+                                pass
+                        else:
+                            actually_missing.append(f)
+
+                if auto_fixed:
+                    logger.info(
+                        f"[ToolLoop] Contract 自动修复: {len(auto_fixed)} 个文件 "
+                        f"({', '.join(auto_fixed[:5])}) 在文件系统中已存在，已标记为 created"
+                    )
+
+                if actually_missing:
+                    # ---- 死锁检测：同一批文件连续多轮被报告缺失 ----
+                    missing_key = ",".join(sorted(actually_missing))
+                    prev_key = state.get("_last_missing_files_key", "")
+                    if missing_key == prev_key:
+                        state["_same_missing_count"] = state.get("_same_missing_count", 0) + 1
+                    else:
+                        state["_same_missing_count"] = 1
+                    state["_last_missing_files_key"] = missing_key
+
+                    if state["_same_missing_count"] >= 3:
+                        logger.warning(
+                            f"[ToolLoop] 死锁检测: 相同文件列表已连续报告 "
+                            f"{state['_same_missing_count']} 轮缺失但未修复 "
+                            f"({actually_missing})。以文件系统为准，清除 contract 阻塞。"
+                        )
+                        try:
+                            contract.clear()
+                        except Exception:
+                            pass
+                        state["_same_missing_count"] = 0
+                        state.pop("_last_missing_files_key", None)
+                        return []
+
+                    return actually_missing
+                return []
+            return []
 
         # 从 plan（TeamLeader/Architect 产出）中提取目标文件结构
         plan = state.get("plan")
@@ -707,7 +788,14 @@ class ToolCallLoop:
 
         if plan_files:
             # 使用架构设计中的文件列表，支持子目录路径
-            return sorted(f for f in plan_files if f not in existing)
+            missing = []
+            for f in plan_files:
+                # 精确匹配或尾部文件名匹配
+                if f not in existing:
+                    basename = f.split("/")[-1]
+                    if not any(e.endswith(basename) for e in existing):
+                        missing.append(f)
+            return sorted(missing)
 
         # Fallback: S 复杂度只需确认有入口文件即可
         if complexity == "S":
@@ -723,6 +811,169 @@ class ToolCallLoop:
         if not has_html:
             missing.append("index.html")
         return missing
+
+    def _update_file_summary_cache(self, arguments: dict):
+        """write_file 成功后增量更新单个文件的摘要缓存"""
+        filename = arguments.get("filename", "")
+        content = arguments.get("content", "")
+        if not filename:
+            return
+
+        if not hasattr(self, '_summary_cache'):
+            self._summary_cache = {}
+
+        # 生成单文件摘要
+        summary = self._build_single_file_summary(filename, content)
+        if summary:
+            self._summary_cache[filename] = summary
+
+    def _build_single_file_summary(self, fname: str, content: str) -> str:
+        """生成单个文件的摘要（提取自 _build_file_summaries）"""
+        if not content or not isinstance(content, str):
+            return f"- {fname}: (无法读取)"
+
+        import re
+        all_lines = [l for l in content.split('\n')]
+        content_lines = [l.strip() for l in all_lines if l.strip()]
+        head_lines = content_lines[:30]
+        tail_lines = content_lines[-10:] if len(content_lines) > 30 else []
+
+        structural = []
+        if fname.endswith('.html'):
+            for l in content_lines:
+                if '<title>' in l:
+                    structural.append(l.strip()[:120])
+                    break
+            ids = set()
+            for l in content_lines:
+                if 'id="' in l:
+                    ids.update(re.findall(r'id="([^"]+)"', l))
+                if "id='" in l:
+                    ids.update(re.findall(r"id='([^']+)'", l))
+            if ids:
+                structural.append(f"元素 id: {', '.join(sorted(ids)[:15])}")
+            classes = set()
+            for l in content_lines:
+                if 'class="' in l:
+                    classes.update(re.findall(r'class="([^"]+)"', l))
+                if "class='" in l:
+                    classes.update(re.findall(r"class='([^']+)'", l))
+            if classes:
+                structural.append(f"CSS class: {', '.join(sorted(classes)[:20])}")
+        elif fname.endswith('.css'):
+            selectors = []
+            for l in content_lines:
+                l = l.strip()
+                if l.endswith('{') and not l.startswith('@') and not l.startswith('/*'):
+                    sel = l[:-1].strip()
+                    if sel and len(sel) < 60:
+                        selectors.append(sel)
+            if selectors:
+                structural.append(f"选择器: {', '.join(selectors[:20])}")
+        elif fname.endswith('.js'):
+            funcs = []
+            for l in content_lines:
+                m = re.match(r'(?:async\s+)?function\s+(\w+)', l)
+                if m:
+                    funcs.append(m.group(1))
+                m = re.match(r'(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(', l)
+                if m:
+                    funcs.append(m.group(1))
+            if funcs:
+                structural.append(f"函数: {', '.join(funcs[:15])}")
+            dom_refs = set()
+            for l in content_lines:
+                for m in re.findall(r"(?:querySelector|getElementById|querySelectorAll)\(['\"]([^'\"]+)['\"]\)", l):
+                    dom_refs.add(m)
+            if dom_refs:
+                structural.append(f"DOM 引用: {', '.join(sorted(dom_refs)[:15])}")
+            # 检测 export 语句（ES Module 语法）——关键：与 <script> 标签加载方式冲突
+            exports = []
+            for l in content_lines:
+                m = re.match(r'export\s+(?:default\s+)?(?:class|function|const|let|var|\{|\*)', l)
+                if m:
+                    exports.append(l.strip()[:80])
+            if exports:
+                structural.append(f"⚠️ EXPORT 语句: {', '.join(exports[:5])} —— 如 index.html 使用普通 <script> 加载，将导致 SyntaxError！")
+
+        head_preview = ' | '.join(head_lines)[:400]
+        parts = [f"- {fname} ({len(content_lines)} 行): {head_preview}"]
+        if tail_lines:
+            tail_preview = ' | '.join(tail_lines)[:200]
+            parts.append(f"  ... 尾部: {tail_preview}")
+        if structural:
+            parts.append("  " + " | ".join(structural))
+        return '\n'.join(parts)
+
+    def _update_contract_on_write(self, state: AgentState, arguments: dict):
+        """write_file 成功后自动更新 CompletionContract（冗余保障）
+
+        progress_hooks.track_write_success 已通过 POST_TOOL_USE Hook 处理，
+        此方法作为额外冗余，确保即使 Hook 失效也能追踪文件创建。
+
+        关键修复：不再依赖 contract.exists() 前置条件。如果 contract 不存在
+        或文件不在 contract 中，自动初始化/扩展 contract 并标记 created。
+        """
+        filename = arguments.get("filename", "")
+        if not filename:
+            return
+
+        # 1. 追踪最近写入（用于防回读）
+        current_round = state.get("tool_call_count", 0)
+        state.setdefault("_recent_writes", {})[filename] = current_round
+
+        # 2. 更新 CompletionContract（强制确保追踪）
+        from harness.constraints.completion_contract import CompletionContract
+        contract = state.get("_completion_contract")
+        if contract is None:
+            contract = CompletionContract(self.workspace)
+            state["_completion_contract"] = contract
+
+        # 如果 contract 文件不存在，从 plan 的 implementation_order 初始化
+        if not contract.exists():
+            impl_order = state.get("implementation_order", [])
+            if impl_order:
+                contract.initialize(impl_order)
+                logger.info(f"[Contract] write_file 触发 contract 初始化: {len(impl_order)} 个文件")
+
+        # 标记 created —— 如果文件不在 contract 中（动态新增），自动添加
+        if not contract.mark_created(filename):
+            # 文件不在 contract 中，追加进去
+            contract.add_file(filename, created=True)
+            logger.info(f"[Contract] 追加动态文件: {filename}")
+
+    def _update_contract_on_edit(self, state: AgentState, arguments: dict):
+        """edit_file 成功后标记文件为已验证
+
+        修复阶段 DEV 优先使用 edit_file 而非 write_file，
+        因此需要单独追踪 edit_file 来更新 contract 状态。
+        """
+        filename = arguments.get("filename", "")
+        if not filename:
+            return
+
+        # 追踪最近修改（用于防回读）
+        current_round = state.get("tool_call_count", 0)
+        state.setdefault("_recent_writes", {})[filename] = current_round
+
+        # 更新 CompletionContract: 标记文件为已验证
+        from harness.constraints.completion_contract import CompletionContract
+        contract = state.get("_completion_contract")
+        if contract is None:
+            contract = CompletionContract(self.workspace)
+            state["_completion_contract"] = contract
+
+        # 如果 contract 不存在，尝试初始化
+        if not contract.exists():
+            impl_order = state.get("implementation_order", [])
+            if impl_order:
+                contract.initialize(impl_order)
+
+        # 如果文件不在 contract 中，动态添加
+        if not contract.is_created(filename):
+            if not contract.mark_created(filename):
+                contract.add_file(filename, created=True)
+        contract.mark_validated(filename)
 
     def _check_no_progress(self, state: AgentState) -> bool:
         """检查连续无进展（前 3 轮豁免，给 LLM 足够的探索空间）"""

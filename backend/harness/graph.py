@@ -1,36 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-LangGraph 工作流定义（三期：多节点编排）
+LangGraph 工作流定义（v5: 简化 3 节点编排，QA 反馈作为对话注入）
 
-图结构（按复杂度路由）：
+图结构:
 
-team_leader (增强：任务分解 + 依赖排序)
+team_leader (需求分析 + 完整 Plan → 初始化 CompletionContract)
     ↓
-[conditional: complexity]
+[conditional: route_after_tl]
     ├── clarify → END
-    ├── XS → simple_coder → END
-    ├── S  → simple_coder → END
-    └── M/L → pm → architect → file_by_file_coder → qa_reviewer
-                  ↓
-                  summarize → END
-                  ↑ pass        ↓ fail
-                  └── repair ───┘
-
-ToolCallLoop 由各编码节点内部调用。
-Harness 组件（tool_loop/role_executor 等）通过 harness_context 模块级缓存传递，
-解决 LangGraph metadata 被节点整体替换导致组件丢失的问题。
+    └── → coder (统一编码节点，内部根据 complexity 选择策略)
+           ↓
+         verify (Fresh-Context Evaluator)
+           ↓
+[conditional: route_after_verify]
+    ├── PASS → END
+    └── NEEDS_WORK → QA 反馈注入 dialogue_history → coder → verify → END
+                                      ↑ (最多 3 轮修复，同一 ToolCallLoop 上下文)
 """
 
 from langgraph.graph import StateGraph, END
 
 from harness.state.agent_state import AgentState
 from harness.instructions.nodes import (
-    team_leader_node, tool_coder_node,
-    pm_node, architect_node, qa_node, repair_node,
+    team_leader_node, coder_node, verify_node,
 )
-from harness.instructions.simple_coder import simple_coder_node
-from harness.instructions.file_coder import file_by_file_coder_node
-from harness.instructions.summarize import summarize_node
 from harness.observability.logger import get_logger
 
 logger = get_logger(__name__)
@@ -38,201 +31,153 @@ logger = get_logger(__name__)
 
 # ==================== 路由函数 ====================
 
-def route_after_team_leader(state: AgentState) -> str:
+def route_after_tl(state: AgentState) -> str:
     """TeamLeader 完成后的路由决策"""
     step = state.get("current_step", "")
     if step == "needs_clarification":
         return "clarify"
 
+    # 其他所有情况 → coder 节点
+    return "coder"
+
+
+def _get_max_repair_rounds(state: AgentState) -> int:
+    """根据需求复杂度动态计算最大修复轮次
+
+    XS=2, S=3, M=4, L=5 —— 复杂度越高，允许越多修复轮次。
+    默认 3（兜底）。
+    """
     complexity = state.get("metadata", {}).get("complexity", "S")
-    complexity_lower = complexity.lower() if isinstance(complexity, str) else "s"
-
-    if complexity_lower in ("xs", "s"):
-        return complexity_lower
-    elif complexity_lower in ("m", "l"):
-        return "m"  # M/L 都走 pm → architect → file_coder
-    else:
-        logger.warning(f"[Graph] 未知复杂度: {complexity}，默认走 simple_coder")
-        return "s"
+    limits = {"XS": 2, "S": 3, "M": 4, "L": 5}
+    return limits.get(complexity, 3)
 
 
-def route_after_pm(state: AgentState) -> str:
-    """PM 完成后的路由"""
-    complexity = state.get("metadata", {}).get("complexity", "S")
-    complexity_lower = complexity.lower() if isinstance(complexity, str) else "s"
+def route_after_verify(state: AgentState) -> str:
+    """Verify 完成后的路由决策
 
-    if complexity_lower == "s":
-        return "simple_coder"  # S 复杂度跳过 Architect
-    else:
-        return "architect"  # M/L 继续到 Architect
-
-
-def route_after_file_coder(state: AgentState) -> str:
-    """逐文件编码后的路由"""
-    step = state.get("current_step", "")
-    if step == "coding_error" or state.get("error"):
-        return "repair"
-    return "qa"
-
-
-def route_after_simple_coder(state: AgentState) -> str:
-    """简单编码后的路由"""
-    step = state.get("current_step", "")
-    if step == "coding_error" or state.get("error"):
-        return "repair"
-    return "done"
-
-
-def route_after_qa(state: AgentState) -> str:
-    """QA 审查后的路由"""
-    if state.get("qa_passed", True):
-        return "summarize"
-    else:
-        repair_count = state.get("metadata", {}).get("repair_count", 0)
-        if repair_count >= 3:
-            logger.warning("[Graph] 修复已达上限，强制通过")
-            return "summarize"
-        return "repair"
-
-
-def route_after_repair(state: AgentState) -> str:
-    """修复后的路由"""
-    repair_count = state.get("metadata", {}).get("repair_count", 0)
-    if repair_count >= 3:
-        logger.warning(f"[Graph] 修复已达 {repair_count} 轮，跳过 QA")
-        return "summarize"
-    return "qa"
-
-
-def route_after_summarize(state: AgentState) -> str:
-    """SummarizeCode 审查后的路由"""
-    if state.get("summarize_passed", True):
+    PASS → 结束
+    NEEDS_WORK → 重新进入 coder（QA 反馈已写入 dialogue_history）
+    修复轮次根据复杂度动态调整 (XS=2, S=3, M=4, L=5)，超出则强制结束
+    """
+    if state.get("verify_passed", False):
         return "done"
     else:
         repair_count = state.get("metadata", {}).get("repair_count", 0)
-        if repair_count >= 3:
-            logger.warning("[Graph] 修复已达上限，强制结束")
+        max_rounds = _get_max_repair_rounds(state)
+        if repair_count >= max_rounds:
+            complexity = state.get("metadata", {}).get("complexity", "?")
+            logger.warning(
+                f"[Graph] 修复已达上限 {max_rounds} 轮 "
+                f"(complexity={complexity}, repair_count={repair_count})，强制结束"
+            )
             return "done"
-        return "repair"
+        # NEEDS_WORK → 直接回到 coder（QA findings 已在 dialogue_history 中）
+        # coder 在连续上下文中修复，不会丢失之前的编码记忆
+        return "coder"
 
 
 # ==================== 工作流创建 ====================
 
-def create_workflow_v3() -> StateGraph:
+def create_workflow_v5() -> StateGraph:
     """
-    三期：多节点编排图。
+    v5: 简化 3 节点编排
 
-    team_leader → [conditional] → simple_coder / pm → architect → file_coder → qa → summarize → END
-                                                                                ↑ fail          ↓ fail
-                                                                                └── repair ─────┘
+    team_leader → coder → verify → (QA 反馈注入 → coder) → END
+
+    与 v4 的关键区别:
+    - 移除独立的 repair 节点，QA 反馈直接注入 dialogue_history
+    - NEEDS_WORK 时直接回到 coder（连续上下文），而非经过 repair 重置
+    - coder 拥有完整工具权限（不受 MAX_ITERATIONS=8 限制）
+    - coder 可以自验证（run_preview）和自主决定修复策略
     """
     workflow = StateGraph(AgentState)
 
-    # ---- 添加所有节点 ----
+    # ---- 添加节点 ----
     workflow.add_node("team_leader", team_leader_node)
-    workflow.add_node("pm", pm_node)
-    workflow.add_node("architect", architect_node)
-    workflow.add_node("simple_coder", simple_coder_node)
-    workflow.add_node("file_by_file_coder", file_by_file_coder_node)
-    workflow.add_node("qa_reviewer", qa_node)
-    workflow.add_node("summarize", summarize_node)
-    workflow.add_node("repair", repair_node)
+    workflow.add_node("coder", coder_node)
+    workflow.add_node("verify", verify_node)
 
     # ---- 设置入口 ----
     workflow.set_entry_point("team_leader")
 
     # ---- 条件路由 ----
 
-    # TeamLeader → clarify / xs / s / m
+    # TeamLeader → clarify (END) / coder
     workflow.add_conditional_edges(
         "team_leader",
-        route_after_team_leader,
+        route_after_tl,
         {
             "clarify": END,
-            "xs": "simple_coder",
-            "s": "simple_coder",
-            "m": "pm",
-            # "l" also goes to "m" path (see route_after_team_leader)
+            "coder": "coder",
         }
     )
 
-    # PM → simple_coder (S) / architect (M/L)
-    workflow.add_conditional_edges(
-        "pm",
-        route_after_pm,
-        {
-            "simple_coder": "simple_coder",
-            "architect": "architect",
-        }
-    )
+    # Coder → verify
+    workflow.add_edge("coder", "verify")
 
-    # Architect → file_by_file_coder (固定路径)
-    workflow.add_edge("architect", "file_by_file_coder")
-
-    # FileByFileCoder → qa / repair
+    # Verify → done / coder (QA 反馈注入 → 重新编码修复)
     workflow.add_conditional_edges(
-        "file_by_file_coder",
-        route_after_file_coder,
-        {
-            "qa": "qa_reviewer",
-            "repair": "repair",
-        }
-    )
-
-    # SimpleCoder → done / repair
-    workflow.add_conditional_edges(
-        "simple_coder",
-        route_after_simple_coder,
+        "verify",
+        route_after_verify,
         {
             "done": END,
-            "repair": "repair",
-        }
-    )
-
-    # QA → summarize / repair
-    workflow.add_conditional_edges(
-        "qa_reviewer",
-        route_after_qa,
-        {
-            "summarize": "summarize",
-            "repair": "repair",
-        }
-    )
-
-    # Repair → qa / summarize
-    workflow.add_conditional_edges(
-        "repair",
-        route_after_repair,
-        {
-            "qa": "qa_reviewer",
-            "summarize": "summarize",
-        }
-    )
-
-    # Summarize → done / repair
-    workflow.add_conditional_edges(
-        "summarize",
-        route_after_summarize,
-        {
-            "done": END,
-            "repair": "repair",
+            "coder": "coder",
         }
     )
 
     app = workflow.compile()
-    logger.info("LangGraph 工作流 v3 已创建 (多节点编排: team_leader → [simple|multi-role] → summarize → END)")
+    logger.info("LangGraph 工作流 v5 已创建 (3 节点: team_leader → coder → verify, QA 反馈作为对话注入)")
     return app
 
 
 # ==================== 兼容旧接口 ====================
 
+def create_workflow_v4() -> StateGraph:
+    """v4 兼容接口（内部调用 v5）"""
+    return create_workflow_v5()
+
+
+def create_workflow_v3() -> StateGraph:
+    """v3 兼容接口（内部调用 v5）"""
+    return create_workflow_v5()
+
+
 def create_workflow_v2() -> StateGraph:
-    """v2 兼容接口（已废弃，内部调用 v3）"""
-    return create_workflow_v3()
+    """v2 兼容接口（已废弃，内部调用 v5）"""
+    return create_workflow_v5()
+
+
+def create_workflow_post_plan() -> StateGraph:
+    """
+    v5 Post-Plan 子图：用户确认 Plan 后，从 coder 节点开始执行
+
+    coder → verify → (QA 反馈注入 → coder) → END
+    """
+    workflow = StateGraph(AgentState)
+
+    workflow.add_node("coder", coder_node)
+    workflow.add_node("verify", verify_node)
+
+    workflow.set_entry_point("coder")
+
+    workflow.add_edge("coder", "verify")
+
+    workflow.add_conditional_edges(
+        "verify",
+        route_after_verify,
+        {
+            "done": END,
+            "coder": "coder",
+        }
+    )
+
+    app = workflow.compile()
+    logger.info("LangGraph 工作流 Post-Plan v5 已创建 (coder → verify, QA 反馈注入)")
+    return app
 
 
 def create_workflow() -> StateGraph:
-    return create_workflow_v3()
+    return create_workflow_v5()
 
 
 _workflow_instance = None
@@ -241,5 +186,5 @@ _workflow_instance = None
 def get_workflow() -> StateGraph:
     global _workflow_instance
     if _workflow_instance is None:
-        _workflow_instance = create_workflow_v3()
+        _workflow_instance = create_workflow_v5()
     return _workflow_instance

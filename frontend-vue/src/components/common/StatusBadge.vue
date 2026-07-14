@@ -8,7 +8,7 @@
 import { computed } from 'vue'
 
 const props = defineProps<{
-  status: 'pending' | 'processing' | 'finished' | 'failed'
+  status: 'pending' | 'processing' | 'planning' | 'finished' | 'failed'
 }>()
 
 const labels: Record<string, string> = {

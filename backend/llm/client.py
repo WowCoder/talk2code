@@ -83,13 +83,108 @@ def _try_fix_json(raw: str) -> dict | None:
         return json.loads(fixed)
     except json.JSONDecodeError:
         pass
-    # 方法2: 去掉最后不完整的字段
+    # 方法2: 去掉最后不完整的字段（查找最后一个 ",
     last_quote = fixed.rfind('",')
     if last_quote > 0:
         try:
             return json.loads(fixed[:last_quote + 1] + '}')
         except json.JSONDecodeError:
             pass
+    # 方法3: 从末尾去掉不完整 token，找到最后一个顶层逗号截断
+    # 适用于截断位置在 key 开始处的情况（如 ..., "tech_stack": {...}, "）
+    last_top_comma = -1
+    depth = 0
+    in_str3 = False
+    escaped3 = False
+    for i, ch in enumerate(raw):
+        if escaped3:
+            escaped3 = False
+            continue
+        if ch == '\\':
+            escaped3 = True
+            continue
+        if ch == '"':
+            in_str3 = not in_str3
+        elif not in_str3:
+            if ch in '{[':
+                depth += 1
+            elif ch in '}]':
+                depth -= 1
+            elif ch == ',' and depth == 1:
+                last_top_comma = i
+    if last_top_comma > 0:
+        truncated = raw[:last_top_comma].rstrip()
+        # 补齐未闭合的括号
+        truncated_depth = 0
+        in_ts = False
+        esc_ts = False
+        for ch in truncated:
+            if esc_ts:
+                esc_ts = False
+                continue
+            if ch == '\\':
+                esc_ts = True
+                continue
+            if ch == '"':
+                in_ts = not in_ts
+            elif not in_ts:
+                if ch in '{[':
+                    truncated_depth += 1
+                elif ch in '}]':
+                    truncated_depth -= 1
+        for _ in range(truncated_depth):
+            truncated += '}'
+        try:
+            return json.loads(truncated)
+        except json.JSONDecodeError:
+            pass
+    # 方法4: 从右向左扫描，尝试在每个 '}' 位置截断并解析
+    # 适用于 JSON 之后有额外非 JSON 文本的 LLM 响应
+    for end_try in range(len(raw) - 1, max(0, len(raw) - 500), -1):
+        if raw[end_try] == '}':
+            try:
+                return json.loads(raw[:end_try + 1])
+            except json.JSONDecodeError:
+                pass
+    # 方法5: 截断在 key: 后面没有 value（如 {"key":, {"a": 1, "b":）
+    # 移除最后一个不完整的 key-value 对，然后补全括号
+    last_colon = raw.rfind('":')
+    if last_colon > 0:
+        # 往前找到这个 key 之前的最后一个分隔符
+        # 可能是 ','（同层前一个字段之后）或 '{'（对象开头/嵌套对象开头）
+        prev_comma = raw.rfind(',', 0, last_colon)
+        prev_brace = raw.rfind('{', 0, last_colon)
+        key_start = max(prev_comma, prev_brace)
+        if key_start >= 0:
+            if raw[key_start] == ',':
+                # 截掉逗号及之后的不完整 key-value
+                prefix = raw[:key_start]
+            else:
+                # key_start 指向 {，保留 { 并截掉其后的不完整 key
+                prefix = raw[:key_start + 1]
+            # 补全未闭合的括号
+            depth = 0
+            in_s = False
+            esc = False
+            for ch in prefix:
+                if esc:
+                    esc = False
+                    continue
+                if ch == '\\':
+                    esc = True
+                    continue
+                if ch == '"':
+                    in_s = not in_s
+                elif not in_s:
+                    if ch in '{[':
+                        depth += 1
+                    elif ch in '}]':
+                        depth -= 1
+            prefix += '}' * depth
+            try:
+                return json.loads(prefix)
+            except json.JSONDecodeError:
+                pass
     return None
 
 
@@ -274,7 +369,7 @@ class LLMClient:
                                 try:
                                     chunk = json.loads(content)
                                     delta = chunk.get('choices', [{}])[0].get('delta', {})
-                                    content_text = delta.get('content', '')
+                                    content_text = delta.get('content', '') or delta.get('reasoning_content', '')
                                     if content_text:
                                         yield content_text
                                 except json.JSONDecodeError:
@@ -291,7 +386,8 @@ class LLMClient:
                     response.raise_for_status()
                     result = response.json()
                     _log_llm_response(call_id, response.status_code, result, (time.time() - t0) * 1000)
-                    content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
+                    msg = result.get('choices', [{}])[0].get('message', {})
+                    content = msg.get('content', '') or msg.get('reasoning_content', '')
                     yield content
                 return
 

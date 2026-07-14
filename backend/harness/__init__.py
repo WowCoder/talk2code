@@ -6,24 +6,28 @@ Layer 1 - Instructions:   动态上下文组装、上下文压缩、提示词模
 Layer 2 - Tools:          工具注册表、文件操作、代码验证、Web 工具
 Layer 3 - Environment:    权限管理、沙箱执行、会话隔离
 Layer 4 - State:          WorkspaceFS、Git 版本化、长期记忆、断点恢复
-Layer 5 - Constraints:    Hook 系统、代码质量检查、安全检查、Craft 强制执行
+Layer 5 - Constraints:    Hook 系统、CompletionContract、进度约束、安全检查
 Layer 6 - Observability:  链路追踪、成本统计、SSE 事件管理、日志系统
 
 Runtime:                  ToolCallLoop (harness.runtime) —— ReAct 工具调用循环
-Graph:                    LangGraph 工作流定义 (harness.graph)
+Graph:                    LangGraph 工作流 v5 (harness.graph) —— 3 节点编排，QA 反馈作为对话注入
 """
 
 from harness.runtime import ToolCallLoop
-from harness.graph import create_workflow, create_workflow_v2, get_workflow
-from harness.instructions.nodes import team_leader_node, tool_coder_node
+from harness.graph import create_workflow, create_workflow_v5, get_workflow
+from harness.instructions.nodes import (
+    team_leader_node, coder_node, verify_node, repair_node,
+)
 
 __all__ = [
     'ToolCallLoop',
     'create_workflow',
-    'create_workflow_v2',
+    'create_workflow_v5',
     'get_workflow',
     'team_leader_node',
-    'tool_coder_node',
+    'coder_node',
+    'verify_node',
+    'repair_node',  # v5 中已废弃，保留向后兼容
     'create_harness',
 ]
 
@@ -43,7 +47,6 @@ def create_harness(requirement_id: int, user_id: int, db_session=None):
     from harness.state.memory import MemoryManager
     from harness.tools.registry import create_tool_registry
     from harness.constraints.hooks import create_default_hook_manager
-    from harness.environment.permissions import PermissionManager
     from harness.instructions.compactor import ContextCompactor
     from harness.observability.tracer import Tracer
     from harness.observability.cost import CostTracker
@@ -53,7 +56,6 @@ def create_harness(requirement_id: int, user_id: int, db_session=None):
     git = GitVersioning(workspace)
     tools = create_tool_registry()
     hooks = create_default_hook_manager()
-    permissions = PermissionManager()
     checkpoint = CheckpointManager(db_session=db_session)
     memory_manager = MemoryManager(llm_client=get_client())
     compactor = ContextCompactor()
@@ -65,7 +67,6 @@ def create_harness(requirement_id: int, user_id: int, db_session=None):
         "git": git,
         "tools": tools,
         "hooks": hooks,
-        "permissions": permissions,
         "checkpoint": checkpoint,
         "memory_manager": memory_manager,
         "compactor": compactor,

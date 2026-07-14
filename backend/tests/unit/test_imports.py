@@ -121,19 +121,19 @@ class TestProjectImportsClean:
         assert workflow is not None
 
     def test_harness_instructions_nodes_exist(self):
-        """验证 harness/instructions/nodes.py 节点函数存在"""
+        """验证 harness/instructions/nodes.py 节点函数存在 (v4)"""
         from harness.instructions import nodes
-        assert hasattr(nodes, 'planner_node')
-        assert hasattr(nodes, 'tool_coder_node')
+        assert hasattr(nodes, 'team_leader_node')
+        assert hasattr(nodes, 'coder_node')
+        assert hasattr(nodes, 'verify_node')
+        assert hasattr(nodes, 'repair_node')
 
     def test_agents_backward_compat(self):
         """验证 agents/ 向后兼容重导出仍然有效"""
         from agents.workflow import create_workflow
-        from agents.nodes import planner_node, tool_coder_node
+        from agents.nodes import team_leader_node, tool_coder_node
         from agents.tool_loop import ToolCallLoop
         assert create_workflow is not None
-        assert planner_node is not None
-        assert tool_coder_node is not None
         assert ToolCallLoop is not None
 
     def test_llm_client_imports(self):
@@ -175,10 +175,9 @@ class TestProjectImportsClean:
         from harness.instructions.prompts import load_prompt, load_prompt_template
         assert load_prompt
         assert load_prompt_template
-        # 验证加载实际 Prompt
-        s = load_prompt("roles/team_leader.md")
-        assert "Leon" in s
-        assert "TeamLeader" in s or "TeamLeader" not in s  # at least it's a string
+        # 验证加载实际 Prompt (coding/tl_analysis.md)
+        s = load_prompt("coding/tl_analysis.md")
+        assert len(s) > 0
         # 验证模板加载
         result = load_prompt_template("coding/coder_xs.md",
             requirement="test", plan_section="", existing_text="",

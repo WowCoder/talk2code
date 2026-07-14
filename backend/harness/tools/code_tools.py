@@ -6,6 +6,7 @@
 import subprocess
 import tempfile
 import os
+import re
 
 from harness.tools.registry import ToolDefinition, ToolResult
 
@@ -55,7 +56,7 @@ def register_code_tools(registry):
 
     registry.register(ToolDefinition(
         name="lint_js",
-        description="检查 JavaScript 语法错误（使用 Node.js AST 解析）",
+        description="检查 JavaScript 语法错误（自动检测 ES Module, 使用 Node.js AST 解析）",
         parameters={
             "type": "object",
             "properties": {
@@ -101,15 +102,29 @@ class CodeToolHandler:
             return ToolResult(error=str(e))
 
     def lint_js(self, filename: str) -> ToolResult:
+        """检查 JavaScript 语法错误，自动检测 ES Module 语法并匹配参数"""
         try:
             content = self.workspace.read(filename)
+
+            # 检测 ES Module 语法 (export/import 关键字)
+            is_es_module = bool(re.search(
+                r'\b(?:export|import)\s+(?:\{|\*|default|type|function|class|const|let|var|\w+\s+from)',
+                content
+            ))
+
+            node_args = ["node", "--check"]
+            if is_es_module:
+                node_args.append("--input-type=module")
+            node_args.append("-")
+
             result = subprocess.run(
-                ["node", "--check", "-"],
+                node_args,
                 input=content, capture_output=True, text=True, timeout=10
             )
             if result.returncode != 0:
                 return ToolResult(error=f"JavaScript 语法错误 ({filename}): {result.stderr[:300]}")
-            return ToolResult(content=f"JavaScript 语法检查通过 ({filename})")
+            mode_label = " (ES Module)" if is_es_module else ""
+            return ToolResult(content=f"JavaScript 语法检查通过{mode_label} ({filename})")
         except FileNotFoundError:
             return ToolResult(content=f"Node.js 未安装，跳过 JS 语法检查 ({filename})")
         except subprocess.TimeoutExpired:

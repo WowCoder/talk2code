@@ -5,13 +5,14 @@
 """
 
 import json
+import threading
 from typing import Optional
 
 from models import SessionLocal, Requirement
 from harness.observability.logger import get_logger
 from utils.sse import SSEMessage, get_current_timestamp
 from services.sse_manager import sse_manager
-from harness.graph import get_workflow
+from harness.graph import get_workflow, create_workflow_post_plan
 from harness.harness_context import set_all as set_harness_components
 from harness.state.agent_state import AgentState
 from harness.state.workspace import WorkspaceFS
@@ -21,15 +22,13 @@ from harness.tools.registry import create_tool_registry
 from harness.tools.file_tools import FileToolHandler
 from harness.tools.code_tools import CodeToolHandler
 from harness.constraints.hooks import create_default_hook_manager
-from harness.environment.permissions import PermissionManager
+
 from harness.observability.tracer import Tracer
 from harness.observability.cost import CostTracker
 from harness.observability.sse_reporter import SSEReporter
 from harness.runtime import ToolCallLoop
+from harness.agent_names import TL_NAME, DEV_NAME, QA_NAME
 from harness.instructions.intent_router import IntentRouter, IntentType
-from harness.instructions.orchestrator import RoleOrchestrator
-from harness.instructions.role_executor import RoleExecutor
-from harness.roles.definitions import create_role_registry as _create_role_registry
 from harness.state.memory import MemoryManager
 from llm.client import get_client
 
@@ -50,18 +49,47 @@ def _get_memory_manager() -> MemoryManager:
 class RequirementService:
     """需求管理服务（集成 harness 6 层）"""
 
+    # 取消信号：全局字典，key=requirement_id, value=threading.Event
+    _cancel_events: dict = {}
+    _cancel_lock = threading.Lock()
+
+    @classmethod
+    def get_cancel_event(cls, requirement_id: int) -> threading.Event:
+        """获取或创建需求对应的取消信号"""
+        with cls._cancel_lock:
+            if requirement_id not in cls._cancel_events:
+                cls._cancel_events[requirement_id] = threading.Event()
+            return cls._cancel_events[requirement_id]
+
+    @classmethod
+    def signal_cancel(cls, requirement_id: int):
+        """发送取消信号"""
+        with cls._cancel_lock:
+            event = cls._cancel_events.get(requirement_id)
+            if event:
+                event.set()
+                logger.info(f"[Cancel] 需求 {requirement_id} 取消信号已发送")
+
+    @classmethod
+    def clear_cancel(cls, requirement_id: int):
+        """清除取消信号"""
+        with cls._cancel_lock:
+            cls._cancel_events.pop(requirement_id, None)
+
+    @staticmethod
+    def is_cancelled(requirement_id: int) -> bool:
+        """检查需求是否已被取消"""
+        with RequirementService._cancel_lock:
+            event = RequirementService._cancel_events.get(requirement_id)
+            return event.is_set() if event else False
+
     def __init__(self):
         self.workflow = get_workflow()
         self._progress_map = {
             'team_leader': 20,
-            'pm': 35,
-            'architect': 50,
-            'simple_coder': 80,
-            'file_by_file_coder': 80,
-            'qa_reviewer': 90,
-            'summarize': 95,
+            'coder': 70,
+            'verify': 90,
             'repair': 85,
-            'engineer': 80,
         }
 
     def process_requirement(self, requirement_id: int) -> bool:
@@ -100,7 +128,6 @@ class RequirementService:
             git = GitVersioning(workspace)
             tools = create_tool_registry()
             hooks = create_default_hook_manager()
-            permissions = PermissionManager()
             # 注入 db_session：记忆/检查点/追踪跨重启持久化
             checkpoint = CheckpointManager(db_session=db)
             cost_tracker = CostTracker()
@@ -134,7 +161,6 @@ class RequirementService:
                 tracer=tracer,
                 cost_tracker=cost_tracker,
                 sse_reporter=sse,
-                permission_manager=permissions,
                 checkpoint=checkpoint,
                 on_iteration=_persist_dialogue,
             )
@@ -175,6 +201,7 @@ class RequirementService:
                 'implementation_order': [],
                 'code_errors': [],
                 'qa_passed': True,
+                'tester_passed': True,
                 'summarize_passed': True,
                 'repair_count': 0,
                 'role_history': [],
@@ -195,23 +222,12 @@ class RequirementService:
 
             # 将 harness 组件注入 state metadata + 模块级缓存（双路径）
             # metadata 可能被 LangGraph 节点整体替换，模块级缓存作为兜底
-            role_executor = RoleExecutor(
-                workspace=workspace,
-                sse_reporter=sse,
-                tools=tools,
-            )
-            role_registry = _create_role_registry()
-
             initial_state["metadata"]["_tool_loop"] = tool_loop
-            initial_state["metadata"]["_role_executor"] = role_executor
-            initial_state["metadata"]["_role_registry"] = role_registry
             initial_state["metadata"]["_workspace"] = workspace
 
-            # 设置模块级缓存（防止 metadata 被节点覆盖后丢失）
+            # 设置模块级缓存
             set_harness_components(
                 tool_loop=tool_loop,
-                role_executor=role_executor,
-                role_registry=role_registry,
                 workspace=workspace,
             )
 
@@ -233,6 +249,18 @@ class RequirementService:
                 db.commit()
                 return True
 
+            # TL 完成（成功或失败），暂停等待用户确认 Plan
+            if final_state.get('current_step') in ('presenting_plan', 'team_leader_failed'):
+                dialogue = final_state.get('dialogue_history', [])
+                if dialogue:
+                    requirement.dialogue_history = dialogue
+                    from sqlalchemy.orm.attributes import flag_modified
+                    flag_modified(requirement, 'dialogue_history')
+                requirement.status = 'planning'
+                db.commit()
+                logger.info(f"[Service] 需求 {requirement_id} 进入 planning 状态，等待用户确认")
+                return True
+
             # 处理最终状态
             return self._process_final_state(db, requirement, requirement_id, final_state,
                                              workspace, git, tracer, sse)
@@ -241,6 +269,7 @@ class RequirementService:
             logger.error(f"处理需求时发生异常：{e}", exc_info=True)
             try:
                 requirement.status = 'failed'
+                requirement.error_message = f"处理异常: {str(e)}"
                 db.commit()
             except:
                 pass
@@ -249,14 +278,35 @@ class RequirementService:
         finally:
             db.close()
 
-    def _execute_workflow_with_stream(self, requirement_id: int, initial_state: AgentState) -> Optional[AgentState]:
-        """流式执行 LangGraph 工作流（三期：多节点编排）"""
+    def _execute_workflow_with_stream(self, requirement_id: int, initial_state: AgentState,
+                                       workflow=None) -> Optional[AgentState]:
+        """流式执行 LangGraph 工作流（三期：多节点编排）
+
+        Args:
+            requirement_id: 需求 ID
+            initial_state: 初始状态
+            workflow: 可选，指定的工作流实例。默认使用 self.workflow (完整 v4 图)
+        """
         final_state = None
         last_dialogue_count = len(initial_state.get('dialogue_history', []) or [])
         last_code_count = 0
 
-        for event in self.workflow.stream(initial_state, stream_mode='values'):
+        wf = workflow if workflow is not None else self.workflow
+
+        for event in wf.stream(initial_state, stream_mode='values'):
             final_state = event
+
+            # 检查取消信号
+            if RequirementService.is_cancelled(requirement_id):
+                logger.info(f"[Workflow] 需求 {requirement_id} 已被取消，终止工作流")
+                final_state['current_step'] = 'cancelled'
+                final_state['error'] = '操作已被用户取消'
+                cancel_msg = SSEMessage.format_event('cancelled', {
+                    'message': '操作已被用户取消',
+                    'requirement_id': requirement_id,
+                })
+                sse_manager.broadcast(str(requirement_id), cancel_msg)
+                break
 
             if final_state.get('current_step') == 'needs_clarification':
                 # 优先从 metadata 获取 question_form，fallback 到 dialogue_history
@@ -272,20 +322,77 @@ class RequirementService:
                 break
 
             current_step = final_state.get('current_step', '')
+
+            # TL 完成后推送 SPEC 和任务清单到前端，暂停等待用户确认
+            # 处理 team_leader_done（成功）和 team_leader_failed（失败但有部分 plan）
+            tl_completed = current_step in ('team_leader_done', 'team_leader_failed')
+            if tl_completed and not getattr(self, '_spec_pushed', False):
+                self._spec_pushed = True
+                plan = final_state.get('plan') or {}
+                if isinstance(plan, dict) and plan:  # 有有效 plan 数据时才推送
+                    logger.info(f"[SSE] 推送 SPEC 和 task_list for requirement {requirement_id}")
+                    spec_msg = SSEMessage.format_event('spec', {
+                        'title': (final_state.get('requirement_content') or '')[:60],
+                        'features': plan.get('features', []),
+                        'acceptance_criteria': plan.get('acceptance_criteria', []),
+                        'file_structure': plan.get('file_structure', []),
+                        'tech_stack': plan.get('tech_stack', {}),
+                        'data_model': plan.get('data_model', ''),
+                        'complexity': plan.get('complexity', 'S'),
+                        'implementation_notes': plan.get('implementation_notes', ''),
+                    })
+                    sse_manager.broadcast(str(requirement_id), spec_msg)
+                    impl_order = plan.get('implementation_order', [])
+                    tasks = plan.get('tasks', [])
+                    if impl_order:
+                        task_items = []
+                        for f in impl_order:
+                            task_info = None
+                            for t in tasks:
+                                if t.get('file') == f:
+                                    task_info = t
+                                    break
+                            task_items.append({
+                                'file': f,
+                                'description': task_info.get('description', f) if task_info else f,
+                                'status': 'pending',
+                            })
+                        task_msg = SSEMessage.format_event('task_list', {
+                            'tasks': task_items
+                        })
+                        sse_manager.broadcast(str(requirement_id), task_msg)
+                else:
+                    # TL 失败且无有效 plan，推送错误信息
+                    logger.warning(f"[SSE] TL 失败无有效 plan for requirement {requirement_id}")
+                    error_msg = SSEMessage.format_event('spec', {
+                        'title': (final_state.get('requirement_content') or '')[:60],
+                        'features': [],
+                        'acceptance_criteria': [],
+                        'file_structure': [],
+                        'tech_stack': {},
+                        'data_model': '',
+                        'complexity': 'S',
+                        'implementation_notes': f"分析失败: {final_state.get('error', '未知错误')}",
+                    })
+                    sse_manager.broadcast(str(requirement_id), error_msg)
+
+                # 保存检查点，暂停等待用户确认
+                tool_loop = final_state.get('metadata', {}).get('_tool_loop')
+                if tool_loop and tool_loop.checkpoint:
+                    final_state['current_step'] = 'presenting_plan'
+                    tool_loop.checkpoint.save(requirement_id, 'team_leader', final_state)
+                    logger.info(f"[SSE] 暂停工作流, 等待用户确认 plan for requirement {requirement_id}")
+                break  # 暂停 stream, 等待用户确认后继续
+
             # 多节点进度映射
             node_name = self._detect_node_name(current_step)
             if node_name:
                 progress = self._progress_map.get(node_name, 0)
                 display_name = {
-                    'team_leader': 'Leon（负责人）',
-                    'pm': 'Catherine（产品经理）',
-                    'architect': 'Bob（架构师）',
-                    'simple_coder': 'Henry（开发）',
-                    'file_by_file_coder': 'Henry（开发）',
-                    'qa_reviewer': 'Annie（测试）',
-                    'summarize': 'Annie（测试）',
-                    'repair': 'Henry（开发）',
-                    'engineer': 'Henry（开发）',
+                    'team_leader': TL_NAME,
+                    'coder': DEV_NAME,
+                    'verify': QA_NAME,
+                    'repair': DEV_NAME,
                 }.get(node_name, node_name)
                 self._send_progress(requirement_id, display_name, progress)
 
@@ -300,7 +407,7 @@ class RequirementService:
                 # 跳过标记为 hidden 的内部系统提示
                 if dialogue.get('hidden'):
                     continue
-                self._send_dialogue(requirement_id, dialogue.get('name', 'AI'),
+                self._send_dialogue(requirement_id, dialogue.get('name', TL_NAME),
                                     dialogue.get('content', ''),
                                     role)
             last_dialogue_count = len(dialogues)
@@ -317,23 +424,186 @@ class RequirementService:
 
         return final_state
 
+    def confirm_plan(self, requirement_id: int, feedback: str = "") -> bool:
+        """
+        用户确认 Plan 后，从 coder 节点继续执行工作流。
+
+        Args:
+            requirement_id: 需求 ID
+            feedback: 用户反馈/修改意见（可选，为空表示直接确认）
+
+        Returns:
+            成功 True，失败 False
+        """
+        from harness.runtime import ToolCallLoop
+        from harness.tools.registry import create_tool_registry
+        from harness.constraints.hooks import create_default_hook_manager
+        from harness.observability.tracer import Tracer
+        from harness.observability.cost import CostTracker
+        from sqlalchemy.orm.attributes import flag_modified
+
+        db = SessionLocal()
+        try:
+            requirement = db.query(Requirement).filter(Requirement.id == requirement_id).first()
+            if not requirement:
+                logger.error(f"需求不存在：{requirement_id}")
+                return False
+
+            if requirement.status != 'planning':
+                logger.warning(f"需求 {requirement_id} 状态为 {requirement.status}，非 planning，跳过")
+                return False
+
+            # 如果有用户反馈，追加到需求内容中
+            if feedback:
+                enriched = f"{requirement.content}\n\n[用户反馈]\n{feedback}"
+                requirement.content = enriched
+
+                # 追加 plan_feedback 标记的消息到对话历史
+                dialogue_list = list(requirement.dialogue_history or [])
+                dialogue_list.append({
+                    'role': 'user', 'name': '用户',
+                    'content': f"对 Plan 的反馈：{feedback}",
+                    'plan_feedback': True,
+                })
+                requirement.dialogue_history = dialogue_list
+                flag_modified(requirement, 'dialogue_history')
+
+                # 清除旧检查点，重置状态为 pending，重新走完整工作流（含 TL 分析）
+                checkpoint_mgr = CheckpointManager(db_session=db)
+                checkpoint_mgr.clear(requirement_id)
+                requirement.status = 'pending'
+                db.commit()
+                logger.info(f"[ConfirmPlan] 需求 {requirement_id} 有反馈，重置状态重新走完整工作流")
+
+                # 异步重新执行完整工作流（在新的 RequirementService 实例上，避免状态污染）
+                import threading
+                new_service = RequirementService()
+                thread = threading.Thread(
+                    target=new_service.process_requirement,
+                    args=(requirement_id,),
+                    daemon=False,
+                )
+                thread.start()
+                return True
+
+            requirement.status = 'processing'
+            db.commit()
+            logger.info(f"[ConfirmPlan] 需求 {requirement_id} 开始 Post-Plan 编码流程")
+
+            # ---- 初始化 harness 组件 ----
+            workspace = WorkspaceFS(requirement.user_id, requirement_id)
+            workspace.init(requirement.code_files)
+            git = GitVersioning(workspace)
+            tools = create_tool_registry()
+            hooks = create_default_hook_manager()
+            checkpoint = CheckpointManager(db_session=db)
+            cost_tracker = CostTracker()
+            tracer = Tracer(db_session=db, cost_tracker=cost_tracker)
+            sse = SSEReporter(sse_manager)
+
+            def _persist_dialogue(state):
+                try:
+                    dialogue = state.get('dialogue_history', [])
+                    if dialogue:
+                        requirement.dialogue_history = dialogue
+                        flag_modified(requirement, 'dialogue_history')
+                        db.commit()
+                except Exception as e:
+                    logger.warning(f"增量持久化对话失败（不阻断）：{e}")
+
+            tool_loop = ToolCallLoop(
+                workspace=workspace, git=git, tools=tools, hooks=hooks,
+                tracer=tracer, cost_tracker=cost_tracker, sse_reporter=sse,
+                checkpoint=checkpoint, on_iteration=_persist_dialogue,
+            )
+
+            # 记忆注入
+            _original_builder = tool_loop._build_system_prompt
+            _req_content = requirement.content
+            _mgr = _get_memory_manager()
+
+            def _memory_aware_prompt(state):
+                base = _original_builder(state)
+                return _mgr.before_task(_req_content, base)
+
+            tool_loop._build_system_prompt = _memory_aware_prompt
+
+            # ---- 从检查点恢复 TL 后的状态 ----
+            resumed_state = checkpoint.resume(requirement_id)
+            if not resumed_state:
+                logger.error(f"[ConfirmPlan] 找不到检查点 for requirement {requirement_id}")
+                requirement.status = 'failed'
+                db.commit()
+                return False
+
+            logger.info(f"[ConfirmPlan] 从检查点恢复状态: node={resumed_state.get('current_step', '?')}")
+
+            # 构建初始状态（合并检查点 + harness 注入）
+            initial_state: AgentState = {
+                **resumed_state,
+                'current_step': 'starting',  # 重置，让 post-plan 图正常流转
+            }
+
+            # 注入 harness 组件
+            initial_state["metadata"]["_tool_loop"] = tool_loop
+            initial_state["metadata"]["_workspace"] = workspace
+            set_harness_components(tool_loop=tool_loop, workspace=workspace)
+
+            # 如果有用户反馈，追加到对话历史
+            if feedback:
+                initial_state.setdefault('dialogue_history', []).append({
+                    'role': 'user', 'name': '用户',
+                    'content': f"对 Plan 的反馈：{feedback}",
+                    'plan_feedback': True,
+                })
+
+            # 开始链路追踪
+            trace = tracer.start_trace(requirement_id, requirement.user_id)
+            initial_state['metadata']['trace_id'] = trace.trace_id
+
+            sse.progress(requirement_id, 20, '用户已确认 Plan，开始编码')
+
+            # ---- 执行 Post-Plan 工作流（coder → verify → repair）----
+            post_plan_workflow = create_workflow_post_plan()
+            final_state = self._execute_workflow_with_stream(
+                requirement_id, initial_state, post_plan_workflow
+            )
+
+            if final_state is None:
+                return False
+
+            # 处理最终状态
+            return self._process_final_state(db, requirement, requirement_id, final_state,
+                                             workspace, git, tracer, sse)
+
+        except Exception as e:
+            logger.error(f"[ConfirmPlan] 异常：{e}", exc_info=True)
+            try:
+                requirement = db.query(Requirement).filter(Requirement.id == requirement_id).first()
+                if requirement:
+                    requirement.status = 'failed'
+                    db.commit()
+            except:
+                pass
+            return False
+
+        finally:
+            db.close()
+
     @staticmethod
     def _detect_node_name(current_step: str) -> str:
         """根据 current_step 检测当前节点名称"""
         step_to_node = {
             'team_leader_done': 'team_leader',
             'team_leader_failed': 'team_leader',
-            'pm_done': 'pm',
-            'architect_done': 'architect',
-            'generating': 'engineer',
-            'coding_done': 'file_by_file_coder',
-            'coding_error': 'file_by_file_coder',
-            'qa_done': 'qa_reviewer',
-            'qa_skipped': 'qa_reviewer',
-            'summarize_done': 'summarize',
+            'generating': 'coder',
+            'coding_done': 'coder',
+            'coding_error': 'coder',
+            'llm_error': 'coder',
+            'verify_done': 'verify',
             'repair_done': 'repair',
             'repair_error': 'repair',
-            'task_complete': 'engineer',
+            'task_complete': 'coder',
         }
         return step_to_node.get(current_step, '')
 
@@ -343,7 +613,7 @@ class RequirementService:
             current_step = final_state.get('current_step', '')
 
             # 成功状态列表
-            success_steps = ('task_complete', 'summarize_done', 'coding_done', 'repair_done')
+            success_steps = ('task_complete', 'coding_done', 'verify_done', 'repair_done')
 
             # 安全网：如果 current_step 明确表示任务完成，忽略可能残留的 error
             if current_step in success_steps:
@@ -353,16 +623,34 @@ class RequirementService:
 
             if final_state.get('error'):
                 requirement.status = 'failed'
+                requirement.error_message = final_state.get('error', '')
                 db.commit()
+                # 失败时也保存 trace（供诊断）
+                self._save_trace_on_failure(final_state, requirement_id, tracer)
                 return False
 
             # 检查 current_step 是否为真正的成功状态
             # "no_progress" / "max_iterations" / "coding_error" 表示 Agent 卡住或超限，不应标记为完成
-            if current_step in ('no_progress', 'max_iterations', 'coding_error', 'repair_error'):
+            if current_step in ('no_progress', 'max_iterations', 'coding_error',
+                               'repair_error', 'llm_error', 'cancelled'):
                 logger.warning(
                     f"需求 {requirement_id} 因 {current_step} 终止，标记为 failed"
                 )
                 requirement.status = 'failed'
+                # 每个终止原因都有对应的中文描述
+                step_descriptions = {
+                    'no_progress': 'Agent 连续多轮无文件变更，判定为卡住',
+                    'max_iterations': 'Agent 达到最大迭代次数上限',
+                    'coding_error': '编码过程中发生错误',
+                    'repair_error': '修复过程失败',
+                    'llm_error': 'LLM API 调用失败',
+                    'cancelled': '用户取消了操作',
+                }
+                base_message = step_descriptions.get(current_step, f"执行终止: {current_step}")
+                requirement.error_message = base_message
+                # 如果有更详细的错误信息，附加到 error_message
+                if final_state.get('error') and str(final_state['error']).strip():
+                    requirement.error_message += f" — {final_state['error']}"
                 # 保存已有的对话历史和代码产物（部分产物可能有用）
                 dialogue_history = final_state.get('dialogue_history', [])
                 if dialogue_history:
@@ -376,10 +664,10 @@ class RequirementService:
                     for file_data in code_files:
                         self._send_code(requirement_id, file_data['filename'], file_data['content'])
                 db.commit()
+                # 失败时也保存 trace（供诊断）
+                self._save_trace_on_failure(final_state, requirement_id, tracer)
                 self._send_complete(requirement_id)
                 return False
-
-            # 从 workspace 获取最终文件
             code_files = workspace.snapshot()
 
             # 保存对话历史
@@ -394,6 +682,40 @@ class RequirementService:
                 logger.info(f"保存了 {len(code_files)} 个代码文件")
                 for file_data in code_files:
                     self._send_code(requirement_id, file_data['filename'], file_data['content'])
+
+            # 检查 verify_passed：如果 Evaluator 明确返回 NEEDS_WORK，标记为 failed
+            verify_passed = final_state.get("verify_passed")
+            if verify_passed is False:
+                logger.warning(
+                    f"需求 {requirement_id} verify_passed=False（Evaluator 判定 NEEDS_WORK），标记为 failed"
+                )
+                requirement.status = 'failed'
+                # 提取评估摘要作为错误信息
+                eval_error = "代码评估未通过"
+                repair_count = final_state.get("metadata", {}).get("repair_count", 0)
+                eval_error += f"（经 {repair_count} 轮修复后仍未达标）"
+                # 尝试从 Evaluator 结果中提取具体失败原因
+                role_outputs = final_state.get("role_outputs", {}) or {}
+                if "Evaluator" in role_outputs:
+                    try:
+                        import json as _json
+                        evaluator_raw = role_outputs["Evaluator"]
+                        evaluator_data = _json.loads(evaluator_raw) if isinstance(evaluator_raw, str) else evaluator_raw
+                        findings = evaluator_data.get("findings", [])
+                        if findings:
+                            critical_findings = [f for f in findings if f.get("severity") == "critical"]
+                            if critical_findings:
+                                eval_error += "。关键问题: " + "; ".join(
+                                    f['description'][:100] for f in critical_findings[:3]
+                                )
+                    except Exception:
+                        pass
+                requirement.error_message = eval_error
+                db.commit()
+                # 失败时也保存 trace（供诊断）
+                self._save_trace_on_failure(final_state, requirement_id, tracer)
+                self._send_complete(requirement_id)
+                return False
 
             requirement.status = 'finished'
             db.commit()
@@ -416,20 +738,22 @@ class RequirementService:
             try:
                 complexity = final_state.get("metadata", {}).get("complexity", "S")
                 qa_data = None
-                # 从多角色流程中提取 QA 审查结果
+                # 从 Evaluator 结果中提取质量评分
                 role_outputs = final_state.get("role_outputs", {}) or {}
-                role_history = final_state.get("role_history", []) or []
-                for entry in role_history:
-                    if entry.get("role_name") == "QAReviewer" and entry.get("success"):
-                        # QA 角色已存储 structured_output 到 role_outputs
-                        pass
-                # 从 final_state 的 role_outputs 检查是否有 QA 结果
-                if "QAReviewer" in role_outputs:
+                if "Evaluator" in role_outputs:
                     import json as _json
-                    qa_raw = role_outputs["QAReviewer"]
+                    evaluator_raw = role_outputs["Evaluator"]
                     try:
-                        qa_data = _json.loads(qa_raw) if isinstance(qa_raw, str) else qa_raw
-                    except _json.JSONDecodeError:
+                        evaluator_data = _json.loads(evaluator_raw) if isinstance(evaluator_raw, str) else evaluator_raw
+                        qa_data = {
+                            "overall_rating": evaluator_data.get("overall_score", 7),
+                            "passed": evaluator_data.get("verdict") == "PASS",
+                            "critical_issues": [
+                                f"{f.get('severity', '?')}: {f.get('description', '')}"
+                                for f in evaluator_data.get("findings", [])
+                            ],
+                        }
+                    except (_json.JSONDecodeError, TypeError):
                         pass
 
                 _mgr = _get_memory_manager()
@@ -454,8 +778,23 @@ class RequirementService:
         except Exception as e:
             logger.error(f"处理最终状态时发生异常：{e}", exc_info=True)
             requirement.status = 'failed'
+            requirement.error_message = f"处理异常: {str(e)}"
             db.commit()
+            # 失败时也保存 trace（供诊断）
+            self._save_trace_on_failure(final_state, requirement_id, tracer)
             return False
+
+    def _save_trace_on_failure(self, final_state, requirement_id, tracer):
+        """失败时也保存链路追踪数据，供后续诊断"""
+        try:
+            if not tracer:
+                return
+            trace_id = final_state.get('metadata', {}).get('trace_id', '')
+            if trace_id:
+                tracer.end_trace(trace_id)
+                logger.info(f"[Trace] 失败任务 {requirement_id} 的 trace 已保存: {trace_id}")
+        except Exception as e:
+            logger.warning(f"[Trace] 保存失败任务 trace 异常: {e}")
 
     def _send_question_form(self, requirement_id: int, form_data: dict):
         message = SSEMessage.question_form_message(form_data)
@@ -497,7 +836,7 @@ class RequirementService:
         # 保存对话历史
         dialogue_list = list(requirement.dialogue_history or [])
         dialogue_list.append({
-            'role': 'agent', 'name': 'AI',
+            'role': 'agent', 'name': TL_NAME,
             'content': answer,
             'status': 'completed',
             'timestamp': get_current_timestamp(),
@@ -508,7 +847,7 @@ class RequirementService:
         db.commit()
 
         # SSE 推送
-        sse.dialogue(requirement_id, 'agent', 'AI', answer, 'completed')
+        sse.dialogue(requirement_id, 'agent', TL_NAME, answer, 'completed')
         sse.complete(requirement_id)
         logger.info(f"需求 {requirement_id} QUICK 回答完成")
         return True
@@ -536,7 +875,7 @@ class RequirementService:
 
         dialogue_list = list(requirement.dialogue_history or [])
         dialogue_list.append({
-            'role': 'agent', 'name': 'AI',
+            'role': 'agent', 'name': TL_NAME,
             'content': answer,
             'status': 'completed',
             'timestamp': get_current_timestamp(),
@@ -546,7 +885,7 @@ class RequirementService:
         requirement.status = 'finished'
         db.commit()
 
-        sse.dialogue(requirement_id, 'agent', 'AI', answer, 'completed')
+        sse.dialogue(requirement_id, 'agent', TL_NAME, answer, 'completed')
         sse.complete(requirement_id)
         logger.info(f"需求 {requirement_id} SEARCH 回答完成")
         return True
@@ -571,7 +910,7 @@ class RequirementService:
 
         dialogue_list = list(requirement.dialogue_history or [])
         dialogue_list.append({
-            'role': 'system', 'name': 'Leon（负责人）',
+            'role': 'system', 'name': TL_NAME,
             'content': '需求不够明确，需要补充一些信息',
             'status': 'needs_clarification',
             'question_form': {'questions': questions},

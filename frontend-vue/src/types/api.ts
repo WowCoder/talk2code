@@ -8,7 +8,7 @@ export interface User {
 }
 
 // ===== Requirement Types =====
-export type RequirementStatus = 'pending' | 'processing' | 'finished' | 'failed'
+export type RequirementStatus = 'pending' | 'processing' | 'planning' | 'finished' | 'failed'
 
 export interface RequirementSummary {
   id: number
@@ -27,7 +27,7 @@ export interface CodeFile {
 }
 
 export interface DialogueMessage {
-  role: 'user' | 'agent' | 'assistant' | 'system' | 'tool_call' | 'tool_result' | 'thinking' | 'hook_check'
+  role: 'user' | 'agent' | 'assistant' | 'system' | 'tool_call' | 'tool_result' | 'thinking' | 'hook_check' | 'iteration_batch'
   name?: string
   content: string
   timestamp?: string
@@ -45,12 +45,22 @@ export interface DialogueMessage {
   hook_name?: string
   // thinking specific
   // (uses content)
+  // iteration_batch specific
+  iteration?: number
+  thinking_preview?: string
+  agent_text?: string
+  tools?: Array<{
+    name: string
+    readable: string
+    success: boolean
+    arguments?: Record<string, unknown>
+  }>
   // clarification
   question_form?: SSEQuestionFormData
   status?: string
   // hidden: 内部系统提示，不展示在前端
   hidden?: boolean
-  // grouped tool_calls (virtual message)
+  // grouped tool_calls (virtual message, 前端旧版兼容)
   _grouped?: boolean
   label?: string
   items?: DialogueMessage[]

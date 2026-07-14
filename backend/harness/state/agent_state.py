@@ -82,8 +82,15 @@ class AgentState(TypedDict, total=False):
     # QA 审查通过标记
     qa_passed: Optional[bool]
 
+    # Tester SPEC 验收测试通过标记
+    tester_passed: Optional[bool]
+
     # SummarizeCode 通过标记
     summarize_passed: Optional[bool]
+
+    # Verify （Fresh-Context Evaluator）通过标记
+    # 由 verify_node 设置，route_after_verify 和 _process_final_state 消费
+    verify_passed: Optional[bool]
 
     # 修复轮次计数
     repair_count: Optional[int]

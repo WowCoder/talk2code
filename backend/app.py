@@ -18,6 +18,7 @@ from services.sse_manager import sse_manager
 from services.task_queue import task_queue
 from services.requirement_service import process_requirement_async
 from harness.observability.logger import setup_logger, get_logger, setup_logging
+from harness.agent_names import TL_NAME
 from utils.rate_limiter import get_user_identity, rate_limit_handler, RATE_LIMITS
 
 # ==================== 日志配置 ====================
@@ -384,9 +385,9 @@ def get_requirement(req_id):
         if not requirement:
             return jsonify({'error': '需求不存在'}), 404
 
-        # 查询 trace 数据（已完成需求加载时前端可展示执行详情面板）
+        # 查询 trace 数据（已完成/失败需求加载时前端可展示执行详情面板）
         trace_data = None
-        if requirement.status == 'finished':
+        if requirement.status in ('finished', 'failed'):
             from models.models import AgentTrace
             trace_row = db.query(AgentTrace).filter(
                 AgentTrace.requirement_id == req_id
@@ -394,18 +395,31 @@ def get_requirement(req_id):
             if trace_row and trace_row.data:
                 trace_data = trace_row.data
 
+        # 推导 plan_status: 从 requirement.status 和 dialogue_history 判断
+        plan_status = None
+        if requirement.status == 'planning':
+            plan_status = 'needs_confirmation'
+        elif requirement.status in ('processing', 'finished'):
+            # 检查是否有 TL 生成的 plan（对话历史中包含 plan 字段的消息）
+            for msg in (requirement.dialogue_history or []):
+                if isinstance(msg, dict) and msg.get('plan'):
+                    plan_status = 'confirmed'
+                    break
+
         result = {
             'requirement': {
                 'id': requirement.id,
                 'title': requirement.title,
                 'content': requirement.content,
                 'status': requirement.status,
+                'plan_status': plan_status,
                 'dialogue_history': requirement.dialogue_history or [],
                 'code_files': requirement.code_files or [],
                 'create_time': requirement.create_time.isoformat() if requirement.create_time else None,
                 'update_time': requirement.update_time.isoformat() if requirement.update_time else None,
                 'is_deleted': requirement.is_deleted,
                 'deleted_at': requirement.deleted_at.isoformat() if requirement.deleted_at else None,
+                'error_message': requirement.error_message or None,
             }
         }
         if trace_data:
@@ -517,7 +531,6 @@ def chat_with_requirement(req_id):
     from harness.state.versioning import GitVersioning
     from harness.tools.registry import create_tool_registry
     from harness.constraints.hooks import create_default_hook_manager
-    from harness.environment.permissions import PermissionManager
     from harness.instructions.compactor import ContextCompactor
     from harness.observability.sse_reporter import SSEReporter
     from harness.observability.tracer import Tracer
@@ -570,7 +583,6 @@ def chat_with_requirement(req_id):
         git = GitVersioning(workspace)
         tools = create_tool_registry()
         hooks = create_default_hook_manager()
-        permissions = PermissionManager()
         sse = SSEReporter(sse_manager)
         tracer = Tracer(db_session=db)
         cost_tracker = CostTracker()
@@ -608,7 +620,7 @@ def chat_with_requirement(req_id):
         tool_loop = ToolCallLoop(
             workspace=workspace, git=git, tools=tools,
             hooks=hooks, tracer=tracer, cost_tracker=cost_tracker,
-            sse_reporter=sse, permission_manager=permissions,
+            sse_reporter=sse,
             on_iteration=_persist_dialogue,
         )
         # Chat 模式下降低迭代上限（修改任务应该在 3-5 轮内完成）
@@ -651,6 +663,7 @@ def chat_with_requirement(req_id):
         current_step = final_state.get('current_step', '')
         if current_step in ('no_progress', 'max_iterations'):
             requirement.status = 'failed'
+            requirement.error_message = f"对话执行终止: {current_step}"
         else:
             requirement.status = 'finished'
         db.commit()
@@ -669,7 +682,8 @@ def chat_with_requirement(req_id):
         try:
             from models import Requirement
             db.query(Requirement).filter(Requirement.id == req_id).update(
-                {'status': 'failed'}, synchronize_session=False
+                {'status': 'failed', 'error_message': f"对话异常: {str(e)}"},
+                synchronize_session=False
             )
             db.commit()
         except Exception:
@@ -751,6 +765,108 @@ def clarify_requirement(req_id):
     except Exception as e:
         db.rollback()
         return jsonify({'error': f'处理失败：{str(e)}'}), 500
+    finally:
+        db.close()
+
+
+@app.route('/api/requirements/<int:req_id>/confirm', methods=['POST'])
+@jwt_required()
+def confirm_plan(req_id):
+    """用户确认 TL 生成的开发计划，继续执行编码流程"""
+    from models import Requirement, SessionLocal
+    from services.requirement_service import RequirementService
+
+    user_id = int(get_jwt_identity())
+    data = request.get_json(silent=True) or {}
+    feedback = data.get('feedback', '').strip()
+
+    db = SessionLocal()
+    try:
+        req_record = db.query(Requirement).filter(
+            Requirement.id == req_id, Requirement.user_id == user_id
+        ).first()
+        if not req_record:
+            return jsonify({'error': '需求不存在'}), 404
+
+        if req_record.status != 'planning':
+            return jsonify({'error': f'需求状态为 {req_record.status}，无需确认'}), 400
+
+        db.close()
+
+        # 提交到任务队列（后台异步执行编码流程）
+        service = RequirementService()
+        task_id = task_queue.submit(req_id, service.confirm_plan, req_id, feedback)
+        if task_id is None:
+            import threading
+            thread = threading.Thread(
+                target=service.confirm_plan,
+                args=(req_id, feedback),
+                daemon=False
+            )
+            thread.start()
+            logger.info(f"需求 {req_id} 确认 Plan，启动独立线程执行编码流程")
+        else:
+            logger.info(f"需求 {req_id} 确认 Plan，提交任务：{task_id}")
+
+        return jsonify({'message': 'Plan 已确认，开始编码', 'requirement_id': req_id})
+    except Exception as e:
+        return jsonify({'error': f'确认失败：{str(e)}'}), 500
+
+
+@app.route('/api/requirements/<int:req_id>/cancel', methods=['POST'])
+@jwt_required()
+def cancel_requirement(req_id):
+    """取消正在处理的需求"""
+    from models import Requirement, SessionLocal
+    from services.requirement_service import RequirementService
+    from services.task_queue import task_queue
+    from services.sse_manager import sse_manager
+    from utils.sse import SSEMessage
+
+    user_id = int(get_jwt_identity())
+    db = SessionLocal()
+    try:
+        req_record = db.query(Requirement).filter(
+            Requirement.id == req_id, Requirement.user_id == user_id
+        ).first()
+        if not req_record:
+            return jsonify({'error': '需求不存在'}), 404
+
+        if req_record.status not in ('processing', 'planning'):
+            return jsonify({'error': f'需求状态为 {req_record.status}，无法取消'}), 400
+
+        # 1. 取消任务队列中的任务
+        task_queue.cancel_task(req_id)
+
+        # 2. 发送取消信号（触发 ToolCallLoop 和工作流中断）
+        RequirementService.signal_cancel(req_id)
+
+        # 3. 更新需求状态并追加取消消息
+        req_record.status = 'failed'
+        dialogue_list = list(req_record.dialogue_history or [])
+        dialogue_list.append({
+            'role': 'system',
+            'name': 'System',
+            'content': '操作已被用户取消',
+        })
+        req_record.dialogue_history = dialogue_list
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(req_record, 'dialogue_history')
+        db.commit()
+
+        # 4. SSE 推送取消通知
+        cancel_msg = SSEMessage.format_event('cancelled', {
+            'message': '操作已被用户取消',
+            'requirement_id': req_id,
+        })
+        sse_manager.broadcast(str(req_id), cancel_msg)
+
+        logger.info(f"需求 {req_id} 已被用户取消")
+        return jsonify({'message': '操作已取消', 'requirement_id': req_id}), 200
+    except Exception as e:
+        db.rollback()
+        logger.error(f"取消需求 {req_id} 失败：{e}", exc_info=True)
+        return jsonify({'error': f'取消失败：{str(e)}'}), 500
     finally:
         db.close()
 
@@ -874,6 +990,7 @@ def save_all_code(req_id):
 # ==================== SSE 实时推送 ====================
 
 @app.route('/api/sse/<int:req_id>')
+@limiter.exempt if limiter else (lambda f: f)
 def sse_stream(req_id):
     """SSE 实时推送连接"""
     import queue
@@ -1062,33 +1179,6 @@ def readiness_check():
         return jsonify({'status': 'not_ready', 'error': str(e)}), 503
 
 
-@app.route('/api/requirements/<int:req_id>/permission', methods=['POST'])
-@jwt_required()
-def permission_approval(req_id):
-    """接收用户权限审批决策"""
-    user_id = get_jwt_identity()
-    data = request.get_json() or {}
-    decision = data.get('decision', 'deny')  # 'allow' | 'deny'
-
-    from models import SessionLocal, Requirement
-    db = SessionLocal()
-    requirement = db.query(Requirement).filter_by(id=req_id, user_id=user_id).first()
-    if not requirement:
-        db.close()
-        return jsonify({'error': '需求不存在'}), 404
-
-    logger.info(f"用户 {user_id} 对需求 {req_id} 的权限请求做出了 {decision} 决定")
-
-    # 允许写入权限
-    if decision == 'allow':
-        from harness.environment.permissions import PermissionManager
-        pm = PermissionManager()
-        pm.grant(req_id, 'write')
-
-    db.close()
-    return jsonify({'status': 'ok', 'decision': decision})
-
-
 @app.route('/api/metrics', methods=['GET'])
 def metrics():
     """Prometheus 监控指标端点"""
@@ -1161,7 +1251,7 @@ def _handle_chat_quick(req_id, requirement, user_message, chat_router, db):
         'timestamp': get_current_timestamp(),
     })
     dialogue_list.append({
-        'role': 'agent', 'name': 'AI',
+        'role': 'agent', 'name': TL_NAME,
         'content': answer,
         'status': 'completed',
         'timestamp': get_current_timestamp(),
@@ -1173,7 +1263,7 @@ def _handle_chat_quick(req_id, requirement, user_message, chat_router, db):
 
     # SSE 推送
     sse_reporter.dialogue(req_id, 'user', '用户', user_message)
-    sse_reporter.dialogue(req_id, 'agent', 'AI', answer, 'completed')
+    sse_reporter.dialogue(req_id, 'agent', TL_NAME, answer, 'completed')
     sse_reporter.complete(req_id)
 
     logger.info(f"Chat QUICK 回答完成 (req_id={req_id})")
@@ -1214,7 +1304,7 @@ def _handle_chat_ambiguous(req_id, requirement, user_message, db):
         'timestamp': get_current_timestamp(),
     })
     dialogue_list.append({
-        'role': 'system', 'name': 'Leon（负责人）',
+        'role': 'system', 'name': TL_NAME,
         'content': '修改意见不够明确，需要补充一些信息',
         'status': 'needs_clarification',
         'question_form': {'questions': questions},

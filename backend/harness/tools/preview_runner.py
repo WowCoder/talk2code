@@ -12,6 +12,11 @@ Playwright headless 预览运行器
   ],
   "logs": [str],               # console.log/info/warn（供调试，非阻断）
   "network": [{"url","status"}],
+  "initialization": {          # 初始化检测（v2: 检测页面功能是否真正启动）
+     "canvas_activity": True/False/None,  # None=无canvas, True=有像素变化, False=静态
+     "animation_started": True/False,     # requestAnimationFrame 是否被调用
+     "details": str,                      # 人类可读的检测结果
+  },
 }
 
 设计要点：
@@ -34,9 +39,20 @@ DEFAULT_TIMEOUT_MS = 10_000
 SETTLE_MS = 1_500
 
 
-def run_preview_in_browser(html_path: Path, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> dict:
+def run_preview_in_browser(
+    html_path: Path,
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    elem_checks: list[dict] | None = None,
+) -> dict:
     """
-    在 headless 浏览器中加载 html_path，收集错误。
+    在 headless 浏览器中加载 html_path，收集错误和元素存在性信息。
+
+    Args:
+        html_path: HTML 文件路径
+        timeout_ms: 超时时间（毫秒）
+        elem_checks: 可选，要检查的页面元素列表。
+            每项格式: {"selector": "canvas", "label": "游戏画布", "required": True}
+            required=True 的元素不存在时会作为功能缺陷记录到 defects 中。
 
     Raises:
         RuntimeError: 当 playwright 未安装或浏览器二进制缺失时（调用方应降级）
@@ -50,6 +66,13 @@ def run_preview_in_browser(html_path: Path, timeout_ms: int = DEFAULT_TIMEOUT_MS
     errors: list[dict] = []
     logs: list[str] = []
     network: list[dict] = []
+    defects: list[dict] = []
+    page_text = ""  # 页面文本内容（供 LLM 评估功能完整性）
+    initialization = {  # 初始化检测结果
+        "canvas_activity": None,
+        "animation_started": False,
+        "details": "",
+    }
 
     try:
         with sync_playwright() as p:
@@ -64,6 +87,17 @@ def run_preview_in_browser(html_path: Path, timeout_ms: int = DEFAULT_TIMEOUT_MS
             try:
                 context = browser.new_context()
                 page = context.new_page()
+
+                # ---- 注入 RAF 追踪脚本（在页面脚本执行前注入） ----
+                # 用于检测 initGame / 游戏循环等是否真正启动了 requestAnimationFrame
+                page.add_init_script("""
+                    window.__talk2code_raf_called = false;
+                    const _origRAF = window.requestAnimationFrame;
+                    window.requestAnimationFrame = function(cb) {
+                        window.__talk2code_raf_called = true;
+                        return _origRAF.call(window, cb);
+                    };
+                """)
 
                 # 收集器：把运行时信号塞进上面三个列表
                 def _on_console(msg):
@@ -110,6 +144,87 @@ def run_preview_in_browser(html_path: Path, timeout_ms: int = DEFAULT_TIMEOUT_MS
                     page.wait_for_timeout(SETTLE_MS)
                 except Exception:
                     pass
+
+                # ---- 元素存在性检查（功能验证的核心增强） ----
+                if elem_checks:
+                    for check in elem_checks:
+                        selector = check.get("selector", "")
+                        label = check.get("label", selector)
+                        required = check.get("required", False)
+                        try:
+                            elem = page.query_selector(selector)
+                            if elem:
+                                logs.append(f"[element_check] ✅ {label} ({selector}) 存在")
+                            else:
+                                defect = {
+                                    "type": "missing_element",
+                                    "selector": selector,
+                                    "label": label,
+                                    "message": f"页面缺少关键元素: {label} ({selector})",
+                                }
+                                if required:
+                                    defects.append(defect)
+                                logs.append(f"[element_check] ❌ {label} ({selector}) 不存在")
+                        except Exception as e:
+                            logs.append(f"[element_check] ⚠️ {label} ({selector}) 检查异常: {e}")
+
+                # ---- 提取页面可见文本（供 LLM 评估内容完整性） ----
+                try:
+                    page_text = page.inner_text("body")[:2000] if page.query_selector("body") else ""
+                except Exception:
+                    pass
+
+                # ---- 初始化检测：canvas 像素变化 + RAF 调用 ----
+                try:
+                    # 检测 RAF 是否被调用
+                    initialization["animation_started"] = page.evaluate(
+                        "() => window.__talk2code_raf_called || false"
+                    )
+
+                    # 检测 canvas 是否有像素变化（游戏是否真正渲染）
+                    canvases = page.query_selector_all("canvas")
+                    if canvases:
+                        canvas = canvases[0]
+                        # 获取当前像素数据
+                        initial_data = page.evaluate("""
+                            (selector) => {
+                                const c = document.querySelector(selector);
+                                if (!c) return null;
+                                const ctx = c.getContext('2d');
+                                if (!ctx) return null;
+                                return Array.from(ctx.getImageData(0, 0, Math.min(c.width, 100), Math.min(c.height, 100)).data);
+                            }
+                        """, "canvas")
+                        # 再等 2 秒让游戏循环跑几帧
+                        page.wait_for_timeout(2000)
+                        later_data = page.evaluate("""
+                            (selector) => {
+                                const c = document.querySelector(selector);
+                                if (!c) return null;
+                                const ctx = c.getContext('2d');
+                                if (!ctx) return null;
+                                return Array.from(ctx.getImageData(0, 0, Math.min(c.width, 100), Math.min(c.height, 100)).data);
+                            }
+                        """, "canvas")
+                        if initial_data and later_data and len(initial_data) == len(later_data):
+                            changed = sum(1 for a, b in zip(initial_data, later_data) if a != b)
+                            initialization["canvas_activity"] = changed > 50  # 至少 50 个像素变化
+                            initialization["details"] = (
+                                f"Canvas 像素变化: {changed} pixels"
+                                + (" (有动画)" if changed > 50 else " (静态/未启动)")
+                            )
+                        else:
+                            initialization["canvas_activity"] = False
+                            initialization["details"] = "无法读取 canvas 像素数据"
+                        logs.append(
+                            f"[init_check] canvas_activity={initialization['canvas_activity']}, "
+                            f"animation_started={initialization['animation_started']}"
+                        )
+                    else:
+                        initialization["details"] = "无 canvas 元素"
+                except Exception as e:
+                    initialization["details"] = f"初始化检测异常: {e}"
+                    logs.append(f"[init_check] 异常: {e}")
             finally:
                 browser.close()
     except RuntimeError:
@@ -123,6 +238,8 @@ def run_preview_in_browser(html_path: Path, timeout_ms: int = DEFAULT_TIMEOUT_MS
             "errors": [],
             "logs": [],
             "network": [],
+            "defects": [],
+            "page_text": "",
             "skip_reason": f"运行异常: {e}",
         }
 
@@ -132,6 +249,9 @@ def run_preview_in_browser(html_path: Path, timeout_ms: int = DEFAULT_TIMEOUT_MS
         "errors": errors,
         "logs": logs[:50],  # 限制体积
         "network": network[:50],
+        "defects": defects,
+        "page_text": page_text,
+        "initialization": initialization,
     }
 
 

@@ -14,9 +14,11 @@ import json
 from typing import Dict, Any, Optional
 
 from harness.state.agent_state import AgentState
+from harness.agent_names import DEV_NAME, QA_NAME
 from harness.observability.logger import get_logger
 from harness.harness_context import get_tool_loop as _get_tool_loop
 from harness.instructions.prompts import load_prompt, load_prompt_template
+from harness.constraints.completion_contract import CompletionContract
 from llm.client import get_client
 
 logger = get_logger(__name__)
@@ -244,12 +246,10 @@ def _review_single_file(file_path: str, workspace, state: AgentState,
 def _legacy_coder(state: AgentState, tool_loop) -> dict:
     """回退到旧行为：直接 ToolCallLoop（兼容没有 tasks 的情况）"""
     logger.info("[FileCoder] 无 tasks 数据，回退到旧版编码模式")
-    state.setdefault("metadata", {})["coder_name"] = "Henry（开发）"
-    state["metadata"]["thinking_name"] = "Henry（开发）"
+    state.setdefault("metadata", {})["coder_name"] = DEV_NAME
+    state["metadata"]["thinking_name"] = DEV_NAME
     result = tool_loop.run(state)
-    state["dialogue_history"] = result.get("dialogue_history", [])
-    state["current_step"] = "coding_done"
-    return state
+    return {"current_step": "coding_done"}
 
 
 def file_by_file_coder_node(state: AgentState) -> Dict[str, Any]:
@@ -273,13 +273,38 @@ def file_by_file_coder_node(state: AgentState) -> Dict[str, Any]:
     workspace = tool_loop.workspace
 
     # 设置角色名称
-    state.setdefault("metadata", {})["coder_name"] = "Henry（开发）"
-    state["metadata"]["thinking_name"] = "Henry（开发）"
+    state.setdefault("metadata", {})["coder_name"] = DEV_NAME
+    state["metadata"]["thinking_name"] = DEV_NAME
+
+    # ---- 初始化 CompletionContract ----
+    contract = CompletionContract(workspace)
+    if implementation_order:
+        contract.initialize(implementation_order)
+        # 注入到 state，供 progress_hooks 访问
+        state.setdefault("metadata", {})["_completion_contract"] = contract
+        state["_completion_contract"] = contract
 
     # 如果没有 tasks，回退到旧行为（兼容）
     if not tasks or not implementation_order:
         logger.info("[FileCoder] 缺少 tasks/implementation_order，使用旧版编码模式")
         return _legacy_coder(state, tool_loop)
+
+    # ---- SDD: 推送任务清单到前端 ----
+    req_id = state.get("requirement_id", 0)
+    task_items = []
+    for fpath in implementation_order:
+        task_info = _find_task(tasks, fpath)
+        task_items.append({
+            "file": fpath,
+            "description": task_info.get("description", fpath) if task_info else fpath,
+            "status": "pending",
+        })
+    if tool_loop.sse:
+        try:
+            tool_loop.sse.task_list(req_id, task_items)
+            logger.info(f"[FileCoder] 推送 task_list: {len(task_items)} 个文件")
+        except Exception as e:
+            logger.warning(f"[FileCoder] 推送 task_list 失败: {e}")
 
     logger.info(
         f"[FileCoder] 启动逐文件编码: {len(implementation_order)} 个文件 "
@@ -296,6 +321,13 @@ def file_by_file_coder_node(state: AgentState) -> Dict[str, Any]:
             continue
 
         logger.info(f"[FileCoder] 开始编码: {file_path} (描述: {task.get('description', '')[:60]})")
+
+        # 推送任务状态: in_progress
+        if tool_loop.sse:
+            try:
+                tool_loop.sse.task_update(req_id, file_path, "in_progress")
+            except Exception:
+                pass
 
         # 1. 构建 CodingContext
         context = _build_coding_context(
@@ -318,7 +350,7 @@ def file_by_file_coder_node(state: AgentState) -> Dict[str, Any]:
             if attempt > 0 and context.get("review_feedback"):
                 state.setdefault("dialogue_history", []).append({
                     "role": "user",
-                    "name": "Eve（代码审查）",
+                    "name": QA_NAME,
                     "content": (
                         f"文件 {file_path} 审查未通过（第 {attempt} 次），请修复以下问题：\n"
                         + "\n".join(f"- {i}" for i in context["review_feedback"])
@@ -351,6 +383,12 @@ def file_by_file_coder_node(state: AgentState) -> Dict[str, Any]:
             if review_result["verdict"] == "LGTM":
                 logger.info(f"[FileCoder] {file_path} 审查通过 (score={review_result['score']})")
                 file_passed = True
+                # 推送任务状态: completed
+                if tool_loop.sse:
+                    try:
+                        tool_loop.sse.task_update(req_id, file_path, "completed")
+                    except Exception:
+                        pass
                 break
             else:
                 # LBTM: 将审查反馈注入，下轮重写
@@ -368,21 +406,51 @@ def file_by_file_coder_node(state: AgentState) -> Dict[str, Any]:
             logger.warning(
                 f"[FileCoder] {file_path} 经 {MAX_CODE_REVIEW_ATTEMPTS} 次审查仍未通过，继续下一个文件"
             )
+            # 推送任务状态: failed
+            if tool_loop.sse:
+                try:
+                    tool_loop.sse.task_update(req_id, file_path, "failed")
+                except Exception:
+                    pass
 
         # 清除对话历史中的临时审查反馈，避免污染下一个文件的上下文
         state["dialogue_history"] = [
             m for m in (state.get("dialogue_history") or [])
-            if m.get("name") != "Eve（代码审查）"
+            if m.get("name") != QA_NAME
         ]
 
-    # 保存审查结果到 state
-    state["current_step"] = "coding_done"
-    state["code_errors"] = code_errors
-    state.setdefault("metadata", {})["review_results"] = review_results
+    # ---- CompletionContract 完成检查 ----
+    if contract.exists() and not contract.all_completed():
+        pending = contract.pending_files()
+        logger.warning(
+            f"[FileCoder] contract 未全部完成: "
+            f"{contract.completed_count()}/{contract.total_files()}，"
+            f"缺少: {pending}"
+        )
+        # 将缺失文件反馈注入，触发额外编码轮次
+        state.setdefault("dialogue_history", []).append({
+            "role": "system", "name": "System",
+            "content": (
+                f"以下 {len(pending)} 个文件尚未创建，请立即创建：\n"
+                + "\n".join(f"- {f}" for f in pending)
+                + "\n\n全部创建完成后才能声明任务完成。"
+            ),
+            "hidden": True,
+        })
+        # 重置 current_step 让 ToolCallLoop 继续执行
+        state["current_step"] = "generating"
+        state["no_progress_count"] = 0
+        # 额外编码轮次 (追加一轮，用已有编码上下文)
+        try:
+            result_state = tool_loop.run(state)
+            state["dialogue_history"] = result_state.get("dialogue_history", [])
+        except Exception as e:
+            logger.warning(f"[FileCoder] contract 补全编码失败: {e}")
 
     logger.info(
         f"[FileCoder] 逐文件编码完成: {len(review_results)} 次审查, "
         f"错误 {len(code_errors)} 条"
     )
 
-    return state
+    # 原地修改了 state（dialogue_history 等），只返回变更字段
+    return {"current_step": "coding_done", "code_errors": code_errors}

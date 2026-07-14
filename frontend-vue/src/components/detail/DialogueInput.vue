@@ -9,8 +9,16 @@
       @keypress="onKeypress"
     />
     <button
+      v-if="disabled"
+      class="btn-stop"
+      @click="onStop"
+    >
+      ⏹ 停止
+    </button>
+    <button
+      v-else
       class="btn-send"
-      :disabled="disabled || !message.trim()"
+      :disabled="!message.trim()"
       @click="send"
     >
       发送
@@ -27,12 +35,13 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   send: [message: string]
+  stop: []
 }>()
 
 const message = ref('')
 
 function onKeypress(e: KeyboardEvent) {
-  if (e.key === 'Enter') {
+  if (e.key === 'Enter' && !props.disabled) {
     send()
   }
 }
@@ -42,6 +51,10 @@ function send() {
   if (!msg || props.disabled) return
   emit('send', msg)
   message.value = ''
+}
+
+function onStop() {
+  emit('stop')
 }
 </script>
 
@@ -97,5 +110,24 @@ function send() {
 .btn-send:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+.btn-stop {
+  padding: 10px 20px;
+  border: 1px solid oklch(55% 0.15 20);
+  border-radius: 12px;
+  background: transparent;
+  color: oklch(55% 0.15 20);
+  font-size: 14px;
+  font-weight: 600;
+  font-family: var(--font-body);
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s;
+  white-space: nowrap;
+}
+
+.btn-stop:hover {
+  background: oklch(55% 0.15 20);
+  color: #fff;
 }
 </style>

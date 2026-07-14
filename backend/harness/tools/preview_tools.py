@@ -75,8 +75,14 @@ class PreviewToolHandler:
                     error=f"文件不存在：{filename}",
                     metadata={"available": True, "errors": [{"type": "missing_file"}]},
                 )
-            report = run_preview_in_browser(self.workspace.path / filename)
-            if report["errors"]:
+
+            # 自动检测页面中的交互元素，用于功能验证
+            elem_checks = self._detect_elements_to_check(filename)
+
+            report = run_preview_in_browser(
+                self.workspace.path / filename, elem_checks=elem_checks
+            )
+            if report["errors"] or report.get("defects"):
                 return ToolResult(
                     error=self._format_errors(report),
                     metadata=report,
@@ -93,16 +99,86 @@ class PreviewToolHandler:
                 metadata={"available": False, "errors": [], "skip_reason": str(e)},
             )
 
+    def _detect_elements_to_check(self, filename: str) -> list[dict]:
+        """扫描 HTML 源码，自动检测需要验证的关键交互元素
+
+        返回值格式与 run_preview_in_browser 的 elem_checks 参数一致。
+        """
+        checks = []
+        try:
+            html = self.workspace.read(filename)
+        except Exception:
+            return checks
+
+        import re
+
+        # 检测 Canvas 元素（游戏/图表类应用的核心渲染层）
+        if re.search(r'<canvas\b', html, re.IGNORECASE):
+            canvas_id = re.search(r'<canvas[^>]*\bid\s*=\s*["\']([^"\']+)["\']', html, re.IGNORECASE)
+            selector = f"#{canvas_id.group(1)}" if canvas_id else "canvas"
+            checks.append({
+                "selector": selector,
+                "label": "游戏画布 (Canvas)",
+                "required": True,
+            })
+
+        # 检测常见游戏 UI 元素
+        ui_patterns = [
+            (r'id\s*=\s*["\']score["\']', "#score", "分数显示"),
+            (r'id\s*=\s*["\']gameOver["\']', "#gameOver", "游戏结束提示"),
+            (r'id\s*=\s*["\']start["\']', "#start", "开始按钮"),
+            (r'id\s*=\s*["\']restart["\']', "#restart", "重新开始按钮"),
+            (r'class\s*=\s*["\'][^"\']*\bscore\b', ".score", "分数显示 (.score)"),
+            (r'id\s*=\s*["\']highScore["\']', "#highScore", "最高分显示"),
+            (r'id\s*=\s*["\']board["\']', "#board", "游戏面板"),
+        ]
+        for pattern, selector, label in ui_patterns:
+            if re.search(pattern, html, re.IGNORECASE):
+                # 避免重复添加相同 selector
+                if not any(c["selector"] == selector for c in checks):
+                    checks.append({
+                        "selector": selector,
+                        "label": label,
+                        "required": False,  # 非画布元素缺失不强制阻断
+                    })
+
+        return checks
+
     @staticmethod
     def _format_errors(report: dict) -> str:
-        lines = [f"页面运行发现 {len(report['errors'])} 个错误："]
-        for i, e in enumerate(report["errors"], 1):
-            lines.append(f"  {i}. [{e['type']}] {e['message']}")
-        return "\n".join(lines)
+        lines = []
+        if report.get("errors"):
+            lines.append(f"页面运行发现 {len(report['errors'])} 个错误：")
+            for i, e in enumerate(report["errors"], 1):
+                lines.append(f"  {i}. [{e['type']}] {e['message']}")
+        if report.get("defects"):
+            lines.append(f"页面功能缺陷 {len(report['defects'])} 个：")
+            for i, d in enumerate(report["defects"], 1):
+                lines.append(f"  {i}. [{d['type']}] {d['message']}")
+        return "\n".join(lines) if lines else "页面运行正常。"
 
     @staticmethod
     def _format_success(report: dict) -> str:
-        return (
+        parts = [
             f"页面运行正常，无错误。console 消息 {len(report.get('logs', []))} 条，"
             f"网络请求 {len(report.get('network', []))} 个。"
+        ]
+        # 附加元素检查结果
+        elem_ok = sum(
+            1 for log in report.get("logs", [])
+            if log.startswith("[element_check] ✅")
         )
+        if elem_ok > 0:
+            parts.append(f"关键元素验证通过: {elem_ok} 个。")
+        # 附加初始化检测结果
+        init = report.get("initialization", {})
+        if init:
+            if init.get("canvas_activity") is False:
+                parts.append("⚠️ Canvas 存在但无像素变化（游戏循环可能未启动）。")
+            elif init.get("canvas_activity") is True:
+                parts.append("✅ Canvas 有像素变化（动画/游戏正在运行）。")
+            if init.get("animation_started") is False:
+                parts.append("⚠️ requestAnimationFrame 未被调用（init/入口函数可能未执行）。")
+            elif init.get("animation_started") is True:
+                parts.append("✅ requestAnimationFrame 已调用（渲染循环已启动）。")
+        return " ".join(parts)

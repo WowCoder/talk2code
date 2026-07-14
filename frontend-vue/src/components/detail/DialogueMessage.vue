@@ -59,7 +59,7 @@
     </div>
   </div>
 
-  <!-- Grouped tool calls (virtual message from DialoguePanel) -->
+  <!-- Grouped tool calls (virtual message from DialoguePanel, 兼容旧版) -->
   <div v-else-if="msg._grouped" class="msg tool-group-msg">
     <div class="tool-group-toggle" @click="toolGroupExpanded = !toolGroupExpanded">
       <span class="thinking-toggle-icon">{{ toolGroupExpanded ? '▾' : '▸' }}</span>
@@ -75,6 +75,64 @@
           :summary="item.name === 'read_file' ? '' : (typeof item.content === 'string' ? item.content.slice(0, 200) : '')"
         />
       </template>
+    </div>
+  </div>
+
+  <!-- Iteration batch card（新版迭代分组，替代逐条 tool_call 展示）-->
+  <div v-else-if="msg.role === 'iteration_batch'" class="msg iteration-msg">
+    <div class="iteration-card">
+      <!-- 折叠栏 -->
+      <div class="iteration-toggle" @click="iterationExpanded = !iterationExpanded">
+        <span class="iteration-toggle-icon">{{ iterationExpanded ? '▾' : '▸' }}</span>
+        <span class="agent-name" :style="{ color: roleColor }">
+          <span class="role-icon">{{ roleIcon }}</span>
+          {{ displayName }}
+        </span>
+        <span class="iteration-label">第 {{ msg.iteration }} 轮</span>
+        <span class="iteration-tool-count">{{ toolsList.length }} 个操作</span>
+        <span v-if="msg.thinking_preview" class="iteration-thinking-dot" title="有思考内容">💭</span>
+      </div>
+
+      <!-- 展开内容 -->
+      <div v-if="iterationExpanded" class="iteration-body">
+        <!-- thinking 预览（可进一步展开） -->
+        <div v-if="msg.thinking_preview" class="iteration-thinking">
+          <div class="iteration-thinking-header" @click="thinkingDetailExpanded = !thinkingDetailExpanded">
+            <span>{{ thinkingDetailExpanded ? '▾' : '▸' }}</span>
+            <span>💭 思考中…</span>
+            <span class="iteration-thinking-preview">{{ msg.thinking_preview }}</span>
+          </div>
+          <div v-if="thinkingDetailExpanded" class="iteration-thinking-full">
+            {{ msg.thinking_preview }}
+          </div>
+        </div>
+
+        <!-- agent 回复文本 -->
+        <div v-if="msg.agent_text" class="iteration-agent-text">
+          {{ msg.agent_text }}
+        </div>
+
+        <!-- 工具操作列表 -->
+        <div class="iteration-tools">
+          <div
+            v-for="(tool, ti) in toolsList"
+            :key="ti"
+            class="iteration-tool-item"
+          >
+            <span class="iteration-tool-icon">{{ tool.success ? '✅' : '❌' }}</span>
+            <span class="iteration-tool-label">{{ tool.readable }}</span>
+            <span
+              v-if="hasToolArgs(tool)"
+              class="iteration-tool-detail"
+              @click="toggleToolDetail(ti)"
+            >{{ expandedTools.has(ti) ? '收起 ▴' : '参数 ▸' }}</span>
+          </div>
+          <!-- 展开的工具参数 -->
+          <div v-for="ti in expandedTools" :key="'arg-' + ti" class="iteration-tool-args">
+            <pre>{{ JSON.stringify(toolsList[ti]?.arguments, null, 2) }}</pre>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -111,25 +169,41 @@ const props = defineProps<{
 
 const thinkingExpanded = ref(false)
 const toolGroupExpanded = ref(false)
+const iterationExpanded = ref(false)
+const thinkingDetailExpanded = ref(false)
+const expandedTools = ref(new Set<number>())
 
-// 角色 → 图标映射（按中文角色名）
-const ROLE_ICONS: Record<string, string> = {
-  'Leon（负责人）': '🎯',  'TeamLeader': '🎯',
-  'Catherine（产品经理）': '📋', 'ProductManager': '📋',
-  'Bob（架构师）': '🏗️', 'Architect': '🏗️',
-  'Henry（开发）': '⚙️', 'FrontendEngineer': '⚙️',
-  'Annie（测试）': '🔍', 'QAReviewer': '🔍',
-  'Eve（代码审查）': '🔎', 'CodeReviewer': '🔎',
+const toolsList = computed(() => {
+  return props.msg.tools || []
+})
+
+function hasToolArgs(tool: any): boolean {
+  const a = tool.arguments
+  return a !== undefined && a !== null && Object.keys(a).length > 0
 }
 
-// 角色 → 颜色映射（按中文角色名）
+function toggleToolDetail(index: number) {
+  const next = new Set(expandedTools.value)
+  if (next.has(index)) {
+    next.delete(index)
+  } else {
+    next.add(index)
+  }
+  expandedTools.value = next
+}
+
+// 角色 → 图标映射
+const ROLE_ICONS: Record<string, string> = {
+  'Leon（技术负责人）': '🎯',
+  'Henry（开发工程师）': '⚙️',
+  'Catherine（质量工程师）': '🔍',
+}
+
+// 角色 → 颜色映射
 const ROLE_COLORS: Record<string, string> = {
-  'Leon（负责人）': '#7c3aed',  'TeamLeader': '#7c3aed',
-  'Catherine（产品经理）': '#2563eb', 'ProductManager': '#2563eb',
-  'Bob（架构师）': '#059669', 'Architect': '#059669',
-  'Henry（开发）': '#ea580c', 'FrontendEngineer': '#ea580c',
-  'Annie（测试）': '#dc2626', 'QAReviewer': '#dc2626',
-  'Eve（代码审查）': '#8b5cf6', 'CodeReviewer': '#8b5cf6',
+  'Leon（技术负责人）': '#7c3aed',
+  'Henry（开发工程师）': '#ea580c',
+  'Catherine（质量工程师）': '#2563eb',
 }
 
 const roleIcon = computed(() => {
@@ -287,5 +361,163 @@ const displayName = computed(() => {
   gap: 8px;
   padding-left: 20px;
   border-left: 2px solid var(--border);
+}
+
+/* ---- Iteration batch card ---- */
+.msg.iteration-msg {
+  max-width: 95%;
+  align-self: flex-start;
+}
+
+.iteration-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.iteration-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  padding: 8px 12px;
+  transition: background 0.15s;
+}
+.iteration-toggle:hover {
+  background: var(--surface);
+}
+
+.iteration-toggle-icon {
+  font-size: 12px;
+  color: var(--muted);
+  width: 14px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.iteration-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+  background: var(--surface);
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+
+.iteration-tool-count {
+  font-size: 12px;
+  color: var(--muted);
+  flex: 1;
+}
+
+.iteration-thinking-dot {
+  font-size: 13px;
+}
+
+.iteration-body {
+  border-top: 1px solid var(--border);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.iteration-thinking {
+  font-size: 12px;
+}
+
+.iteration-thinking-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  color: var(--muted);
+  padding: 4px 0;
+}
+
+.iteration-thinking-preview {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.iteration-thinking-full {
+  margin-top: 6px;
+  padding: 8px 12px;
+  background: var(--surface);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+  white-space: pre-wrap;
+  max-height: 200px;
+  overflow-y: auto;
+  border-left: 2px solid var(--border);
+}
+
+.iteration-agent-text {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--fg);
+  padding: 6px 10px;
+  background: var(--surface);
+  border-radius: 6px;
+}
+
+.iteration-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.iteration-tool-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  font-size: 12px;
+  border-radius: 4px;
+}
+
+.iteration-tool-item:hover {
+  background: var(--surface);
+}
+
+.iteration-tool-icon {
+  font-size: 13px;
+  flex-shrink: 0;
+}
+
+.iteration-tool-label {
+  color: var(--fg);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.iteration-tool-detail {
+  font-size: 11px;
+  color: var(--accent);
+  cursor: pointer;
+  flex-shrink: 0;
+  user-select: none;
+}
+
+.iteration-tool-args {
+  margin: 2px 0 4px 24px;
+  padding: 6px 8px;
+  background: var(--dark-bg);
+  color: var(--dark-fg);
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+  max-height: 160px;
+  overflow-y: auto;
 }
 </style>

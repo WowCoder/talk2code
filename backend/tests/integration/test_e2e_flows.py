@@ -130,38 +130,6 @@ class TestE2EChatModification:
         assert isinstance(failures, list)
 
 
-class TestE2EPermissionApproval:
-    """E2E: 权限审批流程 (14.4)"""
-
-    def test_permission_grant_flow(self):
-        """测试权限授予流程"""
-        from harness.environment.permissions import PermissionManager, PermissionResult
-
-        pm = PermissionManager()
-
-        # 初始: 写入需要审批
-        assert pm.check(1, "write_file", "write") == PermissionResult.NEEDS_APPROVAL
-
-        # 用户授权
-        pm.grant(1, "write")
-
-        # 再次检查: 已授权
-        assert pm.check(1, "write_file", "write") == PermissionResult.ALLOW
-
-    def test_permission_per_call_execute(self):
-        """测试 execute 权限每次都需要审批"""
-        from harness.environment.permissions import PermissionManager, PermissionResult
-
-        pm = PermissionManager()
-
-        # execute 总是需要审批
-        assert pm.check(1, "execute_code", "execute") == PermissionResult.NEEDS_APPROVAL
-        assert pm.check(1, "execute_code", "execute") == PermissionResult.NEEDS_APPROVAL
-        # 即使之前已授权 write
-        pm.grant(1, "write")
-        assert pm.check(1, "execute_code", "execute") == PermissionResult.NEEDS_APPROVAL
-
-
 class TestE2EHookRepair:
     """E2E: Hook 失败 → Agent 修复 (14.5)"""
 
@@ -325,7 +293,6 @@ class TestE2EAllExistingTestsPass:
         from harness.runtime import ToolCallLoop
 
         # L3
-        from harness.environment.permissions import PermissionManager
         from harness.environment.sandbox import SandboxExecutor
 
         # L4
@@ -344,7 +311,6 @@ class TestE2EAllExistingTestsPass:
 
         assert ContextAssembler is not None
         assert ToolRegistry is not None
-        assert PermissionManager is not None
         assert WorkspaceFS is not None
         assert Tracer is not None
 
@@ -357,8 +323,7 @@ class TestE2EAllExistingTestsPass:
         assert "workspace" in harness
         assert "tools" in harness
         assert "hooks" in harness
-        assert "permissions" in harness
         assert "checkpoint" in harness
-        assert "memory" in harness
+        assert "memory_manager" in harness
         assert "tracer" in harness
         assert "cost_tracker" in harness

@@ -122,3 +122,15 @@ def register_all_hooks(manager):
     manager.register(HookPoint.POST_TOOL_USE, _css_lint_hook)
     manager.register(HookPoint.POST_TOOL_USE, _js_syntax_hook)
     manager.register(HookPoint.ON_TASK_COMPLETE, _required_files_hook)
+
+    # ---- 进度约束 Hook（硬阻断） ----
+    from harness.constraints.progress_hooks import (
+        block_unnecessary_read,
+        block_premature_completion,
+        track_write_success,
+    )
+    # PreToolUse: 在工具执行前阻断不合理行为
+    manager.register(HookPoint.PRE_TOOL_USE, block_unnecessary_read)
+    manager.register(HookPoint.PRE_TOOL_USE, block_premature_completion)
+    # PostToolUse: write_file 成功后追踪写入、更新 contract
+    manager.register(HookPoint.POST_TOOL_USE, track_write_success)

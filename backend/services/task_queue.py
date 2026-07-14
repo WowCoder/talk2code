@@ -233,6 +233,40 @@ class TaskQueue:
                         return task.status
         return None
 
+    def cancel_task(self, requirement_id: int) -> bool:
+        """取消指定需求的任务"""
+        with self._requirement_tasks_lock:
+            task_id = self._requirement_tasks.get(requirement_id)
+            if not task_id:
+                logger.warning(f"需求 {requirement_id} 没有关联的任务")
+                return False
+
+        with self._tasks_lock:
+            task_info = self._tasks.get(task_id)
+            if not task_info:
+                return False
+            if task_info.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+                logger.info(f"任务 {task_id} 已结束，状态：{task_info.status.value}")
+                return False
+
+            # 标记为 CANCELLED
+            task_info.status = TaskStatus.CANCELLED
+            task_info.completed_at = datetime.now()
+
+            # 尝试取消 Future（对尚未开始执行的任务有效）
+            if task_info.future and not task_info.future.done():
+                cancelled = task_info.future.cancel()
+                logger.info(f"任务 {task_id} 已取消：future.cancel()={cancelled}")
+            else:
+                logger.info(f"任务 {task_id} 已标记为 CANCELLED（任务正在执行中，将由信号机制终止）")
+
+        # 清理需求映射
+        with self._requirement_tasks_lock:
+            if requirement_id in self._requirement_tasks:
+                del self._requirement_tasks[requirement_id]
+
+        return True
+
     def get_pending_count(self) -> int:
         """获取待处理任务数量"""
         with self._tasks_lock:

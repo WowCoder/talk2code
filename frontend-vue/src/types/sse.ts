@@ -11,10 +11,16 @@ export type SSEEventType =
   | 'thinking'
   | 'hook_check'
   | 'complete'
-  | 'permission_request'
   | 'trace_summary'
   | 'error'
   | 'preview'
+  | 'spec'
+  | 'task_list'
+  | 'task_update'
+  | 'checklist_update'
+  | 'evaluator_result'
+  | 'cancelled'
+  | 'iteration_batch'
 
 // ===== SSE Event Data Shapes =====
 
@@ -92,14 +98,6 @@ export interface SSECompleteData {
   }>
 }
 
-export interface SSEPermissionData {
-  tool_name?: string
-  readable?: string
-  message?: string
-  reason?: string
-  arguments?: Record<string, unknown>
-}
-
 export interface SSETraceSummaryData {
   total_tokens?: number
   total_cost?: number
@@ -123,3 +121,92 @@ export interface SSEPreviewData {
   logs: string[]
   url?: string
 }
+
+// ===== SDD 新增事件 =====
+
+export interface SSESpecData {
+  title?: string
+  features?: string[]
+  acceptance_criteria?: Array<{
+    id: string
+    label: string
+    how_to_verify?: string
+  }>
+  file_structure?: string[]
+  tech_stack?: {
+    css?: string
+    storage?: string
+    framework?: string
+  }
+  data_model?: string
+  complexity?: string
+  implementation_notes?: string
+}
+
+export interface SSETaskListData {
+  tasks: Array<{
+    file: string
+    description: string
+    status: 'pending' | 'in_progress' | 'completed'
+  }>
+}
+
+export interface SSETaskUpdateData {
+  file: string
+  status: 'pending' | 'in_progress' | 'completed'
+}
+
+export interface SSEChecklistUpdateData {
+  ac_id: string
+  passed: boolean
+  reason?: string
+}
+
+// ===== Evaluator 结果 =====
+
+export interface EvaluatorFinding {
+  severity: 'critical' | 'major' | 'minor'
+  dimension: string
+  description: string
+  evidence?: string
+  suggestion?: string
+}
+
+export interface SSEEvaluatorResultData {
+  verdict: 'PASS' | 'NEEDS_WORK'
+  summary: string
+  overall_score: number
+  score: {
+    functionality?: number
+    runtime?: number
+    ui_quality?: number
+    acceptance?: number
+    code_quality?: number
+  }
+  findings: EvaluatorFinding[]
+  browser_result?: {
+    available: boolean
+    errors: string[]
+    warnings: string[]
+  }
+}
+
+// ===== 迭代批量事件 =====
+
+export interface SSEIterationBatchTool {
+  name: string
+  readable: string
+  success: boolean
+  arguments?: Record<string, unknown>
+}
+
+export interface SSEIterationBatchData {
+  iteration: number
+  coder_name: string
+  thinking_preview: string
+  agent_text: string
+  tools: SSEIterationBatchTool[]
+}
+
+// Task 状态联合类型增加 blocked/failed
+export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'blocked' | 'failed'

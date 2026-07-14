@@ -5,7 +5,7 @@ import type {
   DialogueMessage,
   CodeFile,
 } from '@/types/api'
-import type { SSEQuestionFormData } from '@/types/sse'
+import type { SSEQuestionFormData, SSEEvaluatorResultData, SSESpecData, SSETraceSummaryData } from '@/types/sse'
 import { useAuthStore } from './auth'
 
 export const useRequirementStore = defineStore('requirement', () => {
@@ -19,6 +19,17 @@ export const useRequirementStore = defineStore('requirement', () => {
   const questionForm = ref<SSEQuestionFormData | null>(null)
   // chat 模式下的澄清上下文（暂存原始消息，表单提交后拼接重新发送）
   const pendingChatClarification = ref<{ originalMessage: string } | null>(null)
+  // Evaluator 评估结果
+  const evaluatorResult = ref<SSEEvaluatorResultData | null>(null)
+  // Hook 检查结果（仅存储当前迭代的失败项，每次 iteration_batch 时清除旧数据）
+  const hookChecks = ref<Array<{ hook_name: string; passed: boolean; message: string }>>([])
+  // SPEC 和 Task 数据（从 dialogue_history 的 plan 字段恢复，或 SSE 推送）
+  const _specData = ref<SSESpecData | null>(null)
+  const _taskList = ref<any[]>([])
+  // Plan 确认状态: null=无plan, 'needs_confirmation'=等待确认, 'confirmed'=已确认
+  const planStatus = ref<'needs_confirmation' | 'confirmed' | null>(null)
+  // Trace 总结数据
+  const _traceSummary = ref<SSETraceSummaryData | null>(null)
 
   // ===== Actions =====
   async function api<T>(url: string, options: RequestInit = {}): Promise<T> {
@@ -36,6 +47,12 @@ export const useRequirementStore = defineStore('requirement', () => {
         window.location.href = '/login'
         throw new Error('未登录或登录已过期')
       }
+      // 429 → 限流，给出友好提示
+      if (response.status === 429) {
+        const err = await response.json().catch(() => ({}))
+        const retryAfter = err.retry_after || '若干秒'
+        throw new Error(`操作太频繁，请${retryAfter === 'None' ? '稍后' : retryAfter + '秒后'}再试`)
+      }
       const err = await response.json().catch(() => ({ error: 'Network error' }))
       throw new Error(err.error || `HTTP ${response.status}`)
     }
@@ -43,6 +60,17 @@ export const useRequirementStore = defineStore('requirement', () => {
   }
 
   async function loadRequirement(id: number): Promise<{ requirement: Requirement; trace?: any }> {
+    // 先重置所有状态，避免旧需求数据残留
+    dialogueMessages.value = []
+    Object.keys(codeFiles).forEach((k) => delete codeFiles[k])
+    questionForm.value = null
+    evaluatorResult.value = null
+    _specData.value = null
+    _taskList.value = []
+    planStatus.value = null
+    _traceSummary.value = null
+    hookChecks.value = []
+
     const data = await api<{ requirement: Requirement; trace?: any }>(`/api/requirements/${id}`)
     currentRequirement.value = data.requirement
 
@@ -66,6 +94,25 @@ export const useRequirementStore = defineStore('requirement', () => {
           }
         }
       }
+
+      // 从 TL 消息中恢复 SPEC 和 Task 数据（页面刷新后可用）
+      for (const msg of data.requirement.dialogue_history) {
+        if ((msg as any).plan) {
+          const plan = (msg as any).plan
+          _specData.value = {
+            title: data.requirement.title,
+            acceptance_criteria: plan.acceptance_criteria || [],
+            file_structure: plan.file_structure || [],
+            tech_stack: plan.tech_stack || {},
+          }
+          _taskList.value = (plan.implementation_order || []).map((f: string) => ({
+            file: f,
+            description: f,
+            status: 'completed',
+          }))
+          break
+        }
+      }
     }
 
     // Restore code files
@@ -73,6 +120,14 @@ export const useRequirementStore = defineStore('requirement', () => {
       data.requirement.code_files.forEach((f: CodeFile) => {
         codeFiles[f.filename] = f.content
       })
+    }
+
+    // 恢复 Plan 确认状态（从后端 API 返回的 plan_status 字段）
+    const planStatusFromApi = (data.requirement as any).plan_status
+    if (planStatusFromApi === 'needs_confirmation') {
+      planStatus.value = 'needs_confirmation'
+    } else if (planStatusFromApi === 'confirmed') {
+      planStatus.value = 'confirmed'
     }
 
     return data
@@ -89,6 +144,18 @@ export const useRequirementStore = defineStore('requirement', () => {
     if (dialogueMessages.value.length > 200) {
       dialogueMessages.value = dialogueMessages.value.slice(-100)
     }
+  }
+
+  function addHookCheck(check: { hook_name: string; passed: boolean; message: string }) {
+    // 避免重复添加相同 hook 的检查结果
+    const exists = hookChecks.value.some(h => h.hook_name === check.hook_name && h.message === check.message)
+    if (!exists) {
+      hookChecks.value.push(check)
+    }
+  }
+
+  function clearHookChecks() {
+    hookChecks.value = []
   }
 
   function updateCodeFiles(data: { filename?: string; content?: string; files?: Array<{ filename: string; content: string }> }) {
@@ -137,10 +204,19 @@ export const useRequirementStore = defineStore('requirement', () => {
       return data
     }
 
-    // 服务端响应是权威的最终状态，直接替换本地数据
-    // （SSE 在请求期间已实时推送增量更新，此处确保数据与服务端一致）
+    // 服务端响应是权威的最终状态，合并新消息而非直接替换
+    // （避免覆盖用户刚发送的本地消息和 SSE 实时推送的增量数据）
     if (data.dialogue_history?.length) {
-      dialogueMessages.value = data.dialogue_history
+      const existingKeys = new Set(
+        dialogueMessages.value.map(m => `${m.role}::${m.content}`.slice(0, 120))
+      )
+      for (const msg of data.dialogue_history) {
+        const key = `${(msg as any).role || 'agent'}::${(msg as any).content || ''}`.slice(0, 120)
+        if (!existingKeys.has(key)) {
+          dialogueMessages.value.push(msg as DialogueMessage)
+          existingKeys.add(key)
+        }
+      }
     }
     if (data.code_files) {
       Object.keys(codeFiles).forEach((k) => delete codeFiles[k])
@@ -156,14 +232,6 @@ export const useRequirementStore = defineStore('requirement', () => {
     await api(`/api/requirements/${currentRequirement.value.id}/clarify`, {
       method: 'POST',
       body: JSON.stringify({ answers }),
-    })
-  }
-
-  async function submitPermission(decision: 'allow' | 'deny') {
-    if (!currentRequirement.value) return
-    await api(`/api/requirements/${currentRequirement.value.id}/permission`, {
-      method: 'POST',
-      body: JSON.stringify({ decision }),
     })
   }
 
@@ -206,6 +274,25 @@ export const useRequirementStore = defineStore('requirement', () => {
     return sendChatMessage(enrichedMessage)
   }
 
+  async function confirmPlan(feedback: string = ''): Promise<void> {
+    if (!currentRequirement.value) return
+    await api(`/api/requirements/${currentRequirement.value.id}/confirm`, {
+      method: 'POST',
+      body: JSON.stringify({ feedback }),
+    })
+    // 无反馈直接确认时设为 confirmed；有反馈时等待 SSE 重新推送 spec 后再确认
+    if (!feedback) {
+      planStatus.value = 'confirmed'
+    }
+  }
+
+  async function cancelTask(): Promise<void> {
+    if (!currentRequirement.value) return
+    await api(`/api/requirements/${currentRequirement.value.id}/cancel`, { method: 'POST' })
+    isGenerating.value = false
+    progress.value = { currentAgent: '', percent: 0 }
+  }
+
   function reset() {
     currentRequirement.value = null
     dialogueMessages.value = []
@@ -215,6 +302,12 @@ export const useRequirementStore = defineStore('requirement', () => {
     progress.value = { currentAgent: '', percent: 0 }
     questionForm.value = null
     pendingChatClarification.value = null
+    evaluatorResult.value = null
+    _specData.value = null
+    _taskList.value = []
+    planStatus.value = null
+    _traceSummary.value = null
+    hookChecks.value = []
   }
 
   return {
@@ -228,16 +321,25 @@ export const useRequirementStore = defineStore('requirement', () => {
     pendingChatClarification,
     loadRequirement,
     addDialogueMessage,
+    addHookCheck,
+    clearHookChecks,
+    hookChecks,
     updateCodeFiles,
     setActiveFile,
     saveCodeFile,
     sendChatMessage,
     sendChatClarification,
     submitClarification,
-    submitPermission,
     trashRequirement,
     restoreRequirement,
     deleteRequirement,
+    evaluatorResult,
+    _specData,
+    _taskList,
+    _traceSummary,
+    planStatus,
+    confirmPlan,
+    cancelTask,
     reset,
   }
 })

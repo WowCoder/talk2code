@@ -2,16 +2,28 @@
   <div class="panel-tabbar">
     <div class="panel-tabs">
       <button
+        :class="['panel-tab', { active: activeTab === 'spec' }]"
+        @click="$emit('update:activeTab', 'spec')"
+      >
+        📋 Spec
+      </button>
+      <button
+        :class="['panel-tab', { active: activeTab === 'tasks' }]"
+        @click="$emit('update:activeTab', 'tasks')"
+      >
+        📝 任务
+      </button>
+      <button
         :class="['panel-tab', { active: activeTab === 'preview' }]"
         @click="$emit('update:activeTab', 'preview')"
       >
-        预览
+        👁 预览
       </button>
       <button
         :class="['panel-tab', { active: activeTab === 'code' }]"
         @click="$emit('update:activeTab', 'code')"
       >
-        代码
+        📄 代码
       </button>
     </div>
     <button class="btn-download" @click="$emit('download')">

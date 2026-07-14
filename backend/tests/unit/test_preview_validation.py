@@ -157,6 +157,8 @@ class TestToolCallLoopValidationFeedBack:
         done_resp.tool_calls = None
         done_resp.content = "任务完成"
         done_resp.usage = None
+        done_resp.error = None  # v5: response.error 被检查，需显式设为 None
+        done_resp.is_error = False
         client.chat_with_tools.return_value = done_resp
 
         monkeypatch.setattr("harness.runtime.get_client", lambda: client)

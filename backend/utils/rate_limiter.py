@@ -84,14 +84,17 @@ RATE_LIMITS = {
     # 需求创建：防止滥用
     'requirement_create': '10 per hour',
 
-    # 对话接口：防止刷屏
-    'chat': '20 per minute',
+    # 对话接口（chat/clarify/confirm/cancel 等写操作）
+    'chat': '30 per minute',
 
     # 代码保存：防止频繁修改
     'code_save': '30 per minute',
 
-    # SSE 连接：限制并发连接
-    'sse': '5 per minute',
+    # SSE 连接：不限制（长连接，不计入请求频率）
+    'sse_exempt': None,
+
+    # 详情页只读操作：宽松限制
+    'detail_read': '120 per minute',
 
     # 默认限流
     'default': '60 per minute',

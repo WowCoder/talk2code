@@ -244,24 +244,21 @@ class TestToolCallLoopToolExecution:
         assert result.success is False
         assert "未知工具" in result.error
 
-    def test_execute_tool_with_permission_denied(self):
-        """测试权限不足时拒绝执行"""
+    def test_execute_tool_with_missing_handler(self):
+        """测试未知工具调用返回错误"""
         workspace = Mock()
         workspace.path = None
 
         from harness.tools.registry import create_tool_registry
-        from harness.environment.permissions import PermissionManager
 
         tools = create_tool_registry()
-        pm = PermissionManager()
-        # 不给授权，write_file 需要审批
-        loop = ToolCallLoop(workspace=workspace, tools=tools, permission_manager=pm)
+        loop = ToolCallLoop(workspace=workspace, tools=tools)
 
         state = {"requirement_id": 1}
         tc = Mock()
-        tc.name = "write_file"
-        tc.arguments = {"filename": "test.html", "content": "test"}
+        tc.name = "unknown_tool_xyz"
+        tc.arguments = {}
 
         result = loop._execute_tool(state, tc)
         assert result.success is False
-        assert "需要用户审批" in result.error
+        assert "未知工具" in result.error

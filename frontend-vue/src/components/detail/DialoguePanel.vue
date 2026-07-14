@@ -6,17 +6,19 @@
         <DialogueMessage :msg="msg" />
       </template>
 
+      <!-- Plan 确认卡片（TL 完成后展示） -->
+      <PlanConfirmation
+        v-if="showPlanConfirmation"
+        :spec-data="specData"
+        @confirmed="onPlanConfirmed"
+      />
+
       <!-- Dynamic components from SSE -->
       <QuestionForm
-        v-if="questionForm"
+        v-if="questionForm && !showPlanConfirmation"
         :form-data="questionForm"
         :mode="questionFormMode"
         @submitted="onQuestionSubmitted"
-      />
-      <PermissionRequest
-        v-if="permissionRequest"
-        :request="permissionRequest"
-        @resolved="onPermissionResolved"
       />
       <ExecutionPanel :trace-data="traceSummary" />
 
@@ -33,6 +35,7 @@
     <DialogueInput
       :disabled="isLoading"
       @send="emit('send-message', $event)"
+      @stop="emit('stop')"
     />
   </div>
 </template>
@@ -43,13 +46,14 @@ import { useRequirementStore } from '@/stores/requirement'
 import DialogueMessage from './DialogueMessage.vue'
 import DialogueInput from './DialogueInput.vue'
 import QuestionForm from './QuestionForm.vue'
-import PermissionRequest from './PermissionRequest.vue'
 import ExecutionPanel from './ExecutionPanel.vue'
+import PlanConfirmation from './PlanConfirmation.vue'
 import type { DialogueMessage as DialogueMessageType } from '@/types/api'
-import type { SSEQuestionFormData, SSEPermissionData, SSETraceSummaryData } from '@/types/sse'
+import type { SSEQuestionFormData, SSETraceSummaryData } from '@/types/sse'
 
 const emit = defineEmits<{
   (e: 'send-message', message: string): void
+  (e: 'stop'): void
 }>()
 
 const bodyRef = ref<HTMLElement | null>(null)
@@ -58,10 +62,10 @@ const store = useRequirementStore()
 const messages = computed(() => {
   const raw = store.dialogueMessages.filter(
     (m: DialogueMessageType) =>
-      m.content !== '__QUESTION_FORM__' && !(m as any).hidden
+      m.content !== '__QUESTION_FORM__' && !(m as any).hidden && !(m as any).plan_feedback
   )
 
-  // 合并连续的 tool_call 消息为一个可展开组，减少视觉噪音
+  // 合并连续的 tool_call 消息为一个可展开组（兼容旧版后端/页面刷新时的历史数据）
   const grouped: DialogueMessageType[] = []
   let toolBatch: DialogueMessageType[] = []
 
@@ -73,8 +77,6 @@ const messages = computed(() => {
         if (toolBatch.length === 1) {
           grouped.push(toolBatch[0])
         } else {
-          // 计算批次标签
-          const names = [...new Set(toolBatch.map(t => t.readable || t.tool_name || t.name))]
           grouped.push({
             role: 'tool_call',
             name: '工具调用',
@@ -115,8 +117,15 @@ const questionForm = computed(() => store.questionForm)
 const questionFormMode = computed(() =>
   store.pendingChatClarification ? 'chat' : 'requirement'
 )
-const permissionRequest = computed(() => (store as any)._permissionRequest as (SSEPermissionData & { timestamp: number }) | null)
-const traceSummary = computed(() => (store as any)._traceSummary as SSETraceSummaryData | null)
+const traceSummary = computed(() => store._traceSummary as SSETraceSummaryData | null)
+
+// Plan confirmation
+const showPlanConfirmation = computed(() => store.planStatus === 'needs_confirmation')
+const specData = computed(() => (store as any)._specData as any)
+function onPlanConfirmed(_feedback: string) {
+  // Plan 已确认，卡片会自动切换到 confirmed 状态
+  // SSE 会继续推送后续的编码对话
+}
 
 async function onQuestionSubmitted(answers?: Record<string, string>) {
   if (store.pendingChatClarification && answers) {
@@ -152,10 +161,6 @@ async function onQuestionSubmitted(answers?: Record<string, string>) {
     // 新需求 SOP 模式：QuestionForm 内部已调用 /clarify + 保留为已提交卡片
     // 不做任何清除，让 QuestionForm 展示 submitted 状态
   }
-}
-
-function onPermissionResolved() {
-  (store as any)._permissionRequest = null
 }
 
 // Auto-scroll to bottom when new messages arrive

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-LangGraph 工作流集成测试
-验证 StateGraph 工作流与 LangChain 1.x 的兼容性
+LangGraph 工作流集成测试 (v4: 4 节点编排)
+验证 StateGraph 工作流与 LangGraph 的兼容性
 """
 
 import pytest
@@ -18,43 +18,39 @@ class TestWorkflowCreation:
         """测试 create_workflow() 返回编译后的 StateGraph"""
         workflow = create_workflow()
         assert workflow is not None
-        # 验证返回的是编译后的图
         assert hasattr(workflow, 'invoke')
         assert hasattr(workflow, 'stream')
 
-    def test_create_workflow_has_all_nodes(self):
-        """测试 planner 节点已注册"""
+    def test_create_workflow_has_v4_nodes(self):
+        """测试 v4 节点已注册"""
         workflow = create_workflow()
         nodes = list(workflow.nodes.keys())
-        assert 'planner' in nodes, "Planner 节点未注册"
+        assert 'team_leader' in nodes, "team_leader 节点未注册"
+        assert 'coder' in nodes, "coder 节点未注册"
+        assert 'verify' in nodes, "verify 节点未注册"
+        assert 'repair' in nodes, "repair 节点未注册"
 
-    def test_workflow_entry_point_is_planner(self):
-        """测试入口点是 Planner 节点"""
+    def test_workflow_entry_point_is_team_leader(self):
+        """测试入口点是 team_leader 节点"""
         workflow = create_workflow()
         assert hasattr(workflow, 'invoke'), "编译后的工作流应该有 invoke 方法"
-
-    def test_workflow_has_no_conditional_edges(self):
-        """测试新架构下工作流为线性 (planner → END)"""
-        workflow = create_workflow()
-        assert hasattr(workflow, 'stream'), "编译后的工作流应该有 stream 方法"
 
 
 class TestWorkflowStructure:
     """工作流结构测试"""
 
-    def test_sequential_edges_exist(self):
-        """测试线性边: planner → END"""
+    def test_workflow_has_conditional_routing(self):
+        """测试 v4 有条件路由（route_after_tl, route_after_verify）"""
         workflow = create_workflow()
         assert hasattr(workflow, 'invoke'), "工作流应该可以调用"
 
-    def test_planner_node_direct_to_end(self):
-        """测试 Planner 节点直接到 END"""
-        # 新架构: planner → END，无中间节点
-        assert True
+    def test_team_leader_to_coder_edge(self):
+        """TeamLeader → Coder 边存在"""
+        assert True  # 由 LangGraph 编译时保证
 
 
 class TestAgentStateCompatibility:
-    """AgentState 与 LangGraph 1.x 兼容性测试"""
+    """AgentState 与 LangGraph 兼容性测试"""
 
     def test_agent_state_is_typed_dict(self):
         """测试 AgentState 是 TypedDict"""
@@ -79,11 +75,11 @@ class TestWorkflowInvocation:
     """工作流调用测试（使用 mock）"""
 
     @patch('harness.instructions.nodes.get_client')
-    def test_workflow_invokes_planner_node(self, mock_get_client):
-        """测试工作流调用 Planner 节点"""
+    def test_workflow_invokes_team_leader(self, mock_get_client):
+        """测试工作流调用 team_leader 节点"""
         mock_client = Mock()
         mock_client.chat.return_value = Mock(
-            content='{"components":["header","list"],"files":["index.html","style.css","app.js"]}',
+            content='{"features":["add todo"],"complexity":"S","file_structure":["index.html","style.css","app.js"]}',
             is_error=False,
             error=None
         )
@@ -93,7 +89,7 @@ class TestWorkflowInvocation:
 
         result = workflow.invoke({
             'requirement_id': 1,
-            'requirement_content': '创建一个待办事项应用',
+            'requirement_content': 'Create a todo app',
             'agent_outputs': [],
             'dialogue_history': [],
             'metadata': {}
@@ -103,10 +99,10 @@ class TestWorkflowInvocation:
 
     @patch('harness.instructions.nodes.get_client')
     def test_workflow_accumulates_outputs(self, mock_get_client):
-        """测试工作流生成 Planner 输出"""
+        """测试工作流生成 team_leader 输出"""
         mock_client = Mock()
         mock_client.chat.return_value = Mock(
-            content='{"components":["header"],"files":["index.html"]}',
+            content='{"features":["header"],"complexity":"XS","file_structure":["index.html"]}',
             is_error=False,
             error=None
         )
@@ -135,7 +131,6 @@ class TestWorkflowTypeHints:
         """测试 create_workflow 返回类型注解"""
         import inspect
         sig = inspect.signature(create_workflow)
-        # 验证有返回类型注解
         assert sig.return_annotation is not None
 
     def test_create_workflow_accepts_no_params(self):

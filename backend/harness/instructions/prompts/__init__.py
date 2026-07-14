@@ -6,7 +6,7 @@
     from harness.instructions.prompts import load_prompt, load_prompt_template
 
     # 纯文本 Prompt
-    system = load_prompt("roles/team_leader.md")
+    system = load_prompt("coding/tl_analysis.md")
 
     # 带占位符的模板
     prompt = load_prompt_template("review/code_review.md",

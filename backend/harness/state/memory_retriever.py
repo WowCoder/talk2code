@@ -200,7 +200,7 @@ class BGEM3Retriever:
                     try:
                         from sentence_transformers import SentenceTransformer
                         logger.info(f"加载 BGE-M3 模型: {self.MODEL_NAME} ...")
-                        self._model = SentenceTransformer(self.MODEL_NAME)
+                        self._model = SentenceTransformer(self.MODEL_NAME, device='cpu')
                         logger.info("BGE-M3 模型加载完成")
                     except ImportError:
                         logger.warning(
@@ -238,13 +238,17 @@ class BGEM3Retriever:
             self._dirty = True
 
     def _ensure_dense(self):
-        """确保 dense embeddings 已计算"""
-        if self._dirty and not self._use_fallback and self._documents:
-            model = self.model
-            if model and self._documents:
+        """确保 dense embeddings 已计算（模型未就绪时降级到 TF-IDF）"""
+        if self._dirty and self._documents:
+            # 如果模型尚未加载且不在加载中，尝试加载（非阻塞检查）
+            if self._model is None and not self._use_fallback:
+                # 模型未加载，降级到 TF-IDF 避免阻塞请求
+                logger.info("BGE-M3 模型尚未就绪，本次检索使用 TF-IDF 降级方案")
+                self._use_fallback = True
+                self._fallback.fit(self._documents)
+            elif not self._use_fallback and self._model is not None:
                 logger.debug(f"编码 {len(self._documents)} 条文档的 dense embeddings ...")
-                # 文档侧不加前缀（BGE 约定）
-                self._dense_embeddings = model.encode(
+                self._dense_embeddings = self._model.encode(
                     self._documents,
                     normalize_embeddings=True,
                     show_progress_bar=False,

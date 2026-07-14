@@ -2,14 +2,20 @@
 
 ## 输出格式
 返回 JSON，包含以下字段：
-- features: 核心功能列表
-- complexity: 复杂度评级 "XS"|"S"|"M"|"L"
-- tech_stack: 技术选型 {"css": "tailwind/native", "storage": "localStorage/indexedDB/none"}
-- data_model: 数据模型描述
-- file_structure: 推荐的文件组织结构
-- implementation_notes: 实现注意事项
 
-# 任务分解（重要！用于指导逐文件编码）
+### 基础分析
+- features: 核心功能列表 (string[])
+- complexity: 复杂度评级 "XS"|"S"|"M"|"L"
+- tech_stack: 技术选型 {"css": "tailwind/native", "storage": "localStorage/indexedDB/none", "framework": "vanilla"}
+- data_model: 数据模型描述 (string)
+- file_structure: 推荐的文件组织结构 (string[])
+- implementation_notes: 实现注意事项 (string)
+- acceptance_criteria: [                    # 验收条件（必须可验证）
+    {"id": "AC-1", "label": "用户可添加待办事项", "how_to_verify": "输入文字点击添加，列表中出现新项"},
+    {"id": "AC-2", "label": "数据刷新后保留", "how_to_verify": "添加数据后刷新页面，数据仍然存在"}
+  ]
+
+### 任务分解（用于指导逐文件编码）
 - tasks: [                          # 文件级任务列表（按依赖顺序排列）
     {
       "file": "js/utils.js",
@@ -23,7 +29,7 @@
       "imports": {"js/utils.js": ["storage.get", "storage.set", "formatDate"]},
       "dependencies": ["js/utils.js"]
     }
-  ],
+  ]
 - interfaces: {                    # 文件间接口契约
     "js/utils.js": {
       "exports": {
@@ -32,7 +38,7 @@
         "debounce": "(fn, delay) => function"
       }
     }
-  },
+  }
 - implementation_order: ["js/utils.js", "css/style.css", "js/app.js", "index.html"]
 
 ## 复杂度判断标准
@@ -49,4 +55,5 @@
 - tasks 必须按依赖顺序排列（被依赖的文件排在前面）
 - interfaces 定义每个模块对外的 API 契约
 - implementation_order 是拓扑排序后的实施顺序
-- 对于 XS/S 复杂度，tasks/interfaces/implementation_order 可以省略
+- acceptance_criteria 每一条必须有具体的验证方法 (how_to_verify)
+- 对于 XS/S 复杂度，tasks/interfaces/implementation_order/acceptance_criteria 可以省略

@@ -57,13 +57,20 @@ class SSEReporter:
             "url": report.get("url", ""),
         })
 
-    def permission_request(self, requirement_id: int, tool_name: str, arguments: dict, reason: str):
-        self._send(requirement_id, "permission_request", {
-            "tool_name": tool_name, "arguments": arguments, "reason": reason
-        })
-
     def trace_summary(self, requirement_id: int, trace_data: dict):
         self._send(requirement_id, "trace_summary", trace_data)
+
+    def iteration_batch(self, requirement_id: int, batch: dict):
+        """推送一轮迭代的批量事件（替代逐个 tool_call/tool_result/thinking SSE）
+
+        batch 结构:
+            iteration: int          — 第几轮迭代
+            coder_name: str         — 角色名称（如 "Henry（开发）"）
+            thinking_preview: str   — thinking 前 100 字符预览
+            agent_text: str         — LLM 回复文本（截断到 200 字符）
+            tools: list[dict]       — [{name, readable, success, arguments}]
+        """
+        self._send(requirement_id, "iteration_batch", batch)
 
     def complete(self, requirement_id: int, code_files: list = None):
         self._send(requirement_id, "complete", {
@@ -73,6 +80,26 @@ class SSEReporter:
 
     def error(self, requirement_id: int, message: str):
         self._send(requirement_id, "error", {"message": message})
+
+    # ---- SDD 新增事件 ----
+
+    def spec(self, requirement_id: int, spec_data: dict):
+        """推送 SPEC 文档数据（验收条件 + 文件规格）"""
+        self._send(requirement_id, "spec", spec_data)
+
+    def task_list(self, requirement_id: int, tasks: list):
+        """推送开发任务清单（TodoList）"""
+        self._send(requirement_id, "task_list", {"tasks": tasks})
+
+    def task_update(self, requirement_id: int, file_path: str, status: str):
+        """推送单个任务状态更新"""
+        self._send(requirement_id, "task_update", {"file": file_path, "status": status})
+
+    def checklist_update(self, requirement_id: int, ac_id: str, passed: bool, reason: str = ""):
+        """推送验收条件检查结果更新"""
+        self._send(requirement_id, "checklist_update", {
+            "ac_id": ac_id, "passed": passed, "reason": reason
+        })
 
     def _send(self, requirement_id: int, event: str, data: dict):
         try:
