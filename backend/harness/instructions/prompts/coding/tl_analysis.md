@@ -21,12 +21,14 @@
 ### 任务分解（用于指导逐文件编码）
 - tasks: [                          # 文件级任务列表（按依赖顺序排列）
     {
+      "type": "code",              # 任务类型：research(信息收集) | code(编码实现) | review(代码审查)，默认 code
       "file": "js/utils.js",
       "description": "通用工具函数：日期格式化、防抖节流、localStorage 封装",
       "exports": ["formatDate()", "debounce()", "storage.get/set/remove()"],
       "dependencies": []
     },
     {
+      "type": "code",
       "file": "js/app.js",
       "description": "主应用逻辑：初始化、事件绑定、数据流转",
       "imports": {"js/utils.js": ["storage.get", "storage.set", "formatDate"]},

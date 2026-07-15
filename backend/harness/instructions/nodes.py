@@ -283,6 +283,7 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
                 'content': '已完成需求分析和架构设计',
                 'status': 'completed',
                 'plan': tl_plan_data,
+                'preserve': True,
             }],
             'metadata': {
                 **state.get('metadata', {}),
@@ -343,6 +344,112 @@ def tool_coder_node(state: AgentState) -> Dict[str, Any]:
         }
 
 
+def _execute_delegated_tasks(state: AgentState) -> Dict[str, Any]:
+    """Agent 委派：按 TaskType 选择执行策略
+
+    遍历 plan.tasks（按 implementation_order），根据 type 字段：
+    - research: 单次 LLM 调用（client.chat()），结果注入 dialogue_history
+    - code: ToolCallLoop 完整流程
+    - review: 对已完成文件做审查
+
+    未指定 type 时默认 code（向后兼容）。
+    """
+    from harness.state.agent_state import TaskType
+
+    tasks = state.get("tasks") or []
+    impl_order = state.get("implementation_order") or []
+    all_code_files = list(state.get("code_files") or [])
+
+    tool_loop = get_tool_loop(state)
+    if not tool_loop:
+        return {"current_step": "error", "error": "ToolCallLoop 未注入到 state"}
+
+    workspace = get_workspace(state) or tool_loop.workspace
+    requirement = state.get("requirement_content", "")
+
+    for task in tasks:
+        task_type = task.get("type", "code")
+        task_file = task.get("file", "")
+        task_desc = task.get("description", "")
+
+        if task_type == TaskType.RESEARCH.value:
+            # ---- Research: 轻量 LLM 调用，不分配工具权限 ----
+            logger.info(f"[AgentDelegate] 执行 research 任务: {task_desc[:80]}")
+            from llm.client import get_client
+            client = get_client()
+            resp = client.chat(
+                prompt=f"请研究以下问题并给出简洁回答：\n\n{task_desc}\n\n"
+                       f"上下文需求：{requirement[:500]}",
+                max_tokens=2000,
+                timeout=30,
+            )
+            research_result = resp.content if resp and resp.content else ""
+            # 将 research 结果注入 dialogue_history 供后续任务参考
+            state.setdefault("dialogue_history", []).append({
+                "role": "system",
+                "name": "Research",
+                "content": f"[Research 结果] {task_desc}:\n{research_result}",
+                "preserve": True,
+            })
+            state.setdefault("role_outputs", {})[f"research_{task_desc[:30]}"] = research_result
+
+        elif task_type == TaskType.REVIEW.value:
+            # ---- Review: 对已完成文件做审查 ----
+            logger.info(f"[AgentDelegate] 执行 review 任务: {task_file}")
+            review_result = _review_single_file(workspace, task_file, state)
+            # 注入审查结果
+            state.setdefault("dialogue_history", []).append({
+                "role": "system",
+                "name": "Review",
+                "content": f"[Review 结果] {task_file}:\n{review_result}",
+                "preserve": True,
+            })
+
+        else:
+            # ---- Code (默认): ToolCallLoop 完整流程 ----
+            logger.info(f"[AgentDelegate] 执行 code 任务: {task_file}")
+            state["current_step"] = "generating"
+            result = tool_loop.run(state)
+            if result.get("code_files"):
+                all_code_files.extend(result["code_files"])
+            # 更新 completed_files 摘要供后续任务参考
+            existing = workspace.list()
+            if existing:
+                state.setdefault("dialogue_history", []).append({
+                    "role": "system",
+                    "name": "System",
+                    "content": f"[已完成文件] {', '.join(existing)}",
+                    "preserve": True,
+                })
+
+    return {
+        "current_step": "coding_done",
+        "code_files": all_code_files,
+    }
+
+
+def _review_single_file(workspace, filename: str, state: AgentState) -> str:
+    """审查单个文件，返回审查结果文本"""
+    try:
+        content = workspace.read(filename)
+    except Exception as e:
+        return f"无法读取文件 {filename}: {e}"
+
+    # 使用 LLM 进行审查
+    from llm.client import get_client
+    client = get_client()
+    prompt = (
+        f"请审查以下文件代码，指出潜在问题（语法错误、逻辑缺陷、安全漏洞、"
+        f"最佳实践违规）：\n\n文件: {filename}\n```\n{content[:8000]}\n```\n\n"
+        f"请以简洁的方式列出发现的问题。如果没有问题，请回复\"LGTM\"。"
+    )
+    try:
+        resp = client.chat(prompt=prompt, max_tokens=1000, timeout=30)
+        return resp.content if resp and resp.content else "审查未返回结果"
+    except Exception as e:
+        return f"审查异常: {e}"
+
+
 def coder_node(state: AgentState) -> Dict[str, Any]:
     """
     统一编码节点：内部根据 complexity 选择策略
@@ -350,10 +457,22 @@ def coder_node(state: AgentState) -> Dict[str, Any]:
     - XS/S: 直接 ToolCallLoop（简单编码）
     - M/L: 逐文件编码 + CodeReview（使用 file_coder 的逻辑）
 
-    替换了旧的 simple_coder_node 和 file_by_file_coder_node。
+    支持 Agent 委派模式：当 plan.tasks 包含 type 字段时，
+    按 research/code/review 类型选择不同的执行策略。
     """
     complexity = state.get("metadata", {}).get("complexity", "S")
     has_tasks = bool(state.get("implementation_order"))
+
+    # ---- Agent 委派：检查是否有混合类型的子任务 ----
+    tasks = state.get("tasks") or []
+    has_typed_tasks = any(
+        isinstance(t, dict) and t.get("type") and t.get("type") != "code"
+        for t in tasks
+    )
+
+    if has_typed_tasks and has_tasks:
+        # 混合类型任务 → 按 TaskType 选择执行策略
+        return _execute_delegated_tasks(state)
 
     if complexity in ("M", "L") and has_tasks:
         # M/L 复杂度 + 有任务分解 → 逐文件编码

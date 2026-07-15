@@ -3,8 +3,36 @@
 AgentState —— 从 backend/agents/state.py 迁移并增强
 """
 
+from enum import Enum
 from typing import TypedDict, List, Optional, Annotated
 from operator import add
+
+
+class TaskType(str, Enum):
+    """子任务类型枚举
+
+    用于 TeamLeader 产出的 plan.tasks 中每个任务的 type 字段。
+    - research: 信息收集（轻量 LLM 调用，无工具权限）
+    - code: 编码实现（ToolCallLoop 完整流程）
+    - review: 代码审查（对已完成文件做审查）
+    """
+    RESEARCH = "research"
+    CODE = "code"
+    REVIEW = "review"
+
+
+class Subtask(TypedDict, total=False):
+    """Agent 委派子任务定义
+
+    TeamLeader plan.tasks 中每个任务项可携带 type 字段。
+    未指定 type 时默认为 code（向后兼容）。
+    """
+    type: str           # TaskType 值，默认 "code"
+    description: str    # 任务描述
+    file: str           # 目标文件名（code/review 类型）
+    exports: List[str]  # 对外导出
+    imports: List[str]  # 依赖
+    dependencies: List[str]  # 前置任务（文件名列表）
 
 
 class AgentState(TypedDict, total=False):

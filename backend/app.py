@@ -741,7 +741,8 @@ def clarify_requirement(req_id):
             'role': 'user',
             'name': '用户',
             'content': answer_text,
-            'timestamp': get_current_timestamp()
+            'timestamp': get_current_timestamp(),
+            'preserve': True,
         })
         req_record.dialogue_history = dialogue_list
         flag_modified(req_record, 'dialogue_history')

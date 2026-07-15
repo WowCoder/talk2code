@@ -3,6 +3,7 @@
 ContextCompactor —— P0-P3 分层上下文压缩
 
 使用分层策略管理 LLM 上下文窗口，防止长对话导致上下文溢出。
+支持 preserve 标记保护关键消息不被压缩。
 """
 
 from harness.observability.logger import get_logger
@@ -15,7 +16,7 @@ class ContextCompactor:
     上下文压缩器
 
     Token 预算模型:
-    P0 (永远保留): System Prompt + Skill 指令 + Craft 规则
+    P0 (永远保留): System Prompt + Skill 指令 + Craft 规则 + preserve=True 消息
     P1 (压缩保留): 技术决策、文件清单、数据模型
     P2 (滑动窗口): 最近 N 轮对话
     P3 (摘要替代): 旧对话 → LLM 生成摘要
@@ -32,6 +33,7 @@ class ContextCompactor:
         检查是否需要压缩，需要则分层压缩。
 
         优先使用滑动窗口截断（P2），如果超出阈值则进一步压缩（P3）。
+        标记 preserve=True 的消息不参与压缩。
 
         Args:
             messages: 消息列表 [{"role": "...", "content": "..."}]
@@ -44,23 +46,44 @@ class ContextCompactor:
         if estimated < self.budget * self.COMPACTION_THRESHOLD:
             return messages
 
+        # 分离保留消息（preserve=True）
+        preserved = [m for m in messages if m.get("preserve") is True]
+        compressible = [m for m in messages if m.get("preserve") is not True]
+
+        preserved_tokens = self._estimate_tokens(preserved)
+        compressible_budget = self.budget - preserved_tokens
+
+        # 保留消息超额时记录 WARNING，但保留所有 preserve 消息
+        if preserved_tokens > self.budget:
+            logger.warning(
+                f"[ContextCompactor] 保留消息 token 数 ({preserved_tokens}) "
+                f"超过总预算 ({self.budget})，保留全部 preserve 消息，"
+                f"非保留消息将被丢弃"
+            )
+
         logger.info(
             f"[ContextCompactor] 触发压缩: estimated={estimated}, "
-            f"budget={self.budget}, threshold={self.COMPACTION_THRESHOLD}"
+            f"budget={self.budget}, preserved={preserved_tokens}, "
+            f"compressible_budget={compressible_budget}"
         )
 
-        # P2 层：滑动窗口截断
-        compacted = self._compact_old_dialogues(messages)
+        # P2 层：滑动窗口截断（仅压缩可压缩消息，保留 system 角色）
+        compacted = self._compact_old_dialogues(
+            compressible, max_budget=compressible_budget
+        )
+
+        # 合并保留消息和压缩后的消息
+        result = preserved + compacted
 
         # 再次估算，如果还超则 P3 层压缩
-        estimated2 = self._estimate_tokens(compacted)
+        estimated2 = self._estimate_tokens(result)
         if estimated2 > self.budget * self.COMPACTION_THRESHOLD:
             logger.info(f"[ContextCompactor] P2 压缩后仍超限 ({estimated2})，进入 P3 层")
-            compacted = self._compact_with_summary(compacted)
+            result = preserved + self._compact_with_summary(compacted)
 
-        return compacted
+        return result
 
-    def _compact_old_dialogues(self, messages: list) -> list:
+    def _compact_old_dialogues(self, messages: list, max_budget: int = None) -> list:
         """P2 层压缩：保留 system + 最近 N 条消息"""
         kept = []
         for m in messages:
