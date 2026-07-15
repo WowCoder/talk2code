@@ -152,7 +152,11 @@ class SkillLoader:
             return None  # None = 降级到关键词
 
     def select_skills(self, requirement: str) -> list[Skill]:
-        """选择适用的 Skill：LLM 优先，失败降级到关键词"""
+        """选择适用的 Skill：LLM + 关键词匹配取并集
+
+        LLM 做正向选择（判断哪些相关），关键词匹配做保底（防止 LLM 漏选）。
+        两者取并集，确保不遗漏。
+        """
         self._ensure_loaded()
 
         # L0: always=true 始终注入
@@ -164,21 +168,19 @@ class SkillLoader:
         if not selectable:
             return selected
 
-        # 尝试 LLM 选择
+        # LLM 选择（正向补充）
         indices = self._select_by_llm(requirement)
-
         if indices is not None:
-            # LLM 成功
             for idx in indices:
                 if 0 <= idx < len(self._items):
                     s = self._items[idx]
                     if s not in selected:
                         selected.append(s)
-        else:
-            # 降级：关键词匹配
-            for s in selectable:
-                if s.matches_keywords(requirement):
-                    selected.append(s)
+
+        # 关键词匹配（保底补充，LLM 漏选时兜底）
+        for s in selectable:
+            if s not in selected and s.matches_keywords(requirement):
+                selected.append(s)
 
         return selected
 

@@ -2,6 +2,8 @@
 name: generic
 description: 通用前端开发知识：存储方案选择、CDN 引入、文件组织、常见易错点
 when_to_use: 任何前端开发任务都应启用（提供 localStorage/IndexedDB、Tailwind CDN、文件结构等基础模式）
+level: L0
+always: true
 triggers: []
 ---
 

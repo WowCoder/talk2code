@@ -10,6 +10,9 @@
 - data_model: 数据模型描述 (string)
 - file_structure: 推荐的文件组织结构 (string[])
 - implementation_notes: 实现注意事项 (string)
+- visual_direction: 视觉设计方向描述 (string)。例如："暗色主题游戏风格，深色背景+霓虹强调色"、"极简白底+蓝色强调"。分析需求后给出最合适的视觉方向，引导编码阶段做出好的设计决策。
+- layout_structure: 页面布局结构描述 (string)。例如："居中单列布局：标题 → 计分板 → 画布 → 操作按钮 → 提示文字"
+- key_interactions: 关键交互点列表 (string[])。例如：["方向键控制移动", "空格暂停", "游戏结束弹窗+重新开始"]
 - acceptance_criteria: [                    # 验收条件（必须可验证）
     {"id": "AC-1", "label": "用户可添加待办事项", "how_to_verify": "输入文字点击添加，列表中出现新项"},
     {"id": "AC-2", "label": "数据刷新后保留", "how_to_verify": "添加数据后刷新页面，数据仍然存在"}

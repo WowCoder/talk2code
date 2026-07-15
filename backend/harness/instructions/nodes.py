@@ -270,6 +270,9 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
             'implementation_order': impl_order,
             'tasks': tasks,
             'complexity': complexity,
+            'visual_direction': plan.get('visual_direction', ''),
+            'layout_structure': plan.get('layout_structure', ''),
+            'key_interactions': plan.get('key_interactions', []),
         } if isinstance(plan, dict) else {}
 
         return {
@@ -369,22 +372,21 @@ def coder_node(state: AgentState) -> Dict[str, Any]:
         state.setdefault("metadata", {})["coder_name"] = DEV_NAME
         state["metadata"]["thinking_name"] = DEV_NAME
 
-        # 初始化 CompletionContract（幂等：已有 contract 时增量补充，不重置进度）
-        from harness.constraints.completion_contract import CompletionContract
-        impl_order = state.get("implementation_order") or []
-        if impl_order:
-            workspace = get_workspace(state)
-            if not workspace:
-                workspace = tool_loop.workspace
-            contract = CompletionContract(workspace)
-            if contract.exists():
-                # 修复循环重入时用增量初始化，保留已有文件的 created/validated 状态
-                contract.initialize_incremental(impl_order)
-            else:
-                # 首次进入：全量初始化
-                contract.initialize(impl_order)
-            state["_completion_contract"] = contract
-            state.setdefault("metadata", {})["_completion_contract"] = contract
+        # 初始化 CompletionContract（仅 M/L 复杂度使用，XS/S 跳过以减少开销）
+        if complexity in ("M", "L"):
+            from harness.constraints.completion_contract import CompletionContract
+            impl_order = state.get("implementation_order") or []
+            if impl_order:
+                workspace = get_workspace(state)
+                if not workspace:
+                    workspace = tool_loop.workspace
+                contract = CompletionContract(workspace)
+                if contract.exists():
+                    contract.initialize_incremental(impl_order)
+                else:
+                    contract.initialize(impl_order)
+                state["_completion_contract"] = contract
+                state.setdefault("metadata", {})["_completion_contract"] = contract
 
         # 注入 Hook 失败历史
         hook_failures = state.get("hook_failures", {})
@@ -696,24 +698,27 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
         state["verify_passed"] = (verdict == "PASS")
         state["current_step"] = "verify_done"
 
-        # 持久化到 .task/evaluator/result.json
-        try:
-            evaluator_result = {
-                "verdict": verdict,
-                "summary": result.get("summary", ""),
-                "score": score,
-                "overall_score": overall_score,
-                "findings": findings,
-                "browser_result": browser_result,
-                "timestamp": __import__('time').time(),
-            }
-            workspace.write(
-                ".task/evaluator/result.json",
-                json.dumps(evaluator_result, ensure_ascii=False, indent=2)
-            )
-            logger.info(f"[Verify] 评估结果已写入 .task/evaluator/result.json")
-        except Exception as e:
-            logger.warning(f"[Verify] 写入结果文件失败: {e}")
+        # 构建评估结果对象（始终构建，供后续 QA 反馈使用）
+        complexity = state.get("metadata", {}).get("complexity", "S")
+        evaluator_result = {
+            "verdict": verdict,
+            "summary": result.get("summary", ""),
+            "score": score,
+            "overall_score": overall_score,
+            "findings": findings,
+            "browser_result": browser_result,
+            "timestamp": __import__('time').time(),
+        }
+        # 持久化到 .task/evaluator/result.json（XS 复杂度跳过）
+        if complexity != "XS":
+            try:
+                workspace.write(
+                    ".task/evaluator/result.json",
+                    json.dumps(evaluator_result, ensure_ascii=False, indent=2)
+                )
+                logger.info(f"[Verify] 评估结果已写入 .task/evaluator/result.json")
+            except Exception as e:
+                logger.warning(f"[Verify] 写入结果文件失败: {e}")
 
         # 添加评估对话（作为 QA 反馈注入，coder 再次进入时能看到）
         dimension_scores = ", ".join(
@@ -721,32 +726,107 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
         ) if score else f"overall: {overall_score}/10"
 
         if verdict != "PASS":
-            # 防御验证器矛盾输出：score < 6 但 findings 为空时，不消耗修复轮次
+            # 防御验证器矛盾输出：score < 6 但 findings 为空时，尝试重试一次
             # 这是一种 LLM 评估失败，不应让 coder 承担"无问题可修"的代价
             if overall_score < 6 and not findings:
-                # 连续矛盾计数器：防止无限循环
-                verifier_errors = state.get("metadata", {}).get("_verifier_error_count", 0) + 1
-                logger.warning(
-                    f"[Verify] ⚠️ 验证器返回矛盾结果: verdict=NEEDS_WORK, "
-                    f"score={overall_score}, 但 findings 为空。"
-                    f"连续矛盾次数={verifier_errors}"
-                )
-                state.setdefault("metadata", {})["_verifier_error"] = True
-                state["metadata"]["_verifier_error_count"] = verifier_errors
-                # 连续 2 次矛盾 → 保守标记为 PASS（避免无限循环）
-                if verifier_errors >= 2:
+                verifier_errors = state.get("metadata", {}).get("_verifier_error_count", 0)
+
+                if verifier_errors == 0:
+                    # 第一次矛盾：用更强的 prompt 重试，要求必须给出具体 findings
                     logger.warning(
-                        f"[Verify] 连续 {verifier_errors} 次矛盾结果，"
-                        f"保守标记为 PASS 以终止修复循环"
+                        f"[Verify] ⚠️ 验证器返回矛盾结果 (verdict=NEEDS_WORK, score={overall_score}, "
+                        f"findings=[])，将以更强约束重试 evaluator"
                     )
-                    state["verify_passed"] = True
+                    retry_prompt = user_prompt + (
+                        "\n\n⚠️ 重要：你上一次的评估返回了 NEEDS_WORK 但没有给出任何具体的 findings。"
+                        "\n根据硬性规则，NEEDS_WORK 必须伴随至少一个具体的 finding（包含 severity/description/evidence/suggestion）。"
+                        "\n请重新评估：如果代码确实有问题，必须逐条列出具体 findings；"
+                        "\n如果找不到任何具体问题，verdict 必须改为 PASS。"
+                        "\n特别注意检查：入口函数是否被调用、事件监听器是否绑定、run_preview 是否报告错误。"
+                    )
+                    try:
+                        retry_response = client.chat(
+                            prompt=retry_prompt,
+                            system_prompt=evaluator_prompt,
+                            use_memory=False,
+                            max_tokens=2000,
+                            timeout=90,
+                        )
+                        if not retry_response.is_error and retry_response.content:
+                            retry_content = retry_response.content.strip()
+                            try:
+                                result = json.loads(retry_content)
+                            except json.JSONDecodeError:
+                                match = re.search(r'\{[\s\S]*\}', retry_content)
+                                if match:
+                                    try:
+                                        result = json.loads(match.group())
+                                    except json.JSONDecodeError:
+                                        pass
+                            verdict = result.get("verdict", "NEEDS_WORK")
+                            findings = result.get("findings", [])
+                            overall_score = result.get("overall_score", overall_score)
+                            score = result.get("score", score)
+                            logger.info(
+                                f"[Verify] 重试后: verdict={verdict}, score={overall_score}, "
+                                f"findings={len(findings)}"
+                            )
+                    except Exception as retry_err:
+                        logger.warning(f"[Verify] 重试 evaluator 失败: {retry_err}")
+
+                # 重试后仍然矛盾
+                if overall_score < 6 and not findings:
+                    verifier_errors += 1
+                    logger.warning(
+                        f"[Verify] ⚠️ 验证器返回矛盾结果: verdict=NEEDS_WORK, "
+                        f"score={overall_score}, 但 findings 为空。"
+                        f"连续矛盾次数={verifier_errors}"
+                    )
+                    state.setdefault("metadata", {})["_verifier_error"] = True
+                    state["metadata"]["_verifier_error_count"] = verifier_errors
+                    # 连续 2 次矛盾 → 保守标记为 PASS（避免无限循环）
+                    if verifier_errors >= 2:
+                        logger.warning(
+                            f"[Verify] 连续 {verifier_errors} 次矛盾结果，"
+                            f"保守标记为 PASS 以终止修复循环"
+                        )
+                        state["verify_passed"] = True
+                        state["metadata"].pop("_verifier_error", None)
+                        state["metadata"]["_verifier_error_count"] = 0
+                    # 更新 evaluator_result（重试后可能变化）
+                    try:
+                        evaluator_result.update({
+                            "verdict": verdict,
+                            "score": score,
+                            "overall_score": overall_score,
+                            "findings": findings,
+                        })
+                        workspace.write(
+                            ".task/evaluator/result.json",
+                            json.dumps(evaluator_result, ensure_ascii=False, indent=2)
+                        )
+                    except Exception:
+                        pass
+                else:
+                    # 重试后找到了具体 findings，走正常 NEEDS_WORK 流程
                     state["metadata"].pop("_verifier_error", None)
                     state["metadata"]["_verifier_error_count"] = 0
-            else:
-                # NEEDS_WORK: 递增 repair_count（route_after_verify 据此限制修复轮次）
+                    repair_count = state.get("metadata", {}).get("repair_count", 0)
+                    state.setdefault("metadata", {})["repair_count"] = repair_count + 1
+            elif findings:
+                # NEEDS_WORK 且有具体 findings：递增 repair_count
                 repair_count = state.get("metadata", {}).get("repair_count", 0)
                 state.setdefault("metadata", {})["repair_count"] = repair_count + 1
-                # 清除之前的 verifier_error 标记
+                state["metadata"].pop("_verifier_error", None)
+                state["metadata"]["_verifier_error_count"] = 0
+            else:
+                # 边缘情况：NEEDS_WORK 但 score >= 6 且 findings 为空
+                # 可能是 evaluator 输出异常，保守处理为 PASS
+                logger.warning(
+                    f"[Verify] 边缘矛盾: verdict=NEEDS_WORK, score={overall_score}, "
+                    f"findings 为空，保守标记为 PASS"
+                )
+                state["verify_passed"] = True
                 state["metadata"].pop("_verifier_error", None)
                 state["metadata"]["_verifier_error_count"] = 0
 
