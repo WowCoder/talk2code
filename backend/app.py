@@ -395,6 +395,19 @@ def get_requirement(req_id):
             if trace_row and trace_row.data:
                 trace_data = trace_row.data
 
+        # 查询 evaluator 评估结果（页面刷新后恢复评分展示）
+        evaluator_data = None
+        try:
+            from harness.state.workspace import WorkspaceFS
+            import json as _json
+            ws = WorkspaceFS(requirement.user_id, req_id)
+            if ws.exists(".task/evaluator/result.json"):
+                raw = ws.read(".task/evaluator/result.json")
+                if raw and raw.strip():
+                    evaluator_data = _json.loads(raw)
+        except Exception:
+            pass  # evaluator 数据不存在或无法读取，不影响正常流程
+
         # 推导 plan_status: 从 requirement.status 和 dialogue_history 判断
         plan_status = None
         if requirement.status == 'planning':
@@ -424,6 +437,8 @@ def get_requirement(req_id):
         }
         if trace_data:
             result['trace'] = trace_data
+        if evaluator_data:
+            result['evaluator'] = evaluator_data
         return jsonify(result), 200
     finally:
         db.close()

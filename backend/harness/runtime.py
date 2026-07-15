@@ -70,14 +70,17 @@ class ToolCallLoop:
         coder_name = meta.get("coder_name", DEV_NAME)
         thinking_name = meta.get("thinking_name", DEV_NAME)
 
-        # 根据复杂度调整迭代上限（M/L 多角色流程需要更多轮次覆盖文件创建和 QA 修复）
-        complexity = state.get("metadata", {}).get("complexity", "S")
-        effective_max_iterations = {
-            "XS": 5,
-            "S": self.MAX_ITERATIONS,
-            "M": self.MAX_ITERATIONS + 5,  # M 也有多文件模块，需要更多轮次
-            "L": self.MAX_ITERATIONS + 10,  # L 文件更多，QA 修复更复杂
-        }.get(complexity, self.MAX_ITERATIONS)
+        # 根据文件数动态计算迭代上限：文件数×2 + 3，上限 20
+        # simple 复杂度（单文件）使用固定 5 轮快速通道
+        complexity = state.get("metadata", {}).get("complexity", "standard")
+        plan_files = (state.get("implementation_order") or
+                      (state.get("plan") or {}).get("file_structure", []) or
+                      [])
+        if complexity == "simple":
+            effective_max_iterations = 5
+        else:
+            file_count = max(len(plan_files), 3)  # 至少按 3 个文件计算
+            effective_max_iterations = min(file_count * 2 + 3, 20)
 
         for iteration in range(effective_max_iterations):
             state["tool_call_count"] = iteration + 1
@@ -324,30 +327,22 @@ class ToolCallLoop:
                 except Exception as e:
                     logger.warning("保存检查点失败（不阻断）：%s", e)
 
-        # 任务完成验证闭环：Hook 检查 + 真实运行验证（run_preview）
-        # 失败时把错误回灌为修复 prompt，多轮收敛直到通过或达到上限
-        repair_count = state.get("metadata", {}).get("repair_count", 0)
-        if state["current_step"] == "task_complete" and repair_count < self.MAX_REPAIR_ROUNDS:
+        # 任务完成后运行 Hook 检查 + 预览验证，将问题注入上下文
+        # 修复由 graph 层 verify→coder 循环统一处理，不再在 ToolCallLoop 内部递归
+        if state["current_step"] == "task_complete":
             failures = self._trigger_hooks(state) if self.hooks else []
-            # 修复循环中也运行 preview 验证（之前跳过，现在修复）
             preview_errors = self._run_preview_validation(state)
             all_problems = failures + preview_errors
             if all_problems:
-                state.setdefault("metadata", {})["repair_count"] = repair_count + 1
-                repair_prompt = (
-                    "代码已生成，但验证发现以下问题，请立即修复（已有文件用 edit_file 局部修改，"
-                    "不要重写整个文件）：\n"
-                    + "\n".join(f"- {p}" for p in all_problems)
-                )
                 state["dialogue_history"].append({
                     "role": "system", "name": "System",
-                    "content": repair_prompt,
+                    "content": (
+                        "代码已生成，验证发现以下问题（将在质量评估后统一修复）：\n"
+                        + "\n".join(f"- {p}" for p in all_problems)
+                    ),
                     "hidden": True,
                     "preserve": True,
                 })
-                state["current_step"] = "repairing"
-                state["no_progress_count"] = 0
-                return self.run(state)
 
         # Git final commit
         if self.git:
@@ -399,8 +394,13 @@ class ToolCallLoop:
                 tool_args=tool_call.arguments,
                 state=state,
             )
-            if self.hooks.trigger(HookPoint.PRE_TOOL_USE, ctx):
-                pass  # 预处理失败不阻断，只记录
+            pre_failures = self.hooks.trigger(HookPoint.PRE_TOOL_USE, ctx)
+            if pre_failures:
+                # 将阻断信息注入 LLM 上下文，并返回错误结果阻断工具执行
+                failure_msg = "\n".join(pre_failures)
+                state.setdefault("_recent_hook_failures", []).append(failure_msg)
+                logger.info(f"[ToolLoop] PRE_TOOL_USE 阻断: {failure_msg[:200]}")
+                return ToolResult(success=False, error=failure_msg)
 
         # 分发到对应处理器：优先通过注册表获取 ToolHandler 实例
         handler = None
@@ -451,10 +451,14 @@ class ToolCallLoop:
                     )
                 except Exception:
                     pass
+            # ---- 增量质量信号：写文件后自动运行语法检查 ----
+            self._auto_lint_after_write(state, tool_call.arguments)
 
         # ---- edit_file 成功后标记文件为已验证（修复阶段核心操作） ----
         if tool_call.name == "edit_file" and result.success:
             self._update_contract_on_edit(state, tool_call.arguments)
+            # edit_file 后也运行增量 lint
+            self._auto_lint_after_write(state, tool_call.arguments)
 
         return result
 
@@ -606,15 +610,13 @@ class ToolCallLoop:
     def _build_system_prompt(self, state: AgentState) -> str:
         """构建 Coder 系统提示词（含文件内容概要，避免 Agent 重复 read_file）
 
-        根据复杂度 (XS/S/M/L) 切换提示词策略：
-        - XS: 自由文件结构，跳过强制文件列表和验证
-        - S:  当前默认行为（3 文件 + lint 验证）
-        - M:  架构先导 + 子目录组织 + 完整验证
-        - L:  多模块拆分 + 架构设计 + 多轮验证 + Repair
+        根据复杂度切换提示词策略：
+        - simple:  自由文件结构，极简流程，5 轮快速通过
+        - standard: 架构先导 + 批量创建 + 完整验证
         """
         requirement = state.get("requirement_content", "")
         plan = state.get("plan")
-        complexity = state.get("metadata", {}).get("complexity", "S")
+        complexity = state.get("metadata", {}).get("complexity", "standard")
 
         existing_files = self.workspace.list()
         existing_text = self._build_file_summaries(existing_files)
@@ -625,20 +627,14 @@ class ToolCallLoop:
             plan_section = f"""## 实现计划（请严格遵循）
 {plan_text}"""
 
-        # ---- 根据复杂度选择不同的提示词 ----
+        if complexity == "simple":
+            return self._build_simple_prompt(requirement, plan_section, existing_text, existing_files)
+        else:
+            return self._build_standard_prompt(requirement, plan_section, existing_text, existing_files)
 
-        if complexity == "XS":
-            return self._build_xs_prompt(requirement, plan_section, existing_text, existing_files)
-
-        elif complexity in ("M", "L"):
-            return self._build_ml_prompt(requirement, plan_section, existing_text, existing_files, complexity)
-
-        else:  # S (默认)
-            return self._build_s_prompt(requirement, plan_section, existing_text, existing_files)
-
-    def _build_xs_prompt(self, requirement: str, plan_section: str,
-                         existing_text: str, existing_files: list) -> str:
-        """XS 复杂度：自由文件结构，极简流程"""
+    def _build_simple_prompt(self, requirement: str, plan_section: str,
+                              existing_text: str, existing_files: list) -> str:
+        """simple 复杂度：自由文件结构，极简流程，5 轮快速通道"""
         from harness.instructions.prompts import load_prompt_template
         craft_rules, skill_instructions = self._get_craft_context(requirement)
         return load_prompt_template("coding/coder_xs.md",
@@ -649,27 +645,9 @@ class ToolCallLoop:
             skill_instructions=skill_instructions,
         )
 
-    def _build_s_prompt(self, requirement: str, plan_section: str,
-                        existing_text: str, existing_files: list) -> str:
-        """S 复杂度：当前默认行为（3 文件 + lint 验证）"""
-        from harness.instructions.prompts import load_prompt_template
-        target_files = ["index.html", "style.css", "script.js"]
-        missing = [f for f in target_files if f not in existing_files]
-        missing_text = ", ".join(missing) if missing else "全部已创建"
-        craft_rules, skill_instructions = self._get_craft_context(requirement)
-        return load_prompt_template("coding/coder_s.md",
-            requirement=requirement,
-            plan_section=plan_section,
-            existing_text=existing_text,
-            missing_text=missing_text,
-            craft_rules=craft_rules,
-            skill_instructions=skill_instructions,
-        )
-
-    def _build_ml_prompt(self, requirement: str, plan_section: str,
-                         existing_text: str, existing_files: list,
-                         complexity: str) -> str:
-        """M/L 复杂度：架构先导 + 模块化 + 严格验证"""
+    def _build_standard_prompt(self, requirement: str, plan_section: str,
+                                existing_text: str, existing_files: list) -> str:
+        """standard 复杂度：架构先导 + 批量创建 + 完整的浏览��验证"""
         from harness.instructions.prompts import load_prompt_template
         # 从 plan 中提取推荐的文件结构
         file_hint = ""
@@ -684,8 +662,8 @@ class ToolCallLoop:
             plan_section=plan_section,
             file_hint=file_hint,
             existing_text=existing_text,
-            max_repair_rounds=self.MAX_REPAIR_ROUNDS + 1,
-            complexity=complexity,
+            max_repair_rounds=1,
+            complexity="standard",
             craft_rules=craft_rules,
             skill_instructions=skill_instructions,
         )
@@ -731,10 +709,9 @@ class ToolCallLoop:
         关键修复：当 contract 报告缺失但文件系统中文件已存在时，
         以文件系统为准，自动修复 contract 状态，避免死循环。
         """
-        complexity = state.get("metadata", {}).get("complexity", "S")
+        complexity = state.get("metadata", {}).get("complexity", "standard")
         existing = set(self.workspace.list())
-
-        if complexity == "XS":
+        if complexity == "simple":
             if existing:
                 return []
             return ["至少一个文件"]
@@ -850,6 +827,67 @@ class ToolCallLoop:
         summary = self._build_single_file_summary(filename, content)
         if summary:
             self._summary_cache[filename] = summary
+
+    def _auto_lint_after_write(self, state: AgentState, arguments: dict):
+        """write_file/edit_file 成功后自动运行语法检查，增量注入质量信号
+
+        在 LLM 下一轮迭代中自然看到 lint 反馈，无需 Agent 手动调用 lint 工具。
+        只在错误数 <= 5 时注入（过多错误会产生噪声）。
+        """
+        filename = arguments.get("filename", "")
+        if not filename:
+            return
+
+        # 根据文件类型选择对应的 lint 方法
+        try:
+            if filename.endswith('.html'):
+                lint_result = self._code_handler.validate_html(filename=filename)
+            elif filename.endswith('.css'):
+                lint_result = self._code_handler.lint_css(filename=filename)
+            elif filename.endswith('.js'):
+                lint_result = self._code_handler.lint_js(filename=filename)
+            else:
+                return  # 不支持的文件类型，跳过
+
+            if not lint_result.success:
+                return  # lint 工具本身失败，静默跳过
+
+            # 从 lint 结果中提取错误信息
+            lint_content = lint_result.content or ""
+            if "通过" in lint_content or "pass" in lint_content.lower():
+                return  # 无错误，跳过
+
+            # 解析错误行数，过多时跳过（避免噪声）
+            error_lines = [l for l in lint_content.split('\n') if l.strip() and '✗' in l or '❌' in l or 'Error' in l or 'error' in l]
+            if len(error_lines) > 5:
+                logger.debug(f"[AutoLint] {filename}: {len(error_lines)} 个问题，过多，跳过注入")
+                return
+
+            # 注入 lint 结果到下一轮 LLM 上下文
+            lint_feedback = (
+                f"## 🔍 自动语法检查: {filename}\n"
+                f"```\n{lint_content[:1500]}\n```\n"
+                f"请在下一轮编码中修复以上问题。"
+            )
+            state.setdefault("dialogue_history", []).append({
+                "role": "system",
+                "name": "AutoLint",
+                "content": lint_feedback,
+                "hidden": True,
+                "preserve": True,
+            })
+            logger.info(f"[AutoLint] {filename}: 检测到 {len(error_lines)} 个问题，已注入反馈")
+
+            # 推送 lint 结果到前端
+            if self.sse:
+                self.sse.hook_check(
+                    state["requirement_id"],
+                    f"auto_lint:{filename}",
+                    len(error_lines) == 0,
+                    lint_content[:500],
+                )
+        except Exception as e:
+            logger.debug(f"[AutoLint] {filename} lint 异常: {e}")
 
     def _build_single_file_summary(self, fname: str, content: str) -> str:
         """生成单个文件的摘要（提取自 _build_file_summaries）"""

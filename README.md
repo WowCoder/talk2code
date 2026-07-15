@@ -131,17 +131,38 @@ cd backend && python app.py
 
 | Agent | 角色 | 职责 |
 |-------|------|------|
-| **TeamLeader** | Leon（技术负责人） | 需求分析 → 结构化方案 → 任务拆分 |
-| **Coder** | Henry（开发工程师） | 逐文件编码实现，自动选择编码策略 |
-| **Verify** | Catherine（质量工程师） | 独立评估代码质量，浏览器真实执行验证 |
+| **TeamLeader** | Leon（技术负责人） | 需求分析 → 结构化 Plan → 复杂度分级（simple/standard） |
+| **Coder** | Henry（开发工程师） | 批量创建文件 + 自适应迭代上限（文件数驱动），write_file 返回内容预览避免回读 |
+| **Verify** | Catherine（质量工程师） | Playwright 真实浏览器 AC 逐条验收 → 快速通道（全部通过则跳过 LLM 评估） |
 
-**支持三种工作模式**，由意图分类器智能路由：
+**两种复杂度 SOP**，由 TeamLeader 自动判断：
 
-| 模式 | 触发场景 | 流程 |
+| 等级 | 触发条件 | 流程 |
 |------|---------|------|
-| 🆕 **新需求** | 从零开始创建项目 | `TeamLeader` 需求分析 + 任务规划 → `Coder` 逐文件编码 + 自验证 → `Verify` 独立质量评估。不通过则自动修复重试，直到达标 |
-| ➕ **追加需求** | 在已有项目上增加功能 | 小改动走增量编辑直接完成；大改动自动升级为完整 SOP |
-| 🐛 **BUG 修复** | 修复项目中的缺陷 | `Coder` 诊断定位根因 → 精确修复 → 浏览器验证。可选 QA 回归检查确保未引入新问题 |
+| 🟢 **simple** | 单个 HTML 页面、极简交互 | `TeamLeader` 轻量分析 → `Coder` 5 轮快速通道 → `run_preview` 验证 → 完成 |
+| 🔵 **standard** | 多文件、交互式应用 | `TeamLeader` 完整 Plan + AC → 用户确认 → `Coder` 批量创建（文件数×2+3 轮）→ `Verify` AC 逐条验收 → 1 轮修复 → PASS 或 finished_with_issues |
+
+### 代码质量验收系统
+
+Verify 节点采用 **Playwright 真实浏览器执行 + LLM 评估** 双层验证：
+
+**L3 交互式验收**（新增）：
+- LLM 将每条验收条件翻译为 Playwright DOM 操作序列（type/click/assert_exists...）
+- 在 headless Chromium 中逐条执行，收集 passed/failed/截图
+- 全部 AC 通过 + preview 零错误 → **快速通道 PASS**（跳过 LLM 深度评估）
+- 结果实时推送到前端 Spec 面板（AC 级别 ✅/❌）
+
+**L2 深度评估**（AC 未全通过时触发）：
+- 双视角 LLM 评估（功能正确性 + 代码/UI 质量），5 维度 1-10 分
+- 综合评分 ≥ 6 且无 critical 问题 → PASS
+- 未通过 + 1 轮修复后仍不达标 → **finished_with_issues**（保留代码产物）
+
+### 上下文效率优化
+
+- **write_file 返回内容预览**：写入后返回前 80 行 + 尾 10 行，Agent 无需 read_file 验证
+- **PRE_TOOL_USE Hook 真阻断**：写入后 2 轮内实际阻止对同一文件的回读
+- **批量文件创建**：允许一次创建 2-3 个相关文件，消除"每次一个文件"的串行瓶颈
+- **迭代上限文件数驱动**：3 文件 = 9 轮，5 文件 = 13 轮，按需分配不浪费
 
 ### 记忆系统
 

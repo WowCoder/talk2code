@@ -59,7 +59,7 @@ export const useRequirementStore = defineStore('requirement', () => {
     return response.json()
   }
 
-  async function loadRequirement(id: number): Promise<{ requirement: Requirement; trace?: any }> {
+  async function loadRequirement(id: number): Promise<{ requirement: Requirement; trace?: any; evaluator?: SSEEvaluatorResultData }> {
     // 先重置所有状态，避免旧需求数据残留
     dialogueMessages.value = []
     Object.keys(codeFiles).forEach((k) => delete codeFiles[k])
@@ -71,8 +71,13 @@ export const useRequirementStore = defineStore('requirement', () => {
     _traceSummary.value = null
     hookChecks.value = []
 
-    const data = await api<{ requirement: Requirement; trace?: any }>(`/api/requirements/${id}`)
+    const data = await api<{ requirement: Requirement; trace?: any; evaluator?: SSEEvaluatorResultData }>(`/api/requirements/${id}`)
     currentRequirement.value = data.requirement
+
+    // 恢复 evaluator 评估结果（页面刷新后恢复评分展示）
+    if (data.evaluator) {
+      evaluatorResult.value = data.evaluator
+    }
 
     // Restore dialogue
     if (data.requirement.dialogue_history?.length) {

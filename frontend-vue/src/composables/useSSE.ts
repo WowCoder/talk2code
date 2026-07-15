@@ -214,7 +214,7 @@ export function useSSE(reqId: Ref<number | null>) {
 
     es.addEventListener('evaluator_result', (e: MessageEvent) => {
       const data: SSEEvaluatorResultData = JSON.parse(e.data)
-      ;(store as any)._evaluatorResult = data
+      store.evaluatorResult = data
     })
 
     es.addEventListener('checklist_update', (e: MessageEvent) => {

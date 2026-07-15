@@ -184,11 +184,23 @@ export interface SSEEvaluatorResultData {
     code_quality?: number
   }
   findings: EvaluatorFinding[]
+  ac_results?: ACResult[]
   browser_result?: {
     available: boolean
     errors: string[]
     warnings: string[]
   }
+  fast_pass?: boolean
+}
+
+// ===== AC 逐条验收结果 =====
+
+export interface ACResult {
+  ac_id: string
+  label?: string
+  passed: boolean
+  failures?: string[]
+  steps_executed?: number
 }
 
 // ===== 迭代批量事件 =====
