@@ -676,9 +676,20 @@ def chat_with_requirement(req_id):
         requirement.code_files = updated_files
         # 检查 current_step：只有真正完成才标记 finished
         current_step = final_state.get('current_step', '')
-        if current_step in ('no_progress', 'max_iterations'):
+        if current_step in ('no_progress', 'max_iterations', 'llm_error', 'coding_error'):
             requirement.status = 'failed'
-            requirement.error_message = f"对话执行终止: {current_step}"
+            # 构建诊断错误信息
+            error_parts = [f"对话执行终止: {current_step}"]
+            error_detail = final_state.get('error', '')
+            if error_detail:
+                error_parts.append(str(error_detail)[:200])
+            tc_count = final_state.get('tool_call_count', 0)
+            if tc_count:
+                error_parts.append(f"(共 {tc_count} 轮迭代)")
+            np_count = final_state.get('no_progress_count', 0)
+            if np_count:
+                error_parts.append(f"(连续 {np_count} 轮无进展)")
+            requirement.error_message = " — ".join(error_parts)
         else:
             requirement.status = 'finished'
         db.commit()
@@ -697,7 +708,7 @@ def chat_with_requirement(req_id):
         try:
             from models import Requirement
             db.query(Requirement).filter(Requirement.id == req_id).update(
-                {'status': 'failed', 'error_message': f"对话异常: {str(e)}"},
+                {'status': 'failed', 'error_message': f"对话异常: {str(e)[:500]}"},
                 synchronize_session=False
             )
             db.commit()

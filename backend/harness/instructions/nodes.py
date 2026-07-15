@@ -193,12 +193,131 @@ def _generate_clarify_questions(client, requirement: str) -> list:
     return []
 
 
+def _format_plan_summary(plan: dict) -> str:
+    """将 TL plan 格式化为用户可见的结构化 Markdown 摘要"""
+    if not isinstance(plan, dict):
+        return "已完成需求分析和架构设计"
+
+    lines = ["## 📋 需求分析结果\n"]
+
+    features = plan.get("features", [])
+    if features:
+        lines.append("### 核心功能")
+        for f in features:
+            lines.append(f"- ✅ {f}")
+        lines.append("")
+
+    acceptance = plan.get("acceptance_criteria", [])
+    if acceptance:
+        lines.append("### 验收条件")
+        for ac in acceptance:
+            ac_id = ac.get("id", "?") if isinstance(ac, dict) else "?"
+            ac_label = ac.get("label", str(ac)) if isinstance(ac, dict) else str(ac)
+            lines.append(f"- **{ac_id}**: {ac_label}")
+        lines.append("")
+
+    file_structure = plan.get("file_structure", [])
+    if file_structure:
+        lines.append("### 文件结构")
+        for f in file_structure:
+            lines.append(f"- `{f}`")
+        lines.append("")
+
+    tasks = plan.get("tasks", [])
+    if tasks:
+        lines.append("### 任务列表")
+        for t in tasks:
+            fpath = t.get("file", "?") if isinstance(t, dict) else str(t)
+            desc = t.get("description", "") if isinstance(t, dict) else ""
+            lines.append(f"- **{fpath}**: {desc[:80]}")
+        lines.append("")
+
+    complexity = plan.get("complexity", "S")
+    tech = plan.get("tech_stack", {})
+    lines.append(f"**复杂度**: {complexity}  |  **技术栈**: CSS={tech.get('css', '?')}, Storage={tech.get('storage', '?')}")
+
+    return "\n".join(lines)
+
+
+def _extract_plan_metadata(plan: dict) -> dict:
+    """从 plan 中提取关键元数据（供程序使用，前端可选渲染）"""
+    if not isinstance(plan, dict):
+        return {}
+    return {
+        "features": plan.get("features", []),
+        "acceptance_criteria": plan.get("acceptance_criteria", []),
+        "file_structure": plan.get("file_structure", []),
+        "tech_stack": plan.get("tech_stack", {}),
+        "data_model": plan.get("data_model", ""),
+        "implementation_notes": plan.get("implementation_notes", ""),
+        "implementation_order": plan.get("implementation_order", []),
+        "tasks": plan.get("tasks", []),
+        "complexity": plan.get("complexity", "S"),
+    }
+
+
 def team_leader_node(state: AgentState) -> Dict[str, Any]:
     """TeamLeader 节点：需求分析 → 结构化 Plan
 
     澄清由上游 IntentRouter 统一处理（进入此节点前 intent 已固定为 'task'）。
     """
     requirement = state['requirement_content']
+
+    # ---- 输入质量门禁：过短的需求不应直接编造 plan，转为追问澄清 ----
+    MIN_REQUIREMENT_CHARS = 20
+    if len(requirement.strip()) < MIN_REQUIREMENT_CHARS:
+        logger.info(
+            f"[TeamLeader] 输入过短 ({len(requirement)} 字符)，"
+            f"转发澄清流程"
+        )
+        try:
+            client = get_client()
+            # 同时生成澄清问题交给上游处理
+            clarify_system = load_prompt("coding/tl_analysis.md")
+            clarify_prompt = (
+                f"用户输入非常简短（仅 {len(requirement)} 字符）: \"{requirement}\"。\n"
+                f"请根据这个简短输入，生成 2-3 个具体的追问，"
+                f"让用户补充功能细节。每个问题提供 2-4 个单选选项。\n"
+                f"输出格式：{{\"questions\": [{{\"question\": \"...\", \"options\": [\"...\"]}}]}}"
+            )
+            response = client.chat(
+                prompt=clarify_prompt, system_prompt=clarify_system,
+                use_memory=False, max_tokens=1000, timeout=30
+            )
+            if not response.is_error and response.content:
+                try:
+                    import json as _json
+                    clarify_data = _json.loads(
+                        re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', response.content)
+                    )
+                except Exception:
+                    match = re.search(r'\{.*\}', response.content, re.DOTALL)
+                    clarify_data = _json.loads(match.group()) if match else {}
+            else:
+                clarify_data = {}
+        except Exception as e:
+            logger.warning(f"[TeamLeader] 生成澄清问题失败: {e}")
+            clarify_data = {}
+
+        return {
+            'plan': {},
+            'current_step': 'needs_clarification',
+            'clarify_questions': clarify_data.get('questions', []),
+            'dialogue_history': [{
+                'role': 'agent', 'name': 'Leon（负责人）',
+                'content': (
+                    f"你的需求「{requirement}」比较简短。"
+                    f"为了生成更准确的开发计划，请补充以下信息："
+                ),
+                'status': 'pending_clarify',
+                'clarify_questions': clarify_data.get('questions', []),
+            }],
+            'metadata': {
+                **state.get('metadata', {}),
+                'team_leader_success': False,
+                'needs_clarification_reason': 'input_too_short',
+            },
+        }
 
     try:
         client = get_client()
@@ -280,9 +399,12 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
             'current_step': 'team_leader_done',
             'dialogue_history': [{
                 'role': 'agent', 'name': TL_NAME,
-                'content': '已完成需求分析和架构设计',
+                'content': _format_plan_summary(plan),
                 'status': 'completed',
-                'plan': tl_plan_data,
+                'plan': {
+                    **tl_plan_data,
+                    **_extract_plan_metadata(plan),
+                },
                 'preserve': True,
             }],
             'metadata': {

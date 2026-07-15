@@ -29,16 +29,37 @@ from harness.tools.registry import (
 )
 
 
-# SEARCH/REPLACE 块正则：捕获每对 SEARCH...REPLACE
-_BLOCK_RE = re.compile(
-    r"<<<<\s*SEARCH\s*\n(.*?)\n====\s*\n(.*?)\n>>>>",
+# SEARCH/REPLACE 块正则：容忍 LLM 常见的格式变化
+# - <<<< 或 <<<<< 或 <<<<<< （LLM 有时会多加 < 符号）
+# - SEARCH 关键字可选（有的 LLM 会省略）
+# - ==== 或 ===== 或 ==== （分隔符长度容差）
+# - >>>> 或 >>>>> 或 >>>>>> （同上）
+_BLOCK_RE_STRICT = re.compile(
+    r"<<+?\s*SEARCH\s*\n(.*?)\n=+\s*\n(.*?)\n>+",
+    re.DOTALL,
+)
+
+# 回退正则：无 SEARCH 关键字的情况（LLM 偶尔漏写）
+_BLOCK_RE_LOOSE = re.compile(
+    r"<<+?\s*\n(.*?)\n=+\s*\n(.*?)\n>+",
     re.DOTALL,
 )
 
 
 def parse_edit_blocks(edit: str) -> list[tuple[str, str]]:
-    """解析 edit 字符串为 [(search, replace), ...]。格式非法抛 ValueError。"""
-    blocks = _BLOCK_RE.findall(edit)
+    """解析 edit 字符串为 [(search, replace), ...]。
+
+    支持 LLM 常见的格式变体：
+    - <<<< SEARCH / <<<<< SEARCH / <<<<SEARCH（尖括号数量容差）
+    - ==== / ===== / ===（分隔符长度容差）
+    - >>>> / >>>>> / >>>（尖括号数量容差）
+    - 无 SEARCH 关键字时回退到松匹配
+    """
+    # 优先尝试严格匹配（含 SEARCH 关键字）
+    blocks = _BLOCK_RE_STRICT.findall(edit)
+    if not blocks:
+        # 回退松匹配（无 SEARCH 关键字）
+        blocks = _BLOCK_RE_LOOSE.findall(edit)
     if not blocks:
         raise ValueError(
             "edit 中未找到合法的 SEARCH/REPLACE 块。"
