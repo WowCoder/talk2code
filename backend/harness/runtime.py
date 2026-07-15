@@ -282,27 +282,98 @@ class ToolCallLoop:
                     filename = tc.arguments.get("filename", "unknown")
                     self.git.commit(f"[tool] {tc.name}: {filename}")
 
-            # 检测重复工具调用（连续相同 tool+filename 视为卡住）
-            current_signatures = set()
+            # ===== 增强死循环检测：核心操作签名累积 + 读写比 =====
+            # 提取当前轮的核心操作签名（tool_name:filename，忽略行范围等参数差异）
+            core_sigs = set()
+            has_write_or_edit = False
             for tc in (response.tool_calls or []):
                 fname = tc.arguments.get("filename", "") if isinstance(tc.arguments, dict) else ""
-                current_signatures.add(f"{tc.name}:{fname}")
+                sig = f"{tc.name}:{fname}"
+                core_sigs.add(sig)
+                if tc.name in ("write_file", "edit_file"):
+                    has_write_or_edit = True
+
+            # 追踪最近 N 轮的核心操作历史（跨轮累积对比）
+            recent_history = state.setdefault("_recent_core_sigs", [])
+            recent_has_write = state.setdefault("_recent_has_write", [])
+            recent_history.append(core_sigs)
+            recent_has_write.append(has_write_or_edit)
+            HISTORY_WINDOW = 10
+            if len(recent_history) > HISTORY_WINDOW:
+                recent_history.pop(0)
+                recent_has_write.pop(0)
+
+            # 检测 1: 读写比异常 —— 最近 8 轮中纯 read_file 占比过高且无写操作
+            if len(recent_history) >= 8:
+                read_only_rounds = sum(
+                    1 for i, sigs in enumerate(recent_history[-8:])
+                    if sigs and all(s.startswith("read_file:") for s in sigs)
+                )
+                no_write_rounds = sum(1 for w in recent_has_write[-8:] if not w)
+                if read_only_rounds >= 3 and no_write_rounds >= 8:
+                    state["_read_heavy_count"] = state.get("_read_heavy_count", 0) + 1
+                    if state["_read_heavy_count"] >= 2:
+                        read_files = set()
+                        for sigs in recent_history[-3:]:
+                            for s in sigs:
+                                if s.startswith("read_file:"):
+                                    read_files.add(s.split(":", 1)[1])
+                        intervention = (
+                            f"你已连续读取同一批文件 {state['_read_heavy_count'] * 4} 轮，"
+                            f"没有做任何代码修改。请选择下一步：\n"
+                            f"1. 如果代码没问题 → 不要继续读文件，直接结束任务\n"
+                            f"2. 如果发现具体问题 → 立即用 edit_file 修改，不要只读不改\n"
+                            f"3. 不确定 → 用 run_preview 验证一次，根据结果执行 1 或 2\n"
+                            f"已反复读取: {', '.join(read_files)}"
+                        )
+                        state["dialogue_history"].append({
+                            "role": "system", "name": "System",
+                            "content": intervention, "hidden": True,
+                        })
+                        logger.warning(
+                            f"[ToolLoop] 读写比异常: 最近 8 轮无写操作，"
+                            f"read_heavy_count={state['_read_heavy_count']}，注入干预提示"
+                        )
+                        if state["_read_heavy_count"] >= 4:
+                            logger.warning("读写比异常持续多轮干预，强制终止")
+                            state["current_step"] = "no_progress"
+                            state["error"] = "诊断死循环: 连续多轮只有读取、无写入操作"
+                            break
+                else:
+                    if state.get("_read_heavy_count", 0) > 0:
+                        state["_read_heavy_count"] = max(0, state["_read_heavy_count"] - 1)
+
+            # 检测 2: 连续相同实质性签名（忽略 run_preview/execute_code/lint_js 等辅助工具扰动）
             last_signatures = state.get("last_tool_signatures", set())
-            if current_signatures and current_signatures == last_signatures:
+            substantive_tools = {"read_file", "write_file", "edit_file"}
+            substantive_now = {s for s in core_sigs if s.split(":")[0] in substantive_tools}
+            substantive_last = {s for s in last_signatures if s.split(":")[0] in substantive_tools}
+            if substantive_now and substantive_now == substantive_last:
                 state["repeat_call_count"] = state.get("repeat_call_count", 0) + 1
             else:
                 state["repeat_call_count"] = 0
-            state["last_tool_signatures"] = current_signatures
-            # 连续 3 轮相同工具调用 → 判定为卡住
-            if state.get("repeat_call_count", 0) >= 3:
+            state["last_tool_signatures"] = core_sigs
+            # 连续 4 轮相同实质性调用且无写操作 → 卡住
+            if state.get("repeat_call_count", 0) >= 4 and not has_write_or_edit:
                 logger.warning(
-                    f"[ToolLoop] 连续 {state['repeat_call_count']} 轮重复调用相同工具: {current_signatures}，判定为无进展"
+                    f"[ToolLoop] 连续 {state['repeat_call_count']} 轮相同实质性调用"
+                    f" {substantive_now}，判定为无进展"
                 )
                 state["current_step"] = "no_progress"
+                state["error"] = f"连续重复: {', '.join(substantive_now)}"
                 break
 
-            # 检查是否达到最大迭代
+            # 检查是否达到最大迭代（edit_file 失败后自动 +2 轮用于 write_file 回退）
             if iteration >= effective_max_iterations - 1:
+                if state.get("metadata", {}).get("_needs_write_fallback"):
+                    # 给 write_file 回退预留额外 2 轮
+                    effective_max_iterations += 2
+                    state["metadata"]["_needs_write_fallback"] = False
+                    logger.info(
+                        f"[ToolLoop] edit_file 失败后扩展迭代上限至 {effective_max_iterations}"
+                    )
+                    # 继续循环（不 break），让 LLM 用 write_file 重写
+                    continue
                 state["current_step"] = "max_iterations"
                 break
 
@@ -436,8 +507,38 @@ class ToolCallLoop:
                     if self.sse:
                         self.sse.hook_check(state["requirement_id"], hook_name, False, f)
 
-        # ---- write_file 成功后自动更新 CompletionContract + 推送任务状态 ----
+        # ---- edit_file 失败追踪：自动注入 write_file 回退引导 ----
+        if tool_call.name == "edit_file":
+            if result.success:
+                state["_edit_fail_count"] = 0
+                self._update_contract_on_edit(state, tool_call.arguments)
+                # edit_file 后也运行增量 lint
+                self._auto_lint_after_write(state, tool_call.arguments)
+            else:
+                state["_edit_fail_count"] = state.get("_edit_fail_count", 0) + 1
+                filename = tool_call.arguments.get("filename", "unknown")
+                if state["_edit_fail_count"] >= 2:
+                    intervention = (
+                        f"edit_file 对 {filename} 已连续失败 {state['_edit_fail_count']} 次。\n"
+                        f"请立即改用 write_file 重写整个文件：\n"
+                        f"1. 先用 read_file 读取 {filename} 的完整内容\n"
+                        f"2. 修改需要改的部分\n"
+                        f"3. 用 write_file 写入修改后的完整文件\n"
+                        f"不要继续尝试 edit_file！"
+                    )
+                    state["dialogue_history"].append({
+                        "role": "system", "name": "System",
+                        "content": intervention, "hidden": True,
+                    })
+                    state.setdefault("metadata", {})["_needs_write_fallback"] = True
+                    logger.warning(
+                        f"[ToolLoop] edit_file 对 {filename} 失败 {state['_edit_fail_count']} 次，"
+                        f"注入 write_file 回退引导"
+                    )
+
+        # ---- write_file 成功后更新 CompletionContract + 重置计数 ----
         if tool_call.name == "write_file" and result.success:
+            state["_edit_fail_count"] = 0
             self._update_contract_on_write(state, tool_call.arguments)
             # 增量更新文件摘要缓存（避免下次 _build_file_summaries 全量重建）
             self._update_file_summary_cache(tool_call.arguments)
@@ -452,12 +553,6 @@ class ToolCallLoop:
                 except Exception:
                     pass
             # ---- 增量质量信号：写文件后自动运行语法检查 ----
-            self._auto_lint_after_write(state, tool_call.arguments)
-
-        # ---- edit_file 成功后标记文件为已验证（修复阶段核心操作） ----
-        if tool_call.name == "edit_file" and result.success:
-            self._update_contract_on_edit(state, tool_call.arguments)
-            # edit_file 后也运行增量 lint
             self._auto_lint_after_write(state, tool_call.arguments)
 
         return result

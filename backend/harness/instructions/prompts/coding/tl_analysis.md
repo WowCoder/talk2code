@@ -59,3 +59,5 @@
 - acceptance_criteria 每一条必须有具体的验证方法 (how_to_verify)
 - simple 复杂度可省略 tasks/interfaces/implementation_order
 - acceptance_criteria 在 standard 复杂度下必须提供，每条必须有可操作的 how_to_verify
+- **所有复杂度级别都必须填写 features、file_structure、tasks。** XS/S 复杂度可以省略 interfaces/implementation_order（单文件无跨文件契约），但不能省略 tasks 和 file_structure。
+- 如果用户输入非常简短（<20字），在 implementation_notes 中标注不确定性，而非凭空编造细节。

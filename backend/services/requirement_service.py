@@ -92,6 +92,23 @@ class RequirementService:
             'repair': 85,
         }
 
+    @staticmethod
+    def _mark_requirement_failed(requirement, reason: str, final_state: dict = None):
+        """统一标记需求失败，确保 error_message 必填"""
+        requirement.status = 'failed'
+        error_parts = [reason]
+        if final_state:
+            detail = final_state.get('error', '')
+            if detail:
+                error_parts.append(str(detail)[:200])
+            tc_count = final_state.get('tool_call_count', 0)
+            if tc_count:
+                error_parts.append(f"共 {tc_count} 轮迭代")
+            np_count = final_state.get('no_progress_count', 0)
+            if np_count:
+                error_parts.append(f"连续 {np_count} 轮无进展")
+        requirement.error_message = " — ".join(error_parts)
+
     def process_requirement(self, requirement_id: int) -> bool:
         """处理需求：执行 LangGraph 多智能体协同流程"""
         db = SessionLocal()
@@ -268,8 +285,7 @@ class RequirementService:
         except Exception as e:
             logger.error(f"处理需求时发生异常：{e}", exc_info=True)
             try:
-                requirement.status = 'failed'
-                requirement.error_message = f"处理异常: {str(e)}"
+                self._mark_requirement_failed(requirement, f"处理异常: {str(e)[:200]}")
                 db.commit()
             except:
                 pass
@@ -533,6 +549,7 @@ class RequirementService:
             if not resumed_state:
                 logger.error(f"[ConfirmPlan] 找不到检查点 for requirement {requirement_id}")
                 requirement.status = 'failed'
+                requirement.error_message = "找不到检查点，无法恢复状态"
                 db.commit()
                 return False
 
@@ -582,6 +599,7 @@ class RequirementService:
                 requirement = db.query(Requirement).filter(Requirement.id == requirement_id).first()
                 if requirement:
                     requirement.status = 'failed'
+                    requirement.error_message = f"确认计划异常: {str(e)[:200]}"
                     db.commit()
             except:
                 pass
@@ -622,8 +640,11 @@ class RequirementService:
                     final_state['error'] = None
 
             if final_state.get('error'):
-                requirement.status = 'failed'
-                requirement.error_message = final_state.get('error', '')
+                self._mark_requirement_failed(
+                    requirement,
+                    f"执行错误: {final_state['error'][:200]}",
+                    final_state
+                )
                 db.commit()
                 # 失败时也保存 trace（供诊断）
                 self._save_trace_on_failure(final_state, requirement_id, tracer)
@@ -636,21 +657,11 @@ class RequirementService:
                 logger.warning(
                     f"需求 {requirement_id} 因 {current_step} 终止，标记为 failed"
                 )
-                requirement.status = 'failed'
-                # 每个终止原因都有对应的中文描述
-                step_descriptions = {
-                    'no_progress': 'Agent 连续多轮无文件变更，判定为卡住',
-                    'max_iterations': 'Agent 达到最大迭代次数上限',
-                    'coding_error': '编码过程中发生错误',
-                    'repair_error': '修复过程失败',
-                    'llm_error': 'LLM API 调用失败',
-                    'cancelled': '用户取消了操作',
-                }
-                base_message = step_descriptions.get(current_step, f"执行终止: {current_step}")
-                requirement.error_message = base_message
-                # 如果有更详细的错误信息，附加到 error_message
-                if final_state.get('error') and str(final_state['error']).strip():
-                    requirement.error_message += f" — {final_state['error']}"
+                self._mark_requirement_failed(
+                    requirement,
+                    f"执行终止: {current_step}",
+                    final_state
+                )
                 # 保存已有的对话历史和代码产物（部分产物可能有用）
                 dialogue_history = final_state.get('dialogue_history', [])
                 if dialogue_history:
@@ -820,8 +831,7 @@ class RequirementService:
 
         except Exception as e:
             logger.error(f"处理最终状态时发生异常：{e}", exc_info=True)
-            requirement.status = 'failed'
-            requirement.error_message = f"处理异常: {str(e)}"
+            self._mark_requirement_failed(requirement, f"处理最终状态异常: {str(e)[:200]}")
             db.commit()
             # 失败时也保存 trace（供诊断）
             self._save_trace_on_failure(final_state, requirement_id, tracer)

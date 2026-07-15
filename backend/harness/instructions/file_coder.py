@@ -190,12 +190,32 @@ def _review_single_file(file_path: str, workspace, state: AgentState,
     file_interfaces = interfaces.get(file_path, {})
     interface_text = json.dumps(file_interfaces, ensure_ascii=False, indent=2) if file_interfaces else "(无)"
 
+    # 智能截断：保首部 60% + 尾部 40%，避免 LLM 因截断看到不完整代码而误判
+    MAX_CODE_CHARS = 12000
+    truncated_notice = ""
+    if len(code_content) > MAX_CODE_CHARS:
+        head_size = int(MAX_CODE_CHARS * 0.6)
+        tail_size = int(MAX_CODE_CHARS * 0.4)
+        code_content_for_review = (
+            code_content[:head_size]
+            + f"\n\n/* ⚠️ [中间省略 {len(code_content) - head_size - tail_size} 字符]"
+            + " 以下为文件末尾部分 */\n\n"
+            + code_content[-tail_size:]
+        )
+        truncated_notice = (
+            f"\n\n⚠️ 注意：以上代码因文件过大（{len(code_content)} 字符）已被截断。"
+            "如果你在可见部分找不到某个功能的实现，不要断言该功能缺失——"
+            "它可能在省略的中间部分。请标注为「无法评估」而非「缺失」。"
+        )
+    else:
+        code_content_for_review = code_content
+
     prompt = load_prompt_template("review/code_review.md",
         task_description=task.get("description", "实现该文件的功能"),
         interface_contract=interface_text,
         file_path=file_path,
         language=language,
-        code_content=code_content[:8000],
+        code_content=code_content_for_review + truncated_notice,
     )
 
     try:
