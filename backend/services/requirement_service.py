@@ -683,25 +683,22 @@ class RequirementService:
                 for file_data in code_files:
                     self._send_code(requirement_id, file_data['filename'], file_data['content'])
 
-            # 检查 verify_passed：如果 Evaluator 明确返回 NEEDS_WORK，标记为 failed
+            # 检查 verify_passed：如果 Evaluator 明确返回 NEEDS_WORK，标记为 finished_with_issues
+            # （区别于 failed：代码已生成但质量未达标，用户可自行判断是否可用）
             verify_passed = final_state.get("verify_passed")
             if verify_passed is False:
-                logger.warning(
-                    f"需求 {requirement_id} verify_passed=False（Evaluator 判定 NEEDS_WORK），标记为 failed"
-                )
-                requirement.status = 'failed'
-                # 提取评估摘要作为错误信息
                 eval_error = "代码评估未通过"
                 repair_count = final_state.get("metadata", {}).get("repair_count", 0)
                 eval_error += f"（经 {repair_count} 轮修复后仍未达标）"
                 # 尝试从 Evaluator 结果中提取具体失败原因
                 role_outputs = final_state.get("role_outputs", {}) or {}
+                evaluator_data_for_failure = {}
                 if "Evaluator" in role_outputs:
                     try:
                         import json as _json
                         evaluator_raw = role_outputs["Evaluator"]
-                        evaluator_data = _json.loads(evaluator_raw) if isinstance(evaluator_raw, str) else evaluator_raw
-                        findings = evaluator_data.get("findings", [])
+                        evaluator_data_for_failure = _json.loads(evaluator_raw) if isinstance(evaluator_raw, str) else evaluator_raw
+                        findings = evaluator_data_for_failure.get("findings", [])
                         if findings:
                             critical_findings = [f for f in findings if f.get("severity") == "critical"]
                             if critical_findings:
@@ -710,12 +707,58 @@ class RequirementService:
                                 )
                     except Exception:
                         pass
+
+                logger.warning(
+                    f"需求 {requirement_id} verify_passed=False（Evaluator 判定 NEEDS_WORK），"
+                    f"标记为 finished_with_issues"
+                )
+                requirement.status = 'finished_with_issues'
                 requirement.error_message = eval_error
+                # 仍然保存代码产物（用户可以使用部分成果）
+                code_files = workspace.snapshot()
+                if code_files:
+                    requirement.code_files = code_files
+                    for file_data in code_files:
+                        self._send_code(requirement_id, file_data['filename'], file_data['content'])
+                # 保存对话历史
+                dialogue_history = final_state.get('dialogue_history', [])
+                if dialogue_history:
+                    requirement.dialogue_history = dialogue_history
+                    from sqlalchemy.orm.attributes import flag_modified
+                    flag_modified(requirement, 'dialogue_history')
                 db.commit()
-                # 失败时也保存 trace（供诊断）
+                # 保存 trace（供诊断）
                 self._save_trace_on_failure(final_state, requirement_id, tracer)
+                # 推送 evaluator_result SSE（确保前端能看到评估数据）
+                if evaluator_data_for_failure:
+                    try:
+                        sse.evaluator_result(requirement_id, evaluator_data_for_failure)
+                    except Exception:
+                        pass
                 self._send_complete(requirement_id)
-                return False
+
+                # 经验学习（即使未达标，也记录以供后续改进）
+                try:
+                    complexity = final_state.get("metadata", {}).get("complexity", "S")
+                    _mgr = _get_memory_manager()
+                    _mgr.after_task(
+                        requirement=requirement.content,
+                        complexity=complexity,
+                        code_files=code_files,
+                        qa_result={
+                            "overall_rating": evaluator_data_for_failure.get("overall_score", 0),
+                            "passed": False,
+                            "critical_issues": [
+                                f"{f.get('severity', '?')}: {f.get('description', '')}"
+                                for f in evaluator_data_for_failure.get("findings", [])
+                            ],
+                        },
+                        user_id=requirement.user_id,
+                    )
+                except Exception as e:
+                    logger.warning(f"经验学习失败（不阻断）：{e}")
+
+                return True
 
             requirement.status = 'finished'
             db.commit()

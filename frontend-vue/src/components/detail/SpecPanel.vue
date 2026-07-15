@@ -201,16 +201,11 @@ function severityLabel(severity: string): string {
   color: #fff;
 }
 
-.complexity-badge.xs,
-.complexity-badge.s {
+.complexity-badge.simple {
   background: oklch(55% 0.1 155);
 }
 
-.complexity-badge.m {
-  background: oklch(65% 0.12 85);
-}
-
-.complexity-badge.l {
+.complexity-badge.standard {
   background: oklch(50% 0.2 25);
 }
 

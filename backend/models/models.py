@@ -103,7 +103,7 @@ class AgentMemoryV2(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     requirement = Column(Text, nullable=False)
-    complexity = Column(String(8), default="S")
+    complexity = Column(String(16), default="standard")
     code_summary = Column(Text, default="")
     rating = Column(Float, default=7.0)
 

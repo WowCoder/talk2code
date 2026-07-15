@@ -250,10 +250,10 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
         visual_style = state.get('visual_style', '') or \
             state.get('metadata', {}).get('visual_style', '')
 
-        # 提取复杂度评级（默认 S）
-        complexity = plan.get('complexity', 'S') if isinstance(plan, dict) else 'S'
-        if complexity not in ('XS', 'S', 'M', 'L'):
-            complexity = 'S'
+        # 提取复杂度评级（默认 standard）
+        complexity = plan.get('complexity', 'standard') if isinstance(plan, dict) else 'standard'
+        if complexity not in ('simple', 'standard'):
+            complexity = 'standard'
 
         tasks = plan.get('tasks', []) if isinstance(plan, dict) else []
         interfaces = plan.get('interfaces', {}) if isinstance(plan, dict) else {}
@@ -454,13 +454,10 @@ def coder_node(state: AgentState) -> Dict[str, Any]:
     """
     统一编码节点：内部根据 complexity 选择策略
 
-    - XS/S: 直接 ToolCallLoop（简单编码）
-    - M/L: 逐文件编码 + CodeReview（使用 file_coder 的逻辑）
-
-    支持 Agent 委派模式：当 plan.tasks 包含 type 字段时，
-    按 research/code/review 类型选择不同的执行策略。
+    - simple:  直接 ToolCallLoop（极简，5 轮上限）
+    - standard: ToolCallLoop + CompletionContract（完整流程）
     """
-    complexity = state.get("metadata", {}).get("complexity", "S")
+    complexity = state.get("metadata", {}).get("complexity", "standard")
     has_tasks = bool(state.get("implementation_order"))
 
     # ---- Agent 委派：检查是否有混合类型的子任务 ----
@@ -471,28 +468,25 @@ def coder_node(state: AgentState) -> Dict[str, Any]:
     )
 
     if has_typed_tasks and has_tasks:
-        # 混合类型任务 → 按 TaskType 选择执行策略
         return _execute_delegated_tasks(state)
 
-    if complexity in ("M", "L") and has_tasks:
-        # M/L 复杂度 + 有任务分解 → 逐文件编码
+    if complexity == "standard" and has_tasks and len(tasks) >= 4:
+        # standard 且有 4+ 文件任务 → 逐文件编码
         from harness.instructions.file_coder import file_by_file_coder_node
         return file_by_file_coder_node(state)
     else:
-        # XS/S 或缺少任务分解 → 简单编码
+        # simple 或 小规模 standard → 直接 ToolCallLoop
         tool_loop = get_tool_loop(state)
         if not tool_loop:
             return {
                 "current_step": "error",
                 "error": "ToolCallLoop 未注入到 state",
             }
-
-        # 设置角色名称
         state.setdefault("metadata", {})["coder_name"] = DEV_NAME
         state["metadata"]["thinking_name"] = DEV_NAME
 
-        # 初始化 CompletionContract（仅 M/L 复杂度使用，XS/S 跳过以减少开销）
-        if complexity in ("M", "L"):
+        # CompletionContract：standard 复杂度使用，simple 跳过
+        if complexity == "standard":
             from harness.constraints.completion_contract import CompletionContract
             impl_order = state.get("implementation_order") or []
             if impl_order:
@@ -565,6 +559,110 @@ def repair_node(state: AgentState) -> Dict[str, Any]:
     """
     logger.warning("[Repair] v5 中此节点不再被 graph 调用，QA 反馈由 verify_node 直接注入 dialogue_history")
     return {"current_step": "repair_done"}
+
+
+# ==================== Verify 辅助：AC → Playwright 脚本翻译 ====================
+
+
+def _translate_acs_to_scripts(acceptance_criteria: list, code_text: str, requirement: str) -> list[dict]:
+    """用 LLM 将验收条件翻译为 Playwright 操作序列
+
+    每个 AC 的 how_to_verify 字段描述验证方法（如"输入文字点击添加按钮，列表中显示新项目"），
+    LLM 需要翻译为具体的 DOM 操作步骤。
+    """
+    if not acceptance_criteria:
+        return []
+
+    ac_text = "\n".join(
+        f"- {ac.get('id', '?')}: {ac.get('label', '')}\n  验证方式: {ac.get('how_to_verify', '')}"
+        for ac in acceptance_criteria
+    )
+
+    # 从代码中提取可用的 CSS 选择器（供 LLM 参考，减少 selector 猜测错误）
+    import re as _re
+    selectors_hint = []
+    id_pattern = _re.compile(r'id=["\']([^"\']+)["\']')
+    class_pattern = _re.compile(r'class=["\']([^"\']+)["\']')
+    for m in id_pattern.finditer(code_text):
+        selectors_hint.append(f"#{m.group(1)}")
+    for m in class_pattern.finditer(code_text):
+        for cls in m.group(1).split():
+            selectors_hint.append(f".{cls}")
+    selector_text = ", ".join(list(set(selectors_hint))[:40]) if selectors_hint else "(从代码中提取)"
+
+    prompt = f"""将以下验收条件翻译为 Playwright DOM 操作序列。
+
+## 可用 CSS 选择器（从实际代码中提取）
+{selector_text}
+
+## 验收条件
+{ac_text}
+
+## 翻译规则
+- 每个步骤的 action 必须是: type | click | select | wait | assert_exists | assert_visible | assert_text | assert_count | assert_value
+- selector 必须从"可用 CSS 选择器"中选择，或从 AC 描述中合理推断
+- type 需要 value 字段
+- wait 需要 ms 字段（默认 500）
+- assert_text 需要 contains 字段
+- assert_count 需要 min_count 字段
+- assert_value 需要 value 字段
+
+## 输出格式
+只返回 JSON 数组:
+```json
+[
+  {{
+    "ac_id": "AC-1",
+    "label": "...",
+    "steps": [
+      {{"action": "type", "selector": "#input", "value": "测试文字"}},
+      {{"action": "click", "selector": "#add-btn"}},
+      {{"action": "wait", "ms": 500}},
+      {{"action": "assert_exists", "selector": ".result-item", "label": "新项目出现在列表中"}}
+    ]
+  }}
+]
+```"""
+
+    try:
+        from llm.client import get_client
+        client = get_client()
+        response = client.chat(
+            prompt=prompt,
+            system_prompt="你是 Playwright 自动化测试专家。只返回 JSON，不要其他文字。",
+            use_memory=False,
+            max_tokens=2000,
+            timeout=30,
+        )
+        if response.is_error or not response.content:
+            return []
+
+        import json as _json
+        content = response.content.strip()
+        # 提取 JSON 数组
+        try:
+            scripts = _json.loads(content)
+        except _json.JSONDecodeError:
+            match = _re.search(r'\[[\s\S]*\]', content)
+            if match:
+                try:
+                    scripts = _json.loads(match.group())
+                except _json.JSONDecodeError:
+                    return []
+            else:
+                return []
+
+        if isinstance(scripts, list):
+            from harness.observability.logger import get_logger
+            get_logger(__name__).info(
+                f"[AC Translate] {len(scripts)} 条 AC 翻译完成"
+            )
+            return scripts
+    except Exception as e:
+        from harness.observability.logger import get_logger
+        get_logger(__name__).warning(f"[AC Translate] 翻译失败: {e}")
+
+    return []
 
 
 # ==================== Verify 节点（Fresh-Context Evaluator） ====================
@@ -760,7 +858,101 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             logger.warning(f"[Verify] run_preview 失败: {e}")
             browser_result["errors"].append(f"run_preview 异常: {e}")
 
-    # 构建评估 prompt
+    # ========== Playwright AC 逐条验收 ==========
+    ac_check_results = []
+    plan = state.get("plan", {})
+    acceptance_criteria = plan.get("acceptance_criteria", []) if isinstance(plan, dict) else []
+
+    if acceptance_criteria and any(f.endswith("index.html") for f in code_files):
+        logger.info(f"[Verify] 启动 AC 逐条验收: {len(acceptance_criteria)} 条 AC")
+        try:
+            # Step 1: LLM 将 AC 描述翻译为 Playwright 操作序列
+            ac_scripts = _translate_acs_to_scripts(acceptance_criteria, code_text, requirement)
+            # Step 2: Playwright 执行
+            if ac_scripts:
+                from harness.tools.preview_runner import run_ac_checks
+                workspace_path = __import__('pathlib').Path(workspace._root) if hasattr(workspace, '_root') else __import__('pathlib').Path(workspace.workspace_dir)
+                index_path = workspace_path / "index.html"
+                if index_path.exists():
+                    ac_check_results = run_ac_checks(index_path, ac_scripts)
+                    logger.info(
+                        f"[Verify] AC 验收完成: {sum(1 for r in ac_check_results if r['passed'])}/"
+                        f"{len(ac_check_results)} 通过"
+                    )
+                    # Step 3: 推送逐条 AC 结果到前端
+                    tl = get_tool_loop(state)
+                    sse = tl.sse if tl else None
+                    for result in ac_check_results:
+                        if sse:
+                            sse.checklist_update(
+                                state.get("requirement_id", 0),
+                                result["ac_id"],
+                                result["passed"],
+                                "; ".join(result.get("failures", [])) if not result["passed"] else "",
+                            )
+        except Exception as e:
+            logger.warning(f"[Verify] AC 逐条验收异常（降级为 LLM 评估）: {e}")
+
+    # 判断是否可以走快速通道
+    preview_clean = len(browser_result.get("errors", [])) == 0
+    ac_all_passed = (
+        len(ac_check_results) > 0 and
+        all(r["passed"] for r in ac_check_results)
+    )
+    fast_pass = preview_clean and ac_all_passed
+
+    if fast_pass:
+        # 快速通道：preview 零错误 + 所有 AC 通过 → 跳过深度 LLM 评估
+        logger.info(f"[Verify] 快速通道: preview 零错误 + {len(ac_check_results)} 条 AC 全部通过 → PASS")
+        evaluator_result = {
+            "verdict": "PASS",
+            "summary": f"浏览器验证无错误，{len(ac_check_results)} 条验收条件全部通过",
+            "score": {"functionality": 10, "runtime": 10, "ui_quality": 8, "acceptance": 10, "code_quality": 8},
+            "overall_score": 9.2,
+            "findings": [],
+            "ac_results": ac_check_results,
+            "browser_result": browser_result,
+            "fast_pass": True,
+            "timestamp": __import__('time').time(),
+        }
+        state["verify_passed"] = True
+        state["current_step"] = "verify_done"
+        # 持久化
+        try:
+            workspace.write(".task/evaluator/result.json", json.dumps(evaluator_result, ensure_ascii=False, indent=2))
+        except Exception:
+            pass
+        # SSE 推送
+        try:
+            tl = get_tool_loop(state)
+            if tl and tl.sse:
+                tl.sse.evaluator_result(state.get("requirement_id", 0), evaluator_result)
+        except Exception:
+            pass
+        state.setdefault("dialogue_history", []).append({
+            "role": "agent", "name": QA_NAME,
+            "content": (
+                f"## 代码评估: ✅ PASS (快速通道)\n\n"
+                f"**浏览器验证**: 无错误\n"
+                f"**验收条件**: {len(ac_check_results)} 条全部通过\n"
+            ),
+            "status": "completed",
+        })
+        return {"verify_passed": True, "current_step": "verify_done"}
+
+    # 构建评估 prompt（含 AC 验收结果供 LLM 参考）
+    ac_results_text = ""
+    if ac_check_results:
+        passed_count = sum(1 for r in ac_check_results if r["passed"])
+        ac_results_text = f"\n\n## AC 逐条验收结果（浏览器实际执行）\n{passed_count}/{len(ac_check_results)} 条通过:\n"
+        for r in ac_check_results:
+            status = "✅" if r["passed"] else "❌"
+            failures = "; ".join(r.get("failures", []))
+            ac_results_text += f"- {status} {r['ac_id']}: {r.get('label', '')}"
+            if failures:
+                ac_results_text += f" — {failures}"
+            ac_results_text += "\n"
+
     evaluator_prompt = load_prompt("verify/evaluator.md")
     user_prompt = f"""## 原始需求
 {requirement}
@@ -775,69 +967,177 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
 ```json
 {json.dumps(browser_result, ensure_ascii=False, indent=2)}
 ```
+{ac_results_text}
 
 请基于以上信息，按照 Evaluator 的评估维度和输出格式，给出结构化评估结果。"""
 
     logger.info(f"[Verify] 启动评估: {len(code_files)} 个文件, prompt 长度={len(user_prompt)}")
 
-    try:
+    def _call_evaluator(focus_instruction: str, max_tokens: int = 3000):
+        """调用 Evaluator LLM，支持 finish_reason=length 自动重试"""
+        prompt = user_prompt + "\n\n" + focus_instruction
         client = get_client()
         response = client.chat(
-            prompt=user_prompt,
+            prompt=prompt,
             system_prompt=evaluator_prompt,
             use_memory=False,
-            max_tokens=2000,
+            max_tokens=max_tokens,
             timeout=90,
         )
+        # finish_reason=length → 截断，用更大 max_tokens 重试
+        if response.finish_reason == "length" and max_tokens < 6000:
+            logger.warning(
+                f"[Verify] 检测到截断 (finish_reason=length, max_tokens={max_tokens})，"
+                f"以 max_tokens=6000 重试"
+            )
+            retry_response = client.chat(
+                prompt=prompt,
+                system_prompt=evaluator_prompt,
+                use_memory=False,
+                max_tokens=6000,
+                timeout=120,
+            )
+            if not retry_response.is_error and retry_response.content:
+                response = retry_response
+        return response
 
+    def _parse_evaluator_response(response) -> dict:
+        """解析 Evaluator 响应，提取 JSON 结果"""
         if response.is_error or not response.content:
-            logger.warning(f"[Verify] LLM 调用失败: {response.error}，保守判定为 NEEDS_WORK")
-            return {"verify_passed": False, "current_step": "verify_done",
-                    "error": f"LLM 调用失败: {response.error}"}
-
-        # 解析评估结果
+            return {}
         content = response.content.strip()
-        result = {}
         try:
-            result = json.loads(content)
+            return json.loads(content)
         except json.JSONDecodeError:
             match = re.search(r'\{[\s\S]*\}', content)
             if match:
                 try:
-                    result = json.loads(match.group())
+                    return json.loads(match.group())
                 except json.JSONDecodeError:
                     pass
+        return {}
 
-        verdict = result.get("verdict", "NEEDS_WORK")
-        findings = result.get("findings", [])
-        overall_score = result.get("overall_score", 0.0)
-        score = result.get("score", {})
+    # ---- 双视角评估：Correctness + Quality ----
+    try:
+        client = get_client()
+
+        # 视角 1: 功能正确性（functionality + runtime + acceptance）
+        correctness_focus = (
+            "## 评估重点：功能正确性\n"
+            "你本次只需要评估以下三个维度，对其他维度标记为 N/A 即可：\n"
+            "- **functionality** (1-10): 所有 SPEC 定义的功能是否已实现\n"
+            "- **runtime** (1-10): 浏览器执行是否有 JS 错误、交互是否正确\n"
+            "- **acceptance** (1-10): SPEC 中每条验收条件是否通过\n"
+            "\n请基于以上信息，给出结构化评估结果（只返回 JSON）。"
+        )
+        correctness_response = _call_evaluator(correctness_focus, max_tokens=3000)
+        correctness_result = _parse_evaluator_response(correctness_response)
+
+        # 视角 2: 代码与 UI 质量（code_quality + ui_quality）
+        quality_focus = (
+            "## 评估重点：代码与 UI 质量\n"
+            "你本次只需要评估以下两个维度，对其他维度标记为 N/A 即可：\n"
+            "- **ui_quality** (1-10): 布局是否合理美观、视觉风格是否统一、是否覆盖空态/错误态\n"
+            "- **code_quality** (1-10): 代码结构是否清晰、是否正确处理异步、是否存在安全风险（XSS/innerHTML）\n"
+            "\n请基于以上信息，给出结构化评估结果（只返回 JSON）。"
+        )
+        quality_response = _call_evaluator(quality_focus, max_tokens=3000)
+        quality_result = _parse_evaluator_response(quality_response)
+
+        # ---- 合并双视角结果 ----
+        # 如果任一视角完全失败，回退为单次全维度评估
+        if not correctness_result and not quality_result:
+            logger.warning("[Verify] 双视角评估均失败，回退为单次全维度评估")
+            fallback_focus = "请基于以上信息，按照 Evaluator 的评估维度和输出格式，给出结构化评估结果。"
+            fallback_response = _call_evaluator(fallback_focus, max_tokens=4000)
+            combined = _parse_evaluator_response(fallback_response)
+            if not combined:
+                logger.warning(f"[Verify] 回退评估也失败，保守判定为 NEEDS_WORK")
+                return {"verify_passed": False, "current_step": "verify_done",
+                        "error": "LLM 评估调用失败"}
+        else:
+            # 合并双视角的 score、findings、verdict
+            c_score = correctness_result.get("score", {}) if correctness_result else {}
+            q_score = quality_result.get("score", {}) if quality_result else {}
+
+            merged_score = {}
+            for dim in ["functionality", "runtime", "acceptance", "ui_quality", "code_quality"]:
+                val = c_score.get(dim, 0) or q_score.get(dim, 0) or 0
+                merged_score[dim] = val
+
+            c_findings = correctness_result.get("findings", []) if correctness_result else []
+            q_findings = quality_result.get("findings", []) if quality_result else []
+            merged_findings = c_findings + q_findings
+
+            # 计算 overall_score（所有维度的均值）
+            valid_scores = [v for v in merged_score.values() if isinstance(v, (int, float)) and v > 0]
+            merged_overall = round(sum(valid_scores) / len(valid_scores), 1) if valid_scores else 0.0
+
+            # verdict 判定：任一视角 NEEDS_WORK → NEEDS_WORK
+            c_verdict = correctness_result.get("verdict", "PASS") if correctness_result else "PASS"
+            q_verdict = quality_result.get("verdict", "PASS") if quality_result else "PASS"
+            merged_verdict = "NEEDS_WORK" if (c_verdict == "NEEDS_WORK" or q_verdict == "NEEDS_WORK") else "PASS"
+
+            # 优先取两个视角的 summary（取更详细的那个）
+            c_summary = correctness_result.get("summary", "") if correctness_result else ""
+            q_summary = quality_result.get("summary", "") if quality_result else ""
+            merged_summary = c_summary if len(c_summary) >= len(q_summary) else q_summary
+
+            combined = {
+                "verdict": merged_verdict,
+                "summary": merged_summary,
+                "score": merged_score,
+                "overall_score": merged_overall,
+                "findings": merged_findings,
+                "browser_result": browser_result,
+                "ac_results": ac_check_results,  # Playwright 实际执行结果
+            }
+
+            logger.info(
+                f"[Verify] 双视角评估完成: correctness_verdict={c_verdict}, "
+                f"quality_verdict={q_verdict}, merged_verdict={merged_verdict}, "
+                f"overall_score={merged_overall}, findings={len(merged_findings)}"
+            )
+
+        # 从合并结果中提取字段
+        verdict = combined.get("verdict", "NEEDS_WORK")
+        findings = combined.get("findings", [])
+        overall_score = combined.get("overall_score", 0.0)
+        score = combined.get("score", {})
 
         # 将 verdict 转为 verify_passed
         state["verify_passed"] = (verdict == "PASS")
         state["current_step"] = "verify_done"
 
         # 构建评估结果对象（始终构建，供后续 QA 反馈使用）
-        complexity = state.get("metadata", {}).get("complexity", "S")
         evaluator_result = {
             "verdict": verdict,
-            "summary": result.get("summary", ""),
+            "summary": combined.get("summary", ""),
             "score": score,
             "overall_score": overall_score,
             "findings": findings,
+            "ac_results": ac_check_results,  # Playwright 实际执行的逐条 AC 结果
             "browser_result": browser_result,
             "timestamp": __import__('time').time(),
         }
-        # 持久化到 .task/evaluator/result.json（XS 复杂度跳过）
-        if complexity != "XS":
-            try:
-                workspace.write(
-                    ".task/evaluator/result.json",
-                    json.dumps(evaluator_result, ensure_ascii=False, indent=2)
-                )
-                logger.info(f"[Verify] 评估结果已写入 .task/evaluator/result.json")
-            except Exception as e:
-                logger.warning(f"[Verify] 写入结果文件失败: {e}")
+        # 持久化到 .task/evaluator/result.json（全复杂度通用，支持 API 读取）
+        try:
+            workspace.write(
+                ".task/evaluator/result.json",
+                json.dumps(evaluator_result, ensure_ascii=False, indent=2)
+            )
+            logger.info(f"[Verify] 评估结果已写入 .task/evaluator/result.json")
+        except Exception as e:
+            logger.warning(f"[Verify] 写入结果文件失败: {e}")
+
+        # 推送 evaluator_result SSE 事件到前端（实时展示评分面板）
+        try:
+            tl = get_tool_loop(state)
+            if tl and tl.sse:
+                tl.sse.evaluator_result(state.get("requirement_id", 0), evaluator_result)
+                logger.info(f"[Verify] 已推送 evaluator_result SSE 事件")
+        except Exception as e:
+            logger.warning(f"[Verify] 推送 evaluator_result SSE 失败: {e}")
 
         # 添加评估对话（作为 QA 反馈注入，coder 再次进入时能看到）
         dimension_scores = ", ".join(
@@ -868,24 +1168,24 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                             prompt=retry_prompt,
                             system_prompt=evaluator_prompt,
                             use_memory=False,
-                            max_tokens=2000,
+                            max_tokens=4000,
                             timeout=90,
                         )
                         if not retry_response.is_error and retry_response.content:
                             retry_content = retry_response.content.strip()
                             try:
-                                result = json.loads(retry_content)
+                                retry_result = json.loads(retry_content)
                             except json.JSONDecodeError:
                                 match = re.search(r'\{[\s\S]*\}', retry_content)
                                 if match:
                                     try:
-                                        result = json.loads(match.group())
+                                        retry_result = json.loads(match.group())
                                     except json.JSONDecodeError:
-                                        pass
-                            verdict = result.get("verdict", "NEEDS_WORK")
-                            findings = result.get("findings", [])
-                            overall_score = result.get("overall_score", overall_score)
-                            score = result.get("score", score)
+                                        retry_result = {}
+                            verdict = retry_result.get("verdict", "NEEDS_WORK")
+                            findings = retry_result.get("findings", [])
+                            overall_score = retry_result.get("overall_score", overall_score)
+                            score = retry_result.get("score", score)
                             logger.info(
                                 f"[Verify] 重试后: verdict={verdict}, score={overall_score}, "
                                 f"findings={len(findings)}"
@@ -950,22 +1250,45 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                 state["metadata"]["_verifier_error_count"] = 0
 
         # 构建 QA 反馈消息（对话式注入，coder 在下一轮 ToolCallLoop 中自然看到）
+        # 增强修复指令：对每种 severity 级别给出精确的修复提示
+        critical_findings = [f for f in findings if f.get("severity") == "critical"]
+        major_findings = [f for f in findings if f.get("severity") == "major"]
+        minor_findings = [f for f in findings if f.get("severity") == "minor"]
+
         qa_feedback = (
             f"## 代码评估: {'✅ PASS' if verdict == 'PASS' else '❌ NEEDS_WORK'}\n\n"
             f"**评分**: {overall_score}/10 ({dimension_scores})\n\n"
-            f"**摘要**: {result.get('summary', '')}\n\n"
+            f"**摘要**: {combined.get('summary', '')}\n\n"
         )
         if findings:
             qa_feedback += "**发现的问题**:\n" + "\n".join(
                 f"- [{f.get('severity', '?')}] {f.get('description', '')}"
-                + (f"\n  → 修复建议: {f.get('suggestion', '')}" if f.get('suggestion') else "")
+                + (f"\n  📍 证据: {f.get('evidence', '')}" if f.get('evidence') else "")
+                + (f"\n  💡 修复建议: {f.get('suggestion', '')}" if f.get('suggestion') else "")
+                + (f"\n  📂 维度: {f.get('dimension', '?')}")
                 for f in findings
             )
+            qa_feedback += "\n\n**修复指南**:\n"
+
+            if critical_findings:
+                qa_feedback += (
+                    f"- 🔴 **{len(critical_findings)} 个严重问题**须优先修复："
+                    f"{', '.join(f.get('description', '')[:80] for f in critical_findings)}\n"
+                )
+            if major_findings:
+                qa_feedback += (
+                    f"- 🟠 **{len(major_findings)} 个重要问题**："
+                    f"{', '.join(f.get('description', '')[:80] for f in major_findings)}\n"
+                )
+            if minor_findings:
+                qa_feedback += (
+                    f"- 🟡 **{len(minor_findings)} 个建议优化**可最后处理\n"
+                )
+
             qa_feedback += (
-                "\n\n**修复指南**:\n"
                 "- 逐条修复以上问题，每修完一个问题用 run_preview 验证\n"
-                "- 优先使用 edit_file 做局部修改；如果 edit_file 连续失败 2 次，改用 write_file 重写文件\n"
-                "- 对于大文件（>300行），用 read_file 的 start_line/end_line 参数定位到问题所在行\n"
+                "- 优先使用 edit_file 做局部修改；如果 edit_file 连续失败 2 次，改用 write_file 重写\n"
+                "- 如果 finding 包含 📍 证据，先用 read_file 读取对应文件的问题区域再修改\n"
                 "- 修复完成后调用 run_preview 确认所有问题已解决\n"
             )
         else:

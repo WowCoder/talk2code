@@ -5,7 +5,9 @@
 
 ### 基础分析
 - features: 核心功能列表 (string[])
-- complexity: 复杂度评级 "XS"|"S"|"M"|"L"
+- complexity: 复杂度评级 "simple"|"standard"
+  - simple: 单个 HTML 页面，纯展示或极简交互（个人主页、计数器、静态信息页）。无需 tasks/interfaces。
+  - standard: 多文件应用，有交互功能或多视图（待办清单、游戏、看板、仪表盘等）。需 tasks/interfaces/acceptance_criteria。
 - tech_stack: 技术选型 {"css": "tailwind/native", "storage": "localStorage/indexedDB/none", "framework": "vanilla"}
 - data_model: 数据模型描述 (string)
 - file_structure: 推荐的文件组织结构 (string[])
@@ -46,12 +48,6 @@
   }
 - implementation_order: ["js/utils.js", "css/style.css", "js/app.js", "index.html"]
 
-## 复杂度判断标准
-- XS: 单个 HTML 页面，纯展示或极简交互（个人主页、简单计数器、静态信息页）
-- S:  单页应用，1-2 个功能模块（待办清单、便签、番茄钟、倒计时）
-- M:  多功能页面，需数据持久化/多视图（任务看板、笔记系统、博客、仪表盘）
-- L:  复杂应用，多页面/多模块/复杂状态管理（电商、后台管理系统、社交平台）
-
 ## 重要
 - 只返回 JSON，不要其他文字
 - 纯前端应用，不涉及后端 API
@@ -61,4 +57,5 @@
 - interfaces 定义每个模块对外的 API 契约
 - implementation_order 是拓扑排序后的实施顺序
 - acceptance_criteria 每一条必须有具体的验证方法 (how_to_verify)
-- 对于 XS/S 复杂度，tasks/interfaces/implementation_order/acceptance_criteria 可以省略
+- simple 复杂度可省略 tasks/interfaces/implementation_order
+- acceptance_criteria 在 standard 复杂度下必须提供，每条必须有可操作的 how_to_verify

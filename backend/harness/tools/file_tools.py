@@ -73,8 +73,16 @@ class WriteFileHandler(ToolHandler):
             lines = content.count('\n') + 1
             char_count = len(content)
             ws.write(filename, content)
+            # 返回内容预览（前80行+后10行），让 Agent 不读文件就知道自己写了什么
+            all_lines = content.split('\n')
+            head_lines = all_lines[:80]
+            tail_lines = all_lines[-10:] if len(all_lines) > 80 else []
+            preview = '\n'.join(head_lines)
+            if tail_lines:
+                preview += f"\n\n... (中间省略 {len(all_lines) - 90} 行) ...\n\n" + '\n'.join(tail_lines)
+            preview_note = f"已创建 {filename} ({lines} 行, {char_count} 字符)\n\n--- 文件内容预览 ---\n{preview[:3000]}"
             return ToolResult(
-                content=f"已创建 {filename} ({lines} 行, {char_count} 字符)",
+                content=preview_note,
                 metadata={"filename": filename, "lines": lines, "chars": char_count}
             )
         except Exception as e:

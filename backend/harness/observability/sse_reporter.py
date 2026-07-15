@@ -102,6 +102,10 @@ class SSEReporter:
             "ac_id": ac_id, "passed": passed, "reason": reason
         })
 
+    def evaluator_result(self, requirement_id: int, result: dict):
+        """推送 Evaluator 代码评估结果（评分 + findings）"""
+        self._send(requirement_id, "evaluator_result", result)
+
     def _send(self, requirement_id: int, event: str, data: dict):
         try:
             msg = SSEMessage.format_event(event, data)

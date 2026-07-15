@@ -255,6 +255,142 @@ def run_preview_in_browser(
     }
 
 
+def run_ac_checks(
+    html_path: Path,
+    ac_scripts: list[dict],
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+) -> list[dict]:
+    """
+    执行验收条件（AC）的 Playwright 交互验证脚本。
+
+    每个 ac_script 包含：
+    {
+        "ac_id": "AC-1",
+        "label": "用户可添加待办事项",
+        "steps": [
+            {"action": "type", "selector": "#input", "value": "测试"},
+            {"action": "click", "selector": "#add-btn"},
+            {"action": "wait", "ms": 500},
+            {"action": "assert_exists", "selector": ".todo-item", "label": "列表有新项目"},
+            {"action": "assert_text", "selector": ".todo-item", "contains": "测试"},
+        ]
+    }
+
+    支持的 action 类型：
+    - type:       在元素中输入文本
+    - click:      点击元素
+    - select:     下拉选择
+    - wait:       等待 ms 毫秒
+    - assert_exists:    元素存在则通过
+    - assert_visible:   元素可见则通过
+    - assert_text:      元素文本包含指定内容
+    - assert_count:     匹配元素数量 ≥ 预期
+    - assert_value:     input 元素的 value 符合预期
+
+    Returns:
+        [{"ac_id": "AC-1", "passed": True, "failures": [], "steps_executed": 5}, ...]
+    """
+    try:
+        from playwright.sync_api import sync_playwright, Error as PWError
+    except ImportError:
+        return [{"ac_id": s["ac_id"], "passed": False, "failures": ["playwright 未安装"], "steps_executed": 0} for s in ac_scripts]
+
+    url = html_path.resolve().as_uri()
+    results = []
+
+    try:
+        with sync_playwright() as p:
+            try:
+                browser = p.chromium.launch(headless=True)
+            except PWError:
+                return [{"ac_id": s["ac_id"], "passed": False, "failures": ["chromium 未安装"], "steps_executed": 0} for s in ac_scripts]
+
+            try:
+                context = browser.new_context()
+                page = context.new_page()
+                page.set_default_timeout(timeout_ms)
+
+                for script in ac_scripts:
+                    ac_id = script.get("ac_id", "?")
+                    label = script.get("label", ac_id)
+                    steps = script.get("steps", [])
+                    failures = []
+                    steps_executed = 0
+
+                    try:
+                        # 重新加载页面，确保每个 AC 都从干净状态开始
+                        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                        page.wait_for_timeout(1000)  # 等待初始化
+
+                        for step in steps:
+                            action = step.get("action", "")
+                            selector = step.get("selector", "")
+                            steps_executed += 1
+
+                            try:
+                                if action == "type":
+                                    page.fill(selector, step.get("value", ""))
+                                elif action == "click":
+                                    page.click(selector)
+                                elif action == "select":
+                                    page.select_option(selector, step.get("value", ""))
+                                elif action == "wait":
+                                    page.wait_for_timeout(step.get("ms", 500))
+                                elif action == "assert_exists":
+                                    elem = page.query_selector(selector)
+                                    if not elem:
+                                        failures.append(f"元素不存在: {step.get('label', selector)}")
+                                elif action == "assert_visible":
+                                    if not page.is_visible(selector):
+                                        failures.append(f"元素不可见: {step.get('label', selector)}")
+                                elif action == "assert_text":
+                                    elem = page.query_selector(selector)
+                                    text = elem.inner_text() if elem else ""
+                                    contains = step.get("contains", "")
+                                    if contains not in text:
+                                        failures.append(
+                                            f"文本不匹配: 期望包含 '{contains}', 实际 '{text[:100]}'"
+                                        )
+                                elif action == "assert_count":
+                                    count = len(page.query_selector_all(selector))
+                                    expected = step.get("min_count", 1)
+                                    if count < expected:
+                                        failures.append(
+                                            f"元素数量不足: {selector} 期望 ≥{expected}, 实际 {count}"
+                                        )
+                                elif action == "assert_value":
+                                    value = page.input_value(selector)
+                                    expected = step.get("value", "")
+                                    if value != expected:
+                                        failures.append(
+                                            f"值不匹配: {selector} 期望 '{expected}', 实际 '{value}'"
+                                        )
+                                elif action == "screenshot":
+                                    # 截图用于 LLM 诊断（不参与通过/失败判断）
+                                    pass
+                            except Exception as step_err:
+                                failures.append(f"步骤 [{action} {selector}]: {step_err}")
+
+                    except Exception as ac_err:
+                        failures.append(f"AC 执行异常: {ac_err}")
+
+                    results.append({
+                        "ac_id": ac_id,
+                        "label": label,
+                        "passed": len(failures) == 0,
+                        "failures": failures,
+                        "steps_executed": steps_executed,
+                    })
+
+            finally:
+                browser.close()
+    except Exception as e:
+        logger.warning("AC 验证运行异常: %s", e)
+        return [{"ac_id": s["ac_id"], "passed": False, "failures": [f"运行异常: {e}"], "steps_executed": 0} for s in ac_scripts]
+
+    return results
+
+
 def _loc(loc) -> str:
     try:
         return f"{loc.url}:{loc.line_number}:{loc.column_number}"
