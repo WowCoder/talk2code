@@ -1,0 +1,7 @@
+{
+  "name": "anti-ai-slop",
+  "description": "禁止 AI 刻板设计模式，让生成代码摆脱\"AI 味\"",
+  "type": "knowledge",
+  "trigger": ".*",
+  "priority": 100
+}

@@ -25,9 +25,14 @@ talk2code/
 │   ├── llm/                      # LLM 统一客户端（OpenAI/Anthropic 双协议）
 │   ├── harness/                  # Agent 运行时框架
 │   │   ├── instructions/         #   LLM 指令与 Prompt 管理
-│   │   ├── tools/                #   工具注册与文件读写
+│   │   │   ├── compactor.py     #     上下文压缩（支持 preserve 标记保护关键消息）
+│   │   │   ├── skill_loader.py  #     声明式 Skill 加载（manifest.json 触发）
+│   │   │   └── nodes.py         #     LangGraph 节点（支持 Agent 委派）
+│   │   ├── tools/                #   工具注册表（ToolHandler + @register_tool 装饰器）
 │   │   ├── state/                #   状态管理 / 工作区 / 记忆系统
 │   │   ├── constraints/          #   Hook 与质量约束
+│   │   ├── events.py             #   类型化事件模型（Pydantic）
+│   │   ├── plugins/              #   插件系统（.talk2code-plugin/plugin.json）
 │   │   └── observability/        #   追踪 / Token 成本 / SSE 上报
 │   ├── services/                 # SSE 传输、任务队列
 │   └── utils/                    # 限流、重试、安全工具

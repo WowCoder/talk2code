@@ -60,17 +60,18 @@ class SSEReporter:
     def trace_summary(self, requirement_id: int, trace_data: dict):
         self._send(requirement_id, "trace_summary", trace_data)
 
-    def iteration_batch(self, requirement_id: int, batch: dict):
+    def iteration_batch(self, requirement_id: int, batch):
         """推送一轮迭代的批量事件（替代逐个 tool_call/tool_result/thinking SSE）
 
-        batch 结构:
-            iteration: int          — 第几轮迭代
-            coder_name: str         — 角色名称（如 "Henry（开发）"）
-            thinking_preview: str   — thinking 前 100 字符预览
-            agent_text: str         — LLM 回复文本（截断到 200 字符）
-            tools: list[dict]       — [{name, readable, success, arguments}]
+        接受 IterationBatchEvent 或 dict（向后兼容）。
+        IterationBatchEvent 通过 .to_dict() 序列化为 dict 后通过 SSE 发送。
         """
-        self._send(requirement_id, "iteration_batch", batch)
+        from harness.events import IterationBatchEvent
+        if isinstance(batch, IterationBatchEvent):
+            data = batch.to_dict()
+        else:
+            data = batch  # 兼容旧的 dict 调用方式
+        self._send(requirement_id, "iteration_batch", data)
 
     def complete(self, requirement_id: int, code_files: list = None):
         self._send(requirement_id, "complete", {

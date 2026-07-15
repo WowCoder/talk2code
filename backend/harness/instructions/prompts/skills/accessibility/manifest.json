@@ -1,0 +1,7 @@
+{
+  "name": "accessibility",
+  "description": "可访问性基础规则：对比度、键盘导航、语义化 HTML、ARIA 标签",
+  "type": "knowledge",
+  "trigger": "表单|输入|登录|注册|设置|填写|提交|按钮|输入框|搜索|checkbox|radio|form",
+  "priority": 10
+}

@@ -1,0 +1,7 @@
+{
+  "name": "generic",
+  "description": "通用前端开发知识：存储方案选择、CDN 引入、文件组织、常见易错点",
+  "type": "knowledge",
+  "trigger": ".*",
+  "priority": 100
+}

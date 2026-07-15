@@ -15,6 +15,7 @@ from harness.tools.file_tools import FileToolHandler
 from harness.tools.code_tools import CodeToolHandler
 from harness.tools.preview_tools import PreviewToolHandler
 from harness.tools.edit_tools import EditToolHandler
+from harness.events import ToolCallEvent, IterationBatchEvent
 from llm.client import get_client
 from harness.observability.logger import get_logger
 
@@ -43,11 +44,16 @@ class ToolCallLoop:
         self.checkpoint = checkpoint
         self.on_iteration = on_iteration  # 可选回调，每轮迭代后调用以增量持久化
 
-        # 创建工具处理器
+        # 创建工具处理器（已弃用 — 仅用于 _execute_tool_fallback 回退路径。
+        # 新工具应通过 ToolHandler 子类 + ToolRegistry 注册，不使用此实例化方式。）
         self._file_handler = FileToolHandler(workspace)
         self._code_handler = CodeToolHandler(workspace)
         self._preview_handler = PreviewToolHandler(workspace)
         self._edit_handler = EditToolHandler(workspace)
+
+        # 将 workspace 注入注册表中的 ToolHandler 实例
+        if self.tools:
+            self.tools.set_workspace(workspace)
 
     def run(self, state: AgentState) -> AgentState:
         client = get_client()
@@ -143,6 +149,7 @@ class ToolCallLoop:
                         "content": f"你还没有创建所有必需的文件，缺少：{', '.join(missing)}。"
                                  f"请继续用 write_file 创建剩余文件，不要停止。",
                         "hidden": True,
+                        "preserve": True,
                     })
                     continue
                 state["current_step"] = "task_complete"
@@ -177,7 +184,7 @@ class ToolCallLoop:
             state["_missing_files_rounds"] = 0
 
             # 执行所有工具调用（收集到 batch_tools，统一发送迭代批量事件）
-            batch_tools = []
+            batch_tools: list[ToolCallEvent] = []
             for tc in response.tool_calls:
                 result = self._execute_tool(state, tc)
                 logger.info(f"[ToolLoop] 执行 {tc.name}: success={result.success} content={result.content[:100] if result.success else ''} error={result.error[:100] if not result.success else ''}")
@@ -185,13 +192,13 @@ class ToolCallLoop:
                 # 生成前端展示用简短标签
                 display_readable = self._tool_display_label(tc.name, tc.arguments, result)
 
-                # 收集到批量列表（前端只展示简短标签，不暴露大段内容）
-                batch_tools.append({
-                    "name": tc.name,
-                    "readable": display_readable,
-                    "success": result.success,
-                    "arguments": tc.arguments,
-                })
+                # 收集到批量列表（使用 Pydantic 模型替代松散 dict）
+                batch_tools.append(ToolCallEvent(
+                    name=tc.name,
+                    arguments=tc.arguments,
+                    display_label=display_readable,
+                    success=result.success,
+                ))
 
                 # 实时推送 code 事件（代码面板需要实时更新）
                 if self.sse:
@@ -245,14 +252,15 @@ class ToolCallLoop:
 
             # ---- 推送迭代批量事件（替代逐个 tool_call/tool_result/thinking SSE） ----
             if self.sse and batch_tools:
-                self.sse.iteration_batch(state["requirement_id"], {
-                    "iteration": iteration + 1,
-                    "coder_name": coder_name,
-                    "thinking_preview": (thinking_text or "")[:100],
-                    "agent_text": agent_text[:300] if agent_text else "",
-                    "tools": batch_tools,
-                    "content": f"第 {iteration + 1} 轮迭代 — {len(batch_tools)} 个操作",
-                })
+                batch_event = IterationBatchEvent(
+                    iteration=iteration + 1,
+                    coder_name=coder_name,
+                    thinking_preview=(thinking_text or "")[:100],
+                    agent_text=agent_text[:300] if agent_text else "",
+                    tools=batch_tools,
+                    content=f"第 {iteration + 1} 轮迭代 — {len(batch_tools)} 个操作",
+                )
+                self.sse.iteration_batch(state["requirement_id"], batch_event)
 
             # 保存迭代批量消息到对话历史（页面刷新后恢复分组展示）
             if batch_tools:
@@ -263,7 +271,7 @@ class ToolCallLoop:
                     "iteration": iteration + 1,
                     "thinking_preview": (thinking_text or "")[:100],
                     "agent_text": agent_text[:300] if agent_text else "",
-                    "tools": batch_tools,
+                    "tools": [t.to_dict() for t in batch_tools],
                 })
 
                 # Git 自动 commit
@@ -335,6 +343,7 @@ class ToolCallLoop:
                     "role": "system", "name": "System",
                     "content": repair_prompt,
                     "hidden": True,
+                    "preserve": True,
                 })
                 state["current_step"] = "repairing"
                 state["no_progress_count"] = 0
@@ -393,29 +402,17 @@ class ToolCallLoop:
             if self.hooks.trigger(HookPoint.PRE_TOOL_USE, ctx):
                 pass  # 预处理失败不阻断，只记录
 
-        # 分发到对应处理器
-        handler_map = {
-            "read_file": lambda: self._file_handler.read_file(
-                filename=tool_call.arguments.get("filename"),
-                start_line=tool_call.arguments.get("start_line"),
-                end_line=tool_call.arguments.get("end_line"),
-            ),
-            "write_file": lambda: self._file_handler.write_file(**tool_call.arguments),
-            "edit_file": lambda: self._edit_handler.edit_file(**tool_call.arguments),
-            "list_files": lambda: self._file_handler.list_files(),
-            "delete_file": lambda: self._file_handler.delete_file(**tool_call.arguments),
-            "validate_html": lambda: self._code_handler.validate_html(**tool_call.arguments),
-            "lint_css": lambda: self._code_handler.lint_css(**tool_call.arguments),
-            "lint_js": lambda: self._code_handler.lint_js(**tool_call.arguments),
-            "execute_code": lambda: self._code_handler.execute_code(**tool_call.arguments),
-            "run_preview": lambda: self._preview_handler.run_preview(**tool_call.arguments),
-        }
+        # 分发到对应处理器：优先通过注册表获取 ToolHandler 实例
+        handler = None
+        if self.tools:
+            handler = self.tools.get_handler(tool_call.name)
 
-        handler = handler_map.get(tool_call.name)
         if handler:
-            result = handler()
+            # 通过 ToolHandler.execute() 统一接口调用
+            result = handler.execute(tool_call.arguments)
         else:
-            result = self.tools.execute(tool_call.name, tool_call.arguments)
+            # 回退：兼容旧的硬编码 handler_map（逐步废弃）
+            result = self._execute_tool_fallback(state, tool_call)
 
         # 后处理 Hook
         if self.hooks:
@@ -460,6 +457,32 @@ class ToolCallLoop:
             self._update_contract_on_edit(state, tool_call.arguments)
 
         return result
+
+    def _execute_tool_fallback(self, state: AgentState, tool_call) -> "ToolResult":
+        """回退：硬编码 handler_map（逐步废弃，新增工具应使用 ToolHandler + 注册表）"""
+        from harness.tools.registry import ToolResult
+
+        handler_map = {
+            "read_file": lambda: self._file_handler.read_file(
+                filename=tool_call.arguments.get("filename"),
+                start_line=tool_call.arguments.get("start_line"),
+                end_line=tool_call.arguments.get("end_line"),
+            ),
+            "write_file": lambda: self._file_handler.write_file(**tool_call.arguments),
+            "edit_file": lambda: self._edit_handler.edit_file(**tool_call.arguments),
+            "list_files": lambda: self._file_handler.list_files(),
+            "delete_file": lambda: self._file_handler.delete_file(**tool_call.arguments),
+            "validate_html": lambda: self._code_handler.validate_html(**tool_call.arguments),
+            "lint_css": lambda: self._code_handler.lint_css(**tool_call.arguments),
+            "lint_js": lambda: self._code_handler.lint_js(**tool_call.arguments),
+            "execute_code": lambda: self._code_handler.execute_code(**tool_call.arguments),
+            "run_preview": lambda: self._preview_handler.run_preview(**tool_call.arguments),
+        }
+
+        handler = handler_map.get(tool_call.name)
+        if handler:
+            return handler()
+        return self.tools.execute(tool_call.name, tool_call.arguments)
 
     def _trigger_hooks(self, state: AgentState) -> list:
         """触发 ON_TASK_COMPLETE Hook，返回失败列表"""
@@ -563,17 +586,18 @@ class ToolCallLoop:
     def _get_craft_context(self, requirement: str = '') -> tuple:
         """渐进式加载 Skills，注入到编码 Prompt 中。
 
-        同一任务只做一次 LLM 选择，后续轮次复用缓存。
+        使用 SkillLoader（基于 manifest.json）替代旧的 LLM 选择机制。
+        同一任务只做一次匹配，后续轮次复用缓存。
 
         Returns:
             (rules_text: str, _unused: str)
         """
         try:
-            from harness.instructions.prompts.skills import load_for_task
             if not hasattr(self, '_skill_cache'):
                 self._skill_cache = {}
             cache_key = requirement[:200]  # 用需求前 200 字做缓存键
             if cache_key not in self._skill_cache:
+                from harness.instructions.skill_loader import load_for_task
                 self._skill_cache[cache_key] = load_for_task(requirement) if requirement else ''
             return self._skill_cache[cache_key], ''
         except Exception:
