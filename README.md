@@ -161,6 +161,12 @@ cd backend && python app.py
 ### 预览 — 浏览器实时运行
 ![预览](docs/images/detail_preview.png)
 
+### 预览 — Spec
+![预览](docs/images/detail_spec.png)
+
+### 预览 — task
+![预览](docs/images/detail_task.png)
+
 ### 历史对话
 ![历史](docs/images/history.png)
 
