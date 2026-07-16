@@ -324,13 +324,34 @@ class RequirementService:
                 sse_manager.broadcast(str(requirement_id), cancel_msg)
                 break
 
+            # ★ 先推送增量对话消息（在 early-break 之前），
+            # 确保 TL 分析消息 / 澄清追问等在 SSE 实时流中可见，
+            # 避免实时视图与持久化顺序不一致
+            _SKIP_DIALOGUE_ROLES = {'thinking', 'tool_call', 'tool_result', 'hook_check'}
+            dialogues = final_state.get('dialogue_history', []) or []
+            for dialogue in dialogues[last_dialogue_count:]:
+                role = dialogue.get('role', 'agent')
+                if role in _SKIP_DIALOGUE_ROLES:
+                    continue
+                if dialogue.get('hidden'):
+                    continue
+                self._send_dialogue(requirement_id, dialogue.get('name', TL_NAME),
+                                    dialogue.get('content', ''),
+                                    role)
+            last_dialogue_count = len(dialogues)
+
+            code_files = final_state.get('code_files', []) or []
+            for file_data in code_files[last_code_count:]:
+                self._send_code(requirement_id, file_data.get('filename', 'unknown.txt'), file_data.get('content', ''))
+            last_code_count = len(code_files)
+
             if final_state.get('current_step') == 'needs_clarification':
                 # 优先从 metadata 获取 question_form，fallback 到 dialogue_history
                 question_form = final_state.get('metadata', {}).get('question_form', {})
                 if not question_form:
-                    # 从 dialogue_history 中提取（持久化恢复场景）
+                    # 从 dialogue_history 中提取（持久化恢复场景），跳过已提交的表单
                     for msg in (final_state.get('dialogue_history') or []):
-                        if msg.get('question_form'):
+                        if msg.get('question_form') and not msg['question_form'].get('submitted'):
                             question_form = msg['question_form']
                             break
                 if question_form:
@@ -411,27 +432,6 @@ class RequirementService:
                     'repair': DEV_NAME,
                 }.get(node_name, node_name)
                 self._send_progress(requirement_id, display_name, progress)
-
-            # 只发送真正的对话消息（agent/assistant/system/user），
-            # thinking/tool_call/hook_check 等内部消息已有专用 SSE 通道推送
-            _SKIP_DIALOGUE_ROLES = {'thinking', 'tool_call', 'tool_result', 'hook_check'}
-            dialogues = final_state.get('dialogue_history', []) or []
-            for dialogue in dialogues[last_dialogue_count:]:
-                role = dialogue.get('role', 'agent')
-                if role in _SKIP_DIALOGUE_ROLES:
-                    continue
-                # 跳过标记为 hidden 的内部系统提示
-                if dialogue.get('hidden'):
-                    continue
-                self._send_dialogue(requirement_id, dialogue.get('name', TL_NAME),
-                                    dialogue.get('content', ''),
-                                    role)
-            last_dialogue_count = len(dialogues)
-
-            code_files = final_state.get('code_files', []) or []
-            for file_data in code_files[last_code_count:]:
-                self._send_code(requirement_id, file_data.get('filename', 'unknown.txt'), file_data.get('content', ''))
-            last_code_count = len(code_files)
 
             # 错误不会立即中断（让图走到 END），除非是严重错误
             if final_state.get('error') and 'ToolCallLoop 未注入' in str(final_state.get('error', '')):
@@ -556,23 +556,18 @@ class RequirementService:
             logger.info(f"[ConfirmPlan] 从检查点恢复状态: node={resumed_state.get('current_step', '?')}")
 
             # 构建初始状态（合并检查点 + harness 注入）
+            # dialogue_history 以 DB 为准：包含确认 Plan 时追加的 plan_confirmed 消息，
+            # 避免被检查点中 TL 完成时的旧对话覆盖
             initial_state: AgentState = {
                 **resumed_state,
                 'current_step': 'starting',  # 重置，让 post-plan 图正常流转
+                'dialogue_history': list(requirement.dialogue_history or []),
             }
 
             # 注入 harness 组件
             initial_state["metadata"]["_tool_loop"] = tool_loop
             initial_state["metadata"]["_workspace"] = workspace
             set_harness_components(tool_loop=tool_loop, workspace=workspace)
-
-            # 如果有用户反馈，追加到对话历史
-            if feedback:
-                initial_state.setdefault('dialogue_history', []).append({
-                    'role': 'user', 'name': '用户',
-                    'content': f"对 Plan 的反馈：{feedback}",
-                    'plan_feedback': True,
-                })
 
             # 开始链路追踪
             trace = tracer.start_trace(requirement_id, requirement.user_id)
@@ -946,7 +941,9 @@ class RequirementService:
     def _handle_ambiguous_direct(self, db, requirement, requirement_id: int) -> bool:
         """AMBIGUOUS 意图：直接生成澄清问题，不进入 TeamLeader"""
         from sqlalchemy.orm.attributes import flag_modified
-        from harness.instructions.nodes import _generate_clarify_questions
+        from harness.instructions.nodes import (
+            _generate_clarify_questions, FALLBACK_CLARIFY_QUESTIONS,
+        )
         from llm.client import get_client as _get_llm_client
 
         try:
@@ -954,12 +951,9 @@ class RequirementService:
             questions = _generate_clarify_questions(client, requirement.content)
         except Exception as e:
             logger.warning(f"澄清问题生成失败: {e}")
-            questions = [
-                {"id": "q1", "type": "text", "label": "请更具体地描述你的需求"},
-                {"id": "visual_style", "type": "radio",
-                 "label": "你偏好哪种视觉风格？",
-                 "options": ["极简白", "暖柔风格", "暗黑科技", "活泼多彩", "无偏好"]},
-            ]
+            questions = []
+        if not questions:
+            questions = FALLBACK_CLARIFY_QUESTIONS
 
         dialogue_list = list(requirement.dialogue_history or [])
         dialogue_list.append({

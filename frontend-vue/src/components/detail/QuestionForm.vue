@@ -1,19 +1,6 @@
 <template>
-  <!-- 已提交的只读卡片 -->
-  <div v-if="isSubmitted" class="question-form-card submitted">
-    <div class="qf-title completed-title">
-      ✅ 已提交补充信息
-    </div>
-    <div v-for="q in formData!.questions" :key="q.id" class="qf-item">
-      <div class="qf-label">{{ q.label }}</div>
-      <div class="qf-answer">
-        {{ submittedAnswers[q.id] || '（未填写）' }}
-      </div>
-    </div>
-  </div>
-
-  <!-- 可编辑表单 -->
-  <div v-else-if="formData" class="question-form-card">
+  <!-- 可编辑表单（提交后转为消息流中的"已提交"卡片，由 DialogueMessage 渲染） -->
+  <div v-if="formData" class="question-form-card">
     <div class="qf-title">
       {{ mode === 'chat' ? '补充信息，让修改更精准' : '补充信息，让 AI 更好地理解你的需求' }}
     </div>
@@ -49,7 +36,7 @@
 </template>
 
 <script setup lang="ts">
-import { reactive, ref, computed } from 'vue'
+import { reactive, ref } from 'vue'
 import { useRequirementStore } from '@/stores/requirement'
 import { useToast } from '@/composables/useToast'
 import type { SSEQuestionFormData } from '@/types/sse'
@@ -68,18 +55,24 @@ const { show } = useToast()
 const answers = reactive<Record<string, string>>({})
 const submitting = ref(false)
 
-// 是否已提交（本地标记 + 后端持久化标记）
-const isSubmitted = computed(() =>
-  props.formData?.submitted === true
-)
-// 已提交的答案（优先本地，fallback 到后端持久化的答案）
-const submittedAnswers = computed<Record<string, string>>(() => {
-  if (Object.keys(answers).length > 0) return { ...answers }
-  return props.formData?.answers || {}
-})
-
 function selectRadio(qid: string, value: string) {
   answers[qid] = value
+}
+
+/** 提交/跳过后：清除浮动表单，把已完成的表单落成消息流中的特殊 user 消息（后端持久化同样一条） */
+function finalizeAsMessage(content: string, submittedAnswers: Record<string, string>) {
+  if (!props.formData) return
+  store.addDialogueMessage({
+    role: 'user',
+    name: '用户',
+    content,
+    question_form: {
+      questions: props.formData.questions,
+      submitted: true,
+      answers: submittedAnswers,
+    },
+  })
+  store.questionForm = null
 }
 
 async function submitForm() {
@@ -103,12 +96,10 @@ async function submitForm() {
     // 新需求 SOP 模式：调用 /clarify 接口
     store.isGenerating = true  // 立即显示加载态，等待 SSE 推送进度
     await store.submitClarification({ ...answers })
-    // 保留表单为"已提交"卡片，不清除
-    store.questionForm = {
-      ...props.formData,
-      submitted: true,
-      answers: { ...answers },
-    }
+    const answerText = Object.entries(answers)
+      .map(([q, a]) => `${q}: ${a}`)
+      .join('；')
+    finalizeAsMessage(answerText, { ...answers })
     emit('submitted')
   } catch (err: any) {
     show(err.message || '提交失败', 'error')
@@ -132,14 +123,12 @@ async function skipForm() {
 
     // 新需求 SOP 模式
     await store.submitClarification({ _skip: 'true' })
-    // 保留表单为"已跳过"卡片
-    store.questionForm = {
-      ...props.formData,
-      submitted: true,
-      answers: Object.fromEntries(
+    finalizeAsMessage(
+      '_skip: true',
+      Object.fromEntries(
         props.formData.questions.map((q) => [q.id, '（使用默认方案）'])
-      ),
-    }
+      )
+    )
     emit('submitted')
     show('已跳过，使用默认方案重新处理…', 'success')
   } catch (err: any) {
@@ -267,22 +256,5 @@ async function skipForm() {
 .qf-submit:disabled {
   opacity: 0.5;
   cursor: not-allowed;
-}
-
-/* Submitted state */
-.question-form-card.submitted {
-  opacity: 0.85;
-  border: 1px solid var(--border);
-}
-
-.completed-title {
-  color: var(--fg) !important;
-}
-
-.qf-answer {
-  font-size: 13px;
-  color: var(--fg);
-  padding: 4px 0;
-  line-height: 1.5;
 }
 </style>

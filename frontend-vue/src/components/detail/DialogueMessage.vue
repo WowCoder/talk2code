@@ -9,6 +9,36 @@
     {{ msg.content }}
   </div>
 
+  <!-- 已提交补充信息卡片（特殊 user 消息，靠右展示） -->
+  <div v-else-if="msg.role === 'user' && msg.question_form?.submitted" class="msg user">
+    <div class="qf-submitted-card">
+      <div class="qf-title">✅ 已提交补充信息</div>
+      <div v-for="q in msg.question_form.questions" :key="q.id" class="qf-item">
+        <div class="qf-label">{{ q.label }}</div>
+        <div class="qf-answer">{{ msg.question_form.answers?.[q.id] || '（未填写）' }}</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 已确认开发计划卡片（特殊 user 消息，靠右展示） -->
+  <div v-else-if="msg.role === 'user' && msg.plan_confirmed" class="msg user">
+    <div class="pc-card">
+      <div class="pc-header">
+        <span class="pc-icon">🎯</span>
+        <span class="pc-title">开发计划已确认</span>
+        <span class="pc-badge" :class="planComplexityClass">{{ msg.plan_confirmed.complexity || 'S' }}</span>
+      </div>
+      <div v-if="msg.plan_confirmed.features?.length" class="pc-tags">
+        <span v-for="(f, i) in msg.plan_confirmed.features" :key="i" class="pc-tag">{{ f }}</span>
+      </div>
+      <div v-if="planTechStackText || msg.plan_confirmed.file_structure?.length" class="pc-meta">
+        <span v-if="planTechStackText">{{ planTechStackText }}</span>
+        <span v-if="msg.plan_confirmed.file_structure?.length">📄 {{ msg.plan_confirmed.file_structure.length }} 个文件</span>
+      </div>
+      <div class="pc-confirmed">✅ 已确认，开始编码</div>
+    </div>
+  </div>
+
   <!-- User message -->
   <div v-else-if="msg.role === 'user'" class="msg user">
     <div class="bubble user-bubble">
@@ -119,7 +149,7 @@
             :key="ti"
             class="iteration-tool-item"
           >
-            <span class="iteration-tool-icon">{{ tool.success ? '✅' : '❌' }}</span>
+            <span class="iteration-tool-icon">{{ tool.success ? '✅' : tool.blocked ? '⛔' : '❌' }}</span>
             <span class="iteration-tool-label">{{ tool.readable }}</span>
             <span
               v-if="hasToolArgs(tool)"
@@ -219,6 +249,22 @@ const roleColor = computed(() => {
 const displayName = computed(() => {
   return props.msg.name || 'AI'
 })
+
+// plan_confirmed 卡片：技术栈摘要 & 复杂度徽章样式
+const planTechStackText = computed(() => {
+  const ts = props.msg.plan_confirmed?.tech_stack
+  if (!ts) return ''
+  const parts: string[] = []
+  if (ts.framework) parts.push(`框架: ${ts.framework}`)
+  if (ts.css) parts.push(`CSS: ${ts.css}`)
+  if (ts.storage) parts.push(`存储: ${ts.storage}`)
+  return parts.join(' · ')
+})
+
+const planComplexityClass = computed(() => {
+  const c = props.msg.plan_confirmed?.complexity || 'S'
+  return `complexity-${c.toLowerCase()}`
+})
 </script>
 
 <style scoped>
@@ -284,6 +330,122 @@ const displayName = computed(() => {
   color: var(--accent);
   margin-bottom: 4px;
   letter-spacing: 0.02em;
+}
+
+/* ---- 已提交补充信息卡片（与 QuestionForm 卡片样式保持一致，完成态） ---- */
+.qf-submitted-card {
+  background: var(--accent-soft);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  border-bottom-right-radius: 6px;
+  padding: 16px;
+  opacity: 0.85;
+}
+
+.qf-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  margin-bottom: 12px;
+}
+
+.qf-item {
+  margin-bottom: 10px;
+}
+
+.qf-item:last-child {
+  margin-bottom: 0;
+}
+
+.qf-label {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.qf-answer {
+  font-size: 13px;
+  color: var(--fg);
+  line-height: 1.5;
+}
+
+/* ---- 已确认开发计划卡片（与 PlanConfirmation 卡片样式保持一致，完成态） ---- */
+.pc-card {
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 12px;
+  border-bottom-right-radius: 6px;
+  padding: 16px;
+  opacity: 0.9;
+}
+
+.pc-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.pc-icon {
+  font-size: 18px;
+}
+
+.pc-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.pc-badge {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  color: #fff;
+}
+
+.complexity-xs { background: oklch(55% 0.1 155); }
+.complexity-s { background: oklch(55% 0.1 155); }
+.complexity-m { background: oklch(65% 0.12 85); }
+.complexity-l { background: oklch(50% 0.2 25); }
+
+.pc-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.pc-tag {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-weight: 500;
+  background: oklch(97% 0.01 250 / 0.5);
+  color: oklch(50% 0.1 250);
+  border: 1px solid oklch(85% 0.02 250);
+}
+
+.pc-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.pc-confirmed {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  background: oklch(97% 0.01 155 / 0.5);
+  border-radius: 8px;
+  font-size: 13px;
+  color: oklch(50% 0.08 155);
+  font-weight: 500;
 }
 
 .role-icon {

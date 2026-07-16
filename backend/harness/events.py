@@ -19,6 +19,7 @@ class ToolCallEvent(BaseModel):
     arguments: dict = Field(default_factory=dict, description="工具调用参数")
     display_label: str = Field(default="", description="前端展示用简短标签")
     success: bool = Field(default=False, description="工具执行是否成功")
+    blocked: bool = Field(default=False, description="是否被 PRE_TOOL_USE 硬约束跳过")
 
     def to_dict(self) -> dict:
         """序列化为 dict（兼容现有 dialogue_history 格式）"""
@@ -26,6 +27,7 @@ class ToolCallEvent(BaseModel):
             "name": self.name,
             "readable": self.display_label,
             "success": self.success,
+            "blocked": self.blocked,
             "arguments": self.arguments,
         }
 
@@ -37,6 +39,7 @@ class ToolCallEvent(BaseModel):
             arguments=data.get("arguments", {}),
             display_label=data.get("readable", ""),
             success=data.get("success", False),
+            blocked=data.get("blocked", False),
         )
 
 

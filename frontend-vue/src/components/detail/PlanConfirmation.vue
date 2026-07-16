@@ -40,7 +40,7 @@
     </div>
 
     <!-- 操作按钮 -->
-    <div v-if="!submitted" class="plan-actions">
+    <div class="plan-actions">
       <button class="btn-modify" @click="showFeedback = !showFeedback">
         ✏️ {{ showFeedback ? '收起' : '修改需求' }}
       </button>
@@ -50,7 +50,7 @@
     </div>
 
     <!-- 反馈输入框 -->
-    <div v-if="showFeedback && !submitted" class="plan-feedback">
+    <div v-if="showFeedback" class="plan-feedback">
       <textarea
         v-model="feedbackText"
         placeholder="输入你的修改意见，例如：请使用 React 而不是原生 JS、增加暗黑模式切换功能…"
@@ -64,12 +64,6 @@
       >
         确认修改，重新分析
       </button>
-    </div>
-
-    <!-- 已确认状态 -->
-    <div v-if="submitted" class="plan-confirmed">
-      <span class="confirmed-icon">✅</span>
-      <span>已确认，开始编码…</span>
     </div>
   </div>
 </template>
@@ -91,7 +85,6 @@ const store = useRequirementStore()
 const showFeedback = ref(false)
 const feedbackText = ref('')
 const confirming = ref(false)
-const submitted = computed(() => store.planStatus === 'confirmed')
 
 const complexityClass = computed(() => {
   const c = props.specData?.complexity || 'S'
@@ -330,22 +323,5 @@ async function onConfirmWithFeedback() {
 .btn-confirm-with-feedback:disabled {
   opacity: 0.6;
   cursor: not-allowed;
-}
-
-.plan-confirmed {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 12px;
-  padding: 10px 14px;
-  background: oklch(97% 0.01 155 / 0.5);
-  border-radius: 8px;
-  font-size: 13px;
-  color: oklch(50% 0.08 155);
-  font-weight: 500;
-}
-
-.confirmed-icon {
-  font-size: 16px;
 }
 </style>

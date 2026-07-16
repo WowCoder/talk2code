@@ -570,6 +570,8 @@ def chat_with_requirement(req_id):
             return jsonify({'error': '需求不存在'}), 404
 
         user_message = data.get('message', '').strip()
+        # 澄清表单提交时随消息携带：{'questions': [...], 'answers': {...}}
+        clarify = data.get('clarify')
 
         # ===== 意图路由：Chat 模式下区分"提问"和"修改指令" =====
         if '[用户补充说明]' not in user_message:
@@ -605,11 +607,37 @@ def chat_with_requirement(req_id):
         # 保存用户消息到数据库（立即持久化，防止崩溃丢失）
         from sqlalchemy.orm.attributes import flag_modified
         dialogue_list = list(requirement.dialogue_history or [])
-        dialogue_list.append({
+        user_entry = {
             'role': 'user', 'name': '用户',
             'content': user_message,
             'timestamp': get_current_timestamp()
-        })
+        }
+        if clarify:
+            # 澄清表单提交：标记此前的表单消息为已提交，
+            # 本条 user 消息持久化为已完成卡片（content 仅存答案摘要，LLM 上下文用完整 user_message）
+            cl_answers = clarify.get('answers', {})
+            cl_questions = clarify.get('questions', [])
+            for i in range(len(dialogue_list) - 1, -1, -1):
+                msg = dialogue_list[i]
+                if isinstance(msg, dict) and msg.get('question_form') \
+                        and not msg['question_form'].get('submitted'):
+                    dialogue_list[i] = {
+                        **msg,
+                        'question_form': {
+                            **msg['question_form'],
+                            'submitted': True,
+                            'answers': cl_answers,
+                        }
+                    }
+                    break
+            answer_text = '；'.join(f'{q}: {a}' for q, a in cl_answers.items() if a)
+            user_entry['content'] = answer_text or '已确认'
+            user_entry['question_form'] = {
+                'questions': cl_questions,
+                'submitted': True,
+                'answers': cl_answers,
+            }
+        dialogue_list.append(user_entry)
         requirement.dialogue_history = dialogue_list
         flag_modified(requirement, 'dialogue_history')  # 确保 JSON 列变更被检测到
         requirement.status = 'processing'
@@ -741,6 +769,7 @@ def clarify_requirement(req_id):
             return jsonify({'error': '需求不存在'}), 404
 
         # 拼接答案到原需求
+        is_skip = '_skip' in answers
         answer_text = '；'.join(f'{q}: {a}' for q, a in answers.items())
         original_content = req_record.content
         req_record.content = f'{original_content}\n\n[用户补充说明]\n{answer_text}'
@@ -750,25 +779,39 @@ def clarify_requirement(req_id):
         from sqlalchemy.orm.attributes import flag_modified
         dialogue_list = list(req_record.dialogue_history or [])
 
-        # 标记已有的 question_form 消息为"已提交"（防止前端刷新后恢复成未提交状态）
+        # 标记待提交的 question_form 消息为"已提交"（防止前端刷新后恢复成未提交状态）
+        questions = []
+        display_answers = answers
         for i, msg in enumerate(dialogue_list):
-            if isinstance(msg, dict) and msg.get('question_form'):
+            if isinstance(msg, dict) and msg.get('question_form') \
+                    and not msg['question_form'].get('submitted'):
+                questions = msg['question_form'].get('questions', [])
+                if is_skip:
+                    display_answers = {
+                        q.get('id'): '（使用默认方案）' for q in questions
+                    }
                 dialogue_list[i] = {
                     **msg,
                     'question_form': {
                         **msg['question_form'],
                         'submitted': True,
-                        'answers': answers,
+                        'answers': display_answers,
                     }
                 }
                 break
 
+        # 已完成的补充信息作为结构化 user 消息持久化（前端按已提交卡片样式渲染）
         dialogue_list.append({
             'role': 'user',
             'name': '用户',
             'content': answer_text,
             'timestamp': get_current_timestamp(),
             'preserve': True,
+            'question_form': {
+                'questions': questions,
+                'submitted': True,
+                'answers': display_answers,
+            },
         })
         req_record.dialogue_history = dialogue_list
         flag_modified(req_record, 'dialogue_history')
@@ -817,6 +860,39 @@ def confirm_plan(req_id):
 
         if req_record.status != 'planning':
             return jsonify({'error': f'需求状态为 {req_record.status}，无需确认'}), 400
+
+        # 直接确认（无反馈）时，把确认动作作为结构化 user 消息持久化（前端按已确认卡片样式渲染）
+        # 有反馈时会重新走 TL 分析，不落确认卡片（由 plan_feedback 消息记录）
+        if not feedback:
+            from sqlalchemy.orm.attributes import flag_modified
+            plan_data = {}
+            plan_insert_idx = -1
+            dialogue_list = list(req_record.dialogue_history or [])
+            for i, msg in enumerate(dialogue_list):
+                if isinstance(msg, dict) and msg.get('plan'):
+                    plan_data = msg['plan']
+                    plan_insert_idx = i  # 确认卡片应在此 TL plan 消息之前
+                    break
+            confirm_card = {
+                'role': 'user',
+                'name': '用户',
+                'content': '已确认开发计划，开始编码',
+                'timestamp': get_current_timestamp(),
+                'preserve': True,
+                'plan_confirmed': {
+                    'features': plan_data.get('features', []),
+                    'tech_stack': plan_data.get('tech_stack', {}),
+                    'file_structure': plan_data.get('file_structure', []),
+                    'complexity': plan_data.get('complexity', 'S'),
+                },
+            }
+            if plan_insert_idx >= 0:
+                dialogue_list.insert(plan_insert_idx, confirm_card)
+            else:
+                dialogue_list.append(confirm_card)
+            req_record.dialogue_history = dialogue_list
+            flag_modified(req_record, 'dialogue_history')
+            db.commit()
 
         db.close()
 

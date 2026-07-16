@@ -30,11 +30,12 @@ class ToolResult:
     """工具执行结果"""
     content: str = ""
     error: str = ""
+    blocked: bool = False  # PRE_TOOL_USE 硬约束阻断（不算成功也不算失败，LLM 视为信息提示）
     metadata: dict = None
 
     @property
     def success(self) -> bool:
-        return not self.error
+        return not self.error and not self.blocked
 
     def __post_init__(self):
         if self.metadata is None:

@@ -209,6 +209,7 @@ export interface SSEIterationBatchTool {
   name: string
   readable: string
   success: boolean
+  blocked?: boolean
   arguments?: Record<string, unknown>
 }
 

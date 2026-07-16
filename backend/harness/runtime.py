@@ -201,6 +201,7 @@ class ToolCallLoop:
                     arguments=tc.arguments,
                     display_label=display_readable,
                     success=result.success,
+                    blocked=result.blocked,
                 ))
 
                 # 实时推送 code 事件（代码面板需要实时更新）
@@ -222,7 +223,8 @@ class ToolCallLoop:
                         }])
 
                 # 工具结果摘要（超大文件智能截断，保留首尾关键内容）
-                tool_summary = result.content if result.success else result.error
+                # blocked 的工具 content 为阻断原因，success=False 但不应取 error（为空）
+                tool_summary = result.content if (result.success or result.blocked) else result.error
                 is_chat = state.get("metadata", {}).get("is_chat", False)
                 if tc.name == "read_file":
                     # read_file: 保留完整内容，只对超大文件做首尾保留
@@ -423,6 +425,8 @@ class ToolCallLoop:
 
     def _tool_display_label(self, tool_name: str, arguments: dict, result) -> str:
         """生成前端展示用的简短工具标签（不暴露大段文件内容）"""
+        if result.blocked:
+            return f"⛔ 已跳过 {tool_name}: {result.content[:60]}…" if len(result.content) > 60 else f"⛔ 已跳过 {tool_name}: {result.content}"
         filename = arguments.get("filename", "")
         if tool_name == "read_file":
             lines = result.content.count('\n') + 1 if result.success and result.content else 0
@@ -467,11 +471,19 @@ class ToolCallLoop:
             )
             pre_failures = self.hooks.trigger(HookPoint.PRE_TOOL_USE, ctx)
             if pre_failures:
-                # 将阻断信息注入 LLM 上下文，并返回错误结果阻断工具执行
+                # 将阻断信息注入 LLM 上下文（下一轮 system prompt 会注入），
+                # 返回 success=True + content=阻断原因：
+                # - LLM 视之为"工具返回的信息"而非"工具失败"，不会尝试重试同一工具
+                # - 同时注入一条隐藏 system 消息，供下一轮 LLM 调用时显式提示
                 failure_msg = "\n".join(pre_failures)
                 state.setdefault("_recent_hook_failures", []).append(failure_msg)
-                logger.info(f"[ToolLoop] PRE_TOOL_USE 阻断: {failure_msg[:200]}")
-                return ToolResult(success=False, error=failure_msg)
+                state["dialogue_history"].append({
+                    "role": "system", "name": "System",
+                    "content": f"[约束提醒] {failure_msg}",
+                    "hidden": True,
+                })
+                logger.info(f"[ToolLoop] PRE_TOOL_USE 跳过（非失败）: {failure_msg[:200]}")
+                return ToolResult(content=failure_msg, blocked=True)
 
         # 分发到对应处理器：优先通过注册表获取 ToolHandler 实例
         handler = None

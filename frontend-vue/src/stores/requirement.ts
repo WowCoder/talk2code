@@ -83,18 +83,13 @@ export const useRequirementStore = defineStore('requirement', () => {
     if (data.requirement.dialogue_history?.length) {
       dialogueMessages.value = data.requirement.dialogue_history
 
-      // 恢复 question_form：仅当 pending 状态且表单未被提交过
+      // 恢复 question_form：仅当 pending 状态且存在未提交的表单
+      // （已提交的表单以带 question_form.submitted 的 user 消息形式在消息流中渲染）
       if (data.requirement.status === 'pending') {
         for (const msg of data.requirement.dialogue_history) {
-          if ((msg as any).question_form) {
-            const qf = (msg as any).question_form
-            // 如果后端已标记 submitted，说明用户已经提交过，不再恢复可编辑表单
-            if (!qf.submitted) {
-              questionForm.value = qf
-            } else {
-              // 已提交：仅保留一份只读展示（answers 已在后端注入）
-              questionForm.value = { ...qf, submitted: true }
-            }
+          const qf = (msg as any).question_form
+          if (qf && !qf.submitted) {
+            questionForm.value = qf
             break
           }
         }
@@ -185,7 +180,10 @@ export const useRequirementStore = defineStore('requirement', () => {
     })
   }
 
-  async function sendChatMessage(message: string) {
+  async function sendChatMessage(
+    message: string,
+    clarify?: { questions: SSEQuestionFormData['questions']; answers: Record<string, string> }
+  ) {
     if (!currentRequirement.value) return null
     const data = await api<{
       needs_clarification?: boolean
@@ -195,7 +193,7 @@ export const useRequirementStore = defineStore('requirement', () => {
       updated_files?: string[]
     }>(`/api/requirements/${currentRequirement.value.id}/chat`, {
       method: 'POST',
-      body: JSON.stringify({ message }),
+      body: JSON.stringify(clarify ? { message, clarify } : { message }),
     })
 
     // 如果后端返回澄清需求，只更新对话历史，不更新代码文件
@@ -252,33 +250,6 @@ export const useRequirementStore = defineStore('requirement', () => {
     await api(`/api/requirements/${id}`, { method: 'DELETE' })
   }
 
-  async function sendChatClarification(answers: Record<string, string>) {
-    /** 将澄清答案拼接到原始消息后，重新发送 chat 请求 */
-    if (!pendingChatClarification.value || !currentRequirement.value) return
-
-    const { originalMessage } = pendingChatClarification.value
-    pendingChatClarification.value = null
-    questionForm.value = null
-
-    // 拼接答案
-    const answerText = Object.entries(answers)
-      .filter(([, v]) => v)
-      .map(([q, a]) => `${q}: ${a}`)
-      .join('；')
-
-    const enrichedMessage = `[用户补充说明]\n${answerText}\n\n原始修改意见：${originalMessage}`
-
-    // 将用户答案作为对话消息展示
-    addDialogueMessage({
-      role: 'user',
-      name: '用户',
-      content: answerText || '已确认',
-    })
-
-    // 重新发送
-    return sendChatMessage(enrichedMessage)
-  }
-
   async function confirmPlan(feedback: string = ''): Promise<void> {
     if (!currentRequirement.value) return
     await api(`/api/requirements/${currentRequirement.value.id}/confirm`, {
@@ -333,7 +304,6 @@ export const useRequirementStore = defineStore('requirement', () => {
     setActiveFile,
     saveCodeFile,
     sendChatMessage,
-    sendChatClarification,
     submitClarification,
     trashRequirement,
     restoreRequirement,

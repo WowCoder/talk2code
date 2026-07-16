@@ -59,6 +59,13 @@ def block_unnecessary_read(ctx: HookContext) -> str | None:
 
     write_round = recent_writes[filename]
     current_round = state.get("tool_call_count", 0)
+
+    # 如果 write_round > current_round，说明 tool_call_count 已跨节点重置
+    # （例如修复循环回到 coder 节点），此时应清理过期记录并放行读取
+    if write_round > current_round:
+        del recent_writes[filename]
+        return None
+
     rounds_since_write = current_round - write_round
 
     if rounds_since_write <= READ_BLOCK_WINDOW:

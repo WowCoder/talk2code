@@ -138,6 +138,15 @@ def _is_vague_requirement(text: str) -> bool:
     return not (has_action and has_feature)
 
 
+# 澄清问题兜底（LLM 生成失败时使用），结构与 QuestionForm.vue 对齐
+FALLBACK_CLARIFY_QUESTIONS = [
+    {"id": "q1", "type": "text", "label": "请更具体地描述你的需求"},
+    {"id": "visual_style", "type": "radio",
+     "label": "你偏好哪种视觉风格？",
+     "options": ["极简白", "暖柔风格", "暗黑科技", "活泼多彩", "无偏好"]},
+]
+
+
 def _generate_clarify_questions(client, requirement: str) -> list:
     """生成澄清问题----LLM 根据已有信息自主判断还缺什么
 
@@ -264,7 +273,9 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
     requirement = state['requirement_content']
 
     # ---- 输入质量门禁：过短的需求不应直接编造 plan，转为追问澄清 ----
-    MIN_REQUIREMENT_CHARS = 20
+    # 阈值设为 8 字符：低于此值可能是无意义的短输入（如"帮我"、"一个"等），
+    # 而"贪吃蛇游戏"、"Todo App"、"计算器"等经典明确需求可达 8+ 字符
+    MIN_REQUIREMENT_CHARS = 8
     if len(requirement.strip()) < MIN_REQUIREMENT_CHARS:
         logger.info(
             f"[TeamLeader] 输入过短 ({len(requirement)} 字符)，"
@@ -272,50 +283,32 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
         )
         try:
             client = get_client()
-            # 同时生成澄清问题交给上游处理
-            clarify_system = load_prompt("coding/tl_analysis.md")
-            clarify_prompt = (
-                f"用户输入非常简短（仅 {len(requirement)} 字符）: \"{requirement}\"。\n"
-                f"请根据这个简短输入，生成 2-3 个具体的追问，"
-                f"让用户补充功能细节。每个问题提供 2-4 个单选选项。\n"
-                f"输出格式：{{\"questions\": [{{\"question\": \"...\", \"options\": [\"...\"]}}]}}"
-            )
-            response = client.chat(
-                prompt=clarify_prompt, system_prompt=clarify_system,
-                use_memory=False, max_tokens=1000, timeout=30
-            )
-            if not response.is_error and response.content:
-                try:
-                    import json as _json
-                    clarify_data = _json.loads(
-                        re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', response.content)
-                    )
-                except Exception:
-                    match = re.search(r'\{.*\}', response.content, re.DOTALL)
-                    clarify_data = _json.loads(match.group()) if match else {}
-            else:
-                clarify_data = {}
+            questions = _generate_clarify_questions(client, requirement)
         except Exception as e:
             logger.warning(f"[TeamLeader] 生成澄清问题失败: {e}")
-            clarify_data = {}
+            questions = []
+        if not questions:
+            questions = FALLBACK_CLARIFY_QUESTIONS
 
+        # question_form 同时写入对话消息（前端刷新恢复）和 metadata（SSE 即时推送）
+        question_form = {'questions': questions}
         return {
             'plan': {},
             'current_step': 'needs_clarification',
-            'clarify_questions': clarify_data.get('questions', []),
             'dialogue_history': [{
                 'role': 'agent', 'name': 'Leon（负责人）',
                 'content': (
                     f"你的需求「{requirement}」比较简短。"
                     f"为了生成更准确的开发计划，请补充以下信息："
                 ),
-                'status': 'pending_clarify',
-                'clarify_questions': clarify_data.get('questions', []),
+                'status': 'needs_clarification',
+                'question_form': question_form,
             }],
             'metadata': {
                 **state.get('metadata', {}),
                 'team_leader_success': False,
                 'needs_clarification_reason': 'input_too_short',
+                'question_form': question_form,
             },
         }
 
@@ -1437,7 +1430,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
         # 如果有 findings，保存到 state 供 repair 使用
         if findings:
             state.setdefault("role_outputs", {})["Evaluator"] = json.dumps(
-                result, ensure_ascii=False
+                evaluator_result, ensure_ascii=False
             )
 
         logger.info(

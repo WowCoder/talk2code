@@ -44,10 +44,15 @@ def route_after_tl(state: AgentState) -> str:
 def _get_max_repair_rounds(state: AgentState) -> int:
     """根据复杂度计算最大修复轮次
 
-    simple=0（无修复循环，直接完成），standard=1（1轮修复后仍不通过则finished_with_issues）。
+    simple=0（无修复循环），standard=2（2轮修复后仍不通过则finished_with_issues）。
+    每轮修复后 verify 会重新评估，PASS 则正常结束。
     """
     complexity = state.get("metadata", {}).get("complexity", "standard")
-    return 0 if complexity == "simple" else 1
+    rounds = {
+        "simple": 0,
+        "standard": 2,
+    }
+    return rounds.get(complexity, 2)
 
 
 def route_after_verify(state: AgentState) -> str:

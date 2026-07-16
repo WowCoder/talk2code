@@ -53,11 +53,19 @@ export interface DialogueMessage {
     name: string
     readable: string
     success: boolean
+    blocked?: boolean
     arguments?: Record<string, unknown>
   }>
   // clarification
   question_form?: SSEQuestionFormData
   status?: string
+  // plan 确认卡片（用户确认开发计划后的特殊 user 消息）
+  plan_confirmed?: {
+    features?: string[]
+    tech_stack?: { css?: string; storage?: string; framework?: string }
+    file_structure?: string[]
+    complexity?: string
+  }
   // hidden: 内部系统提示，不展示在前端
   hidden?: boolean
   // grouped tool_calls (virtual message, 前端旧版兼容)

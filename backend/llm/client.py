@@ -15,7 +15,7 @@ from datetime import datetime
 
 import requests
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
-from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_PROVIDER
+from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_PROVIDER, settings
 
 # 注意：llm.client 是底层模块，不能在模块顶层 import harness（harness 依赖 llm.client，
 # 会形成循环导入）。日志用标准 logging，harness 的日志系统会在应用启动时统一配置 root logger。
@@ -258,19 +258,19 @@ class LLMClient:
         base_url: Optional[str] = None,
         model: Optional[str] = None,
         provider: Optional[str] = None,
-        temperature: float = 0.7,
-        max_tokens: int = 4000,
-        timeout: int = 60,
-        max_retries: int = 2
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        timeout: Optional[int] = None,
+        max_retries: Optional[int] = None
     ):
         self.api_key = api_key or LLM_API_KEY
         self.base_url = base_url or LLM_BASE_URL
         self.model = model or LLM_MODEL
         self.provider = provider or LLM_PROVIDER
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-        self.timeout = timeout
-        self.max_retries = max_retries
+        self.temperature = temperature if temperature is not None else settings.LLM_TEMPERATURE
+        self.max_tokens = max_tokens if max_tokens is not None else settings.LLM_MAX_TOKENS
+        self.timeout = timeout if timeout is not None else settings.LLM_TIMEOUT
+        self.max_retries = max_retries if max_retries is not None else settings.LLM_MAX_RETRIES
 
         # 会话记忆
         self._messages: List[Message] = []
@@ -369,7 +369,12 @@ class LLMClient:
                                 try:
                                     chunk = json.loads(content)
                                     delta = chunk.get('choices', [{}])[0].get('delta', {})
-                                    content_text = delta.get('content', '') or delta.get('reasoning_content', '')
+                                    content_text = delta.get('content', '')
+                                    # 注意：不 fallback 到 reasoning_content。
+                                    # reasoning_content 是模型的内部思考链，不是最终回复。
+                                    # reasoning 模型（如 DeepSeek-R1、agnes-2.0-flash）会同时
+                                    # 流式输出 reasoning_content 和 content 两个 delta，
+                                    # 我们只需要最终的 content。
                                     if content_text:
                                         yield content_text
                                 except json.JSONDecodeError:
@@ -387,7 +392,30 @@ class LLMClient:
                     result = response.json()
                     _log_llm_response(call_id, response.status_code, result, (time.time() - t0) * 1000)
                     msg = result.get('choices', [{}])[0].get('message', {})
-                    content = msg.get('content', '') or msg.get('reasoning_content', '')
+                    content = msg.get('content', '')
+                    reasoning = msg.get('reasoning_content', '')
+                    # 如果 content 为空但有 reasoning_content，说明 max_tokens 不足，
+                    # 所有 token 被 reasoning 消耗。此时以默认 max_tokens 重试一次。
+                    if not content and reasoning:
+                        req_tokens = data.get('max_tokens', 0)
+                        fallback_tokens = self.max_tokens  # 默认 8000
+                        logger.warning(
+                            f"[LLM] 检测到 reasoning 模型 token 耗尽 "
+                            f"(reasoning={len(reasoning)} chars, content为空, "
+                            f"req_max_tokens={req_tokens})，"
+                            f"以默认 max_tokens={fallback_tokens} 重试"
+                        )
+                        retry_data = dict(data)
+                        retry_data['max_tokens'] = fallback_tokens
+                        retry_response = requests.post(
+                            url, headers=headers, json=retry_data,
+                            timeout=self.timeout
+                        )
+                        retry_response.raise_for_status()
+                        retry_result = retry_response.json()
+                        retry_msg = retry_result.get('choices', [{}])[0].get('message', {})
+                        content = retry_msg.get('content', '')
+                        # 重试后仍然为空则放弃，让上层错误处理
                     yield content
                 return
 
@@ -699,8 +727,34 @@ class LLMClient:
         reasoning_content = msg.get('reasoning_content', '') or None
         usage_data = result.get('usage')
 
-        # 解析 tool_calls
+        # 如果 content 和 tool_calls 都为空但有 reasoning_content，
+        # 说明 max_tokens 不足，所有 token 被 reasoning 消耗。
+        # 此时以默认 max_tokens 重试一次。
         raw_tool_calls = msg.get('tool_calls', [])
+        if not content and not raw_tool_calls and reasoning_content:
+            req_tokens = data.get('max_tokens', 0)
+            fallback_tokens = self.max_tokens
+            logger.warning(
+                f"[LLM] 检测到 reasoning 模型 token 耗尽 "
+                f"(reasoning={len(reasoning_content)} chars, content/tool_calls为空, "
+                f"req_max_tokens={req_tokens})，"
+                f"以默认 max_tokens={fallback_tokens} 重试"
+            )
+            retry_data = dict(data)
+            retry_data['max_tokens'] = fallback_tokens
+            retry_response = requests.post(
+                url, headers=headers, json=retry_data,
+                timeout=self.timeout
+            )
+            retry_response.raise_for_status()
+            retry_result = retry_response.json()
+            retry_choice = retry_result.get('choices', [{}])[0]
+            retry_msg = retry_choice.get('message', {})
+            content = retry_msg.get('content', '') or ''
+            reasoning_content = retry_msg.get('reasoning_content', '') or None
+            usage_data = retry_result.get('usage')
+            raw_tool_calls = retry_msg.get('tool_calls', [])
+            # 重试后仍然为空则放弃，让上层错误处理
         tool_calls = []
         for tc in raw_tool_calls:
             fn = tc.get('function', {})
@@ -820,8 +874,8 @@ def clear_client_memory(instance_id: str = "default"):
 def chat_with_llm(
     prompt: str,
     system_prompt: Optional[str] = None,
-    max_tokens: int = 4000,
-    timeout: int = 60
+    max_tokens: Optional[int] = None,
+    timeout: Optional[int] = None
 ) -> str:
     """
     简单聊天接口（非流式）

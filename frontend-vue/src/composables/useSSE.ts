@@ -64,6 +64,12 @@ export function useSSE(reqId: Ref<number | null>) {
 
     es.addEventListener('question-form', (e: MessageEvent) => {
       const data: SSEQuestionFormData = JSON.parse(e.data)
+      // 已提交的表单不再弹出浮动编辑框（消息流中已有已提交卡片）
+      if (data.submitted) return
+      // SSE 消息缓冲区回放防御：如果对话中已有已提交表单，忽略回放的旧事件
+      if (store.dialogueMessages.some((m: any) => m.question_form?.submitted === true)) return
+      // 避免重复设置（loadRequirement 已恢复时跳过）
+      if (store.questionForm) return
       store.addDialogueMessage({
         role: 'system',
         name: 'System',
@@ -192,6 +198,9 @@ export function useSSE(reqId: Ref<number | null>) {
     es.addEventListener('spec', (e: MessageEvent) => {
       const data: SSESpecData = JSON.parse(e.data)
       ;(store as any)._specData = data
+      // 记录 TL 分析消息的插入位置（spec 事件到达时，TL 消息已通过 dialogue 事件
+      // 追加到消息列表末尾，确认卡片应插入到它前面）
+      ;(store as any)._specInsertIndex = store.dialogueMessages.length
       // 如果已经确认过，不要覆盖为 needs_confirmation（刷新页面 SSE 重连时可能重放）
       if (store.planStatus !== 'confirmed') {
         store.planStatus = 'needs_confirmation'

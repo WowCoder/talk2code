@@ -13,9 +13,9 @@
         @confirmed="onPlanConfirmed"
       />
 
-      <!-- Dynamic components from SSE -->
+      <!-- Dynamic components from SSE（仅未提交的表单浮动展示；已提交的以消息形式在上方消息流中渲染） -->
       <QuestionForm
-        v-if="questionForm && !showPlanConfirmation"
+        v-if="questionForm && !questionForm.submitted && !showPlanConfirmation"
         :form-data="questionForm"
         :mode="questionFormMode"
         @submitted="onQuestionSubmitted"
@@ -52,7 +52,11 @@ import type { DialogueMessage as DialogueMessageType } from '@/types/api'
 import type { SSEQuestionFormData, SSETraceSummaryData } from '@/types/sse'
 
 const emit = defineEmits<{
-  (e: 'send-message', message: string): void
+  (
+    e: 'send-message',
+    message: string,
+    clarify?: { questions: SSEQuestionFormData['questions']; answers: Record<string, string> }
+  ): void
   (e: 'stop'): void
 }>()
 
@@ -122,9 +126,26 @@ const traceSummary = computed(() => store._traceSummary as SSETraceSummaryData |
 // Plan confirmation
 const showPlanConfirmation = computed(() => store.planStatus === 'needs_confirmation')
 const specData = computed(() => (store as any)._specData as any)
-function onPlanConfirmed(_feedback: string) {
-  // Plan 已确认，卡片会自动切换到 confirmed 状态
-  // SSE 会继续推送后续的编码对话
+function onPlanConfirmed(feedback: string) {
+  // 有反馈时会重新走 TL 分析，不落确认卡片
+  if (feedback) return
+  // 直接确认：将 plan_confirmed 卡片插入到 TL plan 消息之前（后端已持久化同样一条）
+  const spec = specData.value
+  const card: any = {
+    role: 'user',
+    name: '用户',
+    content: '已确认开发计划，开始编码',
+    plan_confirmed: {
+      features: spec?.features || [],
+      tech_stack: spec?.tech_stack || {},
+      file_structure: spec?.file_structure || [],
+      complexity: spec?.complexity || 'S',
+    },
+  }
+  // 确认卡片应插入到 TL 分析消息之前（spec 事件到达时记录的索引，
+  // 避免搜索 plan 字段——SSE dialogue 事件不携带结构化字段）
+  const insertAt = (store as any)._specInsertIndex ?? store.dialogueMessages.length
+  store.dialogueMessages.splice(insertAt, 0, card)
 }
 
 async function onQuestionSubmitted(answers?: Record<string, string>) {
@@ -137,7 +158,8 @@ async function onQuestionSubmitted(answers?: Record<string, string>) {
       store.questionForm = null
       emit('send-message', originalMessage)
     } else {
-      // 拼接答案到原始消息
+      // 拼接答案到原始消息（LLM 上下文用完整消息，展示用已提交卡片）
+      const questions = store.questionForm?.questions || []
       const answerText = Object.entries(answers)
         .filter(([, v]) => v)
         .map(([q, a]) => `${q}: ${a}`)
@@ -148,18 +170,18 @@ async function onQuestionSubmitted(answers?: Record<string, string>) {
       store.pendingChatClarification = null
       store.questionForm = null
 
-      // 将答案作为对话消息展示
+      // 已完成表单作为特殊 user 消息进入消息流（后端持久化同样一条）
       store.addDialogueMessage({
         role: 'user',
         name: '用户',
         content: answerText || '已确认',
+        question_form: { questions, submitted: true, answers: { ...answers } },
       })
 
-      emit('send-message', enrichedMessage)
+      emit('send-message', enrichedMessage, { questions, answers: { ...answers } })
     }
   } else {
-    // 新需求 SOP 模式：QuestionForm 内部已调用 /clarify + 保留为已提交卡片
-    // 不做任何清除，让 QuestionForm 展示 submitted 状态
+    // 新需求 SOP 模式：QuestionForm 内部已调用 /clarify 并把已完成表单落成消息流卡片
   }
 }
 

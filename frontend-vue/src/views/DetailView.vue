@@ -168,9 +168,12 @@ watch(reqId, (newId, oldId) => {
 })
 
 // Chat send handler
-async function onSendMessage(message: string) {
+async function onSendMessage(
+  message: string,
+  clarify?: { questions: any[]; answers: Record<string, string> }
+) {
   // 消息以 [用户补充说明] 开头说明是澄清后的合成消息，
-  // 不重复添加到对话（store.sendChatMessage 会用服务端响应替换）
+  // 已提交卡片由 DialoguePanel 落入消息流，不重复添加纯文本消息
   const isClarifyFollowUp = message.startsWith('[用户补充说明]')
 
   if (!isClarifyFollowUp) {
@@ -187,7 +190,7 @@ async function onSendMessage(message: string) {
   connect()
 
   try {
-    const result = await store.sendChatMessage(message)
+    const result = await store.sendChatMessage(message, clarify)
     if (result?.needs_clarification) {
       // 修改意见模糊，暂停执行等待用户补充信息
       store.pendingChatClarification = { originalMessage: message }
