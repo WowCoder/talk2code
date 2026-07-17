@@ -3,6 +3,7 @@
     <div class="login-card">
       <!-- Brand -->
       <div class="brand">
+        <img src="@/assets/logo.png" alt="Talk2Code" class="brand-logo" />
         <h1 class="brand-title">
           Talk<span>2</span>Code
         </h1>
@@ -92,6 +93,13 @@ function onRegisterSuccess() {
 .brand {
   text-align: center;
   margin-bottom: 24px;
+}
+
+.brand-logo {
+  width: 64px;
+  height: 64px;
+  border-radius: 12px;
+  margin-bottom: 16px;
 }
 
 .brand-title {

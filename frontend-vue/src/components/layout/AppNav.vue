@@ -12,7 +12,7 @@
       </template>
       <template v-else>
         <router-link to="/" class="nav-brand">
-          Talk<span>2</span>Code
+          <img src="@/assets/logo.png" alt="Talk2Code" class="nav-logo" /><span class="brand-text">Talk<span>2</span>Code</span>
         </router-link>
         <div class="nav-links">
           <router-link to="/history" class="nav-link" active-class="active">
@@ -131,10 +131,22 @@ function handleLogout() {
   font-size: 22px;
   font-weight: 700;
   color: var(--fg);
-  letter-spacing: -0.01em;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
-.nav-brand span {
+.brand-text {
+  letter-spacing: -0.04em;
+}
+
+.nav-logo {
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+}
+
+.brand-text span {
   color: var(--accent);
 }
 
