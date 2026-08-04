@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from models import SessionLocal, AgentMemoryV2
-from harness.state.memory_retriever import BGEM3Retriever
+from harness.state.memory_retriever import create_retriever
 from harness.observability.logger import get_logger
 
 logger = get_logger(__name__)
@@ -116,7 +116,7 @@ class MemoryManager:
                         不提供时退化为纯检索模式（无 LLM 反思和校验）。
         """
         self._llm = llm_client
-        self._retriever = BGEM3Retriever()
+        self._retriever = create_retriever()
         self._lock = threading.Lock()
         self._new_since_consolidate = 0
 
@@ -145,8 +145,8 @@ class MemoryManager:
             if not memories:
                 return system_prompt
 
-            # L1: BGE-M3 混合检索
-            self._retriever.index([m.to_text() for m in memories])
+            # L1: 混合检索（BGE-M3 或 pgvector）
+            self._index_memories(memories)
             results = self._retriever.search(requirement, top_k=5)
             if not results:
                 return system_prompt
@@ -246,12 +246,29 @@ class MemoryManager:
 
     # ==================== 内部方法 ====================
 
+    def _index_memories(self, memories: list[Memory]):
+        """构建检索索引，兼容 PGVectorRetriever 和 BGEM3Retriever
+
+        PGVectorRetriever 需要 memory_ids 来:
+        1. 增量 upsert 向量到 pgvector（只编码新文档）
+        2. search 时将 pgvector 结果映射回 doc_index
+
+        BGEM3Retriever 只需要 documents（忽略 memory_ids 参数）
+        """
+        documents = [m.to_text() for m in memories]
+        memory_ids = [m.id for m in memories if m.id is not None]
+        try:
+            self._retriever.index(documents, memory_ids=memory_ids)
+        except TypeError:
+            # BGEM3Retriever.index() 不接受 memory_ids 参数
+            self._retriever.index(documents)
+
     def _rebuild_index(self):
         """启动时从数据库加载所有活跃记忆，建立检索索引"""
         try:
             memories = self._get_active_memories()
             if memories:
-                self._retriever.index([m.to_text() for m in memories])
+                self._index_memories(memories)
                 logger.info(f"[MemoryManager] 初始索引构建完成: {len(memories)} 条记忆")
             else:
                 logger.info("[MemoryManager] 记忆库为空，等待首次任务完成")
@@ -274,9 +291,11 @@ class MemoryManager:
         try:
             # 去重: 如果已有高度相似的需求，标记旧记忆为 superseded
             memories = self._get_active_memories()
+            superseded_ids = set()
             for existing in memories:
                 if self._jaccard_similarity(memory.requirement, existing.requirement) > 0.6:
                     self._mark_superseded(existing.id)
+                    superseded_ids.add(existing.id)
                     logger.debug(f"[MemoryManager] 去重: 标记记忆 {existing.id} 为 superseded")
                     break
 
@@ -299,9 +318,9 @@ class MemoryManager:
             memory.id = row.id
             db.close()
 
-            # 更新检索索引
-            active = self._get_active_memories()
-            self._retriever.index([m.to_text() for m in active])
+            # 更新检索索引（增量构建，避免二次全量查库）
+            active = [m for m in memories if m.id not in superseded_ids] + [memory]
+            self._index_memories(active)
 
         except Exception as e:
             logger.warning(f"[MemoryManager] 存储记忆失败: {e}")
@@ -416,7 +435,7 @@ class MemoryManager:
         self._new_since_consolidate = 0
         # 重建索引
         active = self._get_active_memories()
-        self._retriever.index([m.to_text() for m in active])
+        self._index_memories(active)
         logger.info(f"[MemoryManager] 维护完成: {len(active)} 条活跃记忆")
 
     def _llm_consolidate(self, memories: list[Memory]):

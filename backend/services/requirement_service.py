@@ -53,6 +53,9 @@ class RequirementService:
     _cancel_events: dict = {}
     _cancel_lock = threading.Lock()
 
+    # 已推送 SPEC 的需求 ID 集合（防止并发请求重复推送）
+    _spec_pushed_ids: set = set()
+
     @classmethod
     def get_cancel_event(cls, requirement_id: int) -> threading.Event:
         """获取或创建需求对应的取消信号"""
@@ -363,8 +366,8 @@ class RequirementService:
             # TL 完成后推送 SPEC 和任务清单到前端，暂停等待用户确认
             # 处理 team_leader_done（成功）和 team_leader_failed（失败但有部分 plan）
             tl_completed = current_step in ('team_leader_done', 'team_leader_failed')
-            if tl_completed and not getattr(self, '_spec_pushed', False):
-                self._spec_pushed = True
+            if tl_completed and requirement_id not in self.__class__._spec_pushed_ids:
+                self.__class__._spec_pushed_ids.add(requirement_id)
                 plan = final_state.get('plan') or {}
                 if isinstance(plan, dict) and plan:  # 有有效 plan 数据时才推送
                     logger.info(f"[SSE] 推送 SPEC 和 task_list for requirement {requirement_id}")
@@ -993,6 +996,12 @@ requirement_service = RequirementService()
 
 
 def process_requirement_async(requirement_id: int):
-    """异步处理需求（在线程中执行）"""
+    """异步处理需求（在 Celery worker 或线程中执行）"""
     service = RequirementService()
     return service.process_requirement(requirement_id)
+
+
+def confirm_plan_async(requirement_id: int, feedback: str = ""):
+    """异步确认 Plan 并继续编码（在 Celery worker 或线程中执行）"""
+    service = RequirementService()
+    return service.confirm_plan(requirement_id, feedback)

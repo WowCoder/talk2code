@@ -1,32 +1,41 @@
 <template>
   <form class="register-form" @submit.prevent="handleSubmit">
     <div class="form-group">
+      <label for="reg-username" class="sr-only">用户名</label>
       <input
+        id="reg-username"
         v-model="username"
         type="text"
         class="input-field"
         placeholder="用户名（至少3位）"
         required
         minlength="3"
+        aria-label="用户名"
       />
     </div>
     <div class="form-group">
+      <label for="reg-password" class="sr-only">密码</label>
       <input
+        id="reg-password"
         v-model="password"
         type="password"
         class="input-field"
         placeholder="密码（至少6位）"
         required
         minlength="6"
+        aria-label="密码"
       />
     </div>
     <div class="form-group">
+      <label for="reg-confirm" class="sr-only">确认密码</label>
       <input
+        id="reg-confirm"
         v-model="confirmPassword"
         type="password"
         class="input-field"
         placeholder="确认密码"
         required
+        aria-label="确认密码"
       />
     </div>
     <div v-if="errorMsg" class="form-error">{{ errorMsg }}</div>

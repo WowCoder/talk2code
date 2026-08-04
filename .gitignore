@@ -40,3 +40,9 @@ ENV/
 # 日志
 *.log
 logs/
+
+# 临时文档或者文件
+tmp/
+
+# 用户工作区（运行时生成的代码产物）
+backend/workspaces/

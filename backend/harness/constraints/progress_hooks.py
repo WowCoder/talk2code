@@ -15,7 +15,9 @@ from harness.observability.logger import get_logger
 logger = get_logger(__name__)
 
 # 写入后禁止回读的轮次数（可配置）
-READ_BLOCK_WINDOW = 2
+# 从 2 降低到 1：允许 Agent 在下一轮回读验证写入内容，
+# 避免"盲写"导致连续 edit_file 失败后只能重写整个文件。
+READ_BLOCK_WINDOW = 1
 
 
 def _get_contract(ctx: HookContext):

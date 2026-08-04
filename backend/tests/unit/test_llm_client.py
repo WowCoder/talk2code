@@ -312,11 +312,31 @@ class TestLLMClientRetry:
     @patch('llm.client.requests.post')
     @patch('llm.client.time.sleep')
     def test_max_retries_exceeded(self, mock_sleep, mock_post):
-        """测试超过最大重试次数"""
+        """测试超过最大重试次数（无备份模型时）"""
         mock_post.side_effect = Exception("Always fails")
 
         client = LLMClient(api_key='test_key', max_retries=2)
+        client._has_backup = False  # 禁用备份，只测试主模型重试逻辑
         response = client.chat('Test', use_memory=False)
 
         assert mock_post.call_count == 3  # 1 + 2 retries
         assert response.is_error is True
+
+    @patch('llm.client.requests.post')
+    @patch('llm.client.time.sleep')
+    def test_failover_to_backup_on_primary_failure(self, mock_sleep, mock_post):
+        """测试主模型失败后自动切换到备用模型"""
+        mock_post.side_effect = Exception("Always fails")
+
+        client = LLMClient(api_key='test_key', max_retries=1)
+        # 手动配置备份模型参数
+        client._has_backup = True
+        client.backup_base_url = 'https://backup.api.com/v1'
+        client.backup_model = 'backup-model'
+        client.backup_api_key = 'backup-key'
+        client.backup_provider = 'openai_compatible'
+        response = client.chat('Test', use_memory=False)
+
+        # 主模型 2 次 + 备份模型 2 次 = 4 次
+        assert mock_post.call_count == 4
+        assert response.is_error is True  # 备模型也失败了

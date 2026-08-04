@@ -5,6 +5,7 @@ GitVersioning —— 每次代码变更自动 commit，支持 diff 和回滚
 """
 
 import subprocess
+from pathlib import Path
 from harness.state.workspace import WorkspaceFS
 
 
@@ -13,9 +14,17 @@ class GitVersioning:
 
     def __init__(self, workspace: WorkspaceFS):
         self.workspace = workspace
+        self._ensure_initialized()
+
+    def _ensure_initialized(self):
+        """确保 git 仓库已初始化（幂等操作）"""
+        git_dir = Path(self.workspace.path) / ".git"
+        if git_dir.exists():
+            return
+        self.init()
 
     def init(self):
-        """初始化 git 仓库"""
+        """初始化 git 仓库（公开方法，允许显式重新初始化）"""
         subprocess.run(
             ["git", "init"],
             cwd=self.workspace.path, capture_output=True

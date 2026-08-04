@@ -21,5 +21,16 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     assetsDir: 'assets',
+    target: 'es2020',
+    rollupOptions: {
+      output: {
+        manualChunks(id: string) {
+          // Split CodeMirror into a separate chunk for better caching
+          if (id.includes('codemirror') || id.includes('@codemirror')) {
+            return 'codemirror'
+          }
+        },
+      },
+    },
   },
 })

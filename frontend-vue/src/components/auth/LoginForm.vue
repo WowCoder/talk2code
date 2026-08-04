@@ -1,23 +1,29 @@
 <template>
   <form class="login-form" @submit.prevent="handleSubmit">
     <div class="form-group">
+      <label for="login-username" class="sr-only">用户名</label>
       <input
+        id="login-username"
         v-model="username"
         type="text"
         class="input-field"
         placeholder="用户名"
         required
         autocomplete="username"
+        aria-label="用户名"
       />
     </div>
     <div class="form-group">
+      <label for="login-password" class="sr-only">密码</label>
       <input
+        id="login-password"
         v-model="password"
         type="password"
         class="input-field"
         placeholder="密码"
         required
         autocomplete="current-password"
+        aria-label="密码"
       />
     </div>
     <div v-if="errorMsg" class="form-error">{{ errorMsg }}</div>

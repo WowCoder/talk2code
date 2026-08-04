@@ -3,50 +3,30 @@
 ## 输出格式
 返回 JSON，包含以下字段：
 
-### 基础分析
-- features: 核心功能列表 (string[])
+### 基础分析（必填）
+- features: 核心功能列表 (string[]) — 控制在 3-5 项，每项不超过 15 字
 - complexity: 复杂度评级 "simple"|"standard"
-  - simple: 单个 HTML 页面，纯展示或极简交互（个人主页、计数器、静态信息页）。无需 tasks/interfaces。
-  - standard: 多文件应用，有交互功能或多视图（待办清单、游戏、看板、仪表盘等）。需 tasks/interfaces/acceptance_criteria。
 - tech_stack: 技术选型 {"css": "tailwind/native", "storage": "localStorage/indexedDB/none", "framework": "vanilla"}
-- data_model: 数据模型描述 (string)
 - file_structure: 推荐的文件组织结构 (string[])
-- implementation_notes: 实现注意事项 (string)
-- visual_direction: 视觉设计方向描述 (string)。例如："暗色主题游戏风格，深色背景+霓虹强调色"、"极简白底+蓝色强调"。分析需求后给出最合适的视觉方向，引导编码阶段做出好的设计决策。
-- layout_structure: 页面布局结构描述 (string)。例如："居中单列布局：标题 → 计分板 → 画布 → 操作按钮 → 提示文字"
-- key_interactions: 关键交互点列表 (string[])。例如：["方向键控制移动", "空格暂停", "游戏结束弹窗+重新开始"]
-- acceptance_criteria: [                    # 验收条件（必须可验证）
-    {"id": "AC-1", "label": "用户可添加待办事项", "how_to_verify": "输入文字点击添加，列表中出现新项"},
-    {"id": "AC-2", "label": "数据刷新后保留", "how_to_verify": "添加数据后刷新页面，数据仍然存在"}
-  ]
+- implementation_notes: 实现注意事项 (string) — 控制在 30 字以内
 
-### 任务分解（用于指导逐文件编码）
+### 任务分解（必填）
 - tasks: [                          # 文件级任务列表（按依赖顺序排列）
     {
-      "type": "code",              # 任务类型：research(信息收集) | code(编码实现) | review(代码审查)，默认 code
       "file": "js/utils.js",
-      "description": "通用工具函数：日期格式化、防抖节流、localStorage 封装",
-      "exports": ["formatDate()", "debounce()", "storage.get/set/remove()"],
+      "description": "通用工具函数",
       "dependencies": []
-    },
-    {
-      "type": "code",
-      "file": "js/app.js",
-      "description": "主应用逻辑：初始化、事件绑定、数据流转",
-      "imports": {"js/utils.js": ["storage.get", "storage.set", "formatDate"]},
-      "dependencies": ["js/utils.js"]
     }
   ]
-- interfaces: {                    # 文件间接口契约
-    "js/utils.js": {
-      "exports": {
-        "storage": {"get(key)", "set(key, value)", "remove(key)"},
-        "formatDate": "(date) => string",
-        "debounce": "(fn, delay) => function"
-      }
-    }
-  }
 - implementation_order: ["js/utils.js", "css/style.css", "js/app.js", "index.html"]
+
+### 可选字段（如有必要再填写）
+- acceptance_criteria: []           # 验收条件，标准复杂度下建议提供 2-3 条
+- interfaces: {}                    # 文件间接口契约，多文件时建议提供
+- data_model: ""                    # 数据模型描述，简短即可
+- visual_direction: ""              # 视觉设计方向，简短描述
+- layout_structure: ""              # 页面布局结构，简短描述
+- key_interactions: []              # 关键交互点，不超过 3 项
 
 ## 重要
 - 只返回 JSON，不要其他文字
@@ -54,10 +34,7 @@
 - 使用浏览器本地存储 (localStorage/IndexedDB)
 - 推荐使用 Tailwind CSS CDN
 - tasks 必须按依赖顺序排列（被依赖的文件排在前面）
-- interfaces 定义每个模块对外的 API 契约
 - implementation_order 是拓扑排序后的实施顺序
-- acceptance_criteria 每一条必须有具体的验证方法 (how_to_verify)
-- simple 复杂度可省略 tasks/interfaces/implementation_order
-- acceptance_criteria 在 standard 复杂度下必须提供，每条必须有可操作的 how_to_verify
-- **所有复杂度级别都必须填写 features、file_structure、tasks。** XS/S 复杂度可以省略 interfaces/implementation_order（单文件无跨文件契约），但不能省略 tasks 和 file_structure。
+- simple 复杂度可省略 tasks/implementation_order
+- **所有复杂度级别都必须填写 features、file_structure、tasks。**
 - 如果用户输入非常简短（<20字），在 implementation_notes 中标注不确定性，而非凭空编造细节。

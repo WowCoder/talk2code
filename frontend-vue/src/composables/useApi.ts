@@ -23,6 +23,12 @@ export function useApi() {
         window.location.href = '/login'
         throw new Error('未登录或登录已过期')
       }
+      // Handle 429 - rate limit
+      if (response.status === 429) {
+        const err = await response.json().catch(() => ({}))
+        const retryAfter = err.retry_after || '若干秒'
+        throw new Error(`操作太频繁，请${retryAfter === 'None' ? '稍后' : retryAfter + '秒后'}再试`)
+      }
       const err = await response.json().catch(() => ({ error: 'Network error' }))
       throw new Error(err.message || err.error || `HTTP ${response.status}`)
     }

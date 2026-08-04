@@ -7,7 +7,6 @@
 
 import os
 import json
-import signal
 import time
 from typing import Generator, List, Dict, Optional, Any
 from dataclasses import dataclass, field
@@ -239,6 +238,70 @@ def to_langchain_message(msg: Message) -> BaseMessage:
         return SystemMessage(content=msg.content)
 
 
+class CircuitBreakerOpenError(Exception):
+    """熔断器打开时抛出，调用方应捕获并做降级处理"""
+    pass
+
+
+class CircuitBreaker:
+    """LLM 调用熔断器
+
+    连续失败 N 次 → 熔断器打开 → 后续调用直接抛出 CircuitBreakerOpenError
+    熔断器打开后等待 M 秒 → 半开状态 → 允许 1 次探测调用
+    探测成功 → 关闭熔断器；探测失败 → 重新打开
+
+    设计原则：
+    - 快速失败优于长时间等待（fail fast > wait long）
+    - 避免在 LLM API 不可用时持续消耗系统资源（线程、SSE 连接、用户耐心）
+    - 半开状态允许自动恢复，无需人工干预
+    """
+
+    def __init__(self, threshold: int = 5, recovery_timeout: float = 30.0):
+        self.threshold = threshold
+        self.recovery_timeout = recovery_timeout
+        self._failure_count = 0
+        self._last_failure_time: float = 0.0
+        self._state = "closed"  # closed | open | half_open
+
+    @property
+    def is_open(self) -> bool:
+        if self._state == "closed":
+            return False
+        if self._state == "open":
+            # 检查是否可以进入半开状态
+            if time.time() - self._last_failure_time >= self.recovery_timeout:
+                self._state = "half_open"
+                return False
+            return True
+        # half_open: 允许通过
+        return False
+
+    def record_success(self):
+        """调用成功，重置熔断器"""
+        self._failure_count = 0
+        self._state = "closed"
+
+    def record_failure(self):
+        """调用失败，递增计数"""
+        self._failure_count += 1
+        self._last_failure_time = time.time()
+        if self._failure_count >= self.threshold:
+            self._state = "open"
+            logger.warning(
+                f"[CircuitBreaker] 连续失败 {self._failure_count} 次，熔断器打开，"
+                f"将在 {self.recovery_timeout:.0f}s 后进入半开状态"
+            )
+
+    def check(self):
+        """检查熔断器状态，打开时抛出异常"""
+        if self.is_open:
+            remaining = self.recovery_timeout - (time.time() - self._last_failure_time)
+            raise CircuitBreakerOpenError(
+                f"LLM 熔断器已打开（连续失败 {self._failure_count} 次），"
+                f"约 {remaining:.0f}s 后自动恢复"
+            )
+
+
 class LLMClient:
     """
     统一 LLM 客户端
@@ -272,6 +335,25 @@ class LLMClient:
         self.timeout = timeout if timeout is not None else settings.LLM_TIMEOUT
         self.max_retries = max_retries if max_retries is not None else settings.LLM_MAX_RETRIES
 
+        # 熔断器：防止 LLM API 不可用时持续无效重试
+        self._circuit_breaker = CircuitBreaker(
+            threshold=settings.LLM_CIRCUIT_BREAKER_THRESHOLD,
+            recovery_timeout=settings.LLM_CIRCUIT_BREAKER_TIMEOUT,
+        )
+
+        # 备份模型参数（可选）：主模型不可用时自动切换
+        self.backup_base_url = settings.LLM_BACKUP_BASE_URL or None
+        self.backup_model = settings.LLM_BACKUP_MODEL or None
+        self.backup_api_key = settings.LLM_BACKUP_API_KEY or None
+        self.backup_provider = settings.LLM_BACKUP_PROVIDER or None
+        self._has_backup = all([
+            self.backup_base_url, self.backup_model, self.backup_api_key
+        ])
+        self._backup_circuit_breaker = CircuitBreaker(
+            threshold=settings.LLM_CIRCUIT_BREAKER_THRESHOLD,
+            recovery_timeout=settings.LLM_CIRCUIT_BREAKER_TIMEOUT,
+        ) if self._has_backup else None
+
         # 会话记忆
         self._messages: List[Message] = []
 
@@ -281,7 +363,49 @@ class LLMClient:
         if self.provider not in ('openai_compatible', 'anthropic_compatible'):
             raise ValueError(f"不支持的 LLM_PROVIDER: {self.provider}，可选值：openai_compatible, anthropic_compatible")
 
-        logger.info(f"LLMClient 初始化：provider={self.provider}, model={self.model}, base_url={self.base_url}")
+        if self._has_backup:
+            logger.info(
+                f"LLMClient 初始化：provider={self.provider}, model={self.model}, base_url={self.base_url}"
+                f" | 备用: provider={self.backup_provider}, model={self.backup_model}"
+            )
+        else:
+            logger.info(f"LLMClient 初始化：provider={self.provider}, model={self.model}, base_url={self.base_url}")
+
+    def _use_backup_params(self):
+        """上下文管理器：临时切换到备份模型参数，退出时自动恢复
+
+        用法:
+            with self._use_backup_params():
+                self._do_request(messages)  # 使用备份模型
+        """
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _swap():
+            # 保存主模型参数
+            orig_base_url = self.base_url
+            orig_model = self.model
+            orig_api_key = self.api_key
+            orig_provider = self.provider
+            # 切换到备份模型
+            self.base_url = self.backup_base_url
+            self.model = self.backup_model
+            self.api_key = self.backup_api_key
+            self.provider = self.backup_provider
+            logger.info(
+                f"[Failover] 切换到备用模型: provider={self.provider}, "
+                f"model={self.model}, base_url={self.base_url}"
+            )
+            try:
+                yield
+            finally:
+                # 恢复主模型参数
+                self.base_url = orig_base_url
+                self.model = orig_model
+                self.api_key = orig_api_key
+                self.provider = orig_provider
+
+        return _swap()
 
     def clear_memory(self):
         """清空会话记忆"""
@@ -533,6 +657,41 @@ class LLMClient:
         else:
             yield from self._request_openai(messages, stream, max_tokens=max_tokens)
 
+    def _chat_request_loop(
+        self, messages: list, effective_max_tokens: int, effective_timeout: int
+    ) -> tuple:
+        """核心请求+重试循环（不涉及熔断器，由调用方管理）
+
+        超时保护由底层 requests.post(timeout=...) 提供，支持主线程和工作线程。
+
+        Returns:
+            (content: str, error: str | None, failed: bool)
+        """
+        content = ""
+        error = None
+        failed = False
+        for attempt in range(self.max_retries + 1):
+            try:
+                for chunk in self._do_request(
+                    messages, stream=False,
+                    max_tokens=effective_max_tokens,
+                ):
+                    content = chunk
+
+                if content and not content.startswith('[错误]'):
+                    break  # 成功
+                elif attempt < self.max_retries:
+                    logger.warning(f"LLM 请求失败，重试 {attempt + 1}/{self.max_retries}")
+                    failed = True
+            except Exception as e:
+                error = str(e)
+                logger.error(f"LLM 请求异常：{error}")
+                failed = True
+                if attempt >= self.max_retries:
+                    content = f"[错误] 请求失败：{error}"
+
+        return content, error, failed
+
     def chat(
         self,
         prompt: str,
@@ -543,6 +702,9 @@ class LLMClient:
     ) -> LLMResponse:
         """
         非流式聊天
+
+        支持主备模型自动切换：主模型不可用时（熔断器打开或请求失败），
+        自动切换到备用模型重试。
 
         Args:
             prompt: 用户输入
@@ -562,48 +724,51 @@ class LLMClient:
         messages = self._build_messages(prompt, system_prompt, use_memory)
         logger.debug(f"LLM 请求：messages_count={len(messages)}, max_tokens={effective_max_tokens}")
 
-        # 带重试的请求
         content = ""
         error = None
-        for attempt in range(self.max_retries + 1):
+        tried_backup = False
+
+        # ---- 主模型尝试 ----
+        primary_available = True
+        try:
+            self._circuit_breaker.check()
+        except CircuitBreakerOpenError as e:
+            primary_available = False
+            logger.warning(f"[Failover] 主模型熔断器已打开: {e}")
+
+        if primary_available:
+            content, error, failed = self._chat_request_loop(
+                messages, effective_max_tokens, effective_timeout
+            )
+            if failed and (not content or content.startswith('[错误]')):
+                self._circuit_breaker.record_failure()
+            elif content and not content.startswith('[错误]'):
+                self._circuit_breaker.record_success()
+
+        # ---- 主模型失败 → 尝试备用模型 ----
+        if (not content or content.startswith('[错误]')) and self._has_backup:
+            logger.warning(
+                f"[Failover] 主模型失败，切换到备用模型 "
+                f"({self.backup_provider}/{self.backup_model}@{self.backup_base_url})"
+            )
             try:
-                # 使用超时保护（仅 Unix 主线程）
-                def handler(signum, frame):
-                    raise TimeoutError(f"LLM 调用超时（{effective_timeout}秒）")
-
-                old_handler = None
-                try:
-                    old_handler = signal.signal(signal.SIGALRM, handler)
-                    signal.alarm(effective_timeout)
-                except (ValueError, OSError):
-                    pass  # 非主线程或 Windows
-
-                try:
-                    for chunk in self._do_request(
-                        messages, stream=False,
-                        max_tokens=effective_max_tokens,
-                    ):
-                        content = chunk
-                finally:
-                    try:
-                        signal.alarm(0)
-                        if old_handler:
-                            signal.signal(signal.SIGALRM, old_handler)
-                    except:
-                        pass
-
-                if content and not content.startswith('[错误]'):
-                    break  # 成功，退出重试循环
-                elif attempt < self.max_retries:
-                    logger.warning(f"LLM 请求失败，重试 {attempt + 1}/{self.max_retries}")
-            except Exception as e:
-                error = str(e)
-                logger.error(f"LLM 请求异常：{error}")
-                if attempt >= self.max_retries:
-                    content = f"[错误] 请求失败：{error}"
+                self._backup_circuit_breaker.check()
+            except CircuitBreakerOpenError as e:
+                logger.error(f"[Failover] 备用模型熔断器也已打开: {e}")
+            else:
+                with self._use_backup_params():
+                    content, error, failed = self._chat_request_loop(
+                        messages, effective_max_tokens, effective_timeout
+                    )
+                    if failed and (not content or content.startswith('[错误]')):
+                        self._backup_circuit_breaker.record_failure()
+                    elif content and not content.startswith('[错误]'):
+                        self._backup_circuit_breaker.record_success()
+                        tried_backup = True
+                        logger.info("[Failover] 备用模型请求成功")
 
         # 保存到记忆
-        if use_memory and content:
+        if use_memory and content and not content.startswith('[错误]'):
             self._messages.append(Message(role='user', content=prompt))
             self._messages.append(Message(role='assistant', content=content))
 
@@ -620,7 +785,10 @@ class LLMClient:
         use_memory: bool = True
     ) -> Generator[str, None, None]:
         """
-        流式聊天
+        流式聊天，含主备模型自动切换
+
+        注意：由于流式特性，只能在请求开始前判断主备（熔断器级别切换）。
+        如果流式传输中途失败，本次请求无法重试。
 
         Args:
             prompt: 用户输入
@@ -633,17 +801,88 @@ class LLMClient:
         messages = self._build_messages(prompt, system_prompt, use_memory)
         logger.debug(f"LLM 流式请求：messages_count={len(messages)}")
 
-        full_content = ""
-        for chunk in self._do_request(messages, stream=True):
-            if chunk:
-                full_content += chunk
-                yield chunk
+        # 选择模型：主模型可用 → 主；主不可用 + 有备份 → 备
+        use_backup = False
+        try:
+            self._circuit_breaker.check()
+        except CircuitBreakerOpenError:
+            if self._has_backup:
+                try:
+                    self._backup_circuit_breaker.check()
+                    use_backup = True
+                    logger.warning("[Failover] 主模型熔断器打开，流式请求使用备用模型")
+                except CircuitBreakerOpenError as e:
+                    logger.error(f"[Failover] 主备模型熔断器均已打开: {e}")
+                    yield f"[错误] LLM 服务不可用：{e}"
+                    return
+            else:
+                yield "[错误] LLM 熔断器已打开，请稍后重试"
+                return
+
+        # 流式请求
+        stream_ok = False
+        if use_backup:
+            with self._use_backup_params():
+                full_content = ""
+                for chunk in self._do_request(messages, stream=True):
+                    if chunk:
+                        full_content += chunk
+                        stream_ok = True
+                        yield chunk
+
+                if stream_ok and not full_content.startswith('[错误]'):
+                    self._backup_circuit_breaker.record_success()
+                else:
+                    self._backup_circuit_breaker.record_failure()
+        else:
+            full_content = ""
+            for chunk in self._do_request(messages, stream=True):
+                if chunk:
+                    full_content += chunk
+                    stream_ok = True
+                    yield chunk
+
+            if stream_ok and not full_content.startswith('[错误]'):
+                self._circuit_breaker.record_success()
+            elif not stream_ok or full_content.startswith('[错误]'):
+                self._circuit_breaker.record_failure()
 
         # 保存到记忆
         if use_memory and full_content and not full_content.startswith('[错误]'):
             self._messages.append(Message(role='user', content=prompt))
             self._messages.append(Message(role='assistant', content=full_content))
 
+
+    def _chat_with_tools_request_loop(
+        self, messages: list, tools: list, tool_choice: str, effective_max_tokens: int
+    ) -> tuple:
+        """chat_with_tools 核心请求+重试循环
+
+        Returns:
+            (content, reasoning_content, tool_calls, usage, failed)
+        """
+        content = ""
+        reasoning_content = None
+        tool_calls = None
+        usage = None
+        failed = False
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                if self.provider == 'anthropic_compatible':
+                    content, reasoning_content, tool_calls, usage = self._request_anthropic_with_tools(
+                        messages, tools, max_tokens=effective_max_tokens)
+                else:
+                    content, reasoning_content, tool_calls, usage = self._request_openai_with_tools(
+                        messages, tools, tool_choice, max_tokens=effective_max_tokens)
+                break
+            except Exception as e:
+                logger.error(f"chat_with_tools 失败：{e}")
+                failed = True
+                if attempt >= self.max_retries:
+                    content = f"[错误] 工具调用失败：{e}"
+
+        return content, reasoning_content, tool_calls, usage, failed
 
     def chat_with_tools(
         self,
@@ -653,7 +892,7 @@ class LLMClient:
         max_tokens: Optional[int] = None,
     ) -> LLMResponse:
         """
-        支持 function calling 的聊天接口
+        支持 function calling 的聊天接口，含主备模型自动切换
 
         Args:
             messages: 消息列表 [{"role": "...", "content": "..."}]
@@ -668,26 +907,51 @@ class LLMClient:
         effective_max_tokens = max_tokens or self.max_tokens
 
         content = ""
+        reasoning_content = None
         tool_calls = None
         usage = None
         finish_reason = None
         error = None
 
-        reasoning_content = None
-        for attempt in range(self.max_retries + 1):
+        # ---- 主模型尝试 ----
+        primary_available = True
+        try:
+            self._circuit_breaker.check()
+        except CircuitBreakerOpenError as e:
+            primary_available = False
+            logger.warning(f"[Failover] 主模型熔断器已打开: {e}")
+
+        if primary_available:
+            content, reasoning_content, tool_calls, usage, failed = \
+                self._chat_with_tools_request_loop(
+                    messages, tools, tool_choice, effective_max_tokens
+                )
+            if failed and (not content or content.startswith('[错误]')):
+                self._circuit_breaker.record_failure()
+            elif content and not content.startswith('[错误]'):
+                self._circuit_breaker.record_success()
+
+        # ---- 主模型失败 → 尝试备用模型 ----
+        if (not content or content.startswith('[错误]')) and self._has_backup:
+            logger.warning(
+                f"[Failover] 主模型失败，切换到备用模型 "
+                f"({self.backup_provider}/{self.backup_model}@{self.backup_base_url})"
+            )
             try:
-                if self.provider == 'anthropic_compatible':
-                    content, reasoning_content, tool_calls, usage = self._request_anthropic_with_tools(
-                        messages, tools, max_tokens=effective_max_tokens)
-                else:
-                    content, reasoning_content, tool_calls, usage = self._request_openai_with_tools(
-                        messages, tools, tool_choice, max_tokens=effective_max_tokens)
-                break
-            except Exception as e:
-                error = str(e)
-                logger.error(f"chat_with_tools 失败：{error}")
-                if attempt >= self.max_retries:
-                    content = f"[错误] 工具调用失败：{error}"
+                self._backup_circuit_breaker.check()
+            except CircuitBreakerOpenError as e:
+                logger.error(f"[Failover] 备用模型熔断器也已打开: {e}")
+            else:
+                with self._use_backup_params():
+                    content, reasoning_content, tool_calls, usage, failed = \
+                        self._chat_with_tools_request_loop(
+                            messages, tools, tool_choice, effective_max_tokens
+                        )
+                    if failed and (not content or content.startswith('[错误]')):
+                        self._backup_circuit_breaker.record_failure()
+                    elif content and not content.startswith('[错误]'):
+                        self._backup_circuit_breaker.record_success()
+                        logger.info("[Failover] 备用模型 chat_with_tools 请求成功")
 
         return LLMResponse(content=content, reasoning_content=reasoning_content,
                            usage=usage, finish_reason=finish_reason,

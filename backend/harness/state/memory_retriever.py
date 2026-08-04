@@ -326,3 +326,237 @@ class BGEM3Retriever:
         self._bm25 = _BM25()
         self._fallback = _TFIDFFallback()
         self._dirty = False
+
+
+# ==================== pgvector 向量检索器 ====================
+
+class PGVectorRetriever:
+    """PostgreSQL + pgvector 向量检索器
+
+    特性:
+    - 向量持久化在 PG agent_memory_vectors 表（HNSW 索引），重启不丢失
+    - 增量 upsert（不再全量重建索引）
+    - Dense 检索走 pgvector SQL（ORDER BY embedding <=> query_vec）
+    - BM25 Sparse 仍用内存（轻量）
+    - 混合打分: 0.6 * dense + 0.4 * sparse
+    - 降级回退: PG/pgvector 不可用时回退到 BGEM3Retriever
+    - 接口和 BGEM3Retriever 完全一致（index + search）
+    """
+
+    QUERY_INSTRUCTION = "为这个需求找到相关的历史经验："
+    MODEL_NAME = "BAAI/bge-m3"
+    DENSE_WEIGHT = 0.6
+    SPARSE_WEIGHT = 0.4
+
+    def __init__(self):
+        self._model = None
+        self._model_lock = threading.Lock()
+        self._bm25 = _BM25()
+        self._documents: list[str] = []  # 内存中的文档文本（用于 BM25）
+        self._memory_ids: list[int] = []  # 对应的 memory_id（用于映射 doc_index → memory_id）
+        self._use_fallback = False
+        self._fallback = BGEM3Retriever()
+
+    @property
+    def model(self):
+        """延迟加载 BGE-M3 模型（线程安全）"""
+        if self._model is None and not self._use_fallback:
+            with self._model_lock:
+                if self._model is None and not self._use_fallback:
+                    try:
+                        from sentence_transformers import SentenceTransformer
+                        logger.info(f"加载 BGE-M3 模型: {self.MODEL_NAME} ...")
+                        self._model = SentenceTransformer(self.MODEL_NAME, device='cpu')
+                        logger.info("BGE-M3 模型加载完成")
+                    except ImportError:
+                        logger.warning(
+                            "sentence-transformers 未安装，pgvector 检索降级到 TF-IDF"
+                        )
+                        self._use_fallback = True
+                    except Exception as e:
+                        logger.warning(f"BGE-M3 加载失败 ({e})，降级到 TF-IDF")
+                        self._use_fallback = True
+        return self._model
+
+    def index(self, documents: list[str], memory_ids: list[int] = None, user_id: int = 0):
+        """建立/更新索引
+
+        pgvector 模式下:
+        - 如果 memory_ids 不为空,执行增量 upsert（只编码新文档）
+        - 如果 memory_ids 为空,执行全量重建（从 DB 加载）
+
+        Args:
+            documents: 文档文本列表
+            memory_ids: 对应的 memory_id（可选,增量 upsert 时必须）
+            user_id: 用户 ID（用于过滤）
+        """
+        self._documents = documents
+        if memory_ids:
+            self._memory_ids = memory_ids
+        else:
+            self._memory_ids = []
+
+        if not documents:
+            self._bm25 = _BM25()
+            return
+
+        # BM25 内存索引（轻量,每次都重建）
+        self._bm25.fit(documents)
+
+        # pgvector 增量 upsert（只处理新 memory_id）
+        if memory_ids and self.model is not None:
+            self._upsert_vectors(documents, memory_ids)
+
+    def _upsert_vectors(self, documents: list[str], memory_ids: list[int]):
+        """将文档向量增量 upsert 到 pgvector"""
+        try:
+            from models import SessionLocal, AgentMemoryVector
+            from sqlalchemy import text
+
+            db = SessionLocal()
+            for doc, mem_id in zip(documents, memory_ids):
+                # 检查是否已存在
+                existing = db.query(AgentMemoryVector).filter_by(memory_id=mem_id).first()
+                if existing and existing.embedding is not None:
+                    continue  # 已有向量,跳过
+
+                # 编码文档
+                vec = self.model.encode([doc], normalize_embeddings=True, show_progress_bar=False)[0]
+                vec_str = "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
+
+                if existing:
+                    # 更新已有记录的向量
+                    db.execute(
+                        text("UPDATE agent_memory_vectors SET embedding = :vec WHERE id = :id"),
+                        {"vec": vec_str, "id": existing.id}
+                    )
+                else:
+                    # 插入新记录
+                    db.execute(
+                        text("INSERT INTO agent_memory_vectors (memory_id, user_id, embedding) VALUES (:mid, :uid, :vec::vector)"),
+                        {"mid": mem_id, "uid": 0, "vec": vec_str}
+                    )
+            db.commit()
+            db.close()
+            logger.debug(f"pgvector upsert 完成: {len(documents)} 条文档")
+
+        except Exception as e:
+            logger.warning(f"pgvector upsert 失败（BM25 仍可用）: {e}")
+
+    def search(self, query: str, top_k: int = 5) -> list[tuple[int, float]]:
+        """混合检索 (Dense + Sparse)
+
+        Returns:
+            [(doc_index, combined_score), ...]  按分数降序
+            doc_index 对应 index() 传入的 documents 列表索引
+        """
+        if not self._documents:
+            return []
+
+        # 降级模式
+        if self._use_fallback or self.model is None:
+            return self._fallback_search(query, top_k)
+
+        # Dense 检索: 走 pgvector SQL
+        dense_results = self._dense_search_pg(query, top_k)
+
+        # Sparse 检索: BM25 内存
+        sparse_scores = self._bm25.score(query)
+
+        # 合并打分
+        # dense_results: {memory_id: score} 需要映射回 doc_index
+        dense_by_index = {}
+        if self._memory_ids and dense_results:
+            for mem_id, score in dense_results.items():
+                if mem_id in self._memory_ids:
+                    idx = self._memory_ids.index(mem_id)
+                    dense_by_index[idx] = score
+
+        combined = []
+        for i in range(len(self._documents)):
+            dense_score = dense_by_index.get(i, 0.0)
+            sparse_score = sparse_scores[i] if i < len(sparse_scores) else 0.0
+            score = self.DENSE_WEIGHT * dense_score + self.SPARSE_WEIGHT * sparse_score
+            if score > 0.01:
+                combined.append((i, float(score)))
+
+        combined.sort(key=lambda x: x[1], reverse=True)
+        return combined[:top_k]
+
+    def _dense_search_pg(self, query: str, top_k: int) -> dict:
+        """pgvector Dense 检索
+
+        Returns:
+            {memory_id: score} 字典
+        """
+        try:
+            from models import engine
+            from sqlalchemy import text
+
+            qvec = self.model.encode(
+                self.QUERY_INSTRUCTION + query,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+            vec_str = "[" + ",".join(f"{x:.8f}" for x in qvec) + "]"
+
+            with engine.connect() as conn:
+                # 只搜索当前 memory_ids 对应的向量
+                if self._memory_ids:
+                    id_list = ",".join(str(mid) for mid in self._memory_ids)
+                    result = conn.execute(text(f"""
+                        SELECT memory_id, 1 - (embedding <=> :vec::vector) AS similarity
+                        FROM agent_memory_vectors
+                        WHERE memory_id IN ({id_list})
+                        ORDER BY embedding <=> :vec::vector
+                        LIMIT :top_k
+                    """), {"vec": vec_str, "top_k": top_k})
+                else:
+                    result = conn.execute(text("""
+                        SELECT memory_id, 1 - (embedding <=> :vec::vector) AS similarity
+                        FROM agent_memory_vectors
+                        ORDER BY embedding <=> :vec::vector
+                        LIMIT :top_k
+                    """), {"vec": vec_str, "top_k": top_k})
+
+                return {row[0]: float(row[1]) for row in result}
+
+        except Exception as e:
+            logger.warning(f"pgvector 检索失败（降级到 BM25）: {e}")
+            return {}
+
+    def _fallback_search(self, query: str, top_k: int) -> list[tuple[int, float]]:
+        """降级到 BGEM3Retriever 内存检索"""
+        self._fallback.index(self._documents)
+        return self._fallback.search(query, top_k)
+
+    @property
+    def document_count(self) -> int:
+        return len(self._documents)
+
+    def clear(self):
+        """清空内存索引（不删 DB 数据）"""
+        self._documents = []
+        self._memory_ids = []
+        self._bm25 = _BM25()
+
+
+# ==================== 检索器工厂 ====================
+
+def create_retriever():
+    """根据配置创建检索器
+
+    - PostgreSQL 模式: PGVectorRetriever（增量 upsert + 持久化）
+    - SQLite 模式: BGEM3Retriever（内存全量重建，原行为）
+    """
+    try:
+        from config import settings
+        if settings.IS_POSTGRES:
+            logger.info("使用 PGVectorRetriever（pgvector 增量检索）")
+            return PGVectorRetriever()
+        else:
+            logger.info("使用 BGEM3Retriever（内存检索）")
+            return BGEM3Retriever()
+    except Exception as e:
+        logger.warning(f"检索器创建失败，降级到 BGEM3Retriever: {e}")
+        return BGEM3Retriever()

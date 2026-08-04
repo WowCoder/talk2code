@@ -1,3 +1,16 @@
+/* ===== Accessibility ===== */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+
 /* ===== Global Reset & Base ===== */
 *,
 *::before,
@@ -94,6 +107,21 @@ a {
 
 .input-field:focus {
   border-color: var(--accent);
+  box-shadow: var(--focus-ring);
+}
+
+/* Global focus-visible for keyboard navigation */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Reset outline for elements that have their own focus styles */
+.input-field:focus-visible,
+button:focus-visible,
+[role='button']:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .input-field::placeholder {

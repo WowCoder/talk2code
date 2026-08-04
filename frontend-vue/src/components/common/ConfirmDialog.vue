@@ -2,7 +2,7 @@
   <Teleport to="body">
     <Transition name="fade">
       <div v-if="show" class="overlay" @click.self="$emit('cancel')">
-        <div class="dialog">
+        <div class="dialog" role="dialog" aria-modal="true" :aria-label="message">
           <div class="dialog-body">{{ message }}</div>
           <div class="dialog-actions">
             <button class="btn-ghost" @click="$emit('cancel')">取消</button>

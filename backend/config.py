@@ -31,7 +31,19 @@ class Settings(BaseSettings):
 
     # ==================== 数据库配置 ====================
 
-    DATABASE_NAME: str = Field(default='vcd.db', description='数据库文件名')
+    # SQLite 兼容（仅当 DATABASE_URL 为空时使用）
+    DATABASE_NAME: str = Field(default='vcd.db', description='数据库文件名(SQLite 兼容)')
+
+    # PostgreSQL 连接串（生产环境必须配置）
+    DATABASE_URL: str = Field(
+        default='',
+        description='PostgreSQL 连接串，例如 postgresql+psycopg://user:pass@host:5432/db。为空时回退到 SQLite'
+    )
+
+    # 数据库连接池配置
+    DATABASE_POOL_SIZE: int = Field(default=10, ge=1, le=50, description='连接池大小')
+    DATABASE_MAX_OVERFLOW: int = Field(default=20, ge=0, le=50, description='连接池最大溢出')
+    DATABASE_POOL_PRE_PING: bool = Field(default=True, description='连接池预先 ping 检测存活')
 
     @property
     def DATABASE_PATH(self) -> str:
@@ -39,7 +51,64 @@ class Settings(BaseSettings):
 
     @property
     def DATABASE_URI(self) -> str:
+        """返回数据库连接 URI，优先 PostgreSQL，回退 SQLite"""
+        if self.DATABASE_URL:
+            return self.DATABASE_URL
         return f'sqlite:///{self.DATABASE_PATH}'
+
+    @property
+    def IS_POSTGRES(self) -> bool:
+        """是否使用 PostgreSQL"""
+        return bool(self.DATABASE_URL)
+
+    @property
+    def DATABASE_CONNECT_ARGS(self) -> dict:
+        """数据库连接参数（SQLite 需要 check_same_thread=False，PG 不需要）"""
+        if self.IS_POSTGRES:
+            return {}
+        return {'check_same_thread': False}
+
+    @property
+    def DATABASE_ENGINE_KWARGS(self) -> dict:
+        """SQLAlchemy create_engine 的额外参数"""
+        if self.IS_POSTGRES:
+            return {
+                'pool_size': self.DATABASE_POOL_SIZE,
+                'max_overflow': self.DATABASE_MAX_OVERFLOW,
+                'pool_pre_ping': self.DATABASE_POOL_PRE_PING,
+            }
+        return {}
+
+    # ==================== Redis 配置 ====================
+
+    REDIS_URL: str = Field(
+        default='redis://localhost:6379/0',
+        description='Redis 连接串'
+    )
+
+    # ==================== Celery 配置 ====================
+
+    CELERY_BROKER_URL: str = Field(
+        default='',
+        description='Celery broker URL。为空时使用 REDIS_URL 的 /1 库'
+    )
+    CELERY_RESULT_BACKEND: str = Field(
+        default='',
+        description='Celery result backend。为空时使用 REDIS_URL 的 /2 库'
+    )
+    CELERY_WORKER_CONCURRENCY: int = Field(default=3, ge=1, le=20, description='Celery worker 并发数')
+    CELERY_ENABLED: bool = Field(
+        default=True,
+        description='是否启用 Celery 任务队列。False 时使用 ThreadPoolExecutor'
+    )
+
+    @property
+    def CELERY_BROKER(self) -> str:
+        return self.CELERY_BROKER_URL or self.REDIS_URL.replace('/0', '/1')
+
+    @property
+    def CELERY_RESULT(self) -> str:
+        return self.CELERY_RESULT_BACKEND or self.REDIS_URL.replace('/0', '/2')
 
     # ==================== JWT 配置 ====================
 
@@ -99,6 +168,22 @@ class Settings(BaseSettings):
     LLM_MAX_RETRIES: int = Field(default=2, ge=0, le=5, description='LLM 调用最大重试次数')
     LLM_CRAFT_ENABLED: bool = Field(default=True, description='是否启用 Craft 设计质量规则注入')
 
+    # LLM 熔断器配置
+    LLM_CIRCUIT_BREAKER_THRESHOLD: int = Field(
+        default=5, ge=2, le=20,
+        description='LLM 连续失败多少次后触发熔断'
+    )
+    LLM_CIRCUIT_BREAKER_TIMEOUT: int = Field(
+        default=30, ge=10, le=300,
+        description='熔断器打开后等待多少秒进入半开状态'
+    )
+
+    # 备用 LLM 配置（主模型不可用时自动切换，可选）
+    LLM_BACKUP_BASE_URL: str = Field(default='', description='备用 LLM API 地址')
+    LLM_BACKUP_MODEL: str = Field(default='', description='备用 LLM 模型名称')
+    LLM_BACKUP_API_KEY: str = Field(default='', description='备用 LLM API Key')
+    LLM_BACKUP_PROVIDER: str = Field(default='openai_compatible', description='备用 LLM 协议类型')
+
     @field_validator('LLM_API_KEY')
     @classmethod
     def validate_api_key(cls, v):
@@ -114,6 +199,13 @@ class Settings(BaseSettings):
     # ==================== 任务队列配置 ====================
 
     TASK_QUEUE_MAX_WORKERS: int = Field(default=3, description='任务队列最大工作线程数')
+
+    # ==================== 工作区配置 ====================
+
+    WORKSPACE_DIR: str = Field(
+        default='',
+        description='工作区根目录。为空时使用 BACKEND_DIR/workspaces（持久化，重启不丢失）'
+    )
 
     # ==================== 日志配置 ====================
 
@@ -137,6 +229,16 @@ class Settings(BaseSettings):
     APP_HOST: str = Field(default='0.0.0.0', description='应用监听地址')
     APP_PORT: int = Field(default=5001, ge=1, le=65535, description='应用端口')
     APP_DEBUG: bool = Field(default=False, description='调试模式')
+
+    # CORS 配置
+    CORS_ORIGINS: str = Field(
+        default='http://localhost:5100,http://localhost:5001',
+        description='允许的 CORS 源（逗号分隔）'
+    )
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        return [o.strip() for o in self.CORS_ORIGINS.split(',') if o.strip()]
 
     def validate_production(self) -> bool:
         """

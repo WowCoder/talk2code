@@ -326,4 +326,14 @@ ${files[key]}
   display: flex;
   flex-direction: column;
 }
+
+/* Responsive: stack vertically on narrow screens */
+@media (max-width: 768px) {
+  .split {
+    flex-direction: column;
+  }
+  .right-panel {
+    min-height: 50vh;
+  }
+}
 </style>

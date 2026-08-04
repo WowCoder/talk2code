@@ -6,7 +6,7 @@ import type {
   CodeFile,
 } from '@/types/api'
 import type { SSEQuestionFormData, SSEEvaluatorResultData, SSESpecData, SSETraceSummaryData } from '@/types/sse'
-import { useAuthStore } from './auth'
+import { useApi } from '@/composables/useApi'
 
 export const useRequirementStore = defineStore('requirement', () => {
   // ===== State =====
@@ -31,33 +31,8 @@ export const useRequirementStore = defineStore('requirement', () => {
   // Trace 总结数据
   const _traceSummary = ref<SSETraceSummaryData | null>(null)
 
-  // ===== Actions =====
-  async function api<T>(url: string, options: RequestInit = {}): Promise<T> {
-    const authStore = useAuthStore()
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      ...authStore.getAuthHeaders(),
-      ...(options.headers as Record<string, string> || {}),
-    }
-    const response = await fetch(url, { ...options, headers })
-    if (!response.ok) {
-      // 401 → token 过期/无效 → 清除登录态并跳转
-      if (response.status === 401) {
-        authStore.logout()
-        window.location.href = '/login'
-        throw new Error('未登录或登录已过期')
-      }
-      // 429 → 限流，给出友好提示
-      if (response.status === 429) {
-        const err = await response.json().catch(() => ({}))
-        const retryAfter = err.retry_after || '若干秒'
-        throw new Error(`操作太频繁，请${retryAfter === 'None' ? '稍后' : retryAfter + '秒后'}再试`)
-      }
-      const err = await response.json().catch(() => ({ error: 'Network error' }))
-      throw new Error(err.error || `HTTP ${response.status}`)
-    }
-    return response.json()
-  }
+  // ===== API (from shared composable) =====
+  const { api } = useApi()
 
   async function loadRequirement(id: number): Promise<{ requirement: Requirement; trace?: any; evaluator?: SSEEvaluatorResultData }> {
     // 先重置所有状态，避免旧需求数据残留

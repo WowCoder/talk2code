@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 任务队列模块
-提供线程池和任务队列，控制 AI 智能体任务并发，防止系统过载
+==============
+统一任务调度入口，支持两种后端：
+- Celery（推荐）: 跨进程任务分发，独立 worker 进程，崩溃恢复
+- ThreadPoolExecutor（降级）: 进程内线程池，无需额外进程
+
+通过 config.CELERY_ENABLED 控制切换，对调用方完全透明。
 """
 
 import threading
@@ -9,12 +14,35 @@ import queue
 from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Any, Dict, Optional
+from typing import Callable, Any, Dict, Optional, Union
 from enum import Enum
 
 from harness.observability.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+# ==================== Celery 检测 ====================
+
+_celery_available = False
+_celery_tasks = {}
+
+try:
+    from config import settings
+    if settings.CELERY_ENABLED:
+        from celery_app import celery_app, process_requirement_task, confirm_plan_task
+        _celery_available = True
+        # 函数名 → Celery task 映射
+        _celery_tasks = {
+            'process_requirement_async': process_requirement_task,
+            'RequirementService.confirm_plan': confirm_plan_task,
+            'confirm_plan_async': confirm_plan_task,
+        }
+        logger.info("Celery 任务队列已启用")
+    else:
+        logger.info("Celery 已禁用，使用 ThreadPoolExecutor")
+except Exception as e:
+    logger.warning(f"Celery 初始化失败，降级到 ThreadPoolExecutor: {e}")
 
 
 class TaskStatus(Enum):
@@ -36,7 +64,8 @@ class TaskInfo:
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     error: Optional[str] = None
-    future: Optional[Future] = None
+    future: Optional[Union[Future, Any]] = None  # Future 或 Celery AsyncResult
+    backend: str = "threadpool"  # "celery" 或 "threadpool"
 
 
 class TaskQueue:
@@ -96,6 +125,9 @@ class TaskQueue:
         """
         提交任务
 
+        当 Celery 可用且 task_func 匹配已知 Celery 任务时，通过 Celery 分发。
+        否则降级到 ThreadPoolExecutor。
+
         Args:
             requirement_id: 需求 ID
             task_func: 任务函数
@@ -130,7 +162,24 @@ class TaskQueue:
         with self._requirement_tasks_lock:
             self._requirement_tasks[requirement_id] = task_id
 
-        # 提交到线程池
+        # 尝试通过 Celery 分发
+        celery_task = self._match_celery_task(task_func)
+        if celery_task is not None:
+            task_info.backend = "celery"
+            try:
+                async_result = celery_task.delay(*args, **kwargs)
+                task_info.future = async_result
+                # Celery task ID 作为追踪 ID
+                logger.info(
+                    f"任务已提交到 Celery：task_id={task_id}, "
+                    f"celery_id={async_result.id}, requirement_id={requirement_id}"
+                )
+                return task_id
+            except Exception as e:
+                logger.warning(f"Celery 分发失败，降级到 ThreadPoolExecutor: {e}")
+                task_info.backend = "threadpool"
+
+        # 降级：提交到线程池
         future = self._executor.submit(
             self._run_task,
             task_id,
@@ -192,6 +241,31 @@ class TaskQueue:
                 if requirement_id in self._requirement_tasks:
                     del self._requirement_tasks[requirement_id]
 
+    @staticmethod
+    def _match_celery_task(task_func: Callable) -> Optional[Any]:
+        """将传入的函数匹配到已注册的 Celery task
+
+        匹配规则（按优先级）:
+        1. 函数 __name__（如 'process_requirement_async'）
+        2. 函数 __qualname__（如 'RequirementService.confirm_plan'）
+        """
+        if not _celery_available:
+            return None
+
+        # 获取函数名
+        func_name = getattr(task_func, '__name__', '')
+        qualname = getattr(task_func, '__qualname__', '')
+
+        # 先按 __name__ 匹配
+        if func_name in _celery_tasks:
+            return _celery_tasks[func_name]
+
+        # 再按 __qualname__ 匹配（处理 bound method）
+        if qualname in _celery_tasks:
+            return _celery_tasks[qualname]
+
+        return None
+
     def _schedule_loop(self):
         """任务调度循环（目前主要用于监控）"""
         while self._running:
@@ -204,8 +278,27 @@ class TaskQueue:
             threading.Event().wait(10)  # 每 10 秒检查一次
 
     def _check_tasks_status(self):
-        """检查任务状态，清理完成的任务"""
+        """检查任务状态，同步 Celery 结果并清理完成的任务"""
         with self._tasks_lock:
+            # 同步 Celery 任务状态
+            for tid, task_info in self._tasks.items():
+                if (task_info.backend == "celery" and task_info.future
+                        and task_info.status in (TaskStatus.PENDING, TaskStatus.RUNNING)):
+                    try:
+                        celery_state = task_info.future.state
+                        if celery_state == 'STARTED' and task_info.status == TaskStatus.PENDING:
+                            task_info.status = TaskStatus.RUNNING
+                            task_info.started_at = datetime.now()
+                        elif celery_state == 'SUCCESS':
+                            task_info.status = TaskStatus.COMPLETED
+                            task_info.completed_at = datetime.now()
+                        elif celery_state == 'FAILURE':
+                            task_info.status = TaskStatus.FAILED
+                            task_info.completed_at = datetime.now()
+                            task_info.error = str(task_info.future.result)
+                    except Exception:
+                        pass  # Celery 状态查询失败不影响主循环
+
             completed_tasks = [
                 tid for tid, t in self._tasks.items()
                 if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
@@ -253,8 +346,15 @@ class TaskQueue:
             task_info.status = TaskStatus.CANCELLED
             task_info.completed_at = datetime.now()
 
-            # 尝试取消 Future（对尚未开始执行的任务有效）
-            if task_info.future and not task_info.future.done():
+            if task_info.backend == "celery" and task_info.future:
+                # Celery: 使用 revoke 取消任务
+                try:
+                    task_info.future.revoke(terminate=True, signal='SIGTERM')
+                    logger.info(f"任务 {task_id} 已通过 Celery revoke 取消")
+                except Exception as e:
+                    logger.warning(f"Celery revoke 失败: {e}")
+            elif task_info.future and not task_info.future.done():
+                # ThreadPoolExecutor: 尝试取消 Future
                 cancelled = task_info.future.cancel()
                 logger.info(f"任务 {task_id} 已取消：future.cancel()={cancelled}")
             else:

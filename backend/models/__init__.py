@@ -4,7 +4,7 @@
 """
 
 from .models import (
-    User, Requirement, AgentMemory, AgentMemoryV2, AgentTrace, CheckpointRecord,
+    User, Requirement, AgentMemory, AgentMemoryV2, AgentTrace, CheckpointRecord, AgentMemoryVector,
     init_db, get_db, SessionLocal, engine, Base,
 )
 
@@ -15,6 +15,7 @@ __all__ = [
     'AgentMemoryV2',
     'AgentTrace',
     'CheckpointRecord',
+    'AgentMemoryVector',
     'init_db',
     'get_db',
     'SessionLocal',

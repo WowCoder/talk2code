@@ -22,9 +22,69 @@ from harness.harness_context import get_tool_loop, get_workspace
 logger = get_logger(__name__)
 
 
+def _detect_truncation(content: str) -> bool:
+    """
+    前置检测：判断 LLM 响应是否被截断。
+
+    检测逻辑：
+    1. 括号是否匹配（{} 和 []）
+    2. 字符串是否闭合
+    3. 是否存在不完整的 key-value 对
+
+    注意：只检测不修复，用于决定是否需要重试。
+
+    Returns:
+        True: 可能被截断，建议重试
+        False: 结构完整，可以直接提取
+    """
+    if not content:
+        return False
+
+    raw = content.strip()
+    raw = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', raw)
+
+    start_idx = raw.find('{')
+    if start_idx == -1:
+        return False
+
+    depth = 0
+    in_str = False
+    escaped = False
+    for i in range(start_idx, len(raw)):
+        ch = raw[i]
+        if escaped:
+            escaped = False
+            continue
+        if ch == '\\':
+            escaped = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if not in_str:
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    # 找到匹配的闭合括号，再检查后面是否还有内容
+                    remaining = raw[i+1:].strip()
+                    # 如果后面还有非空白内容，可能是截断或额外文本
+                    if remaining:
+                        # 检查是否只是 "```" 结束标记
+                        if remaining.startswith('```'):
+                            return False
+                        # 否则可能是截断
+                        return True
+                    return False
+
+    # 没有找到匹配的闭合括号 → 被截断
+    return True
+
+
 def _extract_json_from_llm_response(content: str) -> dict | None:
     """
-    从 LLM 原始响应中健壮提取 JSON 对象。
+    从 LLM 原始响应中提取 JSON 对象（纯提取，不修复）。
 
     处理常见 LLM 输出格式：
     1. 纯 JSON
@@ -32,13 +92,12 @@ def _extract_json_from_llm_response(content: str) -> dict | None:
     3. ``` ... ``` 无语言标记的代码块
     4. 开头有说明文字 + JSON
     5. JSON 内嵌在任意文本中
-    6. LLM 输出被 max_tokens 截断（通过 _try_fix_json 修复）
 
     使用括号计数匹配最外层 {}，避免贪婪匹配问题。
+    注意：只做纯提取，不调用 try_fix_json。如果需要修复，由调用方决定。
 
     Returns:
         解析成功的 dict，或 None（表示提取失败）。
-        注意：None 明确表示"无法提取"，区别于空 JSON {}。
     """
     if not content:
         return None
@@ -72,42 +131,41 @@ def _extract_json_from_llm_response(content: str) -> dict | None:
 
     # Step 3: 括号计数法匹配最外层 {}
     # 找到第一个 {，然后计数匹配到对应的 }
+    # ⚠️ 必须正确处理字符串内部的 { 和 }，避免被误计
     start_idx = raw.find('{')
     if start_idx == -1:
         return None
 
     depth = 0
     end_idx = -1
+    in_str = False
+    escaped = False
     for i in range(start_idx, len(raw)):
         ch = raw[i]
-        if ch == '{':
-            depth += 1
-        elif ch == '}':
-            depth -= 1
-            if depth == 0:
-                end_idx = i
-                break
+        if escaped:
+            escaped = False
+            continue
+        if ch == '\\':
+            escaped = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if not in_str:
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    end_idx = i
+                    break
 
     if end_idx > start_idx:
         json_str = raw[start_idx:end_idx + 1]
         try:
             return json.loads(json_str)
         except json.JSONDecodeError:
-            # 尝试修复常见 JSON 问题：尾部逗号、单引号
             pass
-        try:
-            # 移除尾部逗号
-            fixed = re.sub(r',\s*}', '}', json_str)
-            fixed = re.sub(r',\s*]', ']', fixed)
-            return json.loads(fixed)
-        except json.JSONDecodeError:
-            pass
-
-    # Step 3.5: 尝试修复截断 JSON（LLM 输出被 max_tokens 截断）
-    json_str = raw[start_idx:]
-    fixed = try_fix_json(json_str)
-    if fixed:
-        return fixed
 
     # Step 4: 最后尝试 regex 提取（向后兼容）
     match = re.search(r'\{.*\}', raw, re.DOTALL)
@@ -317,46 +375,71 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
         system_prompt = load_prompt("coding/tl_analysis.md")
         user_prompt = f"请分析以下需求并生成开发计划：\n\n{requirement}"
 
-        response = client.chat(
-            prompt=user_prompt, system_prompt=system_prompt,
-            use_memory=False, max_tokens=4000, timeout=45
-        )
+        # L0: 前置检测 + 分层容错
+        # 策略：检测截断 → 重试(最多2次) → 降级修复 → 完整性校验
 
-        if response.is_error:
-            raise Exception(response.error)
-
-        # 清理 LLM 响应并提取 JSON
-        plan = _extract_json_from_llm_response(response.content)
-        if plan is None and response.finish_reason == "length":
-            # 截断响应：用更大 max_tokens 重试一次
-            logger.warning(
-                f"[TeamLeader] 检测到截断 (finish_reason=length)，"
-                f"当前 content 长度={len(response.content)}，"
-                f"准备以 max_tokens=8000 重试"
-            )
-            retry_response = client.chat(
+        def _fetch_and_extract(max_tokens: int) -> tuple[dict | None, bool]:
+            """获取响应并提取 JSON，返回 (plan, is_truncated)"""
+            resp = client.chat(
                 prompt=user_prompt, system_prompt=system_prompt,
-                use_memory=False, max_tokens=8000, timeout=60
+                use_memory=False, max_tokens=max_tokens, timeout=60
             )
-            if not retry_response.is_error:
-                plan = _extract_json_from_llm_response(retry_response.content)
-                if plan is not None:
-                    logger.info("[TeamLeader] 重试成功，提取到完整 JSON")
+            if resp.is_error:
+                return None, False
+            is_truncated = _detect_truncation(resp.content)
+            plan = _extract_json_from_llm_response(resp.content)
+            return plan, is_truncated, resp
+
+        # 第1次请求
+        plan, is_truncated, response = _fetch_and_extract(6000)
+
+        # L1: 优先重试（最多2次）
+        retry_count = 0
+        max_retries = 2
+        retry_tokens = [8000, 10000]
+        while (response.finish_reason == "length" or is_truncated) and retry_count < max_retries:
+            current_tokens = retry_tokens[retry_count]
+            logger.warning(
+                f"[TeamLeader] 检测到截断 (finish_reason={response.finish_reason}, is_truncated={is_truncated})，"
+                f"第 {retry_count + 1}/{max_retries} 次重试，max_tokens={current_tokens}"
+            )
+            plan, is_truncated, response = _fetch_and_extract(current_tokens)
+            if plan is not None and not is_truncated:
+                logger.info(f"[TeamLeader] 重试成功，提取到完整 JSON")
+                break
+            retry_count += 1
+
+        # L2: 降级修复（仅在重试失败时）
+        if plan is None:
+            logger.warning("[TeamLeader] 所有重试均失败，尝试降级修复")
+            # 尝试用 try_fix_json 修复最后一次响应
+            fixed = try_fix_json(response.content) if response else None
+            if fixed:
+                plan = fixed
+                logger.warning("[TeamLeader] 降级修复成功，但数据可能不完整")
+
+        # L3: 完整性校验
+        if plan is not None:
+            required_fields = ['features', 'file_structure', 'tasks']
+            missing_fields = [f for f in required_fields if not plan.get(f)]
+            if missing_fields:
+                logger.error(f"[TeamLeader] 数据完整性校验失败，缺失字段: {missing_fields}")
+                plan = None
 
         if plan is None:
             # 诊断信息
             truncation_hint = ""
-            if response.finish_reason == "length":
+            if response and response.finish_reason == "length":
                 truncation_hint = (
                     "（提示：LLM 返回 finish_reason='length'，响应可能被 max_tokens 截断，"
-                    "已尝试以 max_tokens=8000 重试仍然失败）"
+                    f"已尝试 {max_retries} 次重试仍然失败）"
                 )
-            content_tail = response.content[-300:] if response.content else ""
+            content_tail = response.content[-300:] if response and response.content else ""
             raise Exception(
                 f"无法从 LLM 响应中提取 JSON{truncation_hint}\n"
-                f"响应前200字符: {response.content[:200]}\n"
+                f"响应前200字符: {(response.content[:200] if response else '')}\n"
                 f"响应后300字符: {content_tail}\n"
-                f"响应总长度: {len(response.content)} 字符"
+                f"响应总长度: {len(response.content) if response else 0} 字符"
             )
 
         visual_style = state.get('visual_style', '') or \
@@ -583,12 +666,20 @@ def coder_node(state: AgentState) -> Dict[str, Any]:
     )
 
     if has_typed_tasks and has_tasks:
-        return _execute_delegated_tasks(state)
+        try:
+            return _execute_delegated_tasks(state)
+        except Exception as e:
+            logger.error(f"[Coder] 委派任务执行失败：{e}")
+            return {"current_step": "coding_error", "error": str(e)}
 
     if complexity == "standard" and has_tasks and len(tasks) >= 4:
         # standard 且有 4+ 文件任务 → 逐文件编码
         from harness.instructions.file_coder import file_by_file_coder_node
-        return file_by_file_coder_node(state)
+        try:
+            return file_by_file_coder_node(state)
+        except Exception as e:
+            logger.error(f"[Coder] 逐文件编码失败：{e}")
+            return {"current_step": "coding_error", "error": str(e)}
     else:
         # simple 或 小规模 standard → 直接 ToolCallLoop
         tool_loop = get_tool_loop(state)
@@ -1134,6 +1225,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
 
     # ---- 双视角评估：Correctness + Quality ----
     try:
+        from llm.client import CircuitBreakerOpenError
         client = get_client()
 
         # 视角 1: 功能正确性（functionality + runtime + acceptance）
@@ -1145,8 +1237,12 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             "- **acceptance** (1-10): SPEC 中每条验收条件是否通过\n"
             "\n请基于以上信息，给出结构化评估结果（只返回 JSON）。"
         )
-        correctness_response = _call_evaluator(correctness_focus, max_tokens=3000)
-        correctness_result = _parse_evaluator_response(correctness_response)
+        try:
+            correctness_response = _call_evaluator(correctness_focus, max_tokens=3000)
+            correctness_result = _parse_evaluator_response(correctness_response)
+        except CircuitBreakerOpenError as e:
+            logger.warning(f"[Verify] 熔断器打开，跳过 Correctness 评估: {e}")
+            correctness_result = {}
 
         # 视角 2: 代码与 UI 质量（code_quality + ui_quality）
         quality_focus = (
@@ -1156,8 +1252,56 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             "- **code_quality** (1-10): 代码结构是否清晰、是否正确处理异步、是否存在安全风险（XSS/innerHTML）\n"
             "\n请基于以上信息，给出结构化评估结果（只返回 JSON）。"
         )
-        quality_response = _call_evaluator(quality_focus, max_tokens=3000)
-        quality_result = _parse_evaluator_response(quality_response)
+        try:
+            quality_response = _call_evaluator(quality_focus, max_tokens=3000)
+            quality_result = _parse_evaluator_response(quality_response)
+        except CircuitBreakerOpenError as e:
+            logger.warning(f"[Verify] 熔断器打开，跳过 Quality 评估: {e}")
+            quality_result = {}
+
+        # ---- 如果双视角评估均因熔断器失败，降级为仅基于 preview + AC 结果判定 ----
+        if not correctness_result and not quality_result:
+            logger.warning(
+                "[Verify] LLM 不可用（熔断器打开），降级为仅基于 preview + AC 结果判定"
+            )
+            ac_all_passed = (
+                len(ac_check_results) > 0 and
+                all(r["passed"] for r in ac_check_results)
+            )
+            browser_errors = browser_result.get("errors", [])
+            has_browser_errors = len(browser_errors) > 0
+
+            if preview_clean and ac_all_passed:
+                verdict = "PASS"
+                overall_score = 8.0
+                summary = "LLM 不可用，基于浏览器验证和 AC 验收结果判定通过"
+            elif has_browser_errors:
+                verdict = "NEEDS_WORK"
+                overall_score = 3.0
+                summary = f"LLM 不可用，浏览器报 {len(browser_errors)} 个错误"
+            else:
+                verdict = "NEEDS_WORK"
+                overall_score = 5.0
+                summary = "LLM 不可用，无法深度评估，保守判定为 NEEDS_WORK"
+
+            combined = {
+                "verdict": verdict,
+                "summary": summary,
+                "score": {"functionality": 5, "runtime": 5, "ui_quality": 5, "acceptance": 5, "code_quality": 5},
+                "overall_score": overall_score,
+                "findings": [
+                    {
+                        "severity": "major",
+                        "dimension": "runtime",
+                        "description": "LLM 评估服务不可用，无法进行深度代码审查",
+                        "evidence": "熔断器已打开，LLM API 连续失败",
+                        "suggestion": "请自行检查代码功能是否满足需求，确认无误后重新提交评估",
+                    }
+                ] if verdict == "NEEDS_WORK" else [],
+                "browser_result": browser_result,
+                "ac_results": ac_check_results,
+                "degraded": True,
+            }
 
         # ---- 合并双视角结果 ----
         # 如果任一视角完全失败，回退为单次全维度评估

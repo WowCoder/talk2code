@@ -1,20 +1,33 @@
 # -*- coding: utf-8 -*-
 """
-SSE 连接管理器
-提供线程安全的 SSE 客户端管理，支持心跳检测、超时清理、断线重连、消息缓冲回放
+SSE 连接管理器（Redis Pub/Sub 增强）
+
+架构:
+  - 本地: 维护 client_id -> List[SSEClient] 映射,每个客户端一个 queue.Queue
+  - 跨进程: broadcast() 同时 publish 到 Redis channel,后台线程 subscribe 并转发给本地客户端
+  - 降级: Redis 不可用时回退到纯本地广播
+
+多 worker 场景:
+  Worker A (Celery/Flask) → Redis Pub → Worker B (Flask SSE) → 浏览器
+  Worker A (Celery/Flask) → Redis Pub → Worker A (Flask SSE) → 浏览器
 """
 
 import threading
 import queue
+import json
 from collections import deque
 from datetime import datetime
 from typing import Dict, List, Optional
+
 from harness.observability.logger import get_logger
 
 logger = get_logger(__name__)
 
 # 每个 client_id 最多缓冲的消息数
 MAX_BUFFERED_MESSAGES = 200
+
+# Redis Pub/Sub channel 前缀
+SSE_CHANNEL_PREFIX = "sse:"
 
 
 class SSEClient:
@@ -46,7 +59,12 @@ class SSEClient:
 
 
 class SSEManager:
-    """SSE 连接管理器（线程安全，支持消息缓冲回放）"""
+    """SSE 连接管理器（线程安全，支持 Redis Pub/Sub 跨进程分发）
+
+    降级策略:
+    - Redis 可用: broadcast() 同时发本地 + Redis publish,后台线程订阅并转发
+    - Redis 不可用: 自动降级为纯本地广播（和原版一致）
+    """
 
     _instance: Optional['SSEManager'] = None
     _lock = threading.Lock()
@@ -72,8 +90,19 @@ class SSEManager:
         # 消息缓冲：client_id -> deque of messages（用于回放给迟到客户端）
         self._message_buffers: Dict[str, deque] = {}
 
-        # 启动后台清理线程
+        # Redis Pub/Sub（延迟初始化）
+        self._redis = None
+        self._pubsub = None
+        self._redis_available = False
+        self._redis_thread: Optional[threading.Thread] = None
+
+        # 运行标志（必须在启动后台线程前设置，避免 _redis_subscribe_loop 提前访问）
         self._running = True
+
+        # 尝试连接 Redis（启动后台订阅线程）
+        self._init_redis()
+
+        # 启动后台清理线程
         self._cleanup_thread = threading.Thread(
             target=self._cleanup_loop,
             daemon=True,
@@ -81,7 +110,80 @@ class SSEManager:
         )
         self._cleanup_thread.start()
 
-        logger.info("SSEManager 已初始化（含消息缓冲回放）")
+        if self._redis_available:
+            logger.info("SSEManager 已初始化（Redis Pub/Sub 跨进程分发已启用）")
+        else:
+            logger.info("SSEManager 已初始化（Redis 不可用，降级为本地广播）")
+
+    def _init_redis(self):
+        """初始化 Redis 连接和 Pub/Sub 订阅"""
+        try:
+            import redis as redis_lib
+            from config import settings
+            self._redis = redis_lib.from_url(settings.REDIS_URL, decode_responses=True)
+            self._redis.ping()
+            self._redis_available = True
+
+            # 启动后台订阅线程
+            self._redis_thread = threading.Thread(
+                target=self._redis_subscribe_loop,
+                daemon=True,
+                name="SSE-Redis-Sub"
+            )
+            self._redis_thread.start()
+        except Exception as e:
+            logger.warning(f"Redis 连接失败，SSE 降级为本地广播: {e}")
+            self._redis_available = False
+
+    def _redis_subscribe_loop(self):
+        """Redis Pub/Sub 订阅循环: 监听 sse:* channel,转发消息给本地客户端"""
+        import redis as redis_lib
+        from config import settings
+
+        while self._running:
+            try:
+                # 每次连接创建新的 pubsub 对象（避免重连问题）
+                conn = redis_lib.from_url(settings.REDIS_URL, decode_responses=True)
+                pubsub = conn.pubsub()
+                # 使用 psubscribe 订阅所有 sse:* channel
+                pubsub.psubscribe(f"{SSE_CHANNEL_PREFIX}*")
+                logger.info("SSE Redis 订阅已启动，监听 channel: %s*" % SSE_CHANNEL_PREFIX)
+
+                for message in pubsub.listen():
+                    if not self._running:
+                        break
+                    if message['type'] != 'pmessage':
+                        continue
+
+                    # channel 格式: sse:{client_id}
+                    channel = message['channel']
+                    if not channel.startswith(SSE_CHANNEL_PREFIX):
+                        continue
+
+                    client_id = channel[len(SSE_CHANNEL_PREFIX):]
+                    data = message['data']
+
+                    # 转发给本地客户端（不写入缓冲,因为 publish 的 worker 已经写过缓冲）
+                    self._local_broadcast(client_id, data)
+
+            except Exception as e:
+                if self._running:
+                    logger.error(f"SSE Redis 订阅异常，5 秒后重连: {e}")
+                    import time
+                    time.sleep(5)
+
+    def _local_broadcast(self, client_id: str, message: str) -> int:
+        """本地广播: 发送给当前进程内的客户端（不写缓冲）"""
+        with self._lock:
+            if client_id not in self._clients:
+                return 0
+
+            sent_count = 0
+            for client in self._clients[client_id]:
+                if client.send(message):
+                    sent_count += 1
+
+            return sent_count
 
     def add_client(self, client_id: str, client_queue: queue.Queue) -> SSEClient:
         """添加新的 SSE 客户端，并回放缓冲的消息"""
@@ -128,23 +230,31 @@ class SSEManager:
             return removed > 0
 
     def broadcast(self, client_id: str, message: str) -> int:
-        """向指定 client_id 的所有客户端广播消息，同时写入缓冲"""
+        """向指定 client_id 的所有客户端广播消息
+
+        流程:
+        1. 写入本地消息缓冲（用于迟到客户端回放）
+        2. 本地广播给当前进程的客户端
+        3. publish 到 Redis（其他 worker 的客户端会收到）
+        """
         with self._lock:
-            # 写入消息缓冲（用于迟到客户端回放）
+            # 1. 写入消息缓冲（用于迟到客户端回放）
             if client_id not in self._message_buffers:
                 self._message_buffers[client_id] = deque(maxlen=MAX_BUFFERED_MESSAGES)
             self._message_buffers[client_id].append(message)
 
-            # 发送给当前连接的客户端
-            if client_id not in self._clients:
-                return 0
+        # 2. 本地广播
+        local_count = self._local_broadcast(client_id, message)
 
-            sent_count = 0
-            for client in self._clients[client_id]:
-                if client.send(message):
-                    sent_count += 1
+        # 3. Redis publish（跨进程分发）
+        if self._redis_available:
+            try:
+                channel = f"{SSE_CHANNEL_PREFIX}{client_id}"
+                self._redis.publish(channel, message)
+            except Exception as e:
+                logger.warning(f"Redis publish 失败（降级为本地）: {e}")
 
-            return sent_count
+        return local_count
 
     def get_client_count(self, client_id: str) -> int:
         """获取指定 client_id 的客户端数量"""
@@ -163,7 +273,8 @@ class SSEManager:
                 self.cleanup_stale()
             except Exception as e:
                 logger.error(f"SSE 清理线程异常：{e}")
-            threading.Event().wait(60)  # 每分钟清理一次
+            import time
+            time.sleep(60)  # 每分钟清理一次
 
     def cleanup_stale(self, timeout_seconds: int = 300):
         """清理超时连接和孤儿缓冲"""
@@ -209,6 +320,14 @@ class SSEManager:
         with self._lock:
             self._clients.clear()
             self._message_buffers.clear()
+
+        # 关闭 Redis pubsub
+        if self._pubsub:
+            try:
+                self._pubsub.close()
+            except Exception:
+                pass
+
         logger.info("SSEManager 已关闭")
 
 

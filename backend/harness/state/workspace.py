@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 WorkspaceFS —— 每个需求独立工作目录，三层文件隔离
+
+工作区根目录通过 config.WORKSPACE_DIR 配置，默认 BACKEND_DIR/workspaces，
+持久化存储，重启不丢失（替代原 /tmp 方案）。
 """
 
 from __future__ import annotations
@@ -19,12 +22,21 @@ class WorkspaceFS:
     Layer 3: TaskQueue 同一 requirement_id 仅一个线程执行
     """
 
+    @staticmethod
+    def _get_base_dir() -> Path:
+        """从配置获取工作区根目录（持久化，重启不丢失）"""
+        from config import settings
+        if settings.WORKSPACE_DIR:
+            return Path(settings.WORKSPACE_DIR)
+        return settings.BACKEND_DIR / "workspaces"
+
+    # 向后兼容：保留类属性但实际使用 _get_base_dir()
     BASE_DIR = Path("/tmp/talk2code/workspaces")
 
     def __init__(self, user_id: int, requirement_id: int, base_dir: Path = None):
         self.user_id = user_id
         self.req_id = requirement_id
-        root = base_dir if base_dir is not None else self.BASE_DIR
+        root = base_dir if base_dir is not None else self._get_base_dir()
         self.path = root / str(user_id) / str(requirement_id)
 
     def _validate(self, filename: str):

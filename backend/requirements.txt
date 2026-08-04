@@ -10,6 +10,15 @@ langgraph>=0.1.0
 pydantic>=2.0.0
 pydantic-settings>=2.0.0
 
+# PostgreSQL driver
+psycopg[binary]>=3.1.0
+
+# Redis
+redis>=5.0.0
+
+# Celery (异步任务队列)
+celery>=5.3.0
+
 # Embedding (BGE-M3 混合检索)
 sentence-transformers>=2.7.0
 

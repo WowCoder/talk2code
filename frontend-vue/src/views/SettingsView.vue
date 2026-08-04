@@ -47,4 +47,15 @@ const activeSection = ref('profile')
   border-radius: 16px;
   padding: 28px;
 }
+
+/* Responsive: stack sidebar on narrow screens */
+@media (max-width: 640px) {
+  .settings-main {
+    flex-direction: column;
+    padding: 16px;
+  }
+  .settings-content {
+    padding: 20px;
+  }
+}
 </style>

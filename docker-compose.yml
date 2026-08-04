@@ -1,0 +1,46 @@
+# Talk2Code 中间件服务
+# 使用: docker compose up -d
+# 停止: docker compose down
+# 重置数据: docker compose down -v
+
+services:
+  # ==================== PostgreSQL + pgvector ====================
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: talk2code-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: talk2code
+      POSTGRES_PASSWORD: talk2code
+      POSTGRES_DB: talk2code
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U talk2code -d talk2code"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ==================== Redis ====================
+  redis:
+    image: redis:7-alpine
+    container_name: talk2code-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgdata:
+    driver: local
+  redisdata:
+    driver: local

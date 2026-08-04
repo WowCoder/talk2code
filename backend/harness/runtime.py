@@ -97,11 +97,21 @@ class ToolCallLoop:
 
             # 调用 LLM with tools
             messages = self._build_messages(state)
-            response = client.chat_with_tools(
-                messages=messages,
-                tools=self.tools.get_schemas() if self.tools else [],
-                max_tokens=8000,
-            )
+            try:
+                response = client.chat_with_tools(
+                    messages=messages,
+                    tools=self.tools.get_schemas() if self.tools else [],
+                    max_tokens=8000,
+                )
+            except Exception as e:
+                # 熔断器打开或其他 LLM 不可用异常 → 立即终止
+                error_msg = str(e)
+                logger.error(
+                    f"[ToolLoop] LLM 调用异常 (iter {iteration + 1}): {error_msg}"
+                )
+                state["current_step"] = "llm_error"
+                state["error"] = f"LLM 调用失败（熔断或不可用）: {error_msg}"
+                break
 
             # ---- LLM 调用失败 → 立即终止，不在循环内死磕 ----
             if response.is_error:
@@ -529,7 +539,9 @@ class ToolCallLoop:
             else:
                 state["_edit_fail_count"] = state.get("_edit_fail_count", 0) + 1
                 filename = tool_call.arguments.get("filename", "unknown")
-                if state["_edit_fail_count"] >= 2:
+                # 从 >= 2 降低到 >= 1：第 1 次 edit_file 失败即注入 write_file 回退提示，
+                # 避免 Agent 在模糊匹配失败后持续尝试 edit_file 浪费迭代轮次。
+                if state["_edit_fail_count"] >= 1:
                     intervention = (
                         f"edit_file 对 {filename} 已连续失败 {state['_edit_fail_count']} 次。\n"
                         f"请立即改用 write_file 重写整个文件：\n"
@@ -729,15 +741,151 @@ class ToolCallLoop:
         existing_text = self._build_file_summaries(existing_files)
 
         plan_section = ""
+        batch_hint = ""
         if plan:
             plan_text = json.dumps(plan, ensure_ascii=False, indent=2) if isinstance(plan, dict) else str(plan)
             plan_section = f"""## 实现计划（请严格遵循）
 {plan_text}"""
+            
+            # 动态生成批量创建分组提示（基于依赖关系自动分组）
+            batch_hint = self._generate_batch_hint(plan)
 
         if complexity == "simple":
             return self._build_simple_prompt(requirement, plan_section, existing_text, existing_files)
         else:
-            return self._build_standard_prompt(requirement, plan_section, existing_text, existing_files)
+            return self._build_standard_prompt(requirement, plan_section, existing_text, existing_files, batch_hint)
+
+    def _generate_batch_hint(self, plan: dict) -> str:
+        """基于 Plan 的依赖关系，动态生成批量创建分组提示
+
+        根据文件间的依赖关系，自动将文件分组为 3-4 个批次：
+        - 第1组（基础层）: 无依赖的文件（CSS、常量、工具函数）
+        - 第2组（核心层）: 依赖基础层的核心逻辑文件
+        - 第3组（组装层）: 依赖核心层的应用入口和组装文件
+        - 第4组（验证层）: 统一验证 + run_preview
+
+        这样无论是什么应用（贪吃蛇、待办清单、计算器等），都能自动适配。
+        """
+        if not isinstance(plan, dict):
+            return ""
+
+        tasks = plan.get("tasks", [])
+        implementation_order = plan.get("implementation_order", [])
+        
+        if not implementation_order:
+            # 从 tasks 中提取文件列表
+            implementation_order = [t.get("file", "") for t in tasks if isinstance(t, dict) and t.get("file")]
+        
+        if not implementation_order:
+            return ""
+
+        # 构建依赖映射
+        dep_map = {}  # filename -> set of dependencies
+        for t in tasks:
+            if isinstance(t, dict):
+                fname = t.get("file", "")
+                deps = t.get("dependencies", []) or []
+                dep_map[fname] = set(deps)
+
+        # 按依赖层级分组
+        groups = self._group_by_dependency_level(implementation_order, dep_map)
+        
+        if len(groups) <= 1:
+            # 文件太少，不需要分组
+            return ""
+
+        # 生成分组提示文本
+        lines = ["## 📦 批量创建分组（按依赖顺序）"]
+        lines.append("请严格按照以下分组顺序，每轮创建一个分组的所有文件：")
+        lines.append("")
+
+        for i, group in enumerate(groups, 1):
+            if i == len(groups):
+                lines.append(f"**第 {i} 组（验证）**: 运行 validate_html / lint_css / lint_js → run_preview → 修复 → 完成")
+            else:
+                file_list = ", ".join(group)
+                lines.append(f"**第 {i} 组（创建）**: {file_list}")
+                lines.append(f"  → 本轮目标：一次性创建以上所有文件")
+            lines.append("")
+
+        lines.append("### 规则")
+        lines.append("- 每组内的文件相互无依赖，可以并行创建")
+        lines.append("- 必须完成前一组才能开始下一组")
+        lines.append("- 同一组内的文件使用 write_file 一次性批量创建，不要分多轮")
+        lines.append("- 最后一组（验证）必须确保 run_preview 通过")
+
+        return "\n".join(lines)
+
+    def _group_by_dependency_level(self, files: list, dep_map: dict) -> list:
+        """按依赖层级分组
+
+        将文件按依赖关系分层：
+        - 第1层：无依赖的文件
+        - 第2层：只依赖第1层的文件
+        - 第3层：依赖第1-2层的文件
+        ...
+
+        然后合并为 3-4 个批次（均衡每组文件数）
+        """
+        if not files:
+            return []
+
+        # 计算每个文件的依赖层级
+        levels = {}
+        def _get_level(fname):
+            if fname in levels:
+                return levels[fname]
+            deps = dep_map.get(fname, set())
+            if not deps:
+                levels[fname] = 0
+                return 0
+            max_dep_level = max(_get_level(d) for d in deps if d in files)
+            levels[fname] = max_dep_level + 1
+            return levels[fname]
+
+        for f in files:
+            _get_level(f)
+
+        # 按层级分组
+        level_groups = {}
+        for f in files:
+            lvl = levels.get(f, 0)
+            if lvl not in level_groups:
+                level_groups[lvl] = []
+            level_groups[lvl].append(f)
+
+        # 将层级组合并为 3-4 个批次（均衡分配）
+        all_levels = sorted(level_groups.keys())
+        if len(all_levels) <= 3:
+            # 层级少，直接用层级分组
+            return [level_groups[l] for l in all_levels] + [["验证"]]
+
+        # 层级多，合并为 3 个创建批次 + 1 个验证批次
+        batch_size = len(all_levels) // 3
+        batches = []
+        
+        # 第1批：前 batch_size 个层级
+        batch_1 = []
+        for l in all_levels[:batch_size]:
+            batch_1.extend(level_groups[l])
+        batches.append(batch_1)
+
+        # 第2批：中间 batch_size 个层级
+        batch_2 = []
+        for l in all_levels[batch_size:batch_size*2]:
+            batch_2.extend(level_groups[l])
+        batches.append(batch_2)
+
+        # 第3批：剩余层级
+        batch_3 = []
+        for l in all_levels[batch_size*2:]:
+            batch_3.extend(level_groups[l])
+        batches.append(batch_3)
+
+        # 第4批：验证
+        batches.append(["验证"])
+
+        return batches
 
     def _build_simple_prompt(self, requirement: str, plan_section: str,
                               existing_text: str, existing_files: list) -> str:
@@ -753,8 +901,9 @@ class ToolCallLoop:
         )
 
     def _build_standard_prompt(self, requirement: str, plan_section: str,
-                                existing_text: str, existing_files: list) -> str:
-        """standard 复杂度：架构先导 + 批量创建 + 完整的浏览��验证"""
+                                existing_text: str, existing_files: list,
+                                batch_hint: str = "") -> str:
+        """standard 复杂度：架构先导 + 批量创建 + 完整的浏览器验证"""
         from harness.instructions.prompts import load_prompt_template
         # 从 plan 中提取推荐的文件结构
         file_hint = ""
@@ -768,6 +917,7 @@ class ToolCallLoop:
             requirement=requirement,
             plan_section=plan_section,
             file_hint=file_hint,
+            batch_hint=batch_hint,
             existing_text=existing_text,
             max_repair_rounds=1,
             complexity="standard",

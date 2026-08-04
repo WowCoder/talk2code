@@ -30,7 +30,7 @@
           :src="iframeSrc"
           :style="{ width: iframeWidth + 'px', maxWidth: '100%' }"
           class="preview-iframe"
-          sandbox="allow-scripts allow-same-origin allow-forms"
+          sandbox="allow-scripts allow-forms"
         ></iframe>
       </div>
     </div>
@@ -98,16 +98,24 @@ watch(
   }
 )
 
-// 暴露方法供 SSE composable 调用，更新验证状态
-;(window as any).__previewUpdateStatus = function (
-  status: PreviewStatusType,
-  errors: string[],
-  tooltip: string
-) {
-  previewStatus.value = status
-  previewErrors.value = errors
-  previewTooltip.value = tooltip || (errors.length > 0 ? errors.join('; ') : '')
-}
+// Watch preview store for status updates (replaces window.__previewUpdateStatus)
+import { usePreviewStore } from '@/stores/preview'
+const previewStore = usePreviewStore()
+watch(
+  () => previewStore.status,
+  (status) => { previewStatus.value = status },
+  { immediate: true }
+)
+watch(
+  () => previewStore.errors,
+  (errors) => { previewErrors.value = errors },
+  { immediate: true }
+)
+watch(
+  () => previewStore.tooltip,
+  (tooltip) => { previewTooltip.value = tooltip },
+  { immediate: true }
+)
 </script>
 
 <style scoped>

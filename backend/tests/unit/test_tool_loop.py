@@ -21,6 +21,8 @@ class TestToolCallLoopBasic:
         mock_response.tool_calls = None
         mock_response.content = "任务完成，所有文件已创建"
         mock_response.usage = None
+        mock_response.error = None
+        mock_response.is_error = False  # Mock doesn't use dataclass property
         mock_client.chat_with_tools.return_value = mock_response
         mock_get_client.return_value = mock_client
 
@@ -59,6 +61,8 @@ class TestToolCallLoopBasic:
         mock_response.tool_calls = [Mock(name="list_files", arguments={})]
         mock_response.content = "继续..."
         mock_response.usage = None
+        mock_response.error = None
+        mock_response.is_error = False  # Mock doesn't use dataclass property
         mock_client.chat_with_tools.return_value = mock_response
         mock_get_client.return_value = mock_client
 
@@ -96,6 +100,8 @@ class TestToolCallLoopBasic:
         mock_response.tool_calls = [Mock(name="list_files", arguments={})]
         mock_response.content = "检查中..."
         mock_response.usage = None
+        mock_response.error = None
+        mock_response.is_error = False  # Mock doesn't use dataclass property
         mock_client.chat_with_tools.return_value = mock_response
         mock_get_client.return_value = mock_client
 

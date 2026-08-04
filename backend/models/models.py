@@ -5,14 +5,18 @@
 """
 
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, ForeignKey, JSON, Float, text
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, ForeignKey, JSON, Float, text, Index
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.sql import func
-from config import DATABASE_URI
+from config import settings
 
-# 创建数据库引擎
-engine = create_engine(DATABASE_URI, connect_args={'check_same_thread': False})
+# 创建数据库引擎（支持 PostgreSQL + SQLite 自动切换）
+engine = create_engine(
+    settings.DATABASE_URI,
+    connect_args=settings.DATABASE_CONNECT_ARGS,
+    **settings.DATABASE_ENGINE_KWARGS,
+)
 
 # 创建会话工厂
 SessionLocal = sessionmaker(bind=engine)
@@ -153,12 +157,56 @@ class CheckpointRecord(Base):
     created_at = Column(DateTime, default=func.now())
 
 
+class AgentMemoryVector(Base):
+    """Agent 记忆向量表 —— pgvector 存储 BGE-M3 embeddings
+
+    与 agent_memories_v2 表一一对应（通过 memory_id 外键）。
+    支持增量 upsert（不再全量重建索引），重启后向量不丢失。
+    使用 HNSW 索引加速近似最近邻搜索。
+    """
+    __tablename__ = "agent_memory_vectors"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    memory_id = Column(Integer, ForeignKey("agent_memories_v2.id"), nullable=False, index=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    # embedding 列由 init_db() 在 PG 上用 raw SQL 创建（VECTOR(1024) 类型）
+    # SQLite 回退时用普通 TEXT 列存 JSON
+    embedding_text = Column(Text, nullable=True)  # SQLite 回退存储
+    created_at = Column(DateTime, default=func.now())
+
+
 # 初始化数据库（创建所有表）
 def init_db():
     """初始化数据库，创建所有表并执行迁移"""
     Base.metadata.create_all(engine)
 
-    # 迁移：为已有 requirements 表添加软删除列
+    # PostgreSQL 专用：启用 pgvector 扩展 + 创建 vector 列 + HNSW 索引
+    if settings.IS_POSTGRES:
+        with engine.connect() as conn:
+            # 启用 pgvector 扩展
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            conn.commit()
+
+            # 为 agent_memory_vectors 添加 vector 类型列（如果不存在）
+            try:
+                conn.execute(text("ALTER TABLE agent_memory_vectors ADD COLUMN embedding vector(1024)"))
+                conn.commit()
+            except Exception:
+                pass  # 列已存在
+
+            # 创建 HNSW 索引（余弦距离）
+            try:
+                conn.execute(text("""
+                    CREATE INDEX IF NOT EXISTS idx_memory_vectors_hnsw
+                    ON agent_memory_vectors
+                    USING hnsw (embedding vector_cosine_ops)
+                    WITH (m = 16, ef_construction = 64)
+                """))
+                conn.commit()
+            except Exception:
+                pass  # 索引已存在
+
+    # 迁移：为已有 requirements 表添加软删除列（SQLite 兼容）
     try:
         with engine.connect() as conn:
             conn.execute(text("ALTER TABLE requirements ADD COLUMN is_deleted BOOLEAN DEFAULT 0"))

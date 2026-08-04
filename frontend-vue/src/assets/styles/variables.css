@@ -9,10 +9,23 @@
   --accent: oklch(64% 0.13 28);
   --accent-soft: oklch(88% 0.04 38);
 
-  /* Typography */
-  --font-display: 'Tiempos Headline', 'Newsreader', 'Iowan Old Style', Georgia, serif;
-  --font-body: 'Söhne', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  /* Typography — loaded via Google Fonts in index.html */
+  --font-display: 'Newsreader', 'Iowan Old Style', Georgia, serif;
+  --font-body: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, 'IBM Plex Mono', Menlo, monospace;
+
+  /* Semantic color tokens */
+  --color-success: oklch(55% 0.1 155);
+  --color-danger: oklch(50% 0.18 25);
+  --color-warning: oklch(65% 0.12 85);
+  --color-info: oklch(50% 0.1 250);
+  --color-on-accent: #fff;
+  --color-role-user: oklch(55% 0.12 250);
+  --color-role-agent: oklch(55% 0.04 50);
+  --color-role-system: oklch(45% 0.02 60);
+
+  /* Focus ring */
+  --focus-ring: 0 0 0 3px oklch(64% 0.13 28 / 25%);
 
   /* Right panel (detail page) — lighter in light mode, true dark in dark mode */
   --dark-bg: oklch(95% 0.008 60);
@@ -21,6 +34,9 @@
   --dark-fg: oklch(22% 0.02 50);
   --dark-muted: oklch(50% 0.018 50);
   --dark-hover: oklch(91% 0.01 60);
+
+  /* Responsive breakpoints (for reference in media queries) */
+  /* --bp-sm: 640px; --bp-md: 768px; --bp-lg: 1024px; */
 }
 
 /* Dark mode overrides */

@@ -14,10 +14,11 @@ source venv/bin/activate && bash start.sh
 ## 架构约定
 
 - **LLM 调用必须走 `llm/client.py`**（`get_client()`），禁止直接调 provider API。通过 `LLM_PROVIDER` 环境变量切换协议。
-- **新增 API 路由**：直接在 `app.py` 中用 `@app.route()` 装饰器，本项目不使用 Flask Blueprint。
+- **新增 API 路由**：在 `routes/` 目录下对应的路由模块中添加 `@app.route()` 装饰器。路由按职责分模块：`routes/auth.py`、`routes/requirements.py`、`routes/health.py`、`routes/preview.py`。应用工厂在 `factory.py`（`create_app()`），入口在 `app.py`。
+- **数据库 Session**：统一使用 `utils/db.py` 的 `get_db()` / `transactional_db()` context manager，禁止手动 `SessionLocal()` + `try/finally: db.close()`。
 - **新增 LangGraph 节点**：在 `harness/instructions/nodes.py` 中定义节点函数（签名：`def node_name(state: AgentState) -> Dict[str, Any]:`），在 `harness/graph.py` 中注册到工作流。
 - **新增工具**：在 `harness/tools/` 对应模块中定义 handler，然后在 `registry.py` 的 `create_tool_registry()` 中注册。工具定义使用 `ToolDefinition` dataclass（name/description/parameters/handler/permission）。
-- **新增服务**：业务逻辑放 `backend/services/`，路由 handler 放 `app.py`。
+- **新增服务**：业务逻辑放 `backend/services/`，路由 handler 放 `routes/` 目录。
 - **提示词模板**：放 `harness/instructions/prompts/` 目录下的 `.md` 文件，通过 `load_prompt()` 或 `load_prompt_template()` 加载。注意 JSON 中的 `{` `}` 必须转义为 `{{` `}}`。
 - **SSE 推送**：传输层走 `services/sse_manager.py`，语义层（Agent 事件 → SSE 消息）走 `harness/observability/sse_reporter.py`。
 - **配置**：所有配置通过 `config.py` 的 Pydantic `BaseSettings` 管理，新增配置项需要同步更新 `.env.example`。
@@ -38,6 +39,7 @@ source venv/bin/activate && bash start.sh
 
 - **Bug / 问题处理**：当用户抛出一个问题或 Bug 时，**先分析根因，给出解决方案，等用户确认后再修改代码**。禁止直接动手改代码。流程：分析 → 方案 → 确认 → 实施。
 - **重启提醒**：修改完代码后，如果变更需要重启后端（Flask）或前端（Vite/Nginx）才能生效，**必须立即询问用户是否要重启**。不要等用户自己发现没生效再问。
+- **方案设计原则**：生成解决方案时，不能只关注当前问题本身，要从全局视角审视——考虑对整个系统的影响、与现有架构的兼容性、以及上下游模块的联动。核心目标是让 Agent 以合理（且尽可能少）的步骤生成保证质量的代码，确保需求完整落地，而非仅解决眼前问题。
 
 ## 注意事项
 

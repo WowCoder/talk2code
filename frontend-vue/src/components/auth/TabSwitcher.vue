@@ -1,13 +1,17 @@
 <template>
-  <div class="tab-switcher">
+  <div class="tab-switcher" role="tablist" aria-label="登录/注册切换">
     <button
       :class="['tab', { active: activeTab === 'login' }]"
+      role="tab"
+      :aria-selected="activeTab === 'login'"
       @click="$emit('update:activeTab', 'login')"
     >
       登录
     </button>
     <button
       :class="['tab', { active: activeTab === 'register' }]"
+      role="tab"
+      :aria-selected="activeTab === 'register'"
       @click="$emit('update:activeTab', 'register')"
     >
       注册

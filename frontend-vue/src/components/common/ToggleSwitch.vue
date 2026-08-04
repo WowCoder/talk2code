@@ -3,6 +3,8 @@
     <input
       type="checkbox"
       :checked="modelValue"
+      role="switch"
+      :aria-checked="modelValue"
       @change="$emit('update:modelValue', ($event.target as HTMLInputElement).checked)"
     />
     <span class="toggle-slider"></span>

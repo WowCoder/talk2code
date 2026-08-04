@@ -1,5 +1,6 @@
 import { ref, type Ref, onUnmounted } from 'vue'
 import { useRequirementStore } from '@/stores/requirement'
+import { usePreviewStore } from '@/stores/preview'
 import type {
   SSEDialogueData,
   SSECodeData,
@@ -23,6 +24,7 @@ import type {
 
 export function useSSE(reqId: Ref<number | null>) {
   const store = useRequirementStore()
+  const previewStore = usePreviewStore()
   const eventSource = ref<EventSource | null>(null)
   const isConnected = ref(false)
   const lastTraceSummary = ref<SSETraceSummaryData | null>(null)
@@ -79,31 +81,8 @@ export function useSSE(reqId: Ref<number | null>) {
       store.questionForm = data
     })
 
-    es.addEventListener('tool_call', (e: MessageEvent) => {
-      const data: SSEToolCallData = JSON.parse(e.data)
-      store.addDialogueMessage({
-        role: 'tool_call',
-        name: data.tool_name,
-        content: data.readable || data.tool_name,
-        tool_name: data.tool_name,
-        readable: data.readable,
-        arguments: data.arguments,
-      })
-    })
-
-    es.addEventListener('tool_result', (e: MessageEvent) => {
-      const data: SSEToolResultData = JSON.parse(e.data)
-      store.addDialogueMessage({
-        role: 'tool_result',
-        name: data.tool_name,
-        content: data.summary || data.error || '',
-        tool_name: data.tool_name,
-        success: data.success,
-        summary: data.summary,
-        error: data.error,
-      })
-    })
-
+    // tool_call / tool_result 已合并到 iteration_batch 中，不再作为独立消息展示
+    // thinking 已合并到 iteration_batch 中，标记 hidden 让前端跳过渲染
     es.addEventListener('thinking', (e: MessageEvent) => {
       const data: SSEThinkingData = JSON.parse(e.data)
       // thinking 内容已合并到 iteration_batch 中，不再作为独立消息展示
@@ -187,10 +166,7 @@ export function useSSE(reqId: Ref<number | null>) {
         status = 'failed'
         tooltip = `运行时错误: ${(data.errors || []).length} 个问题`
       }
-      const win = window as any
-      if (win.__previewUpdateStatus) {
-        win.__previewUpdateStatus(status, data.errors || [], tooltip)
-      }
+      previewStore.updatePreviewStatus(status, data.errors || [], tooltip)
     })
 
     // ---- SDD 新增事件 ----

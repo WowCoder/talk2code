@@ -7,6 +7,8 @@
 
 {file_hint}
 
+{batch_hint}
+
 ## 当前已有文件及内容概要
 {existing_text}
 
