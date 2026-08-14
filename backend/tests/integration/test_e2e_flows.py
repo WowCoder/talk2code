@@ -284,7 +284,6 @@ class TestE2EAllExistingTestsPass:
     def test_harness_imports_work(self):
         """测试 harness 所有模块可导入"""
         # L1
-        from harness.instructions.assembler import ContextAssembler
         from harness.instructions.compactor import ContextCompactor
         from harness.instructions.prompts import load_prompt, load_prompt_template
 

@@ -38,7 +38,7 @@ class TestChatWithToolsOpenAI:
         }
 
         with patch("llm.client.requests.post", return_value=mock_response):
-            content, tool_calls, usage = client._request_openai_with_tools(
+            content, _reasoning, tool_calls, usage = client._request_openai_with_tools(
                 [{"role": "user", "content": "创建 index.html"}],
                 [{"type": "function", "function": {"name": "write_file", "description": "写入文件", "parameters": {}}}],
                 "auto"
@@ -74,7 +74,7 @@ class TestChatWithToolsOpenAI:
         }
 
         with patch("llm.client.requests.post", return_value=mock_response):
-            content, tool_calls, usage = client._request_openai_with_tools(
+            content, _reasoning, tool_calls, usage = client._request_openai_with_tools(
                 [{"role": "user", "content": "修改文件"}],
                 [], "auto"
             )
@@ -101,7 +101,7 @@ class TestChatWithToolsOpenAI:
         }
 
         with patch("llm.client.requests.post", return_value=mock_response):
-            content, tool_calls, usage = client._request_openai_with_tools(
+            content, _reasoning, tool_calls, usage = client._request_openai_with_tools(
                 [{"role": "user", "content": "ok"}], [], "auto"
             )
 
@@ -130,7 +130,7 @@ class TestChatWithToolsOpenAI:
         }
 
         with patch("llm.client.requests.post", return_value=mock_response):
-            content, tool_calls, usage = client._request_openai_with_tools(
+            content, _reasoning, tool_calls, usage = client._request_openai_with_tools(
                 [{"role": "user", "content": "创建文件"}], [], "auto"
             )
 
@@ -161,7 +161,7 @@ class TestChatWithToolsOpenAI:
         }
 
         with patch("llm.client.requests.post", return_value=mock_response):
-            content, tool_calls, usage = client._request_openai_with_tools(
+            content, _reasoning, tool_calls, usage = client._request_openai_with_tools(
                 [{"role": "user", "content": "创建文件"}], [], "auto"
             )
 
@@ -196,7 +196,7 @@ class TestChatWithToolsAnthropic:
         }
 
         with patch("llm.client.requests.post", return_value=mock_response):
-            content, tool_calls, usage = client._request_anthropic_with_tools(
+            content, _reasoning, tool_calls, usage = client._request_anthropic_with_tools(
                 [{"role": "user", "content": "创建文件"}], tools
             )
 
@@ -220,7 +220,7 @@ class TestChatWithToolsAnthropic:
         }
 
         with patch("llm.client.requests.post", return_value=mock_response):
-            content, tool_calls, usage = client._request_anthropic_with_tools(
+            content, _reasoning, tool_calls, usage = client._request_anthropic_with_tools(
                 [{"role": "user", "content": "ok"}], []
             )
 

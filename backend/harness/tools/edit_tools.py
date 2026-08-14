@@ -68,58 +68,48 @@ def parse_edit_blocks(edit: str) -> list[tuple[str, str]]:
     return blocks
 
 
-def _normalize(text: str) -> str:
-    """Normalize 行尾空白 + 统一缩进为空格，容忍 LLM 常见空白误差。"""
-    return "\n".join(line.rstrip() for line in text.split("\n"))
-
-
-def _normalize_whitespace(text: str) -> str:
-    """激进空白规范化：折叠所有连续空白为单个空格，行首尾去空白。"""
-    lines = []
-    for line in text.split("\n"):
-        collapsed = " ".join(line.split())
-        if collapsed:
-            lines.append(collapsed)
-    return "\n".join(lines)
-
-
-def _normalize_indentation(text: str) -> str:
-    """去除所有前导空白，只保留内容行。"""
-    return "\n".join(
-        line.lstrip()
-        for line in text.split("\n")
-    )
-
-
 def _match(search: str, content: str) -> tuple[int, str]:
-    """在 content 中匹配 search，返回 (occurrences, match_mode)。"""
+    """在 content 中匹配 search，返回 (occurrences, match_mode)。
+
+    只保留两类安全匹配：
+    - exact: 原始精确匹配
+    - normalized: 行尾空白归一（逐行 rstrip）后按行窗口定位
+    移除了 whitespace/indentation 两档——它们曾对整文件做规范化后替换，
+    会把整个文件的空白/缩进打乱（数据损坏）。
+    """
     # Level 1: 原始精确匹配
     occurrences = content.count(search)
     if occurrences:
         return occurrences, "exact"
 
-    # Level 2: 行尾空白规范化
-    normalized_search = _normalize(search)
-    normalized_content = _normalize(content)
-    occurrences = normalized_content.count(normalized_search)
-    if occurrences:
-        return occurrences, "normalized"
-
-    # Level 3: 激进空白折叠匹配
-    ws_search = _normalize_whitespace(search)
-    ws_content = _normalize_whitespace(content)
-    occurrences = ws_content.count(ws_search)
-    if occurrences:
-        return occurrences, "whitespace"
-
-    # Level 4: 缩进弹性匹配
-    indent_search = _normalize_indentation(search)
-    indent_content = _normalize_indentation(content)
-    occurrences = indent_content.count(indent_search)
-    if occurrences:
-        return occurrences, "indentation"
+    # Level 2: 行尾空白归一（行级窗口匹配，不折叠内部空白、不去前导缩进）
+    search_lines = [line.rstrip() for line in search.split("\n")]
+    content_lines = [line.rstrip() for line in content.split("\n")]
+    n = len(search_lines)
+    count = 0
+    for i in range(len(content_lines) - n + 1):
+        if content_lines[i:i + n] == search_lines:
+            count += 1
+    if count:
+        return count, "normalized"
 
     return 0, ""
+
+
+def _replace_normalized(content: str, search: str, replace: str) -> str:
+    """行尾空白归一后定位 search，仅替换匹配的行范围，不破坏其它行。
+
+    返回替换后的完整内容；未找到时原样返回（调用方在 _match 已确认唯一命中）。
+    """
+    search_lines = [line.rstrip() for line in search.split("\n")]
+    content_lines = content.split("\n")
+    n = len(search_lines)
+    for i in range(len(content_lines) - n + 1):
+        window = [line.rstrip() for line in content_lines[i:i + n]]
+        if window == search_lines:
+            content_lines[i:i + n] = replace.split("\n")
+            return "\n".join(content_lines)
+    return content
 
 
 # ==================== ToolHandler 子类 ====================
@@ -170,21 +160,8 @@ class EditFileHandler(ToolHandler):
                 )
             match_modes.add(match_mode)
 
-            if match_mode == "indentation":
-                indent_content = _normalize_indentation(new_content)
-                indent_search = _normalize_indentation(search)
-                indent_replace = _normalize_indentation(replace)
-                new_content = indent_content.replace(indent_search, indent_replace, 1)
-            elif match_mode == "whitespace":
-                ws_content = _normalize_whitespace(new_content)
-                ws_search = _normalize_whitespace(search)
-                ws_replace = _normalize_whitespace(replace)
-                new_content = ws_content.replace(ws_search, ws_replace, 1)
-            elif match_mode == "normalized":
-                normalized_content = _normalize(new_content)
-                normalized_search = _normalize(search)
-                normalized_replace = _normalize(replace)
-                new_content = normalized_content.replace(normalized_search, normalized_replace, 1)
+            if match_mode == "normalized":
+                new_content = _replace_normalized(new_content, search, replace)
             else:
                 new_content = new_content.replace(search, replace, 1)
 
@@ -201,8 +178,6 @@ class EditFileHandler(ToolHandler):
         mode_labels = {
             "exact": "精确匹配",
             "normalized": "行尾空白归一",
-            "whitespace": "空白折叠匹配",
-            "indentation": "缩进弹性匹配",
         }
         mode_tag = ", ".join(
             mode_labels.get(m, m) for m in match_modes if m != "exact"

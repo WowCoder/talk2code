@@ -91,8 +91,8 @@ class TestPreviewServing:
         assert resp.status_code == 200
         assert b'<!DOCTYPE html>' in resp.data
 
-    def test_nonexistent_requirement_404(self, app_client):
-        """不存在的需求 ID 返回 404"""
+    def test_nonexistent_requirement_404(self, app_client, auth_token):
+        """不存在的需求 ID 返回 404（已认证但需求不存在）"""
         resp = app_client.get('/api/preview/99999/index.html')
         assert resp.status_code == 404
 

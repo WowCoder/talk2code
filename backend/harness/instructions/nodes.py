@@ -378,14 +378,14 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
         # L0: 前置检测 + 分层容错
         # 策略：检测截断 → 重试(最多2次) → 降级修复 → 完整性校验
 
-        def _fetch_and_extract(max_tokens: int) -> tuple[dict | None, bool]:
-            """获取响应并提取 JSON，返回 (plan, is_truncated)"""
+        def _fetch_and_extract(max_tokens: int) -> tuple[dict | None, bool, object]:
+            """获取响应并提取 JSON，返回 (plan, is_truncated, resp)"""
             resp = client.chat(
                 prompt=user_prompt, system_prompt=system_prompt,
                 use_memory=False, max_tokens=max_tokens, timeout=60
             )
             if resp.is_error:
-                return None, False
+                return None, False, resp
             is_truncated = _detect_truncation(resp.content)
             plan = _extract_json_from_llm_response(resp.content)
             return plan, is_truncated, resp
@@ -1049,6 +1049,10 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             )
         except Exception:
             pass
+        # 缺文件早退也必须递增 repair_count，否则 coder↔verify 会无限循环
+        # （route_after_verify 只靠 repair_count >= max_rounds 终止）
+        repair_count = state.get("metadata", {}).get("repair_count", 0)
+        state.setdefault("metadata", {})["repair_count"] = repair_count + 1
         return {"verify_passed": False, "current_step": "verify_done"}
 
     # 运行 run_preview 获取浏览器执行结果
@@ -1227,6 +1231,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
     try:
         from llm.client import CircuitBreakerOpenError
         client = get_client()
+        _circuit_breaker_hit = False
 
         # 视角 1: 功能正确性（functionality + runtime + acceptance）
         correctness_focus = (
@@ -1243,6 +1248,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
         except CircuitBreakerOpenError as e:
             logger.warning(f"[Verify] 熔断器打开，跳过 Correctness 评估: {e}")
             correctness_result = {}
+            _circuit_breaker_hit = True
 
         # 视角 2: 代码与 UI 质量（code_quality + ui_quality）
         quality_focus = (
@@ -1258,6 +1264,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
         except CircuitBreakerOpenError as e:
             logger.warning(f"[Verify] 熔断器打开，跳过 Quality 评估: {e}")
             quality_result = {}
+            _circuit_breaker_hit = True
 
         # ---- 如果双视角评估均因熔断器失败，降级为仅基于 preview + AC 结果判定 ----
         if not correctness_result and not quality_result:
@@ -1304,16 +1311,23 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             }
 
         # ---- 合并双视角结果 ----
-        # 如果任一视角完全失败，回退为单次全维度评估
-        if not correctness_result and not quality_result:
+        if not correctness_result and not quality_result and not _circuit_breaker_hit:
+            # 非熔断失败（如解析失败）：回退为单次全维度评估
             logger.warning("[Verify] 双视角评估均失败，回退为单次全维度评估")
             fallback_focus = "请基于以上信息，按照 Evaluator 的评估维度和输出格式，给出结构化评估结果。"
-            fallback_response = _call_evaluator(fallback_focus, max_tokens=4000)
-            combined = _parse_evaluator_response(fallback_response)
+            try:
+                fallback_response = _call_evaluator(fallback_focus, max_tokens=4000)
+                combined = _parse_evaluator_response(fallback_response)
+            except CircuitBreakerOpenError as e:
+                logger.warning(f"[Verify] 回退评估熔断: {e}")
+                combined = None
             if not combined:
                 logger.warning(f"[Verify] 回退评估也失败，保守判定为 NEEDS_WORK")
                 return {"verify_passed": False, "current_step": "verify_done",
                         "error": "LLM 评估调用失败"}
+        elif not correctness_result and not quality_result:
+            # 熔断降级：combined 已在上方降级块基于 preview+AC 计算，直接使用
+            logger.info("[Verify] 使用熔断降级判定结果（不重复调用 LLM）")
         else:
             # 合并双视角的 score、findings、verdict
             c_score = correctness_result.get("score", {}) if correctness_result else {}
@@ -1445,6 +1459,9 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                             findings = retry_result.get("findings", [])
                             overall_score = retry_result.get("overall_score", overall_score)
                             score = retry_result.get("score", score)
+                            # 重试翻转 verdict 后必须同步 verify_passed，
+                            # 否则 QA 反馈显示 PASS 但图仍会拉回 coder 多跑一轮
+                            state["verify_passed"] = (verdict == "PASS")
                             logger.info(
                                 f"[Verify] 重试后: verdict={verdict}, score={overall_score}, "
                                 f"findings={len(findings)}"

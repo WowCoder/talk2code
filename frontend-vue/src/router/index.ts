@@ -45,11 +45,7 @@ const router = createRouter({
 router.beforeEach((to, _from, next) => {
   const authStore = useAuthStore()
 
-  // Try to restore from storage if not already authenticated
-  if (!authStore.isAuthenticated) {
-    authStore.initFromStorage()
-  }
-
+  // 登录态已在 main.ts 中通过 initAuth() 恢复
   if (to.meta.requiresAuth && !authStore.isAuthenticated) {
     next({ name: 'Login' })
   } else if (to.name === 'Login' && authStore.isAuthenticated) {

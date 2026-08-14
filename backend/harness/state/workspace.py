@@ -30,9 +30,6 @@ class WorkspaceFS:
             return Path(settings.WORKSPACE_DIR)
         return settings.BACKEND_DIR / "workspaces"
 
-    # 向后兼容：保留类属性但实际使用 _get_base_dir()
-    BASE_DIR = Path("/tmp/talk2code/workspaces")
-
     def __init__(self, user_id: int, requirement_id: int, base_dir: Path = None):
         self.user_id = user_id
         self.req_id = requirement_id
@@ -87,6 +84,7 @@ class WorkspaceFS:
             filepath.unlink()
 
     def exists(self, filename: str) -> bool:
+        self._validate(filename)
         return (self.path / filename).exists()
 
     def snapshot(self) -> list[dict]:

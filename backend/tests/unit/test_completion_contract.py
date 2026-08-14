@@ -40,7 +40,7 @@ class TestCompletionContract:
 
         ws.read = _read
         ws.write = _write
-        ws.delete_file = _delete
+        ws.delete = _delete
         ws._storage = storage  # 暴露内部存储便于断言
         return ws
 

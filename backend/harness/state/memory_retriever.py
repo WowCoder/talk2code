@@ -240,20 +240,21 @@ class BGEM3Retriever:
     def _ensure_dense(self):
         """确保 dense embeddings 已计算（模型未就绪时降级到 TF-IDF）"""
         if self._dirty and self._documents:
-            # 如果模型尚未加载且不在加载中，尝试加载（非阻塞检查）
-            if self._model is None and not self._use_fallback:
-                # 模型未加载，降级到 TF-IDF 避免阻塞请求
-                logger.info("BGE-M3 模型尚未就绪，本次检索使用 TF-IDF 降级方案")
-                self._use_fallback = True
-                self._fallback.fit(self._documents)
-            elif not self._use_fallback and self._model is not None:
+            # 触发延迟加载：必须访问 self.model（property），而非裸属性 self._model，
+            # 否则模型永远不加载、被永久降级为 TF-IDF
+            model = self.model
+            if model is not None and not self._use_fallback:
                 logger.debug(f"编码 {len(self._documents)} 条文档的 dense embeddings ...")
-                self._dense_embeddings = self._model.encode(
+                self._dense_embeddings = model.encode(
                     self._documents,
                     normalize_embeddings=True,
                     show_progress_bar=False,
                 )
                 logger.debug(f"编码完成: shape={self._dense_embeddings.shape}")
+            else:
+                # 模型加载失败（property 已置 _use_fallback=True）→ TF-IDF
+                logger.info("BGE-M3 模型不可用，本次检索使用 TF-IDF 降级方案")
+                self._fallback.fit(self._documents)
             self._dirty = False
 
     # ---- 检索 ----

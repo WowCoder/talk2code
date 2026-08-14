@@ -13,7 +13,7 @@ from harness.observability.logger import get_logger
 from utils.sse import SSEMessage, get_current_timestamp
 from services.sse_manager import sse_manager
 from harness.graph import get_workflow, create_workflow_post_plan
-from harness.harness_context import set_all as set_harness_components
+from harness.harness_context import set_all as set_harness_components, clear_all as clear_harness_components
 from harness.state.agent_state import AgentState
 from harness.state.workspace import WorkspaceFS
 from harness.state.versioning import GitVersioning
@@ -125,6 +125,9 @@ class RequirementService:
                 logger.info(f"需求 {requirement_id} 状态为 {requirement.status}，跳过")
                 return False
 
+            # 清除上一次可能遗留的取消信号，避免新任务被旧信号立即判定为已取消
+            RequirementService.clear_cancel(requirement_id)
+
             requirement.status = 'processing'
             db.commit()
             logger.info(f"需求 {requirement_id} 开始处理")
@@ -188,11 +191,12 @@ class RequirementService:
             # 记忆注入：将历史成功经验作为 few-shot 示例追加到 System Prompt
             _original_builder = tool_loop._build_system_prompt
             _req_content = requirement.content
+            _req_user_id = requirement.user_id
             _mgr = _get_memory_manager()
 
             def _memory_aware_prompt(state):
                 base = _original_builder(state)
-                return _mgr.before_task(_req_content, base)
+                return _mgr.before_task(_req_content, base, user_id=_req_user_id)
 
             tool_loop._build_system_prompt = _memory_aware_prompt
 
@@ -295,6 +299,8 @@ class RequirementService:
             return False
 
         finally:
+            # 清理 ContextVar，避免线程池复用时下一个任务拿到上一个任务的 tool_loop/workspace
+            clear_harness_components()
             db.close()
 
     def _execute_workflow_with_stream(self, requirement_id: int, initial_state: AgentState,
@@ -539,11 +545,12 @@ class RequirementService:
             # 记忆注入
             _original_builder = tool_loop._build_system_prompt
             _req_content = requirement.content
+            _req_user_id = requirement.user_id
             _mgr = _get_memory_manager()
 
             def _memory_aware_prompt(state):
                 base = _original_builder(state)
-                return _mgr.before_task(_req_content, base)
+                return _mgr.before_task(_req_content, base, user_id=_req_user_id)
 
             tool_loop._build_system_prompt = _memory_aware_prompt
 
@@ -604,6 +611,7 @@ class RequirementService:
             return False
 
         finally:
+            clear_harness_components()
             db.close()
 
     @staticmethod

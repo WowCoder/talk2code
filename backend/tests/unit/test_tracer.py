@@ -300,5 +300,5 @@ class TestCostTracker:
         """测试价格表包含已知模型"""
         tracker = CostTracker()
         assert "gpt-4o" in tracker.PRICING
-        assert "claude-opus-4-7" in tracker.PRICING
+        assert "claude-opus-4-5" in tracker.PRICING
         assert "deepseek-v3" in tracker.PRICING

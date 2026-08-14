@@ -41,9 +41,14 @@ celery_app.conf.update(
     # 任务执行追踪：记录 STARTED 状态，便于前端查询任务进度
     task_track_started=True,
 
-    # 任务超时（秒）：软限制触发 SoftTimeLimitExceeded 异常，硬限制强制终止 worker
-    task_soft_time_limit=240,
-    task_time_limit=300,
+    # 任务超时（秒）：只用软限制——触发 SoftTimeLimitExceeded 异常，
+    # 由 process_requirement 的 except 捕获并落库 failed。
+    # 不设置 task_time_limit（硬限制会 SIGKILL worker，绕过 except 使需求永久卡死 processing）
+    task_soft_time_limit=1800,
+
+    # 可靠性：任务确认后执行，worker 崩溃时重新投递，避免静默丢失
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
 
     # Worker 并发数
     worker_concurrency=settings.CELERY_WORKER_CONCURRENCY,

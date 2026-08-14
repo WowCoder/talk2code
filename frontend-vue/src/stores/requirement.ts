@@ -109,11 +109,15 @@ export const useRequirementStore = defineStore('requirement', () => {
   }
 
   function addDialogueMessage(msg: DialogueMessage) {
-    // Deduplicate
-    const exists = dialogueMessages.value.some(
-      (m) => m.content === msg.content && m.role === msg.role
-    )
-    if (exists) return
+    // 仅去重「连续」相同的消息（SSE 重放防御），
+    // 不全局按 role+content 去重——否则用户连发"继续"等相同内容会被误删
+    const last = dialogueMessages.value[dialogueMessages.value.length - 1]
+    const isConsecutiveDup =
+      !!last &&
+      last.role === msg.role &&
+      last.content === msg.content &&
+      last.name === msg.name
+    if (isConsecutiveDup) return
     dialogueMessages.value.push(msg)
     // Keep last 100 messages
     if (dialogueMessages.value.length > 200) {

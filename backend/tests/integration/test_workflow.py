@@ -22,13 +22,12 @@ class TestWorkflowCreation:
         assert hasattr(workflow, 'stream')
 
     def test_create_workflow_has_v4_nodes(self):
-        """测试 v4 节点已注册"""
+        """测试 v5 工作流节点已注册（repair 节点已在 v5 移除，QA 反馈直接注入 dialogue）"""
         workflow = create_workflow()
         nodes = list(workflow.nodes.keys())
         assert 'team_leader' in nodes, "team_leader 节点未注册"
         assert 'coder' in nodes, "coder 节点未注册"
         assert 'verify' in nodes, "verify 节点未注册"
-        assert 'repair' in nodes, "repair 节点未注册"
 
     def test_workflow_entry_point_is_team_leader(self):
         """测试入口点是 team_leader 节点"""

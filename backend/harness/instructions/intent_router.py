@@ -104,11 +104,25 @@ class IntentRouter:
 
             raw = response.content.strip().upper()
 
-            # 解析分类结果
+            # 解析分类结果：先精确单标签，再按词边界取最早出现的标签
+            # （避免 "这是 TASK，不需要 search" 被先命中 SEARCH）
             for intent_type in IntentType:
-                if intent_type.value.upper() in raw:
+                if raw == intent_type.value.upper():
                     logger.info(f"[IntentRouter] 分类结果: {intent_type.value} (raw={raw})")
-                    return IntentResult(intent=intent_type, confidence=0.9)
+                    return IntentResult(intent=intent_type, confidence=0.95)
+
+            import re as _re
+            matches = []
+            for intent_type in IntentType:
+                label = intent_type.value.upper()
+                m = _re.search(rf"\b{label}\b", raw)
+                if m:
+                    matches.append((m.start(), intent_type))
+            if matches:
+                matches.sort(key=lambda x: x[0])
+                winner = matches[0][1]
+                logger.info(f"[IntentRouter] 分类结果: {winner.value} (raw={raw})")
+                return IntentResult(intent=winner, confidence=0.7)
 
             # 无法解析，默认 TASK
             logger.warning(f"[IntentRouter] 无法解析分类结果: {raw}，默认 TASK")

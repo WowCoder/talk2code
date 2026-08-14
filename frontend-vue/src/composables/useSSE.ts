@@ -122,13 +122,16 @@ export function useSSE(reqId: Ref<number | null>) {
 
     es.addEventListener('hook_check', (e: MessageEvent) => {
       const data: SSEHookCheckData = JSON.parse(e.data)
-      // hook 检查结果存入独立状态，每次迭代开始时自动清除，避免残留
+      // 失败项以 dialogue 消息形式展示（DialogueMessage 的 hook_check 分支渲染），
+      // 否则用户对质量校验失败完全无感知
       if (!data.passed) {
-        store.addHookCheck({
+        store.addDialogueMessage({
+          role: 'hook_check',
+          name: data.hook_name,
           hook_name: data.hook_name,
-          passed: data.passed,
-          message: data.message || '',
-        })
+          passed: false,
+          content: data.message || '',
+        } as any)
       }
     })
 
@@ -143,6 +146,8 @@ export function useSSE(reqId: Ref<number | null>) {
           store.codeFiles[f.filename] = f.content
         })
       }
+      // 任务已结束，主动断开 SSE，避免连接永久驻留
+      disconnect()
     })
 
     es.addEventListener('trace_summary', (e: MessageEvent) => {
@@ -223,6 +228,8 @@ export function useSSE(reqId: Ref<number | null>) {
         name: 'System',
         content: '操作已被用户取消',
       })
+      // 任务已取消，主动断开 SSE
+      disconnect()
     })
 
     es.addEventListener('error', (e: MessageEvent) => {
@@ -238,8 +245,9 @@ export function useSSE(reqId: Ref<number | null>) {
     })
 
     es.onerror = () => {
+      // 瞬时断线时保持 isGenerating 不变（EventSource 会自动重连），
+      // 避免后端仍在生成、前端却误判为可再次提交
       isConnected.value = false
-      store.isGenerating = false
     }
   }
 

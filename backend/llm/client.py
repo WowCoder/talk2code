@@ -8,12 +8,12 @@
 import os
 import json
 import time
+import threading
 from typing import Generator, List, Dict, Optional, Any
 from dataclasses import dataclass, field
 from datetime import datetime
 
 import requests
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_PROVIDER, settings
 
 # 注意：llm.client 是底层模块，不能在模块顶层 import harness（harness 依赖 llm.client，
@@ -217,27 +217,6 @@ class LLMResponse:
         return self.error is not None
 
 
-def to_langchain_message(msg: Message) -> BaseMessage:
-    """
-    Convert internal Message to langchain_core BaseMessage.
-
-    Enables future integration with LangChain components while keeping
-    the custom DashScope API client.
-
-    Args:
-        msg: Internal Message object with role and content
-
-    Returns:
-        langchain_core BaseMessage subclass (HumanMessage, AIMessage, or SystemMessage)
-    """
-    if msg.role == 'user':
-        return HumanMessage(content=msg.content)
-    elif msg.role == 'assistant':
-        return AIMessage(content=msg.content)
-    else:
-        return SystemMessage(content=msg.content)
-
-
 class CircuitBreakerOpenError(Exception):
     """熔断器打开时抛出，调用方应捕获并做降级处理"""
     pass
@@ -262,44 +241,56 @@ class CircuitBreaker:
         self._failure_count = 0
         self._last_failure_time: float = 0.0
         self._state = "closed"  # closed | open | half_open
+        self._lock = threading.Lock()
+        self._probe_in_flight = False  # 半开状态只放行一个探测请求
 
     @property
     def is_open(self) -> bool:
-        if self._state == "closed":
-            return False
-        if self._state == "open":
-            # 检查是否可以进入半开状态
-            if time.time() - self._last_failure_time >= self.recovery_timeout:
-                self._state = "half_open"
-                return False
-            return True
-        # half_open: 允许通过
-        return False
+        """只读状态查询（不触发状态迁移，无副作用）"""
+        with self._lock:
+            return self._state == "open"
 
     def record_success(self):
         """调用成功，重置熔断器"""
-        self._failure_count = 0
-        self._state = "closed"
+        with self._lock:
+            self._failure_count = 0
+            self._state = "closed"
+            self._probe_in_flight = False
 
     def record_failure(self):
         """调用失败，递增计数"""
-        self._failure_count += 1
-        self._last_failure_time = time.time()
-        if self._failure_count >= self.threshold:
-            self._state = "open"
-            logger.warning(
-                f"[CircuitBreaker] 连续失败 {self._failure_count} 次，熔断器打开，"
-                f"将在 {self.recovery_timeout:.0f}s 后进入半开状态"
-            )
+        with self._lock:
+            self._failure_count += 1
+            self._last_failure_time = time.time()
+            self._probe_in_flight = False
+            if self._failure_count >= self.threshold:
+                self._state = "open"
+                logger.warning(
+                    f"[CircuitBreaker] 连续失败 {self._failure_count} 次，熔断器打开，"
+                    f"将在 {self.recovery_timeout:.0f}s 后进入半开状态"
+                )
 
     def check(self):
-        """检查熔断器状态，打开时抛出异常"""
-        if self.is_open:
-            remaining = self.recovery_timeout - (time.time() - self._last_failure_time)
-            raise CircuitBreakerOpenError(
-                f"LLM 熔断器已打开（连续失败 {self._failure_count} 次），"
-                f"约 {remaining:.0f}s 后自动恢复"
-            )
+        """检查熔断器状态；打开时抛异常；半开时只放行一个探测请求（线程安全）"""
+        with self._lock:
+            if self._state == "closed":
+                return
+            if self._state == "open":
+                if time.time() - self._last_failure_time >= self.recovery_timeout:
+                    self._state = "half_open"
+                    self._probe_in_flight = False
+                else:
+                    remaining = self.recovery_timeout - (time.time() - self._last_failure_time)
+                    raise CircuitBreakerOpenError(
+                        f"LLM 熔断器已打开（连续失败 {self._failure_count} 次），"
+                        f"约 {remaining:.0f}s 后自动恢复"
+                    )
+            # half_open: 只允许一个探测请求通过
+            if self._probe_in_flight:
+                raise CircuitBreakerOpenError(
+                    "LLM 熔断器处于半开状态，已有探测请求在途，请稍后重试"
+                )
+            self._probe_in_flight = True
 
 
 class LLMClient:
@@ -475,6 +466,7 @@ class LLMClient:
 
         last_error = None
         for attempt in range(self.max_retries + 1):
+            stream_yielded = False
             try:
                 if stream:
                     response = requests.post(
@@ -500,6 +492,7 @@ class LLMClient:
                                     # 流式输出 reasoning_content 和 content 两个 delta，
                                     # 我们只需要最终的 content。
                                     if content_text:
+                                        stream_yielded = True
                                         yield content_text
                                 except json.JSONDecodeError:
                                     continue
@@ -545,6 +538,11 @@ class LLMClient:
 
             except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
                 last_error = e
+                # 流式传输中途失败且已产出内容 → 不重试，避免前缀重复推送
+                if stream and stream_yielded:
+                    logger.error(f"LLM 流式传输中断（已产出部分内容，不重试）：{str(e)}")
+                    yield f"[错误] 流式传输中断：{str(e)}"
+                    return
                 if attempt < self.max_retries:
                     import random
                     delay = min(1.0 * (2 ** attempt), 10.0) * (0.5 + random.random() * 0.5)
@@ -589,6 +587,7 @@ class LLMClient:
 
         last_error = None
         for attempt in range(self.max_retries + 1):
+            stream_yielded = False
             try:
                 if stream:
                     response = requests.post(
@@ -608,6 +607,7 @@ class LLMClient:
                                         delta = chunk.get('delta', {})
                                         text = delta.get('text', '')
                                         if text:
+                                            stream_yielded = True
                                             yield text
                                     elif chunk.get('type') == 'message_stop':
                                         break
@@ -636,6 +636,11 @@ class LLMClient:
 
             except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
                 last_error = e
+                # 流式传输中途失败且已产出内容 → 不重试，避免前缀重复推送
+                if stream and stream_yielded:
+                    logger.error(f"LLM 流式传输中断（已产出部分内容，不重试）：{str(e)}")
+                    yield f"[错误] 流式传输中断：{str(e)}"
+                    return
                 if attempt < self.max_retries:
                     import random
                     delay = min(1.0 * (2 ** attempt), 10.0) * (0.5 + random.random() * 0.5)
@@ -660,8 +665,10 @@ class LLMClient:
     def _chat_request_loop(
         self, messages: list, effective_max_tokens: int, effective_timeout: int
     ) -> tuple:
-        """核心请求+重试循环（不涉及熔断器，由调用方管理）
+        """单次请求（不在此层重试）。
 
+        重试由 _request_openai/_request_anthropic 内层负责（带指数退避）。
+        之前这里再加一层循环会导致 (max_retries+1)² 次请求放大。
         超时保护由底层 requests.post(timeout=...) 提供，支持主线程和工作线程。
 
         Returns:
@@ -670,25 +677,23 @@ class LLMClient:
         content = ""
         error = None
         failed = False
-        for attempt in range(self.max_retries + 1):
-            try:
-                for chunk in self._do_request(
-                    messages, stream=False,
-                    max_tokens=effective_max_tokens,
-                ):
-                    content = chunk
+        try:
+            for chunk in self._do_request(
+                messages, stream=False,
+                max_tokens=effective_max_tokens,
+            ):
+                content = chunk
 
-                if content and not content.startswith('[错误]'):
-                    break  # 成功
-                elif attempt < self.max_retries:
-                    logger.warning(f"LLM 请求失败，重试 {attempt + 1}/{self.max_retries}")
-                    failed = True
-            except Exception as e:
-                error = str(e)
-                logger.error(f"LLM 请求异常：{error}")
+            if not content or content.startswith('[错误]'):
                 failed = True
-                if attempt >= self.max_retries:
-                    content = f"[错误] 请求失败：{error}"
+                if content.startswith('[错误]'):
+                    error = content
+                else:
+                    error = "LLM 返回空响应"
+        except Exception as e:
+            error = str(e)
+            failed = True
+            content = f"[错误] 请求失败：{error}"
 
         return content, error, failed
 

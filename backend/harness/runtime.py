@@ -27,9 +27,6 @@ class ToolCallLoop:
 
     MAX_ITERATIONS = 15
     NO_PROGRESS_LIMIT = 5  # 连续无进展轮次限制
-    # 真实运行验证（run_preview）失败后的最大修复轮次。
-    # 与 hook 修复共用同一计数器，避免无限重试。
-    MAX_REPAIR_ROUNDS = 2
 
     def __init__(self, workspace, git=None, tools: ToolRegistry = None,
                  hooks=None, tracer=None, cost_tracker=None, sse_reporter=None,
@@ -82,7 +79,12 @@ class ToolCallLoop:
             file_count = max(len(plan_files), 3)  # 至少按 3 个文件计算
             effective_max_iterations = min(file_count * 2 + 3, 20)
 
-        for iteration in range(effective_max_iterations):
+        # 实例级上限：chat/逐文件编码会覆盖 MAX_ITERATIONS 以收紧轮数
+        effective_max_iterations = min(effective_max_iterations, self.MAX_ITERATIONS)
+
+        # 用 while 循环（而非 for range）：允许 edit_file 失败后动态 +2 轮回退
+        iteration = 0
+        while iteration < effective_max_iterations:
             state["tool_call_count"] = iteration + 1
 
             # 检查取消信号
@@ -164,8 +166,8 @@ class ToolCallLoop:
                         "hidden": True,
                         "preserve": True,
                     })
+                    iteration += 1
                     continue
-                state["current_step"] = "task_complete"
                 state["current_step"] = "task_complete"
                 state["dialogue_history"].append({
                     "role": "agent", "name": coder_name,
@@ -385,6 +387,7 @@ class ToolCallLoop:
                         f"[ToolLoop] edit_file 失败后扩展迭代上限至 {effective_max_iterations}"
                     )
                     # 继续循环（不 break），让 LLM 用 write_file 重写
+                    iteration += 1
                     continue
                 state["current_step"] = "max_iterations"
                 break
@@ -409,6 +412,8 @@ class ToolCallLoop:
                     )
                 except Exception as e:
                     logger.warning("保存检查点失败（不阻断）：%s", e)
+
+            iteration += 1
 
         # 任务完成后运行 Hook 检查 + 预览验证，将问题注入上下文
         # 修复由 graph 层 verify→coder 循环统一处理，不再在 ToolCallLoop 内部递归

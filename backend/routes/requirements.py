@@ -3,7 +3,7 @@
 from flask import request, jsonify, Response
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from utils.db import get_db, transactional_db
-from utils.sse import get_current_timestamp
+from utils.sse import get_current_timestamp, SSEMessage
 from services.sse_manager import sse_manager
 from services.task_queue import task_queue
 from factory import app, rate_limit_requirement, rate_limit_chat, limiter, logger
@@ -43,35 +43,25 @@ def create_requirement():
         )
         db.add(requirement)
         db.flush()  # flush 执行 INSERT 并填充自增 ID，但不提交事务
+        req_id = requirement.id
+        req_title = requirement.title
+        req_status = requirement.status
 
-        logger.info(f"创建需求 {requirement.id}，准备提交到任务队列")
+    # 事务已提交后再入队：避免 worker 在事务未提交时查不到该行导致任务失败
+    logger.info(f"创建需求 {req_id}，准备提交到任务队列")
+    task_id = task_queue.submit(req_id, process_requirement_async, req_id)
+    if task_id is None:
+        # 该需求已有 PENDING/RUNNING 任务：不另起线程（否则并发重复处理）
+        logger.warning(f"需求 {req_id} 已有任务在处理中，跳过重复提交")
 
-        # 提交到任务队列
-        task_id = task_queue.submit(
-            requirement.id,
-            process_requirement_async,
-            requirement.id
-        )
-
-        if task_id is None:
-            # 任务已存在，直接启动线程处理
-            import threading
-            thread = threading.Thread(
-                target=process_requirement_async,
-                args=(requirement.id,),
-                daemon=False
-            )
-            thread.start()
-            logger.info(f"任务已存在，启动独立线程处理：{requirement.id}")
-
-        return jsonify({
-            'message': '需求已提交，正在处理',
-            'requirement': {
-                'id': requirement.id,
-                'title': requirement.title,
-                'status': requirement.status
-            }
-        }), 201
+    return jsonify({
+        'message': '需求已提交，正在处理',
+        'requirement': {
+            'id': req_id,
+            'title': req_title,
+            'status': req_status
+        }
+    }), 201
 
 
 @app.route('/api/requirements', methods=['GET'])
@@ -407,7 +397,15 @@ def chat_with_requirement(req_id):
             'hook_failures': {},
         }
 
-        final_state = tool_loop.run(state)
+        try:
+            final_state = tool_loop.run(state)
+        except Exception as e:
+            # 关键：同步长跑异常时不能把 requirement 永久卡死 processing
+            logger.error(f"Chat 执行异常 (req_id={req_id}): {e}", exc_info=True)
+            requirement.status = 'failed'
+            requirement.error_message = f"对话执行异常: {str(e)[:200]}"
+            db.commit()
+            return jsonify({'error': f'对话执行失败: {str(e)[:200]}'}), 500
 
         # 获取更新后的文件
         updated_files = workspace.snapshot()
@@ -511,21 +509,14 @@ def clarify_requirement(req_id):
         req_record.dialogue_history = dialogue_list
         flag_modified(req_record, 'dialogue_history')
 
-        # 重新提交到任务队列；若已有任务在处理，启动独立线程兜底
-        task_id = task_queue.submit(req_id, process_requirement_async, req_id)
-        if task_id is None:
-            import threading
-            thread = threading.Thread(
-                target=process_requirement_async,
-                args=(req_id,),
-                daemon=False
-            )
-            thread.start()
-            logger.info(f"需求 {req_id} 已有任务在处理，启动独立线程")
-        else:
-            logger.info(f"需求 {req_id} 收到澄清答案，重新处理：{task_id}")
+    # 事务已提交后再入队（避免竞态）；已有任务则不重复启动线程
+    task_id = task_queue.submit(req_id, process_requirement_async, req_id)
+    if task_id is None:
+        logger.warning(f"需求 {req_id} 已有任务在处理，跳过重复提交")
+    else:
+        logger.info(f"需求 {req_id} 收到澄清答案，重新处理：{task_id}")
 
-        return jsonify({'message': '澄清答案已提交', 'requirement_id': req_id})
+    return jsonify({'message': '澄清答案已提交', 'requirement_id': req_id})
 @app.route('/api/requirements/<int:req_id>/confirm', methods=['POST'])
 @jwt_required()
 def confirm_plan(req_id):
@@ -585,14 +576,7 @@ def confirm_plan(req_id):
     from services.requirement_service import confirm_plan_async
     task_id = task_queue.submit(req_id, confirm_plan_async, req_id, feedback)
     if task_id is None:
-        import threading
-        thread = threading.Thread(
-            target=confirm_plan_async,
-            args=(req_id, feedback),
-            daemon=False
-        )
-        thread.start()
-        logger.info(f"需求 {req_id} 确认 Plan，启动独立线程执行编码流程")
+        logger.warning(f"需求 {req_id} 已有任务在处理，跳过重复提交")
     else:
         logger.info(f"需求 {req_id} 确认 Plan，提交任务：{task_id}")
 
@@ -668,10 +652,14 @@ def save_code(req_id):
         if not requirement:
             return jsonify({'error': '需求不存在'}), 404
 
+        from sqlalchemy.orm.attributes import flag_modified
+
         filename = data.get('filename', '').strip()
         content = data.get('content', '')
 
-        code_files = requirement.code_files or []
+        # 重建新列表对象 + flag_modified：就地修改同一引用会导致
+        # SQLAlchemy 变更检测 old is new，不产生 UPDATE，保存静默丢失
+        code_files = list(requirement.code_files or [])
         file_found = False
         for i, file in enumerate(code_files):
             if file.get('filename') == filename:
@@ -688,8 +676,9 @@ def save_code(req_id):
             })
 
         requirement.code_files = code_files
+        flag_modified(requirement, 'code_files')
 
-        dialogue_history = requirement.dialogue_history or []
+        dialogue_history = list(requirement.dialogue_history or [])
         dialogue_history.append({
             'role': 'user',
             'name': '用户',
@@ -698,6 +687,7 @@ def save_code(req_id):
             'type': 'code_edit'
         })
         requirement.dialogue_history = dialogue_history
+        flag_modified(requirement, 'dialogue_history')
 
 
         return jsonify({
@@ -737,6 +727,8 @@ def save_all_code(req_id):
                 })
 
         requirement.code_files = new_code_files
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(requirement, 'code_files')
 
         return jsonify({
             'message': '所有代码已保存',
@@ -744,9 +736,21 @@ def save_all_code(req_id):
         }), 200
 
 @app.route('/api/sse/<int:req_id>')
+@jwt_required()
 @limiter.exempt if limiter else (lambda f: f)
 def sse_stream(req_id):
-    """SSE 实时推送连接"""
+    """SSE 实时推送连接（JWT 鉴权 + 需求归属校验）"""
+    from models import Requirement
+
+    current_user_id = int(get_jwt_identity())
+    with get_db() as db:
+        requirement = db.query(Requirement).filter(
+            Requirement.id == req_id,
+            Requirement.user_id == current_user_id,
+        ).first()
+        if not requirement:
+            return jsonify({'error': '需求不存在'}), 404
+
     import queue
 
     client_queue = queue.Queue()

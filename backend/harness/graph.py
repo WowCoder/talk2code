@@ -37,6 +37,10 @@ def route_after_tl(state: AgentState) -> str:
     if step == "needs_clarification":
         return "clarify"
 
+    # TL 失败时不应进入 coder 用空 plan 编码，直接结束由服务层决定重试
+    if step == "team_leader_failed":
+        return "done"
+
     # 其他所有情况 → coder 节点
     return "coder"
 
@@ -111,6 +115,7 @@ def create_workflow_v5() -> StateGraph:
         route_after_tl,
         {
             "clarify": END,
+            "done": END,
             "coder": "coder",
         }
     )

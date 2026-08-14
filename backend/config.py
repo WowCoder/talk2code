@@ -240,32 +240,6 @@ class Settings(BaseSettings):
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.CORS_ORIGINS.split(',') if o.strip()]
 
-    def validate_production(self) -> bool:
-        """
-        验证生产环境配置
-
-        Returns:
-            配置是否有效
-        """
-        errors = []
-
-        if self.JWT_SECRET_KEY == 'talk2code-secret-key-change-in-production':
-            errors.append("JWT_SECRET_KEY 使用默认值，生产环境必须修改")
-
-        if not self.LLM_API_KEY:
-            errors.append("LLM_API_KEY 未配置")
-
-        if self.APP_DEBUG:
-            errors.append("生产环境不应开启 DEBUG 模式")
-
-        if errors:
-            for error in errors:
-                import warnings
-                warnings.warn(error, UserWarning, stacklevel=2)
-            return False
-
-        return True
-
 
 # 全局配置实例
 _settings: Settings = None

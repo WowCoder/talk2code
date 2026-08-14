@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """用户认证 API 路由"""
 from flask import request, jsonify
-from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
+from flask_jwt_extended import (
+    create_access_token, jwt_required, get_jwt_identity,
+    set_access_cookies, unset_jwt_cookies,
+)
 from config import JWT_ACCESS_TOKEN_EXPIRES
 from utils.db import get_db, transactional_db
 from factory import app, rate_limit_auth, logger
@@ -71,11 +74,22 @@ def login():
         access_token = create_access_token(identity=str(user.id), expires_delta=JWT_ACCESS_TOKEN_EXPIRES)
         logger.info(f"用户登录成功：{username}")
 
-        return jsonify({
+        resp = jsonify({
             'message': '登录成功',
             'token': access_token,
             'user': {'id': user.id, 'username': user.username}
-        }), 200
+        })
+        # 写入 httpOnly cookie（前端不再把 token 存 localStorage，规避 XSS 窃取）
+        set_access_cookies(resp, access_token)
+        return resp, 200
+
+
+@app.route('/api/logout', methods=['POST'])
+def logout():
+    """用户登出：清除 httpOnly cookie"""
+    resp = jsonify({'message': '已登出'})
+    unset_jwt_cookies(resp)
+    return resp, 200
 
 
 @app.route('/api/user/info', methods=['GET'])

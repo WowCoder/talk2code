@@ -62,6 +62,7 @@ async function submit() {
         'Content-Type': 'application/json',
         ...authStore.getAuthHeaders(),
       },
+      credentials: 'include',
       body: JSON.stringify({ content: text }),
     })
 

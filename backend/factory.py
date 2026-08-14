@@ -6,8 +6,11 @@ Talk2Code - Flask 主应用
 
 import os
 import sys
-from flask import Flask, request, jsonify, Response, send_from_directory
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from flask import Flask, request, jsonify, Response, send_from_directory, g
+from flask_jwt_extended import (
+    JWTManager, create_access_token, jwt_required, get_jwt_identity,
+    verify_jwt_in_request,
+)
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -34,17 +37,37 @@ logger.info("日志系统已初始化")
 
 app = Flask(__name__, static_folder=None)
 
+# 请求体大小上限，防止超大 JSON 耗尽内存
+app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5MB
+
 # CORS 配置 - 使用白名单而非全开
-CORS(app, origins=settings.cors_origins_list)
+# supports_credentials: 允许携带 httpOnly cookie（SSE / preview iframe 鉴权需要）
+CORS(app, origins=settings.cors_origins_list, supports_credentials=True)
 
 # JWT 配置
 app.config['JWT_SECRET_KEY'] = JWT_SECRET_KEY
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = JWT_ACCESS_TOKEN_EXPIRES
-app.config['JWT_TOKEN_LOCATION'] = ['headers']
+app.config['JWT_TOKEN_LOCATION'] = ['headers', 'cookies']
 app.config['JWT_HEADER_NAME'] = 'Authorization'
 app.config['JWT_HEADER_TYPE'] = 'Bearer'
+app.config['JWT_COOKIE_SECURE'] = not settings.APP_DEBUG  # 生产环境仅通过 HTTPS 下发
+app.config['JWT_COOKIE_SAMESITE'] = 'Lax'
+app.config['JWT_COOKIE_CSRF_PROTECT'] = False
 
 jwt = JWTManager(app)
+
+
+# 在限流 key 计算前解析 JWT 身份（写入 g.user_id），使限流按用户维度生效。
+# 注意：必须注册在 Limiter 之前（Flask 按注册顺序执行 before_request）。
+@app.before_request
+def _set_rate_limit_identity():
+    try:
+        verify_jwt_in_request(optional=True)
+        ident = get_jwt_identity()
+        g.user_id = ident if ident is not None else None
+    except Exception:
+        g.user_id = None
+
 
 # 限流配置 - 测试环境下禁用
 DISABLE_RATE_LIMIT = os.environ.get('DISABLE_RATE_LIMIT', 'false').lower() == 'true'

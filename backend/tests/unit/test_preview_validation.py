@@ -145,48 +145,6 @@ class TestToolCallLoopValidationFeedBack:
         errors = loop._run_preview_validation(self._make_state())
         assert errors == []
 
-    def test_repair_respects_max_rounds(self, monkeypatch):
-        """验证错误持续存在时，修复轮次不超过 MAX_REPAIR_ROUNDS"""
-        from harness.runtime import ToolCallLoop
-
-        ws = _FakeWorkspace(files={"index.html": "x", "style.css": "", "script.js": ""})
-
-        # 让 client 第一轮就「任务完成」，不再写文件 → 直接进入验证分支
-        client = MagicMock()
-        done_resp = MagicMock()
-        done_resp.tool_calls = None
-        done_resp.content = "任务完成"
-        done_resp.usage = None
-        done_resp.error = None  # v5: response.error 被检查，需显式设为 None
-        done_resp.is_error = False
-        client.chat_with_tools.return_value = done_resp
-
-        monkeypatch.setattr("harness.runtime.get_client", lambda: client)
-
-        loop = ToolCallLoop(workspace=ws, hooks=None)
-        # run_preview 永远报错
-        with patch.object(PreviewToolHandler, "run_preview",
-                          return_value=_to_result({
-                              "available": True,
-                              "errors": [{"type": "pageerror", "message": "persistent error"}],
-                              "logs": [], "network": [], "url": "x"})):
-            state = self._make_state()
-            state["current_step"] = "task_complete"
-            # 直接驱动 run 一次：会反复「完成→验证失败→重跑」，但受 MAX_REPAIR_ROUNDS 限制
-            # 为避免无限循环，用 patch 限制 get_client 调用次数
-            call_count = {"n": 0}
-            orig = client.chat_with_tools
-
-            def counting(*a, **kw):
-                call_count["n"] += 1
-                return done_resp
-
-            client.chat_with_tools.side_effect = counting
-            final_state = loop.run(state)
-
-        # repair_count 最终 == MAX_REPAIR_ROUNDS（不会无限增长）
-        assert final_state["metadata"]["repair_count"] == ToolCallLoop.MAX_REPAIR_ROUNDS
-
     def test_plan_appears_in_system_prompt(self):
         """P1: plan 应被注入 Coder system prompt（之前被丢弃）"""
         from harness.runtime import ToolCallLoop

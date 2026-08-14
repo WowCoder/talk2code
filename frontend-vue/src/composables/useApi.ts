@@ -14,12 +14,12 @@ export function useApi() {
       delete headers['Content-Type']
     }
 
-    const response = await fetch(url, { ...options, headers })
+    const response = await fetch(url, { ...options, headers, credentials: 'include' })
 
     if (!response.ok) {
       // Handle 401 - redirect to login
       if (response.status === 401) {
-        authStore.logout()
+        authStore.clearAuth()
         window.location.href = '/login'
         throw new Error('未登录或登录已过期')
       }

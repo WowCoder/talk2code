@@ -55,8 +55,7 @@ class TestWorkspaceFSFileOperations:
     def test_init_creates_directory(self):
         """测试 init 创建工作目录"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            WorkspaceFS.BASE_DIR = Path(tmpdir) / "workspaces"
-            ws = WorkspaceFS(user_id=1, requirement_id=100)
+            ws = WorkspaceFS(user_id=1, requirement_id=100, base_dir=Path(tmpdir) / "workspaces")
             ws.init()
             assert ws.path.exists()
             assert ws.path.is_dir()
@@ -64,8 +63,7 @@ class TestWorkspaceFSFileOperations:
     def test_init_with_code_files(self):
         """测试从 code_files 初始化工作区"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            WorkspaceFS.BASE_DIR = Path(tmpdir) / "workspaces"
-            ws = WorkspaceFS(user_id=1, requirement_id=100)
+            ws = WorkspaceFS(user_id=1, requirement_id=100, base_dir=Path(tmpdir) / "workspaces")
             ws.init([
                 {"filename": "index.html", "content": "<html></html>"},
                 {"filename": "css/style.css", "content": "body{}"},
@@ -77,8 +75,7 @@ class TestWorkspaceFSFileOperations:
     def test_read_write(self):
         """测试读写文件"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            WorkspaceFS.BASE_DIR = Path(tmpdir) / "workspaces"
-            ws = WorkspaceFS(user_id=1, requirement_id=100)
+            ws = WorkspaceFS(user_id=1, requirement_id=100, base_dir=Path(tmpdir) / "workspaces")
             ws.init()
 
             ws.write("test.html", "<h1>Hello</h1>")
@@ -88,8 +85,7 @@ class TestWorkspaceFSFileOperations:
     def test_read_nonexistent_file(self):
         """测试读取不存在的文件"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            WorkspaceFS.BASE_DIR = Path(tmpdir) / "workspaces"
-            ws = WorkspaceFS(user_id=1, requirement_id=100)
+            ws = WorkspaceFS(user_id=1, requirement_id=100, base_dir=Path(tmpdir) / "workspaces")
             ws.init()
 
             with pytest.raises(FileNotFoundError):
@@ -98,8 +94,7 @@ class TestWorkspaceFSFileOperations:
     def test_write_to_subdirectory(self):
         """测试写入子目录"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            WorkspaceFS.BASE_DIR = Path(tmpdir) / "workspaces"
-            ws = WorkspaceFS(user_id=1, requirement_id=100)
+            ws = WorkspaceFS(user_id=1, requirement_id=100, base_dir=Path(tmpdir) / "workspaces")
             ws.init()
 
             ws.write("deep/nested/file.js", "console.log(1)")
@@ -110,8 +105,7 @@ class TestWorkspaceFSFileOperations:
     def test_list_files(self):
         """测试列出所有文件"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            WorkspaceFS.BASE_DIR = Path(tmpdir) / "workspaces"
-            ws = WorkspaceFS(user_id=1, requirement_id=100)
+            ws = WorkspaceFS(user_id=1, requirement_id=100, base_dir=Path(tmpdir) / "workspaces")
             ws.init()
             ws.write("index.html", "html")
             ws.write("css/style.css", "css")
@@ -126,8 +120,7 @@ class TestWorkspaceFSFileOperations:
     def test_delete_file(self):
         """测试删除文件"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            WorkspaceFS.BASE_DIR = Path(tmpdir) / "workspaces"
-            ws = WorkspaceFS(user_id=1, requirement_id=100)
+            ws = WorkspaceFS(user_id=1, requirement_id=100, base_dir=Path(tmpdir) / "workspaces")
             ws.init()
             ws.write("test.html", "test")
             assert ws.exists("test.html")
@@ -138,8 +131,7 @@ class TestWorkspaceFSFileOperations:
     def test_delete_nonexistent(self):
         """测试删除不存在的文件不报错"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            WorkspaceFS.BASE_DIR = Path(tmpdir) / "workspaces"
-            ws = WorkspaceFS(user_id=1, requirement_id=100)
+            ws = WorkspaceFS(user_id=1, requirement_id=100, base_dir=Path(tmpdir) / "workspaces")
             ws.init()
             # 不应抛异常
             ws.delete("nonexistent.html")
@@ -147,8 +139,7 @@ class TestWorkspaceFSFileOperations:
     def test_snapshot(self):
         """测试快照功能"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            WorkspaceFS.BASE_DIR = Path(tmpdir) / "workspaces"
-            ws = WorkspaceFS(user_id=1, requirement_id=100)
+            ws = WorkspaceFS(user_id=1, requirement_id=100, base_dir=Path(tmpdir) / "workspaces")
             ws.init()
             ws.write("index.html", "html content")
             ws.write("app.js", "js content")
@@ -165,8 +156,7 @@ class TestWorkspaceFSFileOperations:
     def test_cleanup(self):
         """测试清理工作目录"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            WorkspaceFS.BASE_DIR = Path(tmpdir) / "workspaces"
-            ws = WorkspaceFS(user_id=1, requirement_id=100)
+            ws = WorkspaceFS(user_id=1, requirement_id=100, base_dir=Path(tmpdir) / "workspaces")
             ws.init()
             ws.write("test.html", "test")
             assert ws.path.exists()

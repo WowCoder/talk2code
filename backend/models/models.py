@@ -238,11 +238,3 @@ def init_db():
         pass  # 列已存在
 
 
-# 获取数据库会话
-def get_db():
-    """获取数据库会话，使用完毕后需关闭"""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()

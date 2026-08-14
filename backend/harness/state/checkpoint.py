@@ -42,9 +42,29 @@ class CheckpointManager:
     def _persisted(self) -> bool:
         return self._db is not None
 
+    # 不可 JSON 序列化的对象引用（恢复时由 requirement_service 重新注入）
+    _SKIP_KEYS = ("_tool_loop", "_workspace", "_completion_contract")
+
+    @classmethod
+    def _sanitize_state(cls, state: dict) -> dict:
+        """序列化前剥离 metadata 中的对象引用。
+
+        之前用 default=str 会把 ToolCallLoop/WorkspaceFS 等对象存成
+        '<xxx object at 0x...>' 字符串，恢复后 tool_loop.run() 直接 AttributeError。
+        """
+        clean = dict(state)  # 顶层浅拷贝
+        meta = clean.get("metadata")
+        if isinstance(meta, dict):
+            meta = dict(meta)  # 浅拷贝 metadata，避免污染原 state
+            for key in cls._SKIP_KEYS:
+                meta.pop(key, None)
+            clean["metadata"] = meta
+        clean.pop("_completion_contract", None)
+        return clean
+
     def save(self, requirement_id: int, node_name: str, state: dict) -> str:
-        checkpoint_id = f"cp_{requirement_id}_{int(time.time() * 1000)}"
-        state_json = json.dumps(state, default=str, ensure_ascii=False)
+        checkpoint_id = f"cp_{requirement_id}_{time.time_ns()}"
+        state_json = json.dumps(self._sanitize_state(state), ensure_ascii=False)
         cp = Checkpoint(
             id=checkpoint_id,
             requirement_id=requirement_id,

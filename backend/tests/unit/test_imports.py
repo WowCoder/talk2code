@@ -128,14 +128,6 @@ class TestProjectImportsClean:
         assert hasattr(nodes, 'verify_node')
         assert hasattr(nodes, 'repair_node')
 
-    def test_agents_backward_compat(self):
-        """验证 agents/ 向后兼容重导出仍然有效"""
-        from agents.workflow import create_workflow
-        from agents.nodes import team_leader_node, tool_coder_node
-        from agents.tool_loop import ToolCallLoop
-        assert create_workflow is not None
-        assert ToolCallLoop is not None
-
     def test_llm_client_imports(self):
         """验证 llm/client.py 可以正常导入"""
         import llm.client
@@ -143,32 +135,6 @@ class TestProjectImportsClean:
         assert LLMClient is not None
         assert LLMResponse is not None
         assert Message is not None
-
-    def test_to_langchain_message_function_exists(self):
-        """验证 to_langchain_message 转换函数存在"""
-        from llm.client import to_langchain_message
-        assert to_langchain_message is not None
-
-    def test_to_langchain_message_user_to_human(self):
-        """验证 user 角色转换为 HumanMessage"""
-        from llm.client import to_langchain_message, Message
-        msg = Message(role='user', content='Hello')
-        result = to_langchain_message(msg)
-        assert result.content == 'Hello'
-
-    def test_to_langchain_message_assistant_to_ai(self):
-        """验证 assistant 角色转换为 AIMessage"""
-        from llm.client import to_langchain_message, Message
-        msg = Message(role='assistant', content='Hi there')
-        result = to_langchain_message(msg)
-        assert result.content == 'Hi there'
-
-    def test_to_langchain_message_system_to_system(self):
-        """验证 system 角色转换为 SystemMessage"""
-        from llm.client import to_langchain_message, Message
-        msg = Message(role='system', content='System message')
-        result = to_langchain_message(msg)
-        assert result.content == 'System message'
 
     def test_prompts_imports(self):
         """验证 harness/instructions/prompts/ 可以正常导入"""

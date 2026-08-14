@@ -7,6 +7,7 @@ LLM 客户端单元测试
 import pytest
 from unittest.mock import Mock, patch, MagicMock
 import json
+import requests
 
 from llm.client import (
     LLMClient,
@@ -76,7 +77,7 @@ class TestLLMClientInit:
         """测试默认参数"""
         client = LLMClient(api_key='test_key')
         assert client.temperature == 0.7
-        assert client.max_tokens == 4000
+        assert client.max_tokens == 8000  # config 默认值（.env 未覆盖时）
         assert client.timeout == 60
         assert client.max_retries == 2
 
@@ -297,9 +298,9 @@ class TestLLMClientRetry:
     @patch('llm.client.time.sleep')
     def test_retry_on_failure(self, mock_sleep, mock_post):
         """测试失败后重试"""
-        # 第一次失败，第二次成功
+        # 第一次失败，第二次成功（用 RequestException 触发内层重试）
         mock_post.side_effect = [
-            Exception("First error"),
+            requests.exceptions.ConnectionError("First error"),
             Mock(json=lambda: {'choices': [{'message': {'content': 'Success'}}]}, raise_for_status=Mock())
         ]
 
@@ -313,7 +314,7 @@ class TestLLMClientRetry:
     @patch('llm.client.time.sleep')
     def test_max_retries_exceeded(self, mock_sleep, mock_post):
         """测试超过最大重试次数（无备份模型时）"""
-        mock_post.side_effect = Exception("Always fails")
+        mock_post.side_effect = requests.exceptions.ConnectionError("Always fails")
 
         client = LLMClient(api_key='test_key', max_retries=2)
         client._has_backup = False  # 禁用备份，只测试主模型重试逻辑
@@ -326,15 +327,17 @@ class TestLLMClientRetry:
     @patch('llm.client.time.sleep')
     def test_failover_to_backup_on_primary_failure(self, mock_sleep, mock_post):
         """测试主模型失败后自动切换到备用模型"""
-        mock_post.side_effect = Exception("Always fails")
+        mock_post.side_effect = requests.exceptions.ConnectionError("Always fails")
 
+        from llm.client import CircuitBreaker
         client = LLMClient(api_key='test_key', max_retries=1)
-        # 手动配置备份模型参数
+        # 手动配置备份模型参数（含熔断器，否则 _has_backup=True 时 backup 熔断器为 None）
         client._has_backup = True
         client.backup_base_url = 'https://backup.api.com/v1'
         client.backup_model = 'backup-model'
         client.backup_api_key = 'backup-key'
         client.backup_provider = 'openai_compatible'
+        client._backup_circuit_breaker = CircuitBreaker()
         response = client.chat('Test', use_memory=False)
 
         # 主模型 2 次 + 备份模型 2 次 = 4 次

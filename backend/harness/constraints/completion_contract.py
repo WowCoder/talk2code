@@ -215,7 +215,7 @@ class CompletionContract:
     def clear(self):
         """清除 contract（任务完成后）"""
         try:
-            self._workspace.delete_file(self._contract_path)
+            self._workspace.delete(self._contract_path)
             logger.info("[CompletionContract] contract 已清除")
         except Exception as e:
             logger.warning(f"[CompletionContract] 清除 contract 失败: {e}")

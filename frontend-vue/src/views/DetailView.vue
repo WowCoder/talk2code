@@ -224,6 +224,7 @@ async function onStopGeneration() {
     await fetch(`/api/requirements/${store.currentRequirement.id}/cancel`, {
       method: 'POST',
       headers,
+      credentials: 'include',
     })
     // SSE cancelled 事件会自动清理 isGenerating 状态
     // 作为 fallback，也在这里清理

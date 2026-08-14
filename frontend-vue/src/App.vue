@@ -5,15 +5,13 @@
 
 <script setup lang="ts">
 import { onMounted } from 'vue'
-import { useAuthStore } from '@/stores/auth'
 import { useSettingsStore } from '@/stores/settings'
 import ToastContainer from '@/components/common/ToastContainer.vue'
 
-const authStore = useAuthStore()
 const settingsStore = useSettingsStore()
 
 onMounted(() => {
-  authStore.initFromStorage()
+  // 登录态恢复已前移到 main.ts（initAuth），此处仅应用主题
   settingsStore.applyTheme()
 })
 </script>

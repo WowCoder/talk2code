@@ -72,28 +72,47 @@ class ContextCompactor:
             compressible, max_budget=compressible_budget
         )
 
-        # 合并保留消息和压缩后的消息
-        result = preserved + compacted
+        # 合并保留消息和压缩后的消息——保持原始相对顺序（避免 preserve 消息被重排到最前）
+        kept_ids = {id(m) for m in compacted}
+        result = [
+            m for m in messages
+            if m.get("preserve") is True or id(m) in kept_ids
+        ]
 
         # 再次估算，如果还超则 P3 层压缩
         estimated2 = self._estimate_tokens(result)
         if estimated2 > self.budget * self.COMPACTION_THRESHOLD:
             logger.info(f"[ContextCompactor] P2 压缩后仍超限 ({estimated2})，进入 P3 层")
-            result = preserved + self._compact_with_summary(compacted)
+            p3 = self._compact_with_summary(compacted)
+            orig_ids = {id(m) for m in messages}
+            # 摘要消息是 _compact_with_summary 新建的 dict，不在原 messages 中
+            summary_msgs = [m for m in p3 if id(m) not in orig_ids]
+            kept_p3_ids = {id(m) for m in p3 if id(m) in orig_ids}
+            result = [
+                m for m in messages
+                if m.get("preserve") is True or id(m) in kept_p3_ids
+            ] + summary_msgs
 
         return result
 
     def _compact_old_dialogues(self, messages: list, max_budget: int = None) -> list:
-        """P2 层压缩：保留 system + 最近 N 条消息"""
-        kept = []
-        for m in messages:
-            if m.get("role") == "system":
-                kept.append(m)
-
-        # 保留最近 N 条非 system 消息
+        """P2 层压缩：保留 system + 最近 N 条消息（受 max_budget 约束）"""
+        system_msgs = [m for m in messages if m.get("role") == "system"]
         non_system = [m for m in messages if m.get("role") != "system"]
-        kept.extend(non_system[-self.MAX_CONTEXT_MESSAGES:])
 
+        if max_budget is None:
+            return system_msgs + non_system[-self.MAX_CONTEXT_MESSAGES:]
+
+        # 在预算内尽可能多保留最近的消息
+        kept = list(system_msgs)
+        budget_left = max_budget - self._estimate_tokens(system_msgs)
+        window = min(self.MAX_CONTEXT_MESSAGES, len(non_system))
+        while window > 0:
+            tail = non_system[-window:]
+            if self._estimate_tokens(tail) <= budget_left:
+                kept.extend(tail)
+                return kept
+            window -= 1
         return kept
 
     def _compact_with_summary(self, messages: list) -> list:
@@ -164,13 +183,21 @@ class ContextCompactor:
         return "\n".join(summary_parts)
 
     def _estimate_tokens(self, messages: list) -> int:
-        """粗略估算 token 数"""
+        """粗略估算 token 数（中英文字符分段加权，避免中文低估约 50%）"""
         total = 0
         for m in messages:
             content = m.get("content", "")
             if isinstance(content, str):
-                total += len(content) // 3  # 粗略：中文约 1.5 char/token，英文约 4 char/token
+                total += self._estimate_text_tokens(content)
         return total
+
+    @staticmethod
+    def _estimate_text_tokens(text: str) -> int:
+        """中文字符约 1.5 字/token，英文/符号约 4 字/token"""
+        import re
+        chinese = len(re.findall(r'[\u4e00-\u9fff]', text))
+        other = max(len(text) - chinese, 0)
+        return int(chinese / 1.5 + other / 4)
 
     def summarize_old_messages(self, old_messages: list, client=None) -> str:
         """

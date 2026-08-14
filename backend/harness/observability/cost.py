@@ -23,16 +23,28 @@ class CostTracker:
         "gpt-4o-mini": {"input": 0.15, "output": 0.60},
         "qwen-plus": {"input": 0.50, "output": 2.00},
         "qwen-max": {"input": 2.00, "output": 8.00},
-        "claude-opus-4-7": {"input": 15.00, "output": 75.00},
+        "claude-opus-4-5": {"input": 15.00, "output": 75.00},
         "deepseek-v3": {"input": 0.27, "output": 1.10},
         "deepseek-r1": {"input": 0.55, "output": 2.19},
+        # 注意：deepseek 系列按模型名前缀匹配（下方 record 中做前缀回退）
     }
 
     def __init__(self):
         self._usage: dict[str, CostReport] = {}  # trace_id → CostReport
 
     def record(self, trace_id: str, input_tokens: int, output_tokens: int, model: str = ""):
-        pricing = self.PRICING.get(model, {"input": 1.0, "output": 4.0})
+        pricing = self.PRICING.get(model)
+        if pricing is None:
+            # 前缀回退：deepseek-v4-* 等未知版本按 deepseek-v3 计价，避免落到任意默认价
+            prefix = model.split("-")[0] if "-" in model else ""
+            if model.startswith("deepseek-"):
+                pricing = self.PRICING.get("deepseek-v3", {"input": 0.27, "output": 1.10})
+            elif model.startswith("qwen-"):
+                pricing = self.PRICING.get("qwen-plus", {"input": 0.50, "output": 2.00})
+            elif model.startswith("gpt-4o"):
+                pricing = self.PRICING.get("gpt-4o", {"input": 2.50, "output": 10.00})
+            else:
+                pricing = {"input": 1.0, "output": 4.0}
         cost = (input_tokens / 1_000_000) * pricing["input"] + \
                (output_tokens / 1_000_000) * pricing["output"]
 

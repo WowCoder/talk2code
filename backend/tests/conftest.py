@@ -16,6 +16,9 @@ sys.path.insert(0, str(backend_dir))
 os.environ.setdefault('JWT_SECRET_KEY', 'test-secret-key-for-testing-only')
 os.environ.setdefault('LLM_API_KEY', 'test-api-key')
 os.environ.setdefault('DATABASE_NAME', 'test_vcd.db')
+# 强制清空 DATABASE_URL：否则 .env 中的 PostgreSQL 连接串会优先于默认值，
+# 导致测试去连生产 PG 而非 SQLite（config 单例 + models 引擎在导入期已绑定）
+os.environ['DATABASE_URL'] = ''
 os.environ.setdefault('APP_DEBUG', 'false')
 os.environ.setdefault('DISABLE_RATE_LIMIT', 'true')  # Disable rate limiting for tests
 

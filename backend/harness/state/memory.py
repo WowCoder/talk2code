@@ -125,7 +125,7 @@ class MemoryManager:
 
     # ==================== 公有 API ====================
 
-    def before_task(self, requirement: str, system_prompt: str) -> str:
+    def before_task(self, requirement: str, system_prompt: str, user_id: int = 0) -> str:
         """
         任务前: 检索相关记忆，注入 System Prompt。
 
@@ -136,12 +136,13 @@ class MemoryManager:
         Args:
             requirement: 用户需求文本
             system_prompt: 原始系统提示词
+            user_id: 当前用户 ID（记忆隔离，避免跨用户注入）
 
         Returns:
             增强后的系统提示词（追加 few-shot 示例）
         """
         try:
-            memories = self._get_active_memories()
+            memories = self._get_active_memories(user_id)
             if not memories:
                 return system_prompt
 
@@ -275,11 +276,14 @@ class MemoryManager:
         except Exception as e:
             logger.warning(f"[MemoryManager] 索引构建失败（降级为空库）: {e}")
 
-    def _get_active_memories(self) -> list[Memory]:
-        """从数据库加载所有活跃（未被淘汰）的记忆"""
+    def _get_active_memories(self, user_id: int = None) -> list[Memory]:
+        """从数据库加载活跃（未被淘汰）的记忆；传 user_id 时按用户隔离"""
         try:
             db = SessionLocal()
-            rows = db.query(AgentMemoryV2).filter_by(superseded=False).all()
+            query = db.query(AgentMemoryV2).filter_by(superseded=False)
+            if user_id is not None:
+                query = query.filter(AgentMemoryV2.user_id == user_id)
+            rows = query.all()
             db.close()
             return [Memory.from_orm(r) for r in rows]
         except Exception as e:

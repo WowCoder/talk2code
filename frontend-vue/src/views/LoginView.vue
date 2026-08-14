@@ -31,21 +31,13 @@
 
 <script setup lang="ts">
 import { ref } from 'vue'
-import { useRouter } from 'vue-router'
-import { useAuthStore } from '@/stores/auth'
 import TabSwitcher from '@/components/auth/TabSwitcher.vue'
 import LoginForm from '@/components/auth/LoginForm.vue'
 import RegisterForm from '@/components/auth/RegisterForm.vue'
 
 const activeTab = ref<'login' | 'register'>('login')
-const router = useRouter()
-const authStore = useAuthStore()
 
-// Redirect if already authenticated
-authStore.initFromStorage()
-if (authStore.isAuthenticated) {
-  router.replace('/')
-}
+// 已登录跳转由路由守卫（router.beforeEach）处理，无需在此手动判断
 
 function onLoginSuccess() {
   // Already handled in LoginForm (delayed redirect)

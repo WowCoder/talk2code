@@ -81,7 +81,7 @@ class Tracer:
 
     def start_trace(self, requirement_id: int, user_id: int) -> Trace:
         trace = Trace(
-            trace_id=str(uuid.uuid4())[:8],
+            trace_id=uuid.uuid4().hex,
             requirement_id=requirement_id,
             user_id=user_id,
             start_time=time.time(),
@@ -91,7 +91,7 @@ class Tracer:
 
     def start_span(self, trace_id: str, name: str, parent_id: str = None, metadata: dict = None) -> Span:
         span = Span(
-            span_id=str(uuid.uuid4())[:8],
+            span_id=uuid.uuid4().hex,
             parent_id=parent_id,
             name=name,
             start_time=time.time(),
@@ -177,7 +177,11 @@ class Tracer:
             if not row or not row.data:
                 return None
             d = row.data
-            spans = [Span(**s) for s in d.get("spans", [])]
+            span_fields = Span.__dataclass_fields__.keys()
+            spans = [
+                Span(**{k: v for k, v in s.items() if k in span_fields})
+                for s in d.get("spans", [])
+            ]
             return Trace(
                 trace_id=row.trace_id,
                 requirement_id=row.requirement_id,

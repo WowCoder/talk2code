@@ -58,8 +58,12 @@ class TestToolCallLoopBasic:
         from harness.tools.registry import create_tool_registry
         mock_client = Mock()
         mock_response = Mock()
-        mock_response.tool_calls = [Mock(name="list_files", arguments={})]
+        _tc = Mock()
+        _tc.name = "list_files"
+        _tc.arguments = {}
+        mock_response.tool_calls = [_tc]
         mock_response.content = "继续..."
+        mock_response.reasoning_content = ""
         mock_response.usage = None
         mock_response.error = None
         mock_response.is_error = False  # Mock doesn't use dataclass property
@@ -97,8 +101,12 @@ class TestToolCallLoopBasic:
         from harness.tools.registry import create_tool_registry
         mock_client = Mock()
         mock_response = Mock()
-        mock_response.tool_calls = [Mock(name="list_files", arguments={})]
+        _tc = Mock()
+        _tc.name = "list_files"
+        _tc.arguments = {}
+        mock_response.tool_calls = [_tc]
         mock_response.content = "检查中..."
+        mock_response.reasoning_content = ""
         mock_response.usage = None
         mock_response.error = None
         mock_response.is_error = False  # Mock doesn't use dataclass property

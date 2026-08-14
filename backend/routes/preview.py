@@ -216,6 +216,9 @@ def preview_serve(req_id: int, filepath: str):
 
 def _preview_error_html(message: str, status: int = 404):
     """生成预览错误页面（HTML 格式，iframe 友好）"""
+    import html as _html
+    # 转义用户可控的 filepath，防止反射型 XSS
+    message = _html.escape(message)
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -230,6 +233,11 @@ def _preview_error_html(message: str, status: int = 404):
 <body><div class="box">
 <div class="code">{status}</div><div class="msg">{message}</div>
 </div></body></html>"""
-    return Response(html, status=status, mimetype='text/html; charset=utf-8')
+    return Response(
+        html,
+        status=status,
+        mimetype='text/html; charset=utf-8',
+        headers={'X-Content-Type-Options': 'nosniff'},
+    )
 
 
