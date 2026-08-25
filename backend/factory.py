@@ -13,7 +13,6 @@ from flask_jwt_extended import (
 )
 from flask_cors import CORS
 from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 
 from config import JWT_SECRET_KEY, JWT_ACCESS_TOKEN_EXPIRES, LLM_API_KEY, LLM_MODEL, LLM_PROVIDER, settings
 from models import init_db
@@ -40,9 +39,22 @@ app = Flask(__name__, static_folder=None)
 # 请求体大小上限，防止超大 JSON 耗尽内存
 app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5MB
 
+# 进程启动时间（供 /api/metrics 计算 uptime）
+import time as _time
+app.config['START_TIME'] = _time.time()
+
 # CORS 配置 - 使用白名单而非全开
 # supports_credentials: 允许携带 httpOnly cookie（SSE / preview iframe 鉴权需要）
 CORS(app, origins=settings.cors_origins_list, supports_credentials=True)
+
+# 凭证模式下的通配符防护：supports_credentials=True 时反射任意 Origin
+# 会把跨站请求升级为带凭证请求，直接拒绝启动（debug 下仅告警）
+if '*' in settings.cors_origins_list:
+    _cors_msg = "CORS_ORIGINS 含 '*' 且开启了 supports_credentials，存在凭证泄露风险"
+    if settings.APP_DEBUG:
+        logger.warning(f"⚠️  {_cors_msg}")
+    else:
+        raise RuntimeError(_cors_msg)
 
 # JWT 配置
 app.config['JWT_SECRET_KEY'] = JWT_SECRET_KEY
@@ -112,12 +124,19 @@ def check_production_security():
     fatal_issues = []
 
     # 1. 检查 JWT 密钥
+    # "暴露"判定：非调试模式，或监听在非回环地址（0.0.0.0/:: 会被局域网直接访问）。
+    # 默认密钥 + 暴露 ⇒ 拒绝启动，除非显式设置 ALLOW_INSECURE_SECRETS=true 豁免。
     if JWT_SECRET_KEY == 'talk2code-secret-key-change-in-production':
-        msg = "JWT_SECRET_KEY 使用默认值，生产环境必须修改！"
-        issues.append(msg)
-        if not settings.APP_DEBUG:
+        exposed = (not settings.APP_DEBUG) or settings.APP_HOST in ('0.0.0.0', '::')
+        allow_insecure = settings.ALLOW_INSECURE_SECRETS
+        msg = "JWT_SECRET_KEY 使用默认值，可被任何人伪造任意用户令牌！"
+        if exposed and not allow_insecure:
             fatal_issues.append(msg)
-            logger.critical("🔴 JWT_SECRET_KEY 使用默认值，存在安全风险")
+            logger.critical("🔴 JWT_SECRET_KEY 使用默认值且服务对外可达，拒绝启动"
+                            "（配置真实密钥，或隔离环境显式设 ALLOW_INSECURE_SECRETS=true）")
+        else:
+            issues.append(msg)
+            logger.warning("⚠️  JWT_SECRET_KEY 使用默认值（仅限本机调试）")
 
     # 2. 检查 API Key
     if not LLM_API_KEY:
@@ -162,10 +181,24 @@ logger.info("Talk2Code 应用启动")
 import atexit
 
 def cleanup():
-    """清理资源"""
-    logger.info("清理资源...")
-    sse_manager.shutdown()
-    task_queue.shutdown(wait=False)
+    """清理资源（进程退出阶段，日志流可能已关闭，异常不阻断退出）"""
+    import logging as _logging
+    try:
+        # 先 flush 日志处理器，避免退出期 write 到已关闭流报 ValueError
+        for handler in _logging.getLogger().handlers:
+            try:
+                handler.flush()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        logger.info("清理资源...")
+        sse_manager.shutdown()
+        task_queue.shutdown(wait=False)
+    except Exception as e:
+        # 退出阶段尽力而为，任何异常不得影响进程退出
+        print(f"[cleanup] 清理资源异常（忽略）: {e}")
 
 atexit.register(cleanup)
 

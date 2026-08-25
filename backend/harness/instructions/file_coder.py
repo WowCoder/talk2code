@@ -1,30 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-FileByFileCoder 节点 —— M/L 复杂度逐文件编码循环
+Targeted Recovery —— 批量编码后的定向补全模块
 
-仿 MetaGPT 的 Engineer._new_code_actions + WriteCode + WriteCodeReview 模式：
-1. 对 implementation_order 中的每个文件构建 CodingContext
-2. 逐文件执行 ToolCallLoop（限制迭代次数）
-3. 每文件完成后进行 CodeReview（LGTM/LBTM）
-4. LBTM → 重写，最多 K 次
-5. LGTM → 下一个文件
+Batch-First with Targeted Recovery 架构：
+1. coder_node 始终走批量编码（ToolCallLoop + coder_ml.md + batch_hint）
+2. 批量编码完成后，检查文件系统是否有缺失文件
+3. 对缺失文件调用 targeted_recovery 逐个补全
+
+设计原则:
+- 无 CompletionContract（Phase 1 的 contract 已由 hook 自动更新）
+- 无 CodeReview（质量评估统一由 verify_node 负责）
+- 每个文件独立运行 ToolCallLoop，临时计数器由 Fix 1 自动重置
+- 只验证文件是否存在且非空
 """
 
 import json
 from typing import Dict, Any, Optional
 
 from harness.state.agent_state import AgentState
-from harness.agent_names import DEV_NAME, QA_NAME
+from harness.agent_names import DEV_NAME
 from harness.observability.logger import get_logger
 from harness.harness_context import get_tool_loop as _get_tool_loop
-from harness.instructions.prompts import load_prompt, load_prompt_template
-from harness.constraints.completion_contract import CompletionContract
-from llm.client import get_client
+from harness.instructions.prompts import load_prompt_template
 
 logger = get_logger(__name__)
-
-# 每文件最大编码尝试次数（1 次初始 + K 次重写）
-MAX_CODE_REVIEW_ATTEMPTS = 3  # K=2
 
 # 每文件 ToolCallLoop 最大迭代次数
 PER_FILE_MAX_ITERATIONS = 5
@@ -51,7 +50,6 @@ def _get_completed_files(workspace, implementation_order: list,
         try:
             content = workspace.read(prev_file)
             line_count = content.count('\n') + 1 if content else 0
-            # 提取前 30 行作为摘要
             lines = content.split('\n')[:30]
             preview = '\n'.join(lines)[:500]
             completed.append({
@@ -69,7 +67,7 @@ def _build_coding_context(requirement: str, plan: dict, current_task: dict,
                            interfaces: dict, completed_files: list,
                            errors: list, task_package: str) -> dict:
     """
-    构建单文件编码的完整上下文（仿 MetaGPT CodingContext + WriteCode.PROMPT_TEMPLATE）
+    构建单文件编码的完整上下文。
 
     5 块上下文：
     1. Design — 架构设计 / Plan
@@ -78,7 +76,6 @@ def _build_coding_context(requirement: str, plan: dict, current_task: dict,
     4. Interface Contract — 接口契约
     5. Error Log — 之前的错误日志
     """
-    # 已完成文件的摘要文本
     completed_text = ""
     if completed_files:
         completed_lines = ["## 已完成的文件（可作为参考）"]
@@ -89,19 +86,16 @@ def _build_coding_context(requirement: str, plan: dict, current_task: dict,
             )
         completed_text = "\n\n".join(completed_lines)
 
-    # 接口契约
     interface_text = ""
     file_path = current_task.get("file", "")
     if file_path in interfaces:
         interface_text = f"## 接口契约\n```json\n{json.dumps(interfaces[file_path], ensure_ascii=False, indent=2)}\n```"
 
-    # 导入依赖
     imports = current_task.get("imports", {})
     imports_text = ""
     if imports:
         imports_text = f"## 需要引用的模块\n```json\n{json.dumps(imports, ensure_ascii=False, indent=2)}\n```"
 
-    # 错误日志
     error_text = ""
     if errors:
         error_text = "## 之前的错误日志（请避免）\n" + "\n".join(f"- {e}" for e in errors[-10:])
@@ -124,8 +118,8 @@ def _inject_coding_context(tool_loop, context: dict):
     """
     将 CodingContext 注入到 ToolCallLoop 的系统提示中。
 
-    在逐文件编码模式下，每切换一个文件就替换一次系统提示，
-    让 LLM 聚焦当前文件的实现任务。
+    替换 _build_system_prompt 为 file_aware_coder.md 模板，
+    返回原始 builder 以便调用方在使用后恢复。
     """
     original_builder = tool_loop._build_system_prompt
 
@@ -156,200 +150,48 @@ def _inject_coding_context(tool_loop, context: dict):
     return original_builder
 
 
-def _review_single_file(file_path: str, workspace, state: AgentState,
-                         interfaces: dict, task: dict) -> dict:
+def targeted_recovery(state: AgentState, tool_loop, missing_files: list[str]) -> dict:
     """
-    对单个文件进行 CodeReview（LGTM/LBTM）。
+    Phase 2: 对批量编码遗漏的文件进行定向补全。
 
-    仿 MetaGPT WriteCodeReview 的 6 维度审查。
+    - 无 CompletionContract（Phase 1 的 contract 已由 hook 自动更新）
+    - 无 CodeReview（质量评估由 verify_node 负责）
+    - 每个文件独立运行，临时计数器由 ToolCallLoop.run() 开头重置（Fix 1）
+    - 只验证文件是否存在且非空
+
+    Args:
+        state: AgentState（含 dialogue_history、plan、tasks 等）
+        tool_loop: ToolCallLoop 实例（已注入 memory_aware_prompt）
+        missing_files: 批量编码后仍缺失的文件路径列表
 
     Returns:
-        {"verdict": "LGTM"|"LBTM", "issues": [...], "score": float}
+        {"current_step": "coding_done"}
     """
-    try:
-        code_content = workspace.read(file_path)
-    except Exception:
-        return {"verdict": "LGTM", "issues": [], "score": 10.0,
-                "note": "文件无法读取，跳过审查"}
-
-    # 检查是否是空文件或极小文件（可能是刚创建还没写入）
-    if not code_content or len(code_content.strip()) < 20:
-        return {"verdict": "LBTM", "issues": ["文件内容过短或为空"], "score": 1.0}
-
-    # 确定语言
-    if file_path.endswith('.html'):
-        language = 'html'
-    elif file_path.endswith('.css'):
-        language = 'css'
-    elif file_path.endswith('.js'):
-        language = 'javascript'
-    else:
-        language = ''
-
-    # 接口契约
-    file_interfaces = interfaces.get(file_path, {})
-    interface_text = json.dumps(file_interfaces, ensure_ascii=False, indent=2) if file_interfaces else "(无)"
-
-    # 智能截断：保首部 60% + 尾部 40%，避免 LLM 因截断看到不完整代码而误判
-    MAX_CODE_CHARS = 12000
-    truncated_notice = ""
-    if len(code_content) > MAX_CODE_CHARS:
-        head_size = int(MAX_CODE_CHARS * 0.6)
-        tail_size = int(MAX_CODE_CHARS * 0.4)
-        code_content_for_review = (
-            code_content[:head_size]
-            + f"\n\n/* ⚠️ [中间省略 {len(code_content) - head_size - tail_size} 字符]"
-            + " 以下为文件末尾部分 */\n\n"
-            + code_content[-tail_size:]
-        )
-        truncated_notice = (
-            f"\n\n⚠️ 注意：以上代码因文件过大（{len(code_content)} 字符）已被截断。"
-            "如果你在可见部分找不到某个功能的实现，不要断言该功能缺失——"
-            "它可能在省略的中间部分。请标注为「无法评估」而非「缺失」。"
-        )
-    else:
-        code_content_for_review = code_content
-
-    prompt = load_prompt_template("review/code_review.md",
-        task_description=task.get("description", "实现该文件的功能"),
-        interface_contract=interface_text,
-        file_path=file_path,
-        language=language,
-        code_content=code_content_for_review + truncated_notice,
-    )
-
-    try:
-        client = get_client()
-        response = client.chat(
-            prompt=prompt,
-            system_prompt="你是资深代码审查专家。只返回 JSON，不要其他文字。",
-            use_memory=False,
-            max_tokens=800,
-            timeout=30,
-        )
-
-        if response.is_error or not response.content:
-            logger.warning(f"[CodeReview] {file_path} 审查调用失败: {response.error}")
-            return {"verdict": "LGTM", "issues": [], "score": 7.0,
-                    "note": "审查 LLM 调用失败，默认通过"}
-
-        # 解析 JSON
-        import re
-        content = response.content.strip()
-        try:
-            review = json.loads(content)
-        except json.JSONDecodeError:
-            match = re.search(r'\{[\s\S]*\}', content)
-            if match:
-                try:
-                    review = json.loads(match.group())
-                except json.JSONDecodeError:
-                    return {"verdict": "LGTM", "issues": [], "score": 7.0,
-                            "note": "审查结果解析失败，默认通过"}
-            else:
-                return {"verdict": "LGTM", "issues": [], "score": 7.0,
-                        "note": "审查结果解析失败，默认通过"}
-
-        verdict = review.get("verdict", "LGTM")
-        issues = review.get("issues", [])
-        score = review.get("score", 7.0)
-
-        logger.info(f"[CodeReview] {file_path}: verdict={verdict}, score={score}, issues={len(issues)}")
-        return {"verdict": verdict, "issues": issues, "score": score}
-
-    except Exception as e:
-        logger.warning(f"[CodeReview] {file_path} 审查异常: {e}")
-        return {"verdict": "LGTM", "issues": [], "score": 7.0,
-                "note": f"审查异常: {e}"}
-
-
-def _legacy_coder(state: AgentState, tool_loop) -> dict:
-    """回退到旧行为：直接 ToolCallLoop（兼容没有 tasks 的情况）"""
-    logger.info("[FileCoder] 无 tasks 数据，回退到旧版编码模式")
-    state.setdefault("metadata", {})["coder_name"] = DEV_NAME
-    state["metadata"]["thinking_name"] = DEV_NAME
-    result = tool_loop.run(state)
-    return {"current_step": "coding_done"}
-
-
-def file_by_file_coder_node(state: AgentState) -> Dict[str, Any]:
-    """
-    M/L 复杂度逐文件编码节点。
-
-    对 implementation_order 中的每个文件：
-    1. 构建 CodingContext（设计 + 任务 + 已完成文件 + 接口契约 + 错误日志）
-    2. 调用 ToolCallLoop（限制迭代次数）
-    3. CodeReview 检查（LGTM/LBTM）
-    4. LBTM → 重写，最多 K=2 次
-    5. LGTM → 下一个文件
-    """
-    tool_loop = _get_tool_loop(state)
-    if not tool_loop:
-        return {"current_step": "error", "error": "ToolCallLoop 未注入到 state"}
-
+    workspace = tool_loop.workspace
     tasks = state.get("tasks") or []
     interfaces = state.get("interfaces") or {}
     implementation_order = state.get("implementation_order") or []
-    workspace = tool_loop.workspace
-
-    # 设置角色名称
-    state.setdefault("metadata", {})["coder_name"] = DEV_NAME
-    state["metadata"]["thinking_name"] = DEV_NAME
-
-    # ---- 初始化 CompletionContract ----
-    contract = CompletionContract(workspace)
-    if implementation_order:
-        contract.initialize(implementation_order)
-        # 注入到 state，供 progress_hooks 访问
-        state.setdefault("metadata", {})["_completion_contract"] = contract
-        state["_completion_contract"] = contract
-
-    # 如果没有 tasks，回退到旧行为（兼容）
-    if not tasks or not implementation_order:
-        logger.info("[FileCoder] 缺少 tasks/implementation_order，使用旧版编码模式")
-        return _legacy_coder(state, tool_loop)
-
-    # ---- SDD: 推送任务清单到前端 ----
-    req_id = state.get("requirement_id", 0)
-    task_items = []
-    for fpath in implementation_order:
-        task_info = _find_task(tasks, fpath)
-        task_items.append({
-            "file": fpath,
-            "description": task_info.get("description", fpath) if task_info else fpath,
-            "status": "pending",
-        })
-    if tool_loop.sse:
-        try:
-            tool_loop.sse.task_list(req_id, task_items)
-            logger.info(f"[FileCoder] 推送 task_list: {len(task_items)} 个文件")
-        except Exception as e:
-            logger.warning(f"[FileCoder] 推送 task_list 失败: {e}")
-
-    logger.info(
-        f"[FileCoder] 启动逐文件编码: {len(implementation_order)} 个文件 "
-        f"complexity={state.get('metadata', {}).get('complexity', 'M')}"
-    )
-
     code_errors = state.get("code_errors") or []
-    review_results = []
+    req_id = state.get("requirement_id", 0)
 
-    for file_path in implementation_order:
-        task = _find_task(tasks, file_path)
-        if not task:
-            logger.warning(f"[FileCoder] 未找到任务: {file_path}，跳过")
-            continue
+    logger.info(f"[Recovery] 开始定向补全: {len(missing_files)} 个文件缺失: {missing_files}")
 
-        logger.info(f"[FileCoder] 开始编码: {file_path} (描述: {task.get('description', '')[:60]})")
-
-        # 推送任务状态: in_progress
-        if tool_loop.sse:
+    # 推送任务状态
+    if tool_loop.sse:
+        for file_path in missing_files:
             try:
                 tool_loop.sse.task_update(req_id, file_path, "in_progress")
             except Exception:
                 pass
 
-        # 1. 构建 CodingContext
+    for file_path in missing_files:
+        task = _find_task(tasks, file_path)
+        if not task:
+            # tasks 中找不到，构建最小化 task
+            task = {"file": file_path, "description": file_path, "imports": {}, "exports": []}
+            logger.warning(f"[Recovery] 未找到 {file_path} 的 task，使用最小化上下文")
+
+        # 1. 构建编码上下文
         context = _build_coding_context(
             requirement=state.get("requirement_content", ""),
             plan=state.get("plan") or {},
@@ -360,117 +202,55 @@ def file_by_file_coder_node(state: AgentState) -> Dict[str, Any]:
             task_package=state.get("metadata", {}).get("task_package", ""),
         )
 
-        # 2. Code Generation with review loop
-        file_passed = False
-        for attempt in range(MAX_CODE_REVIEW_ATTEMPTS):
-            # 注入当前文件的编码上下文
-            original_builder = _inject_coding_context(tool_loop, context)
+        # 2. 注入文件感知提示 + 逐文件模式标记
+        original_builder = _inject_coding_context(tool_loop, context)
+        state["_per_file_mode"] = True
+        state["_current_target_file"] = file_path
 
-            # 如果有审查反馈，注入到对话历史
-            if attempt > 0 and context.get("review_feedback"):
-                state.setdefault("dialogue_history", []).append({
-                    "role": "user",
-                    "name": QA_NAME,
-                    "content": (
-                        f"文件 {file_path} 审查未通过（第 {attempt} 次），请修复以下问题：\n"
-                        + "\n".join(f"- {i}" for i in context["review_feedback"])
-                        + "\n\n请根据反馈修改代码，用 write_file 重新写入完整文件。"
-                    ),
-                })
+        # 3. 运行 ToolCallLoop（计数器由 Fix 1 自动重置）
+        saved_max = tool_loop.MAX_ITERATIONS
+        tool_loop.MAX_ITERATIONS = PER_FILE_MAX_ITERATIONS
 
-            # 设置单文件迭代上限
-            saved_max = tool_loop.MAX_ITERATIONS
-            tool_loop.MAX_ITERATIONS = PER_FILE_MAX_ITERATIONS
+        try:
+            result_state = tool_loop.run(state)
+            state["dialogue_history"] = result_state.get("dialogue_history", [])
+        except Exception as e:
+            logger.error(f"[Recovery] {file_path} 补全异常: {e}")
+            code_errors.append(f"[{file_path}] 补全异常: {e}")
+        finally:
+            tool_loop.MAX_ITERATIONS = saved_max
+            tool_loop._build_system_prompt = original_builder
 
-            try:
-                result_state = tool_loop.run(state)
-                state["dialogue_history"] = result_state.get("dialogue_history", [])
-            finally:
-                tool_loop.MAX_ITERATIONS = saved_max
-                tool_loop._build_system_prompt = original_builder
-
-            # 3. Code Review
-            review_result = _review_single_file(
-                file_path, workspace, state, interfaces, task
-            )
-
-            review_results.append({
-                "file": file_path,
-                "attempt": attempt + 1,
-                **review_result,
-            })
-
-            if review_result["verdict"] == "LGTM":
-                logger.info(f"[FileCoder] {file_path} 审查通过 (score={review_result['score']})")
-                file_passed = True
-                # 推送任务状态: completed
+        # 4. 简单验证：文件存在且非空
+        try:
+            content = workspace.read(file_path)
+            if content and len(content.strip()) >= 20:
+                logger.info(f"[Recovery] {file_path} 创建成功 ({len(content)} chars)")
                 if tool_loop.sse:
                     try:
                         tool_loop.sse.task_update(req_id, file_path, "completed")
                     except Exception:
                         pass
-                break
             else:
-                # LBTM: 将审查反馈注入，下轮重写
-                issues = review_result.get("issues", [])
-                logger.warning(
-                    f"[FileCoder] {file_path} 审查未通过 (attempt={attempt + 1}, "
-                    f"score={review_result['score']}, issues={len(issues)})"
-                )
-                context["review_feedback"] = issues
-                # 将失败原因记录到全局错误列表（供后续文件参考）
-                for issue in issues:
-                    code_errors.append(f"[{file_path}] {issue}")
-
-        if not file_passed:
-            logger.warning(
-                f"[FileCoder] {file_path} 经 {MAX_CODE_REVIEW_ATTEMPTS} 次审查仍未通过，继续下一个文件"
-            )
-            # 推送任务状态: failed
+                logger.warning(f"[Recovery] {file_path} 创建成功但内容过短")
+                code_errors.append(f"[{file_path}] 文件内容过短或为空")
+                if tool_loop.sse:
+                    try:
+                        tool_loop.sse.task_update(req_id, file_path, "failed")
+                    except Exception:
+                        pass
+        except Exception:
+            logger.warning(f"[Recovery] {file_path} 仍未创建")
+            code_errors.append(f"[{file_path}] 文件未创建")
             if tool_loop.sse:
                 try:
                     tool_loop.sse.task_update(req_id, file_path, "failed")
                 except Exception:
                     pass
 
-        # 清除对话历史中的临时审查反馈，避免污染下一个文件的上下文
-        state["dialogue_history"] = [
-            m for m in (state.get("dialogue_history") or [])
-            if m.get("name") != QA_NAME
-        ]
+    # 清除逐文件模式标记
+    state.pop("_per_file_mode", None)
+    state.pop("_current_target_file", None)
 
-    # ---- CompletionContract 完成检查 ----
-    if contract.exists() and not contract.all_completed():
-        pending = contract.pending_files()
-        logger.warning(
-            f"[FileCoder] contract 未全部完成: "
-            f"{contract.completed_count()}/{contract.total_files()}，"
-            f"缺少: {pending}"
-        )
-        # 将缺失文件反馈注入，触发额外编码轮次
-        state.setdefault("dialogue_history", []).append({
-            "role": "system", "name": "System",
-            "content": (
-                f"以下 {len(pending)} 个文件尚未创建，请立即创建：\n"
-                + "\n".join(f"- {f}" for f in pending)
-                + "\n\n全部创建完成后才能声明任务完成。"
-            ),
-            "hidden": True,
-        })
-        # 重置 current_step 让 ToolCallLoop 继续执行
-        state["current_step"] = "generating"
-        state["no_progress_count"] = 0
-        # 额外编码轮次 (追加一轮，用已有编码上下文)
-        try:
-            result_state = tool_loop.run(state)
-            state["dialogue_history"] = result_state.get("dialogue_history", [])
-        except Exception as e:
-            logger.warning(f"[FileCoder] contract 补全编码失败: {e}")
-
-    logger.info(
-        f"[FileCoder] 逐文件编码完成: {len(review_results)} 次审查, "
-        f"错误 {len(code_errors)} 条"
-    )
-
-    # 原地修改了 state（dialogue_history 等），只返回变更字段
+    logger.info(f"[Recovery] 定向补全完成，剩余错误 {len(code_errors)} 条")
     return {"current_step": "coding_done", "code_errors": code_errors}

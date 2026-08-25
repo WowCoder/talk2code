@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      # 测试环境变量（conftest 会覆盖大部分，这里保证导入期安全）
+      JWT_SECRET_KEY: ci-test-secret-key
+      LLM_API_KEY: ci-test-api-key
+      DATABASE_NAME: test_vcd.db
+      DATABASE_URL: ""
+      APP_DEBUG: "false"
+      DISABLE_RATE_LIMIT: "true"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-timeout
+
+      - name: Run tests
+        run: python -m pytest -q
+
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend-vue
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Type-check & build
+        run: npm run build

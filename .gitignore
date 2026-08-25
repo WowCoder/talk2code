@@ -46,3 +46,16 @@ tmp/
 
 # 用户工作区（运行时生成的代码产物）
 backend/workspaces/
+# 调试/复现脚本与截图（根目录或项目根下的临时产物）
+/tmp/
+/probe_*.py
+/repro_*.py
+/sandbox_test*
+/smoke_via_*
+/t2c_sandbox_wrapper.html
+/*.png
+/*.html
+
+# SQLite WAL 侧车文件（运行时产物）
+*.db-shm
+*.db-wal

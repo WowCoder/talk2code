@@ -119,28 +119,38 @@ class Tracer:
         if self._cost_tracker:
             report = self._cost_tracker.get_report(trace_id)
             trace.total_cost = report.total_cost
+            # trace 已落库/入最近列表，cost 明细无需再按 trace 保留，
+            # 联动清理避免 _usage 无界增长
+            self._cost_tracker.clear(trace_id)
 
         # 持久化整条 trace（跨重启可查）
         if self._persisted:
             self._persist_trace(trace)
 
+        # 从活动字典移入最近列表（_traces 不再无界增长；_recent 是唯一内存回放源）
+        self._traces.pop(trace_id, None)
         self._recent.append(trace)
         if len(self._recent) > 100:
             self._recent = self._recent[-100:]
 
     def get_trace(self, trace_id: str) -> Optional[Trace]:
-        # 内存命中
+        # 内存命中（活动 trace 或最近列表）
         trace = self._traces.get(trace_id)
         if trace:
             return trace
+        for recent in self._recent:
+            if recent.trace_id == trace_id:
+                return recent
         # 持久化回查
         if self._persisted:
             return self._load_db_trace(trace_id)
         return None
 
     def recent_traces(self, limit: int = 20) -> list[dict]:
+        # 已结束（_recent，有界 100）+ 进行中（_traces，仅活跃 trace）
+        pool = list(self._recent) + list(self._traces.values())
         traces = sorted(
-            self._traces.values(),
+            pool,
             key=lambda t: t.start_time,
             reverse=True
         )[:limit]

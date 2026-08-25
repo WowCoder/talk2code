@@ -298,7 +298,7 @@ class TestE2EAllExistingTestsPass:
         from harness.state.workspace import WorkspaceFS
         from harness.state.versioning import GitVersioning
         from harness.state.checkpoint import CheckpointManager
-        from harness.state.memory_store import MemoryStore
+        from harness.state.memory import MemoryManager
 
         # L5
         from harness.constraints.hooks import create_default_hook_manager
@@ -308,13 +308,20 @@ class TestE2EAllExistingTestsPass:
         from harness.observability.cost import CostTracker
         from harness.observability.logger import get_logger
 
-        assert ContextAssembler is not None
         assert ToolRegistry is not None
         assert WorkspaceFS is not None
+        assert MemoryManager is not None
         assert Tracer is not None
 
     def test_default_harness_factory_works(self):
         """测试 harness.create_harness() 工厂函数"""
+        import shutil
+        from harness.state.workspace import WorkspaceFS
+
+        # 预创建工作区目录：GitVersioning 要求目录存在（测试环境不落库、不依赖外部状态）
+        ws = WorkspaceFS(100, 1)
+        ws.path.mkdir(parents=True, exist_ok=True)
+
         from harness import create_harness
 
         harness = create_harness(requirement_id=1, user_id=100)
@@ -326,3 +333,6 @@ class TestE2EAllExistingTestsPass:
         assert "memory_manager" in harness
         assert "tracer" in harness
         assert "cost_tracker" in harness
+
+        # 清理测试工作区，避免污染仓库
+        shutil.rmtree(ws.path, ignore_errors=True)

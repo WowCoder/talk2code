@@ -24,14 +24,14 @@
         <!-- Spec view -->
         <div v-show="activeTab === 'spec'" class="view active">
           <SpecPanel
-            :spec-data="(store as any)._specData"
+            :spec-data="store._specData"
             :evaluator-result="store.evaluatorResult"
           />
         </div>
 
         <!-- Tasks view -->
         <div v-show="activeTab === 'tasks'" class="view active">
-          <TaskPanel :tasks="(store as any)._taskList || []" />
+          <TaskPanel :tasks="store._taskList || []" />
         </div>
 
         <!-- Preview view -->
@@ -58,7 +58,6 @@
 import { ref, computed, watch, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useRequirementStore } from '@/stores/requirement'
-import { useAuthStore } from '@/stores/auth'
 import { useToast } from '@/composables/useToast'
 import { useSSE } from '@/composables/useSSE'
 import AppNav from '@/components/layout/AppNav.vue'
@@ -83,7 +82,7 @@ const reqId = computed(() => {
   const id = route.params.id
   return id ? Number(id) : null
 })
-const { connect, disconnect } = useSSE(reqId)
+const { connect, disconnect, isConnected, connectionError } = useSSE(reqId)
 
 const pageTitle = computed(() => {
   const req = store.currentRequirement
@@ -119,6 +118,8 @@ onMounted(async () => {
 
   try {
     const data = await store.loadRequirement(reqId.value)
+    // 竞态保护：本次加载已被更新的请求取代
+    if (!data) return
 
     const req = store.currentRequirement
     if (!req) return
@@ -126,17 +127,14 @@ onMounted(async () => {
     if (req.status === 'finished' || req.status === 'finished_with_issues') {
       store.isGenerating = false
       store.progress = { currentAgent: '', percent: 100 }
-      // 已完成的请求通过 API response 获取 trace 和 evaluator 数据
-      if ((data as any).trace) {
-        ;store._traceSummary = (data as any).trace
-      }
-    } else if (req.status === 'processing') {
-      // 正在处理中：连接 SSE 并显示处理状态
+      // trace / evaluator 已在 loadRequirement 内恢复
+    } else if (req.status === 'processing' || req.status === 'planning') {
+      // 进行中状态：连接 SSE 并锁定输入
       store.isGenerating = true
       connect()
     } else {
       // pending 状态：连接 SSE 但不立即显示"工作中"
-      // isGenerating 由 progress 事件或 isConnected 触发
+      // isGenerating 由 progress 事件或 SSE 连接状态触发
       connect()
     }
   } catch (err: any) {
@@ -153,17 +151,35 @@ watch(() => store.planStatus, (status) => {
   }
 })
 
+// SSE 连接状态 → 生成中状态：仅在需求处于进行中状态时连接成功才锁定输入，
+// 避免把 pending / finished 等普通浏览态误锁死
+watch(isConnected, (connected) => {
+  const st = store.currentRequirement?.status
+  const inProgress = st === 'processing' || st === 'planning'
+  if (connected && inProgress) {
+    store.isGenerating = true
+  }
+})
+
+// 连接异常提示（退避重连耗尽或鉴权失效）
+watch(connectionError, (msg) => {
+  if (msg) show(msg, 'error')
+})
+
 // Handle SSE disconnection when leaving
 watch(reqId, (newId, oldId) => {
   if (oldId) disconnect()
   if (newId) {
     store.reset()
-    store.loadRequirement(newId).then((data: { requirement: any; trace?: any }) => {
-      if ((data as any)?.trace) {
-        ;store._traceSummary = (data as any).trace
-      }
-      connect()
-    })
+    store.loadRequirement(newId)
+      .then((data) => {
+        // 竞态保护：本次加载已被更新的请求取代
+        if (!data) return
+        connect()
+      })
+      .catch((err: any) => {
+        show(err.message || '加载需求失败', 'error')
+      })
   }
 })
 
@@ -216,14 +232,9 @@ async function onStopGeneration() {
   if (!store.currentRequirement?.id) return
 
   try {
-    const authStore = useAuthStore()
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      ...authStore.getAuthHeaders(),
-    }
     await fetch(`/api/requirements/${store.currentRequirement.id}/cancel`, {
       method: 'POST',
-      headers,
+      headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
     })
     // SSE cancelled 事件会自动清理 isGenerating 状态
@@ -285,7 +296,7 @@ function buildStandaloneHTML(files: Record<string, string>): string {
       for (const key of candidates) {
         if (files[key]) {
           return `<script>/* ${key} */
-${files[key]}
+${escapeInlineScript(files[key])}
 </${'script'}>`
         }
       }
@@ -294,6 +305,11 @@ ${files[key]}
   )
 
   return html
+}
+
+// 内联 JS 前把内容里的 script 闭合标签转义，避免破坏 HTML 结构
+function escapeInlineScript(content: string): string {
+  return content.replace(/<\/script/gi, '<\\/script')
 }
 </script>
 

@@ -83,6 +83,7 @@ export interface Requirement {
   code_files: CodeFile[]
   create_time: string
   update_time: string
+  preview_token?: string
 }
 
 // ===== API Request Types =====
@@ -124,7 +125,6 @@ export interface PermissionRequest {
 // ===== API Response Types =====
 export interface LoginResponse {
   message: string
-  token: string
   user: User
 }
 

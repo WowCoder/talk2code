@@ -69,7 +69,9 @@ class TestUserLogin:
         })
         data = response.get_json()
         assert response.status_code == 200
-        assert 'token' in data
+        # token 只经 httpOnly cookie 下发，body 中不得出现
+        assert app_client.get_cookie('access_token_cookie') is not None
+        assert 'token' not in data
         assert 'user' in data
 
     def test_login_wrong_password(self, app_client, test_user):

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """需求管理 API 路由"""
+import threading
 from flask import request, jsonify, Response
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from utils.db import get_db, transactional_db
@@ -8,8 +9,22 @@ from services.sse_manager import sse_manager
 from services.task_queue import task_queue
 from factory import app, rate_limit_requirement, rate_limit_chat, limiter, logger
 from services.requirement_service import process_requirement_async
+from utils.preview_token import make_preview_token
+from config import settings
 
 # ==================== 需求管理 API ====================
+
+# ---- Chat 并发管控 ----
+# chat_with_requirement 是同步长跑（请求线程内跑完整 LLM 工具循环）。
+# 两个守护：
+# 1. 同需求互斥：同一 req_id 同时只允许一个 Chat 任务，
+#    避免两个循环并发写同一 workspace 造成文件损坏/状态错乱；
+# 2. 全局信号量：并发 LLM 循环数对齐 task_queue.max_workers，
+#    防止每个请求线程都独立打 provider 造成限流/成本失控。
+_chat_semaphore = threading.BoundedSemaphore(settings.TASK_QUEUE_MAX_WORKERS)
+_chat_inflight: dict = {}
+_chat_inflight_lock = threading.Lock()
+_CHAT_ACQUIRE_TIMEOUT = 30  # 等待并发名额的最长秒数，超时返回 429
 
 @app.route('/api/requirements', methods=['POST'])
 @rate_limit_requirement
@@ -164,6 +179,7 @@ def get_requirement(req_id):
                 'is_deleted': requirement.is_deleted,
                 'deleted_at': requirement.deleted_at.isoformat() if requirement.deleted_at else None,
                 'error_message': requirement.error_message or None,
+                'preview_token': make_preview_token(requirement.user_id, requirement.id),
             }
         }
         if trace_data:
@@ -397,6 +413,16 @@ def chat_with_requirement(req_id):
             'hook_failures': {},
         }
 
+        # ---- 并发管控：同需求互斥 + 全局并发上限（见模块头部说明）----
+        with _chat_inflight_lock:
+            if _chat_inflight.get(req_id):
+                return jsonify({'error': '该需求正在对话处理中，请稍候再试'}), 409
+            _chat_inflight[req_id] = True
+        if not _chat_semaphore.acquire(timeout=_CHAT_ACQUIRE_TIMEOUT):
+            with _chat_inflight_lock:
+                _chat_inflight.pop(req_id, None)
+            return jsonify({'error': '系统繁忙（并发对话已满），请稍后重试'}), 429
+
         try:
             final_state = tool_loop.run(state)
         except Exception as e:
@@ -406,6 +432,11 @@ def chat_with_requirement(req_id):
             requirement.error_message = f"对话执行异常: {str(e)[:200]}"
             db.commit()
             return jsonify({'error': f'对话执行失败: {str(e)[:200]}'}), 500
+        finally:
+            # 无论成功/异常都要释放并发名额与互斥标记
+            _chat_semaphore.release()
+            with _chat_inflight_lock:
+                _chat_inflight.pop(req_id, None)
 
         # 获取更新后的文件
         updated_files = workspace.snapshot()

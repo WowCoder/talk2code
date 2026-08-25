@@ -382,7 +382,8 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
             """获取响应并提取 JSON，返回 (plan, is_truncated, resp)"""
             resp = client.chat(
                 prompt=user_prompt, system_prompt=system_prompt,
-                use_memory=False, max_tokens=max_tokens, timeout=60
+                use_memory=False, max_tokens=max_tokens, timeout=60,
+                thinking='enabled',  # 结构化 plan JSON 需要思考模式保证格式正确
             )
             if resp.is_error:
                 return None, False, resp
@@ -672,84 +673,110 @@ def coder_node(state: AgentState) -> Dict[str, Any]:
             logger.error(f"[Coder] 委派任务执行失败：{e}")
             return {"current_step": "coding_error", "error": str(e)}
 
-    if complexity == "standard" and has_tasks and len(tasks) >= 4:
-        # standard 且有 4+ 文件任务 → 逐文件编码
-        from harness.instructions.file_coder import file_by_file_coder_node
-        try:
-            return file_by_file_coder_node(state)
-        except Exception as e:
-            logger.error(f"[Coder] 逐文件编码失败：{e}")
-            return {"current_step": "coding_error", "error": str(e)}
-    else:
-        # simple 或 小规模 standard → 直接 ToolCallLoop
-        tool_loop = get_tool_loop(state)
-        if not tool_loop:
-            return {
-                "current_step": "error",
-                "error": "ToolCallLoop 未注入到 state",
-            }
-        state.setdefault("metadata", {})["coder_name"] = DEV_NAME
-        state["metadata"]["thinking_name"] = DEV_NAME
+    # ---- Batch-First: 统一批量编码 + 定向补全 ----
+    tool_loop = get_tool_loop(state)
+    if not tool_loop:
+        return {
+            "current_step": "error",
+            "error": "ToolCallLoop 未注入到 state",
+        }
+    state.setdefault("metadata", {})["coder_name"] = DEV_NAME
+    state["metadata"]["thinking_name"] = DEV_NAME
 
-        # CompletionContract：standard 复杂度使用，simple 跳过
-        if complexity == "standard":
-            from harness.constraints.completion_contract import CompletionContract
-            impl_order = state.get("implementation_order") or []
-            if impl_order:
-                workspace = get_workspace(state)
-                if not workspace:
-                    workspace = tool_loop.workspace
-                contract = CompletionContract(workspace)
-                if contract.exists():
-                    contract.initialize_incremental(impl_order)
-                else:
-                    contract.initialize(impl_order)
-                state["_completion_contract"] = contract
-                state.setdefault("metadata", {})["_completion_contract"] = contract
+    # CompletionContract：standard 复杂度使用，simple 跳过
+    if complexity == "standard":
+        from harness.constraints.completion_contract import CompletionContract
+        impl_order = state.get("implementation_order") or []
+        if impl_order:
+            workspace = get_workspace(state)
+            if not workspace:
+                workspace = tool_loop.workspace
+            contract = CompletionContract(workspace)
+            if contract.exists():
+                contract.initialize_incremental(impl_order)
+            else:
+                contract.initialize(impl_order)
+            state["_completion_contract"] = contract
+            state.setdefault("metadata", {})["_completion_contract"] = contract
 
-        # 注入 Hook 失败历史
-        hook_failures = state.get("hook_failures", {})
-        if hook_failures:
-            failure_lines = []
-            for hook_name, count in hook_failures.items():
-                if count > 0:
-                    failure_lines.append(f"- {hook_name}: 失败 {count} 次")
-            if failure_lines:
-                state.setdefault("dialogue_history", []).append({
+    # 注入 Hook 失败历史（去重：同一摘要只注入一次，避免 verify→coder
+    # 修复循环多轮重入时重复累积相同内容、无谓膨胀上下文）
+    hook_failures = state.get("hook_failures", {})
+    if hook_failures:
+        failure_lines = []
+        for hook_name, count in hook_failures.items():
+            if count > 0:
+                failure_lines.append(f"- {hook_name}: 失败 {count} 次")
+        if failure_lines:
+            failure_summary = "\n".join(failure_lines)
+            dialogue = state.setdefault("dialogue_history", [])
+            already_injected = any(
+                isinstance(m, dict) and m.get("_hook_failure_summary") == failure_summary
+                for m in dialogue
+            )
+            if not already_injected:
+                dialogue.append({
                     "role": "user",
                     "name": "System",
                     "content": (
                         "## 历史验证失败记录（请注意避免）\n"
-                        + "\n".join(failure_lines)
+                        + failure_summary
                         + "\n\n请在编码时特别注意以上问题，避免重复出现。"
                     ),
+                    "_hook_failure_summary": failure_summary,  # 注入去重标记（hidden 前哨）
                 })
 
-        logger.info(f"[Coder] 启动 {complexity} 简单编码")
+    logger.info(f"[Coder] Phase 1: 启动 {complexity} 批量编码")
 
-        try:
-            result = tool_loop.run(state)
-            # tool_loop.run() 已原地修改 state（含 dialogue_history），
-            # node 只返回变更字段，避免 add reducer 重复拼接 dialogue_history
-            if result.get("current_step") == "task_complete":
-                next_step = "coding_done"
-            elif result.get("current_step") == "llm_error":
-                next_step = "llm_error"
-            elif result.get("error"):
-                next_step = "coding_error"
-            else:
-                next_step = result.get("current_step", "done")
+    # Phase 1: 批量编码
+    try:
+        result = tool_loop.run(state)
+        if result.get("current_step") == "task_complete":
+            next_step = "coding_done"
+        elif result.get("current_step") == "llm_error":
+            next_step = "llm_error"
+        elif result.get("error"):
+            next_step = "coding_error"
+        else:
+            next_step = result.get("current_step", "done")
+    except Exception as e:
+        logger.error(f"[Coder] Phase 1 执行失败：{e}")
+        return {"current_step": "coding_error", "error": str(e)}
 
-            return {
-                "current_step": next_step,
-                "code_files": result.get("code_files", []),
-                "error": result.get("error", "") if not result.get("llm_error") else result.get("error", "LLM call failed"),
-                "hook_failures": result.get("hook_failures", {}),
-            }
+    # Phase 2: 定向补全（仅当 standard 且有缺失文件时触发）
+    if complexity == "standard" and next_step == "coding_done":
+        impl_order = state.get("implementation_order") or []
+        if impl_order:
+            workspace = get_workspace(state)
+            if not workspace:
+                workspace = tool_loop.workspace
+            existing = set(workspace.list())
+            missing = [
+                f for f in impl_order
+                if f not in existing
+                and not any(e.endswith(f.split("/")[-1]) for e in existing)
+            ]
+            if missing:
+                logger.warning(
+                    f"[Coder] Phase 2: 批量编码遗漏 {len(missing)} 个文件: {missing}"
+                )
+                try:
+                    from harness.instructions.file_coder import targeted_recovery
+                    recovery_result = targeted_recovery(state, tool_loop, missing)
+                    # 合并 recovery 的错误
+                    if recovery_result.get("code_errors"):
+                        state.setdefault("code_errors", []).extend(
+                            recovery_result["code_errors"]
+                        )
+                except Exception as e:
+                    logger.error(f"[Coder] Phase 2 定向补全失败：{e}")
 
-        except Exception as e:
-            logger.error(f"[Coder] 执行失败：{e}")
-            return {"current_step": "coding_error", "error": str(e)}
+    return {
+        "current_step": next_step,
+        "code_files": result.get("code_files", []),
+        "error": result.get("error", "") if not result.get("llm_error") else result.get("error", "LLM call failed"),
+        "hook_failures": result.get("hook_failures", {}),
+    }
 
 
 def repair_node(state: AgentState) -> Dict[str, Any]:
@@ -805,13 +832,20 @@ def _translate_acs_to_scripts(acceptance_criteria: list, code_text: str, require
 {ac_text}
 
 ## 翻译规则
-- 每个步骤的 action 必须是: type | click | select | wait | assert_exists | assert_visible | assert_text | assert_count | assert_value
+- 每个步骤的 action 必须是: type | click | select | press | wait | assert_exists | assert_visible | assert_text | assert_count | assert_value | assert_canvas_change
 - selector 必须从"可用 CSS 选择器"中选择，或从 AC 描述中合理推断
-- type 需要 value 字段
+- type 需要 value 字段；只用于 input/textarea，禁止对 canvas/普通元素使用
+- press 需要 key 字段（如 ArrowUp/ArrowDown/Enter/Space）：键盘交互（游戏方向键、快捷键）必须用 press，禁止用 type 模拟
 - wait 需要 ms 字段（默认 500）
 - assert_text 需要 contains 字段
 - assert_count 需要 min_count 字段
 - assert_value 需要 value 字段
+- assert_canvas_change 需要 wait_ms 字段（默认 2000）：验证 canvas 画面随操作变化（游戏移动/动画）
+- 游戏类 AC 的标准模式：click 开始按钮 → wait 800ms → press 方向键 → wait 1500ms → assert_canvas_change(wait_ms=2000)
+- 【重要】游戏类 AC 严禁断言精确分数文本（如 contains="10"），因为蛇吃到食物需要时间和多次操作，分数值不确定。
+  验证"得分/吃食物"改为：assert_canvas_change 验证画面变化（蛇移动/变长），或 assert_exists 验证分数元素存在即可，不要断言具体数字。
+- 【重要】分享类 AC：游戏可能设计为"有成绩才能分享"（score=0 时提示"先玩一局"）。这是合理设计，不要断言 toast 必须包含"复制"等特定文本。
+  验证"分享"改为：assert_exists/assert_visible 验证分享按钮存在，点击后 assert_exists/assert_visible 验证有反馈提示（toast）出现即可，不断言具体文案。
 
 ## 输出格式
 只返回 JSON 数组:
@@ -839,6 +873,7 @@ def _translate_acs_to_scripts(acceptance_criteria: list, code_text: str, require
             use_memory=False,
             max_tokens=2000,
             timeout=30,
+            thinking='enabled',
         )
         if response.is_error or not response.content:
             return []
@@ -859,11 +894,18 @@ def _translate_acs_to_scripts(acceptance_criteria: list, code_text: str, require
                 return []
 
         if isinstance(scripts, list):
+            # 只保留结构合法的条目（LLM 偶尔返回字符串数组导致下游 .get 崩溃）
+            valid = [
+                s for s in scripts
+                if isinstance(s, dict) and isinstance(s.get("steps"), list) and s["steps"]
+            ]
+            dropped = len(scripts) - len(valid)
             from harness.observability.logger import get_logger
             get_logger(__name__).info(
-                f"[AC Translate] {len(scripts)} 条 AC 翻译完成"
+                f"[AC Translate] {len(valid)} 条 AC 翻译完成"
+                + (f"（丢弃 {dropped} 条格式非法）" if dropped else "")
             )
-            return scripts
+            return valid
     except Exception as e:
         from harness.observability.logger import get_logger
         get_logger(__name__).warning(f"[AC Translate] 翻译失败: {e}")
@@ -899,6 +941,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
     if not workspace:
         logger.error("[Verify] 无法获取 workspace")
         return {"verify_passed": False, "current_step": "verify_done",
+                "smoke_defects": [],
                 "error": "无法获取 workspace，评估流程异常"}
 
     requirement = state.get("requirement_content", "")
@@ -1051,9 +1094,11 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             pass
         # 缺文件早退也必须递增 repair_count，否则 coder↔verify 会无限循环
         # （route_after_verify 只靠 repair_count >= max_rounds 终止）
-        repair_count = state.get("metadata", {}).get("repair_count", 0)
-        state.setdefault("metadata", {})["repair_count"] = repair_count + 1
-        return {"verify_passed": False, "current_step": "verify_done"}
+        meta = dict(state.get("metadata") or {})
+        meta["repair_count"] = meta.get("repair_count", 0) + 1
+        state["metadata"] = meta  # 原地同步（兼容当前 langgraph 浅拷贝语义）
+        return {"verify_passed": False, "current_step": "verify_done",
+                "smoke_defects": [], "metadata": meta}  # 显式返回：不依赖浅拷贝副作用
 
     # 运行 run_preview 获取浏览器执行结果
     browser_result = {"available": False, "errors": [], "warnings": []}
@@ -1073,43 +1118,100 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
     plan = state.get("plan", {})
     acceptance_criteria = plan.get("acceptance_criteria", []) if isinstance(plan, dict) else []
 
+    # 验证走与用户一致的预览链路（沙箱 iframe + 能力 URL），杜绝"验证过、用户废"
+    preview_url = None
+    try:
+        from utils.preview_token import make_preview_url
+        preview_url = make_preview_url(workspace.user_id, workspace.req_id, "index.html")
+    except Exception as e:
+        logger.warning(f"[Verify] 构造预览 URL 失败，回退直读文件: {e}")
+
     if acceptance_criteria and any(f.endswith("index.html") for f in code_files):
         logger.info(f"[Verify] 启动 AC 逐条验收: {len(acceptance_criteria)} 条 AC")
         try:
             # Step 1: LLM 将 AC 描述翻译为 Playwright 操作序列
-            ac_scripts = _translate_acs_to_scripts(acceptance_criteria, code_text, requirement)
+            # 带缓存首轮锁定：每轮重译会导致同一份代码结果漂移（选择器/步骤不稳定）
+            ac_cache_path = workspace.path / ".task" / "ac_scripts.json"
+            import hashlib as _hashlib
+            _ac_hash = _hashlib.md5(
+                json.dumps(acceptance_criteria, ensure_ascii=False, sort_keys=True).encode()
+            ).hexdigest()
+            ac_scripts = None
+            if ac_cache_path.exists():
+                try:
+                    cached = json.loads(ac_cache_path.read_text())
+                    if (
+                        cached.get("ac_hash") == _ac_hash
+                        and isinstance(cached.get("scripts"), list)
+                        and cached["scripts"]
+                    ):
+                        ac_scripts = cached["scripts"]
+                        logger.info(f"[Verify] AC 脚本命中缓存（{len(ac_scripts)} 条，首轮锁定不重译）")
+                except Exception:
+                    pass
+            if ac_scripts is None:
+                ac_scripts = _translate_acs_to_scripts(acceptance_criteria, code_text, requirement)
+                if ac_scripts:
+                    try:
+                        ac_cache_path.parent.mkdir(parents=True, exist_ok=True)
+                        ac_cache_path.write_text(
+                            json.dumps({"ac_hash": _ac_hash, "scripts": ac_scripts}, ensure_ascii=False, indent=2)
+                        )
+                    except Exception:
+                        pass
             # Step 2: Playwright 执行
             if ac_scripts:
                 from harness.tools.preview_runner import run_ac_checks
-                workspace_path = __import__('pathlib').Path(workspace._root) if hasattr(workspace, '_root') else __import__('pathlib').Path(workspace.workspace_dir)
-                index_path = workspace_path / "index.html"
+                index_path = workspace.path / "index.html"
                 if index_path.exists():
-                    ac_check_results = run_ac_checks(index_path, ac_scripts)
+                    ac_check_results = run_ac_checks(index_path, ac_scripts, preview_url=preview_url)
+                    _prod_fail = sum(1 for r in ac_check_results if r.get("failures"))
+                    _harness_fail = sum(1 for r in ac_check_results if r.get("harness_errors"))
                     logger.info(
-                        f"[Verify] AC 验收完成: {sum(1 for r in ac_check_results if r['passed'])}/"
-                        f"{len(ac_check_results)} 通过"
+                        f"[Verify] AC 验收完成: {len(ac_check_results) - _prod_fail}/"
+                        f"{len(ac_check_results)} 通过（产品断言失败 {_prod_fail} 条，"
+                        f"脚本驱动失败 {_harness_fail} 条不计入缺陷）"
                     )
                     # Step 3: 推送逐条 AC 结果到前端
                     tl = get_tool_loop(state)
                     sse = tl.sse if tl else None
                     for result in ac_check_results:
                         if sse:
+                            hints = result.get("failures", []) + [
+                                f"[脚本错误] {e}" for e in result.get("harness_errors", [])
+                            ]
                             sse.checklist_update(
                                 state.get("requirement_id", 0),
                                 result["ac_id"],
                                 result["passed"],
-                                "; ".join(result.get("failures", [])) if not result["passed"] else "",
+                                "; ".join(hints) if not result["passed"] else "",
                             )
         except Exception as e:
             logger.warning(f"[Verify] AC 逐条验收异常（降级为 LLM 评估）: {e}")
+
+    # ========== 层1 通用冒烟测试（品类无关的确定性不变量） ==========
+    smoke_result = {"available": False, "defects": [], "checks": {}, "logs": []}
+    if any(f.endswith("index.html") for f in code_files):
+        try:
+            from harness.tools.preview_runner import run_universal_smoke
+            index_path = workspace.path / "index.html"
+            if index_path.exists():
+                smoke_result = run_universal_smoke(index_path, preview_url=preview_url)
+                logger.info(
+                    f"[Verify] 通用冒烟: available={smoke_result.get('available')}, "
+                    f"checks={smoke_result.get('checks')}, defects={len(smoke_result.get('defects', []))}"
+                )
+        except Exception as e:
+            logger.warning(f"[Verify] 通用冒烟异常（跳过）: {e}")
+    smoke_defects = smoke_result.get("defects", [])
 
     # 判断是否可以走快速通道
     preview_clean = len(browser_result.get("errors", [])) == 0
     ac_all_passed = (
         len(ac_check_results) > 0 and
-        all(r["passed"] for r in ac_check_results)
+        all(r["passed"] and not r.get("harness_errors") for r in ac_check_results)
     )
-    fast_pass = preview_clean and ac_all_passed
+    fast_pass = preview_clean and ac_all_passed and not smoke_defects
 
     if fast_pass:
         # 快速通道：preview 零错误 + 所有 AC 通过 → 跳过深度 LLM 评估
@@ -1153,15 +1255,37 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
     # 构建评估 prompt（含 AC 验收结果供 LLM 参考）
     ac_results_text = ""
     if ac_check_results:
-        passed_count = sum(1 for r in ac_check_results if r["passed"])
-        ac_results_text = f"\n\n## AC 逐条验收结果（浏览器实际执行）\n{passed_count}/{len(ac_check_results)} 条通过:\n"
+        prod_pass = sum(1 for r in ac_check_results if not r.get("failures"))
+        harness_fail_n = sum(1 for r in ac_check_results if r.get("harness_errors"))
+        ac_results_text = (
+            f"\n\n## AC 逐条验收结果（浏览器实际执行）\n"
+            f"产品断言 {prod_pass}/{len(ac_check_results)} 通过；"
+            f"另有 {harness_fail_n} 条存在脚本驱动失败（假阴性嫌疑，不计入产品缺陷，供定性判断）:\n"
+        )
         for r in ac_check_results:
-            status = "✅" if r["passed"] else "❌"
-            failures = "; ".join(r.get("failures", []))
+            if r.get("failures"):
+                status = "❌"
+            elif r.get("harness_errors"):
+                status = "⚠️"
+            else:
+                status = "✅"
             ac_results_text += f"- {status} {r['ac_id']}: {r.get('label', '')}"
+            failures = "; ".join(r.get("failures", []))
             if failures:
-                ac_results_text += f" — {failures}"
+                ac_results_text += f" — [产品缺陷] {failures}"
+            herr = "; ".join(r.get("harness_errors", []))
+            if herr:
+                ac_results_text += f" — [脚本错误·可能假阴性] {herr}"
             ac_results_text += "\n"
+
+    # 层1 冒烟结果注入评估 prompt（确定性证据，供 LLM 参考）
+    smoke_text = ""
+    if smoke_result.get("available"):
+        smoke_text = "\n\n## 通用冒烟测试结果（浏览器确定性检查，非 LLM 判断）\n"
+        for cname, cok in (smoke_result.get("checks") or {}).items():
+            smoke_text += f"- {'✅ 通过' if cok else '❌ 未通过'} {cname}\n"
+        for d in smoke_defects:
+            smoke_text += f"- ❌ [{d['type']}] {d['message']}\n  证据: {d.get('evidence', '')}\n"
 
     evaluator_prompt = load_prompt("verify/evaluator.md")
     user_prompt = f"""## 原始需求
@@ -1177,7 +1301,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
 ```json
 {json.dumps(browser_result, ensure_ascii=False, indent=2)}
 ```
-{ac_results_text}
+{ac_results_text}{smoke_text}
 
 请基于以上信息，按照 Evaluator 的评估维度和输出格式，给出结构化评估结果。"""
 
@@ -1193,6 +1317,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             use_memory=False,
             max_tokens=max_tokens,
             timeout=90,
+            thinking='enabled',
         )
         # finish_reason=length → 截断，用更大 max_tokens 重试
         if response.finish_reason == "length" and max_tokens < 6000:
@@ -1206,6 +1331,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                 use_memory=False,
                 max_tokens=6000,
                 timeout=120,
+                thinking='enabled',
             )
             if not retry_response.is_error and retry_response.content:
                 response = retry_response
@@ -1227,49 +1353,44 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                     pass
         return {}
 
-    # ---- 双视角评估：Correctness + Quality ----
+    # ---- 单次全维度评估（原先 Correctness+Quality 双视角 = 2 次 LLM 调用，合并为 1 次减半耗时）----
     try:
         from llm.client import CircuitBreakerOpenError
         client = get_client()
         _circuit_breaker_hit = False
 
-        # 视角 1: 功能正确性（functionality + runtime + acceptance）
-        correctness_focus = (
-            "## 评估重点：功能正确性\n"
-            "你本次只需要评估以下三个维度，对其他维度标记为 N/A 即可：\n"
-            "- **functionality** (1-10): 所有 SPEC 定义的功能是否已实现\n"
-            "- **runtime** (1-10): 浏览器执行是否有 JS 错误、交互是否正确\n"
-            "- **acceptance** (1-10): SPEC 中每条验收条件是否通过\n"
-            "\n请基于以上信息，给出结构化评估结果（只返回 JSON）。"
+        eval_focus = (
+            "请基于以上信息，按照 Evaluator 的评估维度和输出格式，一次性给出结构化评估结果。\n"
+            "必须覆盖 functionality / runtime / acceptance / ui_quality / code_quality 五个维度，"
+            "并给出 verdict、overall_score、findings（只返回 JSON）。"
         )
         try:
-            correctness_response = _call_evaluator(correctness_focus, max_tokens=3000)
-            correctness_result = _parse_evaluator_response(correctness_response)
+            eval_response = _call_evaluator(eval_focus, max_tokens=4000)
+            combined = _parse_evaluator_response(eval_response)
         except CircuitBreakerOpenError as e:
-            logger.warning(f"[Verify] 熔断器打开，跳过 Correctness 评估: {e}")
-            correctness_result = {}
+            logger.warning(f"[Verify] 熔断器打开，跳过评估: {e}")
+            combined = {}
             _circuit_breaker_hit = True
 
-        # 视角 2: 代码与 UI 质量（code_quality + ui_quality）
-        quality_focus = (
-            "## 评估重点：代码与 UI 质量\n"
-            "你本次只需要评估以下两个维度，对其他维度标记为 N/A 即可：\n"
-            "- **ui_quality** (1-10): 布局是否合理美观、视觉风格是否统一、是否覆盖空态/错误态\n"
-            "- **code_quality** (1-10): 代码结构是否清晰、是否正确处理异步、是否存在安全风险（XSS/innerHTML）\n"
-            "\n请基于以上信息，给出结构化评估结果（只返回 JSON）。"
-        )
-        try:
-            quality_response = _call_evaluator(quality_focus, max_tokens=3000)
-            quality_result = _parse_evaluator_response(quality_response)
-        except CircuitBreakerOpenError as e:
-            logger.warning(f"[Verify] 熔断器打开，跳过 Quality 评估: {e}")
-            quality_result = {}
-            _circuit_breaker_hit = True
+        # ---- 解析失败（非熔断）：用更强约束重试一次 ----
+        if not combined and not _circuit_breaker_hit:
+            logger.warning("[Verify] 单次评估解析失败，以更强约束重试")
+            retry_focus = (
+                eval_focus + "\n\n⚠️ 必须只返回一个合法 JSON 对象，"
+                "包含 verdict/summary/score/overall_score/findings 字段。"
+            )
+            try:
+                retry_response = _call_evaluator(retry_focus, max_tokens=4000)
+                combined = _parse_evaluator_response(retry_response)
+            except CircuitBreakerOpenError as e:
+                logger.warning(f"[Verify] 重试评估熔断: {e}")
+                combined = {}
+                _circuit_breaker_hit = True
 
-        # ---- 如果双视角评估均因熔断器失败，降级为仅基于 preview + AC 结果判定 ----
-        if not correctness_result and not quality_result:
+        # ---- 熔断/解析失败降级：仅基于 preview + AC 结果判定 ----
+        if not combined:
             logger.warning(
-                "[Verify] LLM 不可用（熔断器打开），降级为仅基于 preview + AC 结果判定"
+                "[Verify] LLM 不可用或评估失败，降级为仅基于 preview + AC 结果判定"
             )
             ac_all_passed = (
                 len(ac_check_results) > 0 and
@@ -1278,14 +1399,17 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             browser_errors = browser_result.get("errors", [])
             has_browser_errors = len(browser_errors) > 0
 
-            if preview_clean and ac_all_passed:
+            if preview_clean and ac_all_passed and not smoke_defects:
                 verdict = "PASS"
                 overall_score = 8.0
                 summary = "LLM 不可用，基于浏览器验证和 AC 验收结果判定通过"
-            elif has_browser_errors:
+            elif has_browser_errors or smoke_defects:
                 verdict = "NEEDS_WORK"
                 overall_score = 3.0
-                summary = f"LLM 不可用，浏览器报 {len(browser_errors)} 个错误"
+                summary = (
+                    f"LLM 不可用，浏览器报 {len(browser_errors)} 个错误，"
+                    f"通用冒烟发现 {len(smoke_defects)} 个确定性缺陷"
+                )
             else:
                 verdict = "NEEDS_WORK"
                 overall_score = 5.0
@@ -1310,73 +1434,35 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                 "degraded": True,
             }
 
-        # ---- 合并双视角结果 ----
-        if not correctness_result and not quality_result and not _circuit_breaker_hit:
-            # 非熔断失败（如解析失败）：回退为单次全维度评估
-            logger.warning("[Verify] 双视角评估均失败，回退为单次全维度评估")
-            fallback_focus = "请基于以上信息，按照 Evaluator 的评估维度和输出格式，给出结构化评估结果。"
-            try:
-                fallback_response = _call_evaluator(fallback_focus, max_tokens=4000)
-                combined = _parse_evaluator_response(fallback_response)
-            except CircuitBreakerOpenError as e:
-                logger.warning(f"[Verify] 回退评估熔断: {e}")
-                combined = None
-            if not combined:
-                logger.warning(f"[Verify] 回退评估也失败，保守判定为 NEEDS_WORK")
-                return {"verify_passed": False, "current_step": "verify_done",
-                        "error": "LLM 评估调用失败"}
-        elif not correctness_result and not quality_result:
-            # 熔断降级：combined 已在上方降级块基于 preview+AC 计算，直接使用
-            logger.info("[Verify] 使用熔断降级判定结果（不重复调用 LLM）")
-        else:
-            # 合并双视角的 score、findings、verdict
-            c_score = correctness_result.get("score", {}) if correctness_result else {}
-            q_score = quality_result.get("score", {}) if quality_result else {}
-
-            merged_score = {}
-            for dim in ["functionality", "runtime", "acceptance", "ui_quality", "code_quality"]:
-                val = c_score.get(dim, 0) or q_score.get(dim, 0) or 0
-                merged_score[dim] = val
-
-            c_findings = correctness_result.get("findings", []) if correctness_result else []
-            q_findings = quality_result.get("findings", []) if quality_result else []
-            merged_findings = c_findings + q_findings
-
-            # 计算 overall_score（所有维度的均值）
-            valid_scores = [v for v in merged_score.values() if isinstance(v, (int, float)) and v > 0]
-            merged_overall = round(sum(valid_scores) / len(valid_scores), 1) if valid_scores else 0.0
-
-            # verdict 判定：任一视角 NEEDS_WORK → NEEDS_WORK
-            c_verdict = correctness_result.get("verdict", "PASS") if correctness_result else "PASS"
-            q_verdict = quality_result.get("verdict", "PASS") if quality_result else "PASS"
-            merged_verdict = "NEEDS_WORK" if (c_verdict == "NEEDS_WORK" or q_verdict == "NEEDS_WORK") else "PASS"
-
-            # 优先取两个视角的 summary（取更详细的那个）
-            c_summary = correctness_result.get("summary", "") if correctness_result else ""
-            q_summary = quality_result.get("summary", "") if quality_result else ""
-            merged_summary = c_summary if len(c_summary) >= len(q_summary) else q_summary
-
-            combined = {
-                "verdict": merged_verdict,
-                "summary": merged_summary,
-                "score": merged_score,
-                "overall_score": merged_overall,
-                "findings": merged_findings,
-                "browser_result": browser_result,
-                "ac_results": ac_check_results,  # Playwright 实际执行结果
-            }
-
-            logger.info(
-                f"[Verify] 双视角评估完成: correctness_verdict={c_verdict}, "
-                f"quality_verdict={q_verdict}, merged_verdict={merged_verdict}, "
-                f"overall_score={merged_overall}, findings={len(merged_findings)}"
-            )
-
         # 从合并结果中提取字段
         verdict = combined.get("verdict", "NEEDS_WORK")
         findings = combined.get("findings", [])
         overall_score = combined.get("overall_score", 0.0)
         score = combined.get("score", {})
+        logger.info(
+            f"[Verify] 评估完成: verdict={verdict}, overall_score={overall_score}, findings={len(findings)}"
+        )
+
+        # 层1 冒烟缺陷是确定性结论：直接并入 findings 并强制 NEEDS_WORK（进入修复循环）
+        if smoke_defects:
+            smoke_findings = [
+                {
+                    "severity": d.get("severity", "major"),
+                    "dimension": d.get("dimension", "runtime"),
+                    "description": f"[{d['type']}] {d['message']}",
+                    "evidence": d.get("evidence", ""),
+                    "suggestion": d.get("suggestion", ""),
+                }
+                for d in smoke_defects
+            ]
+            findings = smoke_findings + findings
+            verdict = "NEEDS_WORK"
+            if not overall_score or overall_score >= 6:
+                overall_score = 5.5
+            logger.warning(
+                f"[Verify] 通用冒烟发现 {len(smoke_defects)} 个确定性缺陷，"
+                f"强制判定 NEEDS_WORK: {[d['type'] for d in smoke_defects]}"
+            )
 
         # 将 verdict 转为 verify_passed
         state["verify_passed"] = (verdict == "PASS")
@@ -1391,6 +1477,11 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             "findings": findings,
             "ac_results": ac_check_results,  # Playwright 实际执行的逐条 AC 结果
             "browser_result": browser_result,
+            "smoke_result": {
+                "available": smoke_result.get("available", False),
+                "checks": smoke_result.get("checks", {}),
+                "defects": smoke_defects,
+            },
             "timestamp": __import__('time').time(),
         }
         # 持久化到 .task/evaluator/result.json（全复杂度通用，支持 API 读取）
@@ -1443,6 +1534,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                             use_memory=False,
                             max_tokens=4000,
                             timeout=90,
+                            thinking='enabled',
                         )
                         if not retry_response.is_error and retry_response.content:
                             retry_content = retry_response.content.strip()
@@ -1506,12 +1598,14 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                     # 重试后找到了具体 findings，走正常 NEEDS_WORK 流程
                     state["metadata"].pop("_verifier_error", None)
                     state["metadata"]["_verifier_error_count"] = 0
-                    repair_count = state.get("metadata", {}).get("repair_count", 0)
-                    state.setdefault("metadata", {})["repair_count"] = repair_count + 1
+                    meta = dict(state.get("metadata") or {})
+                    meta["repair_count"] = meta.get("repair_count", 0) + 1
+                    state["metadata"] = meta
             elif findings:
                 # NEEDS_WORK 且有具体 findings：递增 repair_count
-                repair_count = state.get("metadata", {}).get("repair_count", 0)
-                state.setdefault("metadata", {})["repair_count"] = repair_count + 1
+                meta = dict(state.get("metadata") or {})
+                meta["repair_count"] = meta.get("repair_count", 0) + 1
+                state["metadata"] = meta
                 state["metadata"].pop("_verifier_error", None)
                 state["metadata"]["_verifier_error_count"] = 0
             else:
@@ -1536,6 +1630,18 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             f"**评分**: {overall_score}/10 ({dimension_scores})\n\n"
             f"**摘要**: {combined.get('summary', '')}\n\n"
         )
+        # 确定性缺陷（浏览器实测）单列置顶：这不是 LLM 观点，是真实复现的缺陷
+        if smoke_defects:
+            qa_feedback += (
+                "## 🔴 确定性缺陷（浏览器实测复现，最高优先级，必须先修复）\n\n"
+                + "\n\n".join(
+                    f"**{d['type']}** — {d['message']}\n"
+                    f"📍 复现证据: {d.get('evidence', '')}\n"
+                    f"🔧 修复方案: {d.get('suggestion', '')}"
+                    for d in smoke_defects
+                )
+                + "\n\n以上缺陷由无头浏览器真实操作复现（非 LLM 判断），修复它们之前不要处理其他问题。\n\n"
+            )
         if findings:
             qa_feedback += "**发现的问题**:\n" + "\n".join(
                 f"- [{f.get('severity', '?')}] {f.get('description', '')}"
@@ -1602,8 +1708,376 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
     except Exception as e:
         logger.warning(f"[Verify] 评估异常: {e}，保守判定为 NEEDS_WORK")
         return {"verify_passed": False, "current_step": "verify_done",
-                "error": f"评估异常: {e}"}
+                "smoke_defects": [],
+                "error": f"评估异常: {e}",
+                "metadata": state.get("metadata") or {}}
 
     # verify_node 原地修改了 state（dialogue_history, role_outputs 等），
-    # 只返回变更字段，避免 add reducer 重复拼接 dialogue_history
-    return {"verify_passed": state.get("verify_passed", False), "current_step": state.get("current_step", "verify_done")}
+    # 只返回变更字段，避免 add reducer 重复拼接 dialogue_history；
+    # metadata 显式返回，避免依赖 langgraph 未文档化的浅拷贝副作用
+    return {"verify_passed": state.get("verify_passed", False),
+            "current_step": state.get("current_step", "verify_done"),
+            "smoke_defects": smoke_defects,
+            "metadata": state.get("metadata") or {}}
+
+
+# ==================== Defect Repair 节点（小上下文定向修复） ====================
+
+
+# 定向修复单轮上下文预算：最多携带 6 个文件、单文件 8000 字符
+_DEFECT_REPAIR_MAX_FILES = 6
+_DEFECT_REPAIR_FILE_CHAR_CAP = 8_000
+
+
+def _content_looks_complete(fname: str, content: str) -> tuple[bool, str]:
+    """检测 LLM 返回的文件内容是否被截断（写回前的完整性闸门）
+
+    实测教训（需求106）：LLM 可能在 JSON 字符串值内部截断文件内容，
+    JSON 本身合法但文件止于半条语句，写回后直接毁掉整个应用。
+    """
+    stripped = content.rstrip()
+    if fname.endswith(".html"):
+        if not stripped.lower().endswith("</html>"):
+            return False, "HTML 未以 </html> 结尾"
+    elif fname.endswith(".js") or fname.endswith(".css"):
+        # 先剥离字符串字面量与注释再配平：字符串/注释内的括号（如
+        # console.log("}")、正则、模板字面量）不应计入，否则会误拒合法补丁
+        code = _strip_strings_and_comments(content)
+        if code.count("{") != code.count("}"):
+            return False, f"花括号不配平 {{={code.count('{')} }}={code.count('}')}"
+        if fname.endswith(".js") and code.count("(") != code.count(")"):
+            return False, "JS 圆括号不配平"
+    return True, ""
+
+
+def _strip_strings_and_comments(code: str) -> str:
+    """把 JS/CSS 中的字符串字面量与注释替换为空，用于括号配平统计。
+
+    覆盖：'...' / "..." / `...`（模板字面量，含 ${}）、// 行注释、/* */ 块注释。
+    不做完整 JS 语法解析，仅尽力避免最常见误判；配平检查本就是启发式。
+    """
+    import re
+    # 字符串与注释统一替换为占位（不删除行结构，保持 \n 数量不变）
+    out = []
+    i, n = 0, len(code)
+    while i < n:
+        ch = code[i]
+        if ch == "'" or ch == '"' or ch == "`":
+            quote = ch
+            j = i + 1
+            while j < n:
+                if code[j] == "\\":
+                    j += 2
+                    continue
+                if code[j] == quote:
+                    break
+                j += 1
+            out.append(" " * (j - i + 1))
+            i = j + 1
+        elif ch == "/" and i + 1 < n and code[i + 1] == "/":
+            j = code.find("\n", i)
+            if j == -1:
+                j = n
+            out.append(" " * (j - i))
+            i = j
+        elif ch == "/" and i + 1 < n and code[i + 1] == "*":
+            j = code.find("*/", i + 2)
+            if j == -1:
+                j = n
+            out.append(" " * (j + 2 - i))
+            i = j + 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def _collect_defect_repair_context(workspace) -> tuple[str, list[str]]:
+    """收集定向修复的最小上下文：index.html 优先，其余 js/css 按相关性排序"""
+    files = [f for f in workspace.list()
+             if not f.startswith("docs/") and not f.startswith(".task/")]
+    html = [f for f in files if f.endswith(".html")]
+    js = [f for f in files if f.endswith(".js")]
+    css = [f for f in files if f.endswith(".css")]
+
+    def _relevance(name: str) -> int:
+        # 入口/主逻辑文件优先（main/game/app/index 命名的权重更高）
+        low = name.lower()
+        for i, kw in enumerate(["main", "game", "app", "index", "storage", "util"]):
+            if kw in low:
+                return i
+        return 99
+
+    ordered = (
+        sorted(html, key=_relevance)
+        + sorted(js, key=_relevance)
+        + sorted(css, key=_relevance)
+    )[:_DEFECT_REPAIR_MAX_FILES]
+
+    blocks = []
+    for fname in ordered:
+        try:
+            content = workspace.read(fname)
+            truncated = ""
+            if len(content) > _DEFECT_REPAIR_FILE_CHAR_CAP:
+                content = content[:_DEFECT_REPAIR_FILE_CHAR_CAP]
+                truncated = "\n<!-- [上下文截断：仅展示前 8000 字符，修复时请基于可见内容] -->"
+            lang = fname.rsplit(".", 1)[-1] if "." in fname else ""
+            blocks.append(f"### {fname}\n```{lang}\n{content}{truncated}\n```")
+        except Exception:
+            blocks.append(f"### {fname}\n(无法读取)")
+    return "\n\n".join(blocks) if blocks else "(无文件)", ordered
+
+
+def defect_repair_node(state: AgentState) -> Dict[str, Any]:
+    """小上下文定向修复：针对通用冒烟测试发现的确定性缺陷
+
+    与 coder_node 修复路径的区别：
+    - 不进入 ToolCallLoop，不携带 plan/dialogue_history/CompletionContract
+    - 单次 LLM 调用，上下文仅包含：缺陷清单（含复现证据与修复方案）+ 相关文件
+    - LLM 返回补丁后的完整文件，直接写回 workspace
+    - 修复后由 graph 路由回 verify 重新冒烟验证
+    """
+    workspace = get_workspace(state)
+    if not workspace:
+        tl = get_tool_loop(state)
+        workspace = tl.workspace if tl else None
+    if not workspace:
+        logger.error("[DefectRepair] 无法获取 workspace")
+        return {"current_step": "defect_repair_failed", "error": "无法获取 workspace"}
+
+    smoke_defects = state.get("smoke_defects") or []
+    if not smoke_defects:
+        logger.warning("[DefectRepair] 无确定性缺陷，跳过")
+        return {"current_step": "defect_repair_skipped"}
+
+    repair_round = state.get("metadata", {}).get("defect_repair_count", 0) + 1
+    # 无论本轮成败都必须递增计数，否则缺陷未修复时 verify↔defect_repair 会无限循环
+    meta = dict(state.get("metadata") or {})
+    meta["defect_repair_count"] = repair_round
+    state["metadata"] = meta  # 原地同步；各 return 显式携带 metadata，不依赖浅拷贝副作用
+    logger.info(
+        f"[DefectRepair] 第 {repair_round} 轮定向修复: "
+        f"{[d.get('type') for d in smoke_defects]}"
+    )
+
+    # SSE 通知前端进入定向修复阶段
+    req_id = state.get("requirement_id", 0)
+    try:
+        tl = get_tool_loop(state)
+        if tl and tl.sse:
+            tl.sse.dialogue(
+                req_id, "agent", DEV_NAME,
+                f"## 🔧 小上下文定向修复（第 {repair_round} 轮）\n\n"
+                + "\n".join(f"- **{d.get('type')}**: {d.get('message', '')}" for d in smoke_defects),
+                status="in_progress",
+            )
+    except Exception:
+        pass
+
+    # ---- 构建最小上下文 ----
+    defects_text = "\n\n".join(
+        f"### 缺陷 {i + 1}: **{d.get('type', '?')}** — {d.get('message', '')}\n"
+        f"- 复现证据: {d.get('evidence', '(无)')}\n"
+        f"- 修复方案: {d.get('suggestion', '(无，需自行判断)')}"
+        for i, d in enumerate(smoke_defects)
+    )
+    files_text, context_files = _collect_defect_repair_context(workspace)
+    user_prompt = (
+        "## 确定性缺陷清单（无头浏览器实测复现）\n\n"
+        f"{defects_text}\n\n"
+        f"## 当前文件（共 {len(context_files)} 个）\n\n{files_text}\n\n"
+        "请按系统指令的修复原则和输出格式，返回修复后的 JSON。"
+    )
+
+    # ---- 单次 LLM 调用（截断检测 + 一次更大 max_tokens 重试） ----
+    from llm.client import get_client
+    client = get_client()
+    system_prompt = load_prompt("tasks/defect_repair.md")
+
+    def _call(max_tokens: int):
+        return client.chat(
+            prompt=user_prompt,
+            system_prompt=system_prompt,
+            use_memory=False,
+            max_tokens=max_tokens,
+            timeout=150,
+            thinking='enabled',  # 补丁 JSON 需要思考模式保证格式正确
+        )
+
+    response = None
+    for max_tokens in (16_000, 32_000):
+        try:
+            resp = _call(max_tokens)
+        except Exception as e:
+            logger.warning(f"[DefectRepair] LLM 调用失败 (max_tokens={max_tokens}): {e}")
+            break
+        if not resp.is_error and resp.content:
+            response = resp
+            if getattr(resp, "finish_reason", None) == "length":
+                logger.warning(
+                    f"[DefectRepair] 响应截断 (max_tokens={max_tokens})，扩大重试"
+                )
+                continue
+            break
+
+    if not response or response.is_error or not response.content:
+        logger.error("[DefectRepair] LLM 未返回有效内容，本轮修复失败")
+        return {"current_step": "defect_repair_failed",
+                "error": "LLM 调用失败",
+                "metadata": state.get("metadata") or {}}
+
+    # ---- 分层 JSON 解析：loads → 正则提取 → try_fix_json 兜底 ----
+    content = response.content.strip()
+    parsed = None
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        match = re.search(r'\{[\s\S]*\}', content)
+        if match:
+            try:
+                parsed = json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+        if parsed is None:
+            try:
+                parsed = try_fix_json(content)
+            except Exception:
+                parsed = None
+
+    patched = parsed.get("files") if isinstance(parsed, dict) else None
+    if not isinstance(patched, list) or not patched:
+        # 整包 JSON 解析失败（通常是多文件输出超预算被截断）→ 降级为单文件修复
+        logger.warning(
+            "[DefectRepair] 整包补丁解析失败，降级为单文件修复（压缩输出预算）"
+        )
+        all_files = [f for f in workspace.list()
+                     if not f.startswith("docs/") and not f.startswith(".task/")]
+        js_files = sorted(
+            [f for f in all_files if f.endswith(".js")],
+            key=lambda n: -len(workspace.read(n)),
+        )
+        target = next((f for f in js_files if "main" in f.lower()), js_files[0] if js_files else "")
+        if target:
+            target_content = workspace.read(target)
+            single_prompt = (
+                f"## 确定性缺陷清单（无头浏览器实测复现）\n\n{defects_text}\n\n"
+                f"## 待修复文件: {target}\n```javascript\n{target_content}\n```\n\n"
+                "只修复这一个文件。返回 JSON: "
+                '{"files": [{"filename": "' + target + '", "content": "修复后的完整文件"}], '
+                '"summary": "..."}\n'
+                "content 必须是完整文件（从第一行到最后一行，不得截断），最小改动。"
+            )
+            try:
+                single_resp = client.chat(
+                    prompt=single_prompt,
+                    system_prompt=system_prompt,
+                    use_memory=False,
+                    max_tokens=16_000,
+                    timeout=150,
+                    thinking='enabled',
+                )
+                if single_resp.content and not single_resp.is_error:
+                    s_content = single_resp.content.strip()
+                    s_parsed = None
+                    try:
+                        s_parsed = json.loads(s_content)
+                    except json.JSONDecodeError:
+                        s_match = re.search(r'\{[\s\S]*\}', s_content)
+                        if s_match:
+                            try:
+                                s_parsed = json.loads(s_match.group())
+                            except json.JSONDecodeError:
+                                pass
+                    if isinstance(s_parsed, dict) and isinstance(s_parsed.get("files"), list):
+                        patched = s_parsed["files"]
+                        logger.info(f"[DefectRepair] 单文件降级修复成功解析: {target}")
+            except Exception as e:
+                logger.warning(f"[DefectRepair] 单文件降级修复调用失败: {e}")
+
+    if not isinstance(patched, list) or not patched:
+        logger.error("[DefectRepair] 整包与单文件降级均失败，本轮修复失败")
+        return {"current_step": "defect_repair_failed",
+                "error": "补丁 JSON 解析失败",
+                "metadata": state.get("metadata") or {}}
+
+    # ---- 校验并写回（最多 4 个文件，路径必须在 workspace 内） ----
+    existing = set(workspace.list())
+    written, skipped = [], []
+    for f in patched[:4]:
+        if not isinstance(f, dict):
+            continue
+        fname, fcontent = f.get("filename", ""), f.get("content", "")
+        if not fname or not isinstance(fcontent, str) or not fcontent.strip():
+            skipped.append(f"{fname or '(空文件名)'}: 内容为空")
+            continue
+        if fname not in existing:
+            skipped.append(f"{fname}: 非现有文件（定向修复禁止新建文件）")
+            continue
+        if len(fcontent) > 200_000:
+            skipped.append(f"{fname}: 内容异常超长")
+            continue
+        # 截断闸门 1: 完整性（花括号配平 / 结尾标记）
+        ok, reason = _content_looks_complete(fname, fcontent)
+        if not ok:
+            skipped.append(f"{fname}: 疑似截断（{reason}），拒绝写回")
+            logger.warning(f"[DefectRepair] {fname} 内容不完整: {reason}，拒绝写回")
+            continue
+        # 截断闸门 2: 长度比（定向修复是最小改动，新内容不应骤缩到原文件的 40% 以下）
+        try:
+            orig_len = len(workspace.read(fname))
+            if orig_len > 1_000 and len(fcontent) < orig_len * 0.4:
+                skipped.append(
+                    f"{fname}: 新内容仅为原文 {len(fcontent)}/{orig_len} 字符，疑似截断，拒绝写回"
+                )
+                logger.warning(f"[DefectRepair] {fname} 长度比异常: {len(fcontent)}/{orig_len}")
+                continue
+        except Exception:
+            pass
+        try:
+            workspace.write(fname, fcontent)
+            written.append(fname)
+        except Exception as e:
+            skipped.append(f"{fname}: 写入失败 {e}")
+
+    summary = parsed.get("summary", "") if isinstance(parsed, dict) else ""
+    logger.info(
+        f"[DefectRepair] 第 {repair_round} 轮完成: 写回 {written}"
+        + (f"，跳过 {skipped}" if skipped else "")
+    )
+
+    # SSE 推送修复结果与更新后的文件
+    try:
+        tl = get_tool_loop(state)
+        if tl and tl.sse:
+            tl.sse.dialogue(
+                req_id, "agent", DEV_NAME,
+                f"## 🔧 定向修复完成（第 {repair_round} 轮）\n\n"
+                f"**修改文件**: {', '.join(written) or '(无)'}\n\n"
+                f"**修复说明**: {summary or '(未提供)'}"
+                + (f"\n\n**跳过**: {'; '.join(skipped)}" if skipped else ""),
+                status="completed",
+            )
+            if written:
+                tl.sse.code(req_id, [
+                    {"filename": fname, "content": workspace.read(fname)}
+                    for fname in written
+                ])
+    except Exception:
+        pass
+
+    # 留痕到对话历史（供最终报告与人工排查）
+    state.setdefault("dialogue_history", []).append({
+        "role": "agent",
+        "name": DEV_NAME,
+        "content": (
+            f"## 🔧 小上下文定向修复（第 {repair_round} 轮）\n"
+            f"目标缺陷: {', '.join(d.get('type', '?') for d in smoke_defects)}\n"
+            f"修改文件: {', '.join(written) or '(无)'}\n"
+            f"修复说明: {summary or '(未提供)'}"
+        ),
+        "status": "completed",
+    })
+
+    return {"current_step": "defect_repair_done",
+                "metadata": state.get("metadata") or {}}

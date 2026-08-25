@@ -416,9 +416,9 @@ class PGVectorRetriever:
 
             db = SessionLocal()
             for doc, mem_id in zip(documents, memory_ids):
-                # 检查是否已存在
+                # 检查是否已存在（embedding_text 为 ORM 映射列，PG/SQLite 通用）
                 existing = db.query(AgentMemoryVector).filter_by(memory_id=mem_id).first()
-                if existing and existing.embedding is not None:
+                if existing and existing.embedding_text is not None:
                     continue  # 已有向量,跳过
 
                 # 编码文档
@@ -426,15 +426,23 @@ class PGVectorRetriever:
                 vec_str = "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
 
                 if existing:
-                    # 更新已有记录的向量
+                    # 更新已有记录的向量（CAST 避免 CAST(:vec AS vector) 被 SQLAlchemy 误解析）
                     db.execute(
-                        text("UPDATE agent_memory_vectors SET embedding = :vec WHERE id = :id"),
+                        text(
+                            "UPDATE agent_memory_vectors "
+                            "SET embedding = CAST(:vec AS vector), embedding_text = :vec "
+                            "WHERE id = :id"
+                        ),
                         {"vec": vec_str, "id": existing.id}
                     )
                 else:
                     # 插入新记录
                     db.execute(
-                        text("INSERT INTO agent_memory_vectors (memory_id, user_id, embedding) VALUES (:mid, :uid, :vec::vector)"),
+                        text(
+                            "INSERT INTO agent_memory_vectors "
+                            "(memory_id, user_id, embedding, embedding_text) "
+                            "VALUES (:mid, :uid, CAST(:vec AS vector), :vec)"
+                        ),
                         {"mid": mem_id, "uid": 0, "vec": vec_str}
                     )
             db.commit()
@@ -506,17 +514,17 @@ class PGVectorRetriever:
                 if self._memory_ids:
                     id_list = ",".join(str(mid) for mid in self._memory_ids)
                     result = conn.execute(text(f"""
-                        SELECT memory_id, 1 - (embedding <=> :vec::vector) AS similarity
+                        SELECT memory_id, 1 - (embedding <=> CAST(:vec AS vector)) AS similarity
                         FROM agent_memory_vectors
                         WHERE memory_id IN ({id_list})
-                        ORDER BY embedding <=> :vec::vector
+                        ORDER BY embedding <=> CAST(:vec AS vector)
                         LIMIT :top_k
                     """), {"vec": vec_str, "top_k": top_k})
                 else:
                     result = conn.execute(text("""
-                        SELECT memory_id, 1 - (embedding <=> :vec::vector) AS similarity
+                        SELECT memory_id, 1 - (embedding <=> CAST(:vec AS vector)) AS similarity
                         FROM agent_memory_vectors
-                        ORDER BY embedding <=> :vec::vector
+                        ORDER BY embedding <=> CAST(:vec AS vector)
                         LIMIT :top_k
                     """), {"vec": vec_str, "top_k": top_k})
 

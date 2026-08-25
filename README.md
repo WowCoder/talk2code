@@ -180,6 +180,15 @@ Verify 节点采用 **Playwright 真实浏览器执行 + LLM 评估** 双层验�
 
 1. 项目仍在迭代中，欢迎 Issue / PR 一同共创
 2. 需要在 `.env` 中配置 `LLM_API_KEY` 才能使用 AI 功能
-3. 生产环境请配置 `JWT_SECRET_KEY`、`LLM_API_KEY` 等敏感信息
-4. 建议使用现代浏览器（Chrome/Edge/Safari）
-5. 前端开发模式：`cd frontend-vue && npm run dev` 启动 Vite 热更新开发服务器
+3. **安全配置（必读）**：
+   - 生产环境必须配置强随机 `JWT_SECRET_KEY`（`python -c "import secrets; print(secrets.token_urlsafe(48))"`）。
+     使用默认密钥且服务对外可达（非 debug 或监听 `0.0.0.0`）时，应用会**拒绝启动**；
+     仅限无法配置密钥的隔离演示环境可显式设 `ALLOW_INSECURE_SECRETS=true` 豁免。
+   - 默认开启 API 限流（`DISABLE_RATE_LIMIT=false`）；测试套件由 conftest 自行注入关闭。
+   - 未部署在可信反向代理之后时，请勿开启 `TRUST_PROXY_HEADERS=true`（否则限流 IP 可被伪造）。
+   - 登录令牌只通过 httpOnly cookie 下发，前端不存储 token。
+4. 预览能力 URL 默认使用同源相对路径；若前后端不同域部署，配置 `PREVIEW_PUBLIC_BASE_URL`
+   指向预览入口（如 `https://preview.example.com`）。
+5. 建议使用现代浏览器（Chrome/Edge/Safari）
+6. 前端开发模式：`cd frontend-vue && npm run dev` 启动 Vite 热更新开发服务器
+7. README 中出现的 `test / 123456` 仅为本地演示账号，生产环境请删除或替换

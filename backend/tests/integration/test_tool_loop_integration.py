@@ -14,15 +14,28 @@ class TestPlannerToToolLoopFlow:
 
     @patch("harness.instructions.nodes.get_client")
     def test_planner_node_returns_plan(self, mock_get_client):
-        """测试 Planner 节点返回结构化计划"""
+        """测试 TeamLeader 节点（原 planner_node）返回结构化计划"""
         mock_client = Mock()
+        plan_json = json.dumps({
+            "features": [{"title": "添加待办", "description": "支持新增待办项"}],
+            "acceptance_criteria": [{"id": "AC1", "description": "可新增待办"}],
+            "file_structure": ["index.html", "style.css", "app.js"],
+            "tech_stack": {"css": "tailwind", "storage": "localStorage"},
+            "implementation_notes": "使用 Tailwind CSS",
+            "implementation_order": ["index.html", "style.css", "app.js"],
+            "tasks": [
+                {"file": "index.html", "description": "页面骨架"},
+                {"file": "app.js", "description": "交互逻辑"},
+            ],
+            "complexity": "standard",
+        })
         mock_client.chat.return_value = Mock(
-            content='{"components":["header","list","form"],"files":["index.html","style.css","app.js"],"tech_stack":{"css":"tailwind","storage":"localStorage"},"implementation_notes":"使用 Tailwind CSS"}',
-            is_error=False, error=None
+            content=plan_json,
+            is_error=False, error=None, finish_reason="stop"
         )
         mock_get_client.return_value = mock_client
 
-        from harness.instructions.nodes import planner_node
+        from harness.instructions.nodes import team_leader_node
 
         state = {
             "requirement_id": 1,
@@ -31,9 +44,10 @@ class TestPlannerToToolLoopFlow:
             "metadata": {},
         }
 
-        result = planner_node(state)
+        result = team_leader_node(state)
         assert result is not None
         assert "current_step" in result
+        assert result.get("plan", {}).get("file_structure") == ["index.html", "style.css", "app.js"]
 
     @patch("harness.instructions.nodes.get_client")
     def test_tool_coder_node_with_tool_calls(self, mock_get_client):

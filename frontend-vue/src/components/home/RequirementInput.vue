@@ -26,7 +26,6 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { useAuthStore } from '@/stores/auth'
 import { useToast } from '@/composables/useToast'
 
 const emit = defineEmits<{
@@ -36,7 +35,6 @@ const emit = defineEmits<{
 const content = ref('')
 const submitting = ref(false)
 const router = useRouter()
-const authStore = useAuthStore()
 const { show } = useToast()
 
 function onInput() {
@@ -60,7 +58,6 @@ async function submit() {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...authStore.getAuthHeaders(),
       },
       credentials: 'include',
       body: JSON.stringify({ content: text }),

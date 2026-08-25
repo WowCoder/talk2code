@@ -120,5 +120,9 @@ class AgentState(TypedDict, total=False):
     # 由 verify_node 设置，route_after_verify 和 _process_final_state 消费
     verify_passed: Optional[bool]
 
+    # 通用冒烟测试发现的确定性缺陷（浏览器实测复现，非 LLM 判断）
+    # 由 verify_node 设置，route_after_verify 据此路由到 defect_repair 节点
+    smoke_defects: Optional[List[dict]]
+
     # 修复轮次计数
     repair_count: Optional[int]

@@ -23,6 +23,28 @@ os.environ.setdefault('APP_DEBUG', 'false')
 os.environ.setdefault('DISABLE_RATE_LIMIT', 'true')  # Disable rate limiting for tests
 
 
+@pytest.fixture(autouse=True)
+def _reset_llm_singleton_breaker():
+    """共享 LLM 单例的熔断器状态不得在用例间泄漏（保证测试顺序无关）。
+
+    此前 test_llm_client.py::test_chat_with_llm_function 在全量运行时失败：
+    更早运行的 functional/integration 用例把单例熔断器打到 open 状态，
+    导致"单跑通过、全量失败"。
+    """
+    from llm.client import get_client as _get_client
+    try:
+        client = _get_client()
+        for attr in ("_circuit_breaker", "_backup_circuit_breaker"):
+            cb = getattr(client, attr, None)
+            if cb is not None:
+                cb._failure_count = 0
+                cb._state = "closed"
+                cb._probe_in_flight = False
+    except Exception:
+        pass
+    yield
+
+
 @pytest.fixture(scope='session')
 def test_config():
     """测试配置"""
@@ -170,12 +192,16 @@ def test_user():
 
 @pytest.fixture(scope='function')
 def auth_token(app_client, test_user):
-    """获取认证 token fixture"""
+    """获取认证 token fixture
+
+    登录响应不再回传 body token（仅 httpOnly cookie），
+    这里从测试客户端的 cookie 中取值，供需要显式 Authorization 头的用例使用。
+    """
     response = app_client.post('/api/login', json={
         'username': test_user['username'],
         'password': test_user['password']
     })
-    data = response.get_json()
-    assert response.status_code == 200, f"Login failed: {data}"
-    assert 'token' in data, f"No token in response: {data}"
-    return data['token']
+    assert response.status_code == 200, f"Login failed: {response.get_json()}"
+    cookie = app_client.get_cookie('access_token_cookie')
+    assert cookie is not None, "登录后未设置 access_token_cookie"
+    return cookie.value

@@ -214,23 +214,29 @@ class TaskQueue:
             # 执行任务函数
             result = task_func(*args, **kwargs)
 
-            # 更新状态为完成
+            # 更新状态为完成（若期间被取消，保持 CANCELLED，避免竞态覆盖）
             with self._tasks_lock:
                 if task_id in self._tasks:
-                    self._tasks[task_id].status = TaskStatus.COMPLETED
-                    self._tasks[task_id].completed_at = datetime.now()
+                    if self._tasks[task_id].status == TaskStatus.CANCELLED:
+                        logger.info(f"任务 {task_id} 执行完毕但已被取消，保持 CANCELLED 状态")
+                    else:
+                        self._tasks[task_id].status = TaskStatus.COMPLETED
+                        self._tasks[task_id].completed_at = datetime.now()
 
             logger.info(f"任务执行完成：task_id={task_id}")
             return result
 
         except Exception as e:
-            # 更新状态为失败
+            # 更新状态为失败（若已被取消则保持 CANCELLED）
             error_msg = str(e)
             with self._tasks_lock:
                 if task_id in self._tasks:
-                    self._tasks[task_id].status = TaskStatus.FAILED
-                    self._tasks[task_id].completed_at = datetime.now()
-                    self._tasks[task_id].error = error_msg
+                    if self._tasks[task_id].status == TaskStatus.CANCELLED:
+                        logger.info(f"任务 {task_id} 已取消，保持 CANCELLED 状态（忽略运行期异常）")
+                    else:
+                        self._tasks[task_id].status = TaskStatus.FAILED
+                        self._tasks[task_id].completed_at = datetime.now()
+                        self._tasks[task_id].error = error_msg
 
             logger.error(f"任务执行失败：task_id={task_id}, error={error_msg}")
             raise
@@ -304,6 +310,14 @@ class TaskQueue:
                 if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
             ]
 
+            # 清理已终态任务的"需求 → 任务"映射（覆盖 Celery 路径，
+            # 线程池路径的 _run_task finally 也会删，双保险）
+            terminal_ids = set(completed_tasks)
+            with self._requirement_tasks_lock:
+                stale_reqs = [req for req, tid in self._requirement_tasks.items() if tid in terminal_ids]
+                for req in stale_reqs:
+                    del self._requirement_tasks[req]
+
             # 清理完成的任务（保留最近 100 个）
             if len(self._tasks) > 100:
                 for tid in completed_tasks[:len(completed_tasks) - 50]:
@@ -360,11 +374,10 @@ class TaskQueue:
             else:
                 logger.info(f"任务 {task_id} 已标记为 CANCELLED（任务正在执行中，将由信号机制终止）")
 
-        # 清理需求映射
-        with self._requirement_tasks_lock:
-            if requirement_id in self._requirement_tasks:
-                del self._requirement_tasks[requirement_id]
-
+        # 需求映射不再在此处立即删除：任务仍在运行时删除映射，
+        # 会让同一需求被重复提交、两个任务并发执行同一需求。
+        # 映射改由 _run_task 的 finally（线程池）或 _check_tasks_status
+        # （Celery 终态）在任务真正结束时清理。
         return True
 
     def get_pending_count(self) -> int:

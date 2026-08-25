@@ -125,7 +125,7 @@ const traceSummary = computed(() => store._traceSummary as SSETraceSummaryData |
 
 // Plan confirmation
 const showPlanConfirmation = computed(() => store.planStatus === 'needs_confirmation')
-const specData = computed(() => (store as any)._specData as any)
+const specData = computed(() => store._specData)
 function onPlanConfirmed(feedback: string) {
   // 有反馈时会重新走 TL 分析，不落确认卡片
   if (feedback) return
@@ -144,7 +144,7 @@ function onPlanConfirmed(feedback: string) {
   }
   // 确认卡片应插入到 TL 分析消息之前（spec 事件到达时记录的索引，
   // 避免搜索 plan 字段——SSE dialogue 事件不携带结构化字段）
-  const insertAt = (store as any)._specInsertIndex ?? store.dialogueMessages.length
+  const insertAt = store._specInsertIndex ?? store.dialogueMessages.length
   store.dialogueMessages.splice(insertAt, 0, card)
 }
 

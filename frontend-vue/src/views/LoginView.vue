@@ -22,9 +22,6 @@
         v-else
         @success="onRegisterSuccess"
       />
-
-      <!-- Hint -->
-      <p class="hint">测试账号 <code>test</code> / <code>123456</code></p>
     </div>
   </div>
 </template>
@@ -44,7 +41,10 @@ function onLoginSuccess() {
 }
 
 function onRegisterSuccess() {
-  activeTab.value = 'login'
+  // 延迟切换，让「注册成功」提示可见后再回到登录页
+  setTimeout(() => {
+    activeTab.value = 'login'
+  }, 1500)
 }
 </script>
 
@@ -110,22 +110,5 @@ function onRegisterSuccess() {
 .brand-subtitle {
   font-size: 14px;
   color: var(--muted);
-}
-
-.hint {
-  text-align: center;
-  font-size: 12px;
-  color: var(--muted);
-  margin-top: 20px;
-}
-
-.hint code {
-  background: var(--bg);
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--accent);
-  border: 1px solid var(--border);
 }
 </style>

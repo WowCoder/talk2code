@@ -8,15 +8,16 @@ export const useAuthStore = defineStore('auth', () => {
   const username = ref<string>('用户')
   const isAuthenticated = ref(false)
 
-  function getAuthHeaders(): Record<string, string> {
-    // cookie 承载鉴权，无需 Authorization 头
-    return {}
-  }
-
-  /** 应用启动时调用：请求后端确认 cookie 是否有效 */
+  /** 应用启动时调用：请求后端确认 cookie 是否有效（带超时，避免白屏） */
   async function initAuth(): Promise<void> {
     try {
-      const resp = await fetch('/api/user/info', { credentials: 'include' })
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 4000)
+      const resp = await fetch('/api/user/info', {
+        credentials: 'include',
+        signal: controller.signal,
+      })
+      clearTimeout(timer)
       if (resp.ok) {
         const data = await resp.json()
         username.value = data.user?.username || localStorage.getItem('username') || '用户'
@@ -83,7 +84,6 @@ export const useAuthStore = defineStore('auth', () => {
   return {
     username,
     isAuthenticated,
-    getAuthHeaders,
     initAuth,
     login,
     register,

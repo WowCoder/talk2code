@@ -163,10 +163,25 @@ class Settings(BaseSettings):
 
     # LLM 调用配置
     LLM_TEMPERATURE: float = Field(default=0.7, ge=0, le=2, description='LLM 温度参数')
-    LLM_MAX_TOKENS: int = Field(default=8000, ge=100, le=32000, description='LLM 最大生成 token 数')
+    LLM_MAX_TOKENS: int = Field(default=12000, ge=100, le=32000, description='LLM 最大生成 token 数')
     LLM_TIMEOUT: int = Field(default=60, ge=10, le=300, description='LLM 调用超时时间（秒）')
     LLM_MAX_RETRIES: int = Field(default=2, ge=0, le=5, description='LLM 调用最大重试次数')
     LLM_CRAFT_ENABLED: bool = Field(default=True, description='是否启用 Craft 设计质量规则注入')
+
+    # 思考模式（reasoning 模型）：DeepSeek V4 默认开启思考且 effort=high，
+    # 会消耗大量 reasoning token（被程序过滤丢弃，纯浪费）。默认关闭以提速。
+    LLM_THINKING: Literal['enabled', 'disabled'] = Field(
+        default='disabled',
+        description='LLM 思考模式开关（OpenAI 格式 {"thinking": {"type": ...}}）'
+    )
+    # 思考强度（仅当 LLM_THINKING=enabled 时生效）
+    # 注意：effort=high 会消耗大量 reasoning token，对 max_tokens 较小的调用
+    # （如 AC 翻译 2000、评估 4000）会把 token 全耗在思考上导致内容为空。
+    # 默认用 low：既保证 JSON 格式正确，又避免 reasoning token 挤占输出预算。
+    LLM_REASONING_EFFORT: Literal['low', 'high', 'max'] = Field(
+        default='low',
+        description='思考强度（low/high/max），仅当 LLM_THINKING=enabled 时生效'
+    )
 
     # LLM 熔断器配置
     LLM_CIRCUIT_BREAKER_THRESHOLD: int = Field(
@@ -224,6 +239,26 @@ class Settings(BaseSettings):
     PASSWORD_MIN_LENGTH: int = Field(default=6, description='密码最小长度')
     USERNAME_MIN_LENGTH: int = Field(default=3, description='用户名最小长度')
 
+    # 显式豁免"默认密钥禁止启动"检查（仅限无法配置密钥的隔离环境，如一次性容器演示）
+    ALLOW_INSECURE_SECRETS: bool = Field(
+        default=False,
+        description='true 时允许使用默认 JWT_SECRET_KEY 启动（显式豁免，需逐环境手动开启）'
+    )
+
+    # 是否信任反向代理头（X-Forwarded-For）。仅在应用确实部署于可信反代之后才开启，
+    # 否则限流/审计的客户端 IP 可被请求方伪造。
+    TRUST_PROXY_HEADERS: bool = Field(
+        default=False,
+        description='true 时从 X-Forwarded-For 解析客户端 IP（须部署在可信反向代理之后）'
+    )
+
+    # 预览能力 URL 的外部基础地址（如 https://preview.example.com）。
+    # 为空时生成同源相对路径（本机/同源反代场景无需配置）。
+    PREVIEW_PUBLIC_BASE_URL: str = Field(
+        default='',
+        description='预览能力 URL 的外部基础地址，空则使用同源相对路径'
+    )
+
     # ==================== 应用配置 ====================
 
     APP_HOST: str = Field(default='0.0.0.0', description='应用监听地址')
@@ -269,6 +304,8 @@ LLM_PROVIDER = settings.LLM_PROVIDER
 LLM_API_KEY = settings.LLM_API_KEY
 LLM_BASE_URL = settings.LLM_BASE_URL
 LLM_MODEL = settings.LLM_MODEL
+LLM_THINKING = settings.LLM_THINKING
+LLM_REASONING_EFFORT = settings.LLM_REASONING_EFFORT
 LOG_LEVEL = settings.LOG_LEVEL
 LOG_FILE = settings.LOG_FILE
 LOG_DIR = settings.LOG_DIR

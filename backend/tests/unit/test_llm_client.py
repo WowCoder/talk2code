@@ -74,12 +74,13 @@ class TestLLMClientInit:
         assert client.model is not None  # 从 .env 加载的模型名
 
     def test_client_init_default_params(self):
-        """测试默认参数"""
+        """测试默认参数（对照 config 实际值，不与本地 .env 覆盖耦合）"""
+        from config import settings
         client = LLMClient(api_key='test_key')
         assert client.temperature == 0.7
-        assert client.max_tokens == 8000  # config 默认值（.env 未覆盖时）
-        assert client.timeout == 60
-        assert client.max_retries == 2
+        assert client.max_tokens == settings.LLM_MAX_TOKENS
+        assert client.timeout == settings.LLM_TIMEOUT
+        assert client.max_retries == settings.LLM_MAX_RETRIES
 
     def test_client_init_custom_params(self):
         """测试自定义参数"""

@@ -8,11 +8,6 @@ from services.sse_manager import sse_manager
 from harness.agent_names import TL_NAME
 from factory import app, logger
 
-# ==================== 辅助函数 ====================
-
-from utils.sse import SSEMessage
-from utils.sse import get_current_timestamp
-
 
 # ==================== Chat 意图路由辅助函数 ====================
 
@@ -161,17 +156,10 @@ def _get_mime_type(filepath: str) -> str:
 @jwt_required()
 def preview_serve(req_id: int, filepath: str):
     """
-    预览文件服务端点
+    预览文件服务端点（JWT 鉴权版，保留给带凭证的直连调用）
 
-    为前端 iframe 提供生成的代码文件，支持子目录路径（如 css/style.css）。
-    相对路径引用（<link href="css/style.css">、<script src="js/game.js">）
-    通过此端点自动解析。
-
-    数据源优先级：
-    1. Workspace 磁盘文件（实时生成中，SSE 推送后立即可用）
-    2. 数据库 code_files（已完成的任务，作为持久化兜底）
-
-    安全：JWT 认证 + 拒绝路径穿越（.. / ~）+ 用户归属校验。
+    前端 iframe 预览请使用 /api/pt/<req_id>/<token>/<path> 能力 URL——
+    iframe 子资源请求带不上 Authorization 头，cookie 又依赖部署环境。
     """
     # 安全校验：拒绝路径穿越
     if '..' in filepath or filepath.startswith('/') or filepath.startswith('~'):
@@ -189,28 +177,75 @@ def preview_serve(req_id: int, filepath: str):
         ).first()
         if not requirement:
             return _preview_error_html('需求不存在', 404)
+        return _serve_preview_file(requirement, filepath)
 
-        # 优先从 workspace 读取（实时生成时更及时）
-        from harness.state.workspace import WorkspaceFS
-        user_id = requirement.user_id
-        workspace = WorkspaceFS(user_id, req_id)
-        if workspace.exists(filepath):
-            content = workspace.read(filepath)
-            if content.strip():  # 非空才返回
-                mime = _get_mime_type(filepath)
-                return Response(content, mimetype=mime)
 
-        # 回退到数据库 code_files（已完成的任务）
-        if requirement.code_files:
-            for f in requirement.code_files:
-                if f.get('filename') == filepath:
-                    content = f.get('content', '')
-                    if content.strip():  # 非空才返回
-                        mime = _get_mime_type(filepath)
-                        return Response(content, mimetype=mime)
+@app.route('/api/pt/<int:req_id>/<token>/<path:filepath>')
+def preview_public_serve(req_id: int, token: str, filepath: str):
+    """
+    预览能力 URL（iframe 专用，无 cookie/header 依赖）
 
-        # 文件不存在（返回 HTML 而非 JSON，iframe 可友好展示）
-        return _preview_error_html(f'文件尚未生成: {filepath}', 404)
+    token = HMAC(JWT_SECRET, "preview:{user_id}:{req_id}")，不可猜测、
+    绑定需求归属；iframe 内所有相对路径子资源自动命中本路由。
+    """
+    if '..' in filepath or filepath.startswith('/') or filepath.startswith('~'):
+        logger.warning(f"预览令牌请求拒绝非法路径: req_id={req_id}, path={filepath}")
+        return _preview_error_html('非法文件路径', 403)
+
+    from models import Requirement
+
+    with get_db() as db:
+        requirement = db.query(Requirement).filter(
+            Requirement.id == req_id
+        ).first()
+        if not requirement:
+            return _preview_error_html('需求不存在', 404)
+
+        from utils.preview_token import verify_preview_token
+        if not verify_preview_token(token, requirement.user_id, req_id):
+            logger.warning(f"预览令牌校验失败: req_id={req_id}")
+            # 与"需求不存在"返回完全一致的 404，避免响应差异被用来探测 req_id 是否存在
+            return _preview_error_html('预览资源不存在', 404)
+
+        return _serve_preview_file(requirement, filepath)
+
+
+def _preview_response(content: str, mime: str, status: int = 200):
+    """预览文件响应：服务端兜底的 sandbox CSP + nosniff。
+
+    前端 iframe 已带 sandbox 属性（省略 allow-same-origin），但用户直接
+    在新标签页打开能力 URL 时没有 iframe 保护——CSP sandbox 让生成代码
+    在任意上下文都以不透明源执行，无法携带主站 cookie 或访问存储。
+    """
+    return Response(
+        content, status=status, mimetype=mime,
+        headers={
+            'Content-Security-Policy': 'sandbox allow-scripts allow-forms',
+            'X-Content-Type-Options': 'nosniff',
+        },
+    )
+
+
+def _serve_preview_file(requirement, filepath: str):
+    """预览文件服务核心：workspace 优先，数据库 code_files 兜底"""
+    # 优先从 workspace 读取（实时生成时更及时）
+    from harness.state.workspace import WorkspaceFS
+    workspace = WorkspaceFS(requirement.user_id, requirement.id)
+    if workspace.exists(filepath):
+        content = workspace.read(filepath)
+        if content.strip():  # 非空才返回
+            return _preview_response(content, _get_mime_type(filepath))
+
+    # 回退到数据库 code_files（已完成的任务）
+    if requirement.code_files:
+        for f in requirement.code_files:
+            if f.get('filename') == filepath:
+                content = f.get('content', '')
+                if content.strip():  # 非空才返回
+                    return _preview_response(content, _get_mime_type(filepath))
+
+    # 文件不存在（返回 HTML 而非 JSON，iframe 可友好展示）
+    return _preview_error_html(f'文件尚未生成: {filepath}', 404)
 
 
 

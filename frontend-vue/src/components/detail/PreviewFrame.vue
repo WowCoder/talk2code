@@ -68,11 +68,12 @@ const hasContent = computed(() => {
   return !!html && html.trim().length > 0
 })
 
-// 预览 URL 指向后端文件服务端点，相对路径自动解析
+// 预览走能力 URL（/api/pt/...）：iframe 子资源带不上 Authorization 头，
+// cookie 又依赖部署环境（localhost↔127.0.0.1 域不互通），token 化后彻底无凭证依赖
 const iframeSrc = computed(() => {
-  const reqId = store.currentRequirement?.id
-  if (!reqId) return ''
-  return `/api/preview/${reqId}/index.html`
+  const req = store.currentRequirement
+  if (!req?.id || !req.preview_token) return ''
+  return `/api/pt/${req.id}/${req.preview_token}/index.html`
 })
 
 // 预览验证状态

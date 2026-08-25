@@ -86,8 +86,15 @@ class LintJsHandler(ToolHandler):
             )
             if result.returncode != 0:
                 return ToolResult(error=f"JavaScript 语法错误 ({filename}): {result.stderr[:300]}")
-            mode_label = " (ES Module)" if is_es_module else ""
-            return ToolResult(content=f"JavaScript 语法检查通过{mode_label} ({filename})")
+            if is_es_module:
+                # 语法合法但 ES Module 无法在 file:// 预览环境加载（CORS 拦截），
+                # 提示改用普通 <script> + IIFE/全局变量
+                return ToolResult(content=(
+                    f"⚠️ JavaScript 语法通过，但检测到 ES Module（import/export）。"
+                    f"预览环境用 file:// 协议加载，ES Module 会被 CORS 拦截导致脚本不执行。"
+                    f"请改用普通 <script> 标签 + IIFE (function(global){{...}})(window) + window.XXX 暴露接口 ({filename})"
+                ))
+            return ToolResult(content=f"JavaScript 语法检查通过 ({filename})")
         except FileNotFoundError:
             return ToolResult(content=f"Node.js 未安装，跳过 JS 语法检查 ({filename})")
         except subprocess.TimeoutExpired:
@@ -154,7 +161,7 @@ def register_code_tools(registry):
 
     registry.register(ToolDefinition(
         name="execute_code",
-        description="在沙箱中执行 HTML 文件，返回渲染结果或控制台输出",
+        description="检查目标 HTML 文件是否具备可渲染的入口结构（<html>/<!doctype>），并确认代码就绪；不做真实浏览器执行",
         parameters={
             "type": "object",
             "properties": {

@@ -8,7 +8,8 @@ import json
 import threading
 from typing import Optional
 
-from models import SessionLocal, Requirement
+from models import Requirement
+from utils.db import get_db
 from harness.observability.logger import get_logger
 from utils.sse import SSEMessage, get_current_timestamp
 from services.sse_manager import sse_manager
@@ -114,194 +115,196 @@ class RequirementService:
 
     def process_requirement(self, requirement_id: int) -> bool:
         """处理需求：执行 LangGraph 多智能体协同流程"""
-        db = SessionLocal()
-        try:
-            requirement = db.query(Requirement).filter(Requirement.id == requirement_id).first()
-            if not requirement:
-                logger.error(f"需求不存在：{requirement_id}")
-                return False
-
-            if requirement.status in ['finished', 'processing']:
-                logger.info(f"需求 {requirement_id} 状态为 {requirement.status}，跳过")
-                return False
-
-            # 清除上一次可能遗留的取消信号，避免新任务被旧信号立即判定为已取消
-            RequirementService.clear_cancel(requirement_id)
-
-            requirement.status = 'processing'
-            db.commit()
-            logger.info(f"需求 {requirement_id} 开始处理")
-
-            # ===== 意图路由：非 TASK 请求快速返回，不进入完整工作流 =====
-            if '[用户补充说明]' not in requirement.content:
-                router = IntentRouter()
-                intent_result = router.classify(requirement.content)
-                logger.info(f"需求 {requirement_id} 意图分类: {intent_result.intent.value}")
-
-                if intent_result.intent == IntentType.QUICK:
-                    return self._handle_quick_answer(db, requirement, requirement_id, intent_result)
-                elif intent_result.intent == IntentType.SEARCH:
-                    return self._handle_search_answer(db, requirement, requirement_id, intent_result)
-                elif intent_result.intent == IntentType.AMBIGUOUS:
-                    return self._handle_ambiguous_direct(db, requirement, requirement_id)
-
-            # 初始化 harness 各层
-            workspace = WorkspaceFS(requirement.user_id, requirement_id)
-            workspace.init(requirement.code_files)
-            git = GitVersioning(workspace)
-            tools = create_tool_registry()
-            hooks = create_default_hook_manager()
-            # 注入 db_session：记忆/检查点/追踪跨重启持久化
-            checkpoint = CheckpointManager(db_session=db)
-            cost_tracker = CostTracker()
-            tracer = Tracer(db_session=db, cost_tracker=cost_tracker)
-
-            # SSE reporter
-            sse = SSEReporter(sse_manager)
-
-            # 经验注入：将历史成功经验注入 ToolCallLoop 的 System Prompt
-            # 通过包装 _build_system_prompt 方法实现（在原始 prompt 后追加 few-shot 示例）
-            _original_builder = None  # 延迟绑定
-
-            # ToolCallLoop
-            # 增量持久化回调：每轮迭代后将对话历史保存到数据库
-            def _persist_dialogue(state):
-                try:
-                    dialogue = state.get('dialogue_history', [])
+        with get_db() as db:
+            try:
+                requirement = db.query(Requirement).filter(Requirement.id == requirement_id).first()
+                if not requirement:
+                    logger.error(f"需求不存在：{requirement_id}")
+                    return False
+    
+                if requirement.status in ['finished', 'processing']:
+                    logger.info(f"需求 {requirement_id} 状态为 {requirement.status}，跳过")
+                    return False
+    
+                # 清除上一次可能遗留的取消信号，避免新任务被旧信号立即判定为已取消
+                RequirementService.clear_cancel(requirement_id)
+    
+                requirement.status = 'processing'
+                db.commit()
+                logger.info(f"需求 {requirement_id} 开始处理")
+    
+                # ===== 意图路由：非 TASK 请求快速返回，不进入完整工作流 =====
+                if '[用户补充说明]' not in requirement.content:
+                    router = IntentRouter()
+                    intent_result = router.classify(requirement.content)
+                    logger.info(f"需求 {requirement_id} 意图分类: {intent_result.intent.value}")
+    
+                    if intent_result.intent == IntentType.QUICK:
+                        return self._handle_quick_answer(db, requirement, requirement_id, intent_result)
+                    elif intent_result.intent == IntentType.SEARCH:
+                        return self._handle_search_answer(db, requirement, requirement_id, intent_result)
+                    elif intent_result.intent == IntentType.AMBIGUOUS:
+                        return self._handle_ambiguous_direct(db, requirement, requirement_id)
+    
+                # 初始化 harness 各层
+                workspace = WorkspaceFS(requirement.user_id, requirement_id)
+                workspace.init(requirement.code_files)
+                git = GitVersioning(workspace)
+                tools = create_tool_registry()
+                hooks = create_default_hook_manager()
+                # 注入 db_session：记忆/检查点/追踪跨重启持久化
+                checkpoint = CheckpointManager(db_session=db)
+                cost_tracker = CostTracker()
+                tracer = Tracer(db_session=db, cost_tracker=cost_tracker)
+    
+                # SSE reporter
+                sse = SSEReporter(sse_manager)
+    
+                # 经验注入：将历史成功经验注入 ToolCallLoop 的 System Prompt
+                # 通过包装 _build_system_prompt 方法实现（在原始 prompt 后追加 few-shot 示例）
+                _original_builder = None  # 延迟绑定
+    
+                # ToolCallLoop
+                # 增量持久化回调：每轮迭代后将对话历史保存到数据库
+                def _persist_dialogue(state):
+                    try:
+                        dialogue = state.get('dialogue_history', [])
+                        if dialogue:
+                            requirement.dialogue_history = dialogue
+                            from sqlalchemy.orm.attributes import flag_modified
+                            flag_modified(requirement, 'dialogue_history')
+                            db.commit()
+                    except Exception as e:
+                        logger.warning(f"增量持久化对话失败（不阻断）：{e}")
+    
+                tool_loop = ToolCallLoop(
+                    workspace=workspace,
+                    git=git,
+                    tools=tools,
+                    hooks=hooks,
+                    tracer=tracer,
+                    cost_tracker=cost_tracker,
+                    sse_reporter=sse,
+                    checkpoint=checkpoint,
+                    on_iteration=_persist_dialogue,
+                )
+    
+                # 记忆注入：将历史成功经验作为 few-shot 示例追加到 System Prompt
+                _original_builder = tool_loop._build_system_prompt
+                _req_content = requirement.content
+                _req_user_id = requirement.user_id
+                _mgr = _get_memory_manager()
+    
+                def _memory_aware_prompt(state):
+                    base = _original_builder(state)
+                    return _mgr.before_task(_req_content, base, user_id=_req_user_id)
+    
+                tool_loop._build_system_prompt = _memory_aware_prompt
+    
+                # 构建初始状态
+                initial_state: AgentState = {
+                    'requirement_id': requirement_id,
+                    'requirement_content': requirement.content,
+                    'user_id': requirement.user_id,
+                    'plan': None,
+                    'current_step': 'starting',
+                    'code_files': requirement.code_files or [],
+                    'validation_result': None,
+                    'retry_count': 0,
+                    'error': None,
+                    'dialogue_history': requirement.dialogue_history or [],
+                    'metadata': {},
+                    'tool_call_count': 0,
+                    'no_progress_count': 0,
+                    'last_file_list': workspace.list(),
+                    'hook_failures': {},
+                    'visual_style': '',
+                    'intent': 'task',  # 进入此流程的均为 TASK
+                    # 三期新增字段
+                    'tasks': [],
+                    'interfaces': {},
+                    'implementation_order': [],
+                    'code_errors': [],
+                    'qa_passed': True,
+                    'tester_passed': True,
+                    'summarize_passed': True,
+                    'repair_count': 0,
+                    'role_history': [],
+                    'role_outputs': {},
+                }
+    
+                # 检查断点恢复
+                resumed_state = checkpoint.resume(requirement_id)
+                if resumed_state:
+                    logger.info(f"从断点恢复需求 {requirement_id}")
+                    initial_state = {**initial_state, **resumed_state}
+    
+                # 开始链路追踪
+                trace = tracer.start_trace(requirement_id, requirement.user_id)
+                initial_state['metadata']['trace_id'] = trace.trace_id
+    
+                sse.progress(requirement_id, 0, '开始处理需求')
+    
+                # 将 harness 组件注入 state metadata + 模块级缓存（双路径）
+                # metadata 可能被 LangGraph 节点整体替换，模块级缓存作为兜底
+                initial_state["metadata"]["_tool_loop"] = tool_loop
+                initial_state["metadata"]["_workspace"] = workspace
+    
+                # 设置模块级缓存
+                set_harness_components(
+                    tool_loop=tool_loop,
+                    workspace=workspace,
+                )
+    
+                # 执行 LangGraph 工作流（三期：多节点编排图）
+                # 图内已包含所有路由逻辑：team_leader → [conditional] → coder → qa → summarize → END
+                final_state = self._execute_workflow_with_stream(requirement_id, initial_state)
+    
+                if final_state is None:
+                    return False
+    
+                # 检查澄清
+                if final_state.get('current_step') == 'needs_clarification':
+                    dialogue = final_state.get('dialogue_history', [])
                     if dialogue:
                         requirement.dialogue_history = dialogue
                         from sqlalchemy.orm.attributes import flag_modified
                         flag_modified(requirement, 'dialogue_history')
-                        db.commit()
-                except Exception as e:
-                    logger.warning(f"增量持久化对话失败（不阻断）：{e}")
-
-            tool_loop = ToolCallLoop(
-                workspace=workspace,
-                git=git,
-                tools=tools,
-                hooks=hooks,
-                tracer=tracer,
-                cost_tracker=cost_tracker,
-                sse_reporter=sse,
-                checkpoint=checkpoint,
-                on_iteration=_persist_dialogue,
-            )
-
-            # 记忆注入：将历史成功经验作为 few-shot 示例追加到 System Prompt
-            _original_builder = tool_loop._build_system_prompt
-            _req_content = requirement.content
-            _req_user_id = requirement.user_id
-            _mgr = _get_memory_manager()
-
-            def _memory_aware_prompt(state):
-                base = _original_builder(state)
-                return _mgr.before_task(_req_content, base, user_id=_req_user_id)
-
-            tool_loop._build_system_prompt = _memory_aware_prompt
-
-            # 构建初始状态
-            initial_state: AgentState = {
-                'requirement_id': requirement_id,
-                'requirement_content': requirement.content,
-                'user_id': requirement.user_id,
-                'plan': None,
-                'current_step': 'starting',
-                'code_files': requirement.code_files or [],
-                'validation_result': None,
-                'retry_count': 0,
-                'error': None,
-                'dialogue_history': requirement.dialogue_history or [],
-                'metadata': {},
-                'tool_call_count': 0,
-                'no_progress_count': 0,
-                'last_file_list': workspace.list(),
-                'hook_failures': {},
-                'visual_style': '',
-                'intent': 'task',  # 进入此流程的均为 TASK
-                # 三期新增字段
-                'tasks': [],
-                'interfaces': {},
-                'implementation_order': [],
-                'code_errors': [],
-                'qa_passed': True,
-                'tester_passed': True,
-                'summarize_passed': True,
-                'repair_count': 0,
-                'role_history': [],
-                'role_outputs': {},
-            }
-
-            # 检查断点恢复
-            resumed_state = checkpoint.resume(requirement_id)
-            if resumed_state:
-                logger.info(f"从断点恢复需求 {requirement_id}")
-                initial_state = {**initial_state, **resumed_state}
-
-            # 开始链路追踪
-            trace = tracer.start_trace(requirement_id, requirement.user_id)
-            initial_state['metadata']['trace_id'] = trace.trace_id
-
-            sse.progress(requirement_id, 0, '开始处理需求')
-
-            # 将 harness 组件注入 state metadata + 模块级缓存（双路径）
-            # metadata 可能被 LangGraph 节点整体替换，模块级缓存作为兜底
-            initial_state["metadata"]["_tool_loop"] = tool_loop
-            initial_state["metadata"]["_workspace"] = workspace
-
-            # 设置模块级缓存
-            set_harness_components(
-                tool_loop=tool_loop,
-                workspace=workspace,
-            )
-
-            # 执行 LangGraph 工作流（三期：多节点编排图）
-            # 图内已包含所有路由逻辑：team_leader → [conditional] → coder → qa → summarize → END
-            final_state = self._execute_workflow_with_stream(requirement_id, initial_state)
-
-            if final_state is None:
+                    requirement.status = 'pending'
+                    db.commit()
+                    return True
+    
+                # TL 完成（成功或失败），暂停等待用户确认 Plan
+                if final_state.get('current_step') in ('presenting_plan', 'team_leader_failed'):
+                    dialogue = final_state.get('dialogue_history', [])
+                    if dialogue:
+                        requirement.dialogue_history = dialogue
+                        from sqlalchemy.orm.attributes import flag_modified
+                        flag_modified(requirement, 'dialogue_history')
+                    requirement.status = 'planning'
+                    db.commit()
+                    logger.info(f"[Service] 需求 {requirement_id} 进入 planning 状态，等待用户确认")
+                    return True
+    
+                # 处理最终状态
+                return self._process_final_state(db, requirement, requirement_id, final_state,
+                                                 workspace, git, tracer, sse)
+    
+            except Exception as e:
+                logger.error(f"处理需求时发生异常：{e}", exc_info=True)
+                try:
+                    self._mark_requirement_failed(requirement, f"处理异常: {str(e)[:200]}")
+                    db.commit()
+                except Exception as mark_err:
+                    logger.warning(f"标记需求失败状态时异常（忽略）：{mark_err}")
                 return False
-
-            # 检查澄清
-            if final_state.get('current_step') == 'needs_clarification':
-                dialogue = final_state.get('dialogue_history', [])
-                if dialogue:
-                    requirement.dialogue_history = dialogue
-                    from sqlalchemy.orm.attributes import flag_modified
-                    flag_modified(requirement, 'dialogue_history')
-                requirement.status = 'pending'
-                db.commit()
-                return True
-
-            # TL 完成（成功或失败），暂停等待用户确认 Plan
-            if final_state.get('current_step') in ('presenting_plan', 'team_leader_failed'):
-                dialogue = final_state.get('dialogue_history', [])
-                if dialogue:
-                    requirement.dialogue_history = dialogue
-                    from sqlalchemy.orm.attributes import flag_modified
-                    flag_modified(requirement, 'dialogue_history')
-                requirement.status = 'planning'
-                db.commit()
-                logger.info(f"[Service] 需求 {requirement_id} 进入 planning 状态，等待用户确认")
-                return True
-
-            # 处理最终状态
-            return self._process_final_state(db, requirement, requirement_id, final_state,
-                                             workspace, git, tracer, sse)
-
-        except Exception as e:
-            logger.error(f"处理需求时发生异常：{e}", exc_info=True)
-            try:
-                self._mark_requirement_failed(requirement, f"处理异常: {str(e)[:200]}")
-                db.commit()
-            except:
-                pass
-            return False
-
-        finally:
-            # 清理 ContextVar，避免线程池复用时下一个任务拿到上一个任务的 tool_loop/workspace
-            clear_harness_components()
-            db.close()
+    
+            finally:
+                # 清理 ContextVar，避免线程池复用时下一个任务拿到上一个任务的 tool_loop/workspace
+                clear_harness_components()
+                # 任务结束：回收 SPEC 推送标记与取消信号，避免全局集合无界增长
+                RequirementService._spec_pushed_ids.discard(requirement_id)
+                RequirementService.clear_cancel(requirement_id)
 
     def _execute_workflow_with_stream(self, requirement_id: int, initial_state: AgentState,
                                        workflow=None) -> Optional[AgentState]:
@@ -467,152 +470,157 @@ class RequirementService:
         from harness.observability.cost import CostTracker
         from sqlalchemy.orm.attributes import flag_modified
 
-        db = SessionLocal()
-        try:
-            requirement = db.query(Requirement).filter(Requirement.id == requirement_id).first()
-            if not requirement:
-                logger.error(f"需求不存在：{requirement_id}")
-                return False
-
-            if requirement.status != 'planning':
-                logger.warning(f"需求 {requirement_id} 状态为 {requirement.status}，非 planning，跳过")
-                return False
-
-            # 如果有用户反馈，追加到需求内容中
-            if feedback:
-                enriched = f"{requirement.content}\n\n[用户反馈]\n{feedback}"
-                requirement.content = enriched
-
-                # 追加 plan_feedback 标记的消息到对话历史
-                dialogue_list = list(requirement.dialogue_history or [])
-                dialogue_list.append({
-                    'role': 'user', 'name': '用户',
-                    'content': f"对 Plan 的反馈：{feedback}",
-                    'plan_feedback': True,
-                })
-                requirement.dialogue_history = dialogue_list
-                flag_modified(requirement, 'dialogue_history')
-
-                # 清除旧检查点，重置状态为 pending，重新走完整工作流（含 TL 分析）
-                checkpoint_mgr = CheckpointManager(db_session=db)
-                checkpoint_mgr.clear(requirement_id)
-                requirement.status = 'pending'
-                db.commit()
-                logger.info(f"[ConfirmPlan] 需求 {requirement_id} 有反馈，重置状态重新走完整工作流")
-
-                # 异步重新执行完整工作流（在新的 RequirementService 实例上，避免状态污染）
-                import threading
-                new_service = RequirementService()
-                thread = threading.Thread(
-                    target=new_service.process_requirement,
-                    args=(requirement_id,),
-                    daemon=False,
-                )
-                thread.start()
-                return True
-
-            requirement.status = 'processing'
-            db.commit()
-            logger.info(f"[ConfirmPlan] 需求 {requirement_id} 开始 Post-Plan 编码流程")
-
-            # ---- 初始化 harness 组件 ----
-            workspace = WorkspaceFS(requirement.user_id, requirement_id)
-            workspace.init(requirement.code_files)
-            git = GitVersioning(workspace)
-            tools = create_tool_registry()
-            hooks = create_default_hook_manager()
-            checkpoint = CheckpointManager(db_session=db)
-            cost_tracker = CostTracker()
-            tracer = Tracer(db_session=db, cost_tracker=cost_tracker)
-            sse = SSEReporter(sse_manager)
-
-            def _persist_dialogue(state):
-                try:
-                    dialogue = state.get('dialogue_history', [])
-                    if dialogue:
-                        requirement.dialogue_history = dialogue
-                        flag_modified(requirement, 'dialogue_history')
-                        db.commit()
-                except Exception as e:
-                    logger.warning(f"增量持久化对话失败（不阻断）：{e}")
-
-            tool_loop = ToolCallLoop(
-                workspace=workspace, git=git, tools=tools, hooks=hooks,
-                tracer=tracer, cost_tracker=cost_tracker, sse_reporter=sse,
-                checkpoint=checkpoint, on_iteration=_persist_dialogue,
-            )
-
-            # 记忆注入
-            _original_builder = tool_loop._build_system_prompt
-            _req_content = requirement.content
-            _req_user_id = requirement.user_id
-            _mgr = _get_memory_manager()
-
-            def _memory_aware_prompt(state):
-                base = _original_builder(state)
-                return _mgr.before_task(_req_content, base, user_id=_req_user_id)
-
-            tool_loop._build_system_prompt = _memory_aware_prompt
-
-            # ---- 从检查点恢复 TL 后的状态 ----
-            resumed_state = checkpoint.resume(requirement_id)
-            if not resumed_state:
-                logger.error(f"[ConfirmPlan] 找不到检查点 for requirement {requirement_id}")
-                requirement.status = 'failed'
-                requirement.error_message = "找不到检查点，无法恢复状态"
-                db.commit()
-                return False
-
-            logger.info(f"[ConfirmPlan] 从检查点恢复状态: node={resumed_state.get('current_step', '?')}")
-
-            # 构建初始状态（合并检查点 + harness 注入）
-            # dialogue_history 以 DB 为准：包含确认 Plan 时追加的 plan_confirmed 消息，
-            # 避免被检查点中 TL 完成时的旧对话覆盖
-            initial_state: AgentState = {
-                **resumed_state,
-                'current_step': 'starting',  # 重置，让 post-plan 图正常流转
-                'dialogue_history': list(requirement.dialogue_history or []),
-            }
-
-            # 注入 harness 组件
-            initial_state["metadata"]["_tool_loop"] = tool_loop
-            initial_state["metadata"]["_workspace"] = workspace
-            set_harness_components(tool_loop=tool_loop, workspace=workspace)
-
-            # 开始链路追踪
-            trace = tracer.start_trace(requirement_id, requirement.user_id)
-            initial_state['metadata']['trace_id'] = trace.trace_id
-
-            sse.progress(requirement_id, 20, '用户已确认 Plan，开始编码')
-
-            # ---- 执行 Post-Plan 工作流（coder → verify → repair）----
-            post_plan_workflow = create_workflow_post_plan()
-            final_state = self._execute_workflow_with_stream(
-                requirement_id, initial_state, post_plan_workflow
-            )
-
-            if final_state is None:
-                return False
-
-            # 处理最终状态
-            return self._process_final_state(db, requirement, requirement_id, final_state,
-                                             workspace, git, tracer, sse)
-
-        except Exception as e:
-            logger.error(f"[ConfirmPlan] 异常：{e}", exc_info=True)
+        with get_db() as db:
             try:
                 requirement = db.query(Requirement).filter(Requirement.id == requirement_id).first()
-                if requirement:
-                    requirement.status = 'failed'
-                    requirement.error_message = f"确认计划异常: {str(e)[:200]}"
+                if not requirement:
+                    logger.error(f"需求不存在：{requirement_id}")
+                    return False
+    
+                if requirement.status != 'planning':
+                    logger.warning(f"需求 {requirement_id} 状态为 {requirement.status}，非 planning，跳过")
+                    return False
+    
+                # 如果有用户反馈，追加到需求内容中
+                if feedback:
+                    enriched = f"{requirement.content}\n\n[用户反馈]\n{feedback}"
+                    requirement.content = enriched
+    
+                    # 追加 plan_feedback 标记的消息到对话历史
+                    dialogue_list = list(requirement.dialogue_history or [])
+                    dialogue_list.append({
+                        'role': 'user', 'name': '用户',
+                        'content': f"对 Plan 的反馈：{feedback}",
+                        'plan_feedback': True,
+                    })
+                    requirement.dialogue_history = dialogue_list
+                    flag_modified(requirement, 'dialogue_history')
+    
+                    # 清除旧检查点，重置状态为 pending，重新走完整工作流（含 TL 分析）
+                    checkpoint_mgr = CheckpointManager(db_session=db)
+                    checkpoint_mgr.clear(requirement_id)
+                    requirement.status = 'pending'
                     db.commit()
-            except:
-                pass
-            return False
-
-        finally:
-            clear_harness_components()
-            db.close()
+                    logger.info(f"[ConfirmPlan] 需求 {requirement_id} 有反馈，重置状态重新走完整工作流")
+    
+                    # 异步重新执行完整工作流（经由 task_queue 提交：
+                    # 获得全局并发上限与"同需求去重"，且不阻塞进程退出；
+                    # 在新的 RequirementService 实例上执行，避免状态污染）
+                    from services.task_queue import task_queue
+                    new_service = RequirementService()
+                    task_id = task_queue.submit(
+                        requirement_id,
+                        new_service.process_requirement,
+                        requirement_id,
+                    )
+                    if task_id is None:
+                        logger.warning(
+                            f"[ConfirmPlan] 需求 {requirement_id} 已有任务在处理中，跳过重复提交"
+                        )
+                        return False
+                    return True
+    
+                requirement.status = 'processing'
+                db.commit()
+                logger.info(f"[ConfirmPlan] 需求 {requirement_id} 开始 Post-Plan 编码流程")
+    
+                # ---- 初始化 harness 组件 ----
+                workspace = WorkspaceFS(requirement.user_id, requirement_id)
+                workspace.init(requirement.code_files)
+                git = GitVersioning(workspace)
+                tools = create_tool_registry()
+                hooks = create_default_hook_manager()
+                checkpoint = CheckpointManager(db_session=db)
+                cost_tracker = CostTracker()
+                tracer = Tracer(db_session=db, cost_tracker=cost_tracker)
+                sse = SSEReporter(sse_manager)
+    
+                def _persist_dialogue(state):
+                    try:
+                        dialogue = state.get('dialogue_history', [])
+                        if dialogue:
+                            requirement.dialogue_history = dialogue
+                            flag_modified(requirement, 'dialogue_history')
+                            db.commit()
+                    except Exception as e:
+                        logger.warning(f"增量持久化对话失败（不阻断）：{e}")
+    
+                tool_loop = ToolCallLoop(
+                    workspace=workspace, git=git, tools=tools, hooks=hooks,
+                    tracer=tracer, cost_tracker=cost_tracker, sse_reporter=sse,
+                    checkpoint=checkpoint, on_iteration=_persist_dialogue,
+                )
+    
+                # 记忆注入
+                _original_builder = tool_loop._build_system_prompt
+                _req_content = requirement.content
+                _req_user_id = requirement.user_id
+                _mgr = _get_memory_manager()
+    
+                def _memory_aware_prompt(state):
+                    base = _original_builder(state)
+                    return _mgr.before_task(_req_content, base, user_id=_req_user_id)
+    
+                tool_loop._build_system_prompt = _memory_aware_prompt
+    
+                # ---- 从检查点恢复 TL 后的状态 ----
+                resumed_state = checkpoint.resume(requirement_id)
+                if not resumed_state:
+                    logger.error(f"[ConfirmPlan] 找不到检查点 for requirement {requirement_id}")
+                    requirement.status = 'failed'
+                    requirement.error_message = "找不到检查点，无法恢复状态"
+                    db.commit()
+                    return False
+    
+                logger.info(f"[ConfirmPlan] 从检查点恢复状态: node={resumed_state.get('current_step', '?')}")
+    
+                # 构建初始状态（合并检查点 + harness 注入）
+                # dialogue_history 以 DB 为准：包含确认 Plan 时追加的 plan_confirmed 消息，
+                # 避免被检查点中 TL 完成时的旧对话覆盖
+                initial_state: AgentState = {
+                    **resumed_state,
+                    'current_step': 'starting',  # 重置，让 post-plan 图正常流转
+                    'dialogue_history': list(requirement.dialogue_history or []),
+                }
+    
+                # 注入 harness 组件
+                initial_state["metadata"]["_tool_loop"] = tool_loop
+                initial_state["metadata"]["_workspace"] = workspace
+                set_harness_components(tool_loop=tool_loop, workspace=workspace)
+    
+                # 开始链路追踪
+                trace = tracer.start_trace(requirement_id, requirement.user_id)
+                initial_state['metadata']['trace_id'] = trace.trace_id
+    
+                sse.progress(requirement_id, 20, '用户已确认 Plan，开始编码')
+    
+                # ---- 执行 Post-Plan 工作流（coder → verify → repair）----
+                post_plan_workflow = create_workflow_post_plan()
+                final_state = self._execute_workflow_with_stream(
+                    requirement_id, initial_state, post_plan_workflow
+                )
+    
+                if final_state is None:
+                    return False
+    
+                # 处理最终状态
+                return self._process_final_state(db, requirement, requirement_id, final_state,
+                                                 workspace, git, tracer, sse)
+    
+            except Exception as e:
+                logger.error(f"[ConfirmPlan] 异常：{e}", exc_info=True)
+                try:
+                    requirement = db.query(Requirement).filter(Requirement.id == requirement_id).first()
+                    if requirement:
+                        requirement.status = 'failed'
+                        requirement.error_message = f"确认计划异常: {str(e)[:200]}"
+                        db.commit()
+                except Exception as mark_err:
+                    logger.warning(f"标记需求失败状态时异常（忽略）：{mark_err}")
+                return False
+    
+            finally:
+                clear_harness_components()
 
     @staticmethod
     def _detect_node_name(current_step: str) -> str:

@@ -4,6 +4,9 @@ SSEReporter —— SSE 事件统一管理
 """
 
 from utils.sse import SSEMessage, get_current_timestamp
+from harness.observability.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class SSEReporter:
@@ -110,8 +113,9 @@ class SSEReporter:
         try:
             msg = SSEMessage.format_event(event, data)
             self.sse.broadcast(str(requirement_id), msg)
-        except Exception:
-            pass
+        except Exception as e:
+            # 不再静默吞掉：序列化失败/断连都要留痕，否则事件悄悄丢失无人知晓
+            logger.warning(f"SSE 事件发送失败 (req_id={requirement_id}, event={event}): {e}")
 
     def _make_readable(self, tool_name: str, arguments: dict) -> str:
         if tool_name == "write_file":

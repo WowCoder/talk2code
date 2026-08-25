@@ -9,9 +9,9 @@
     system = load_prompt("coding/tl_analysis.md")
 
     # 带占位符的模板
-    prompt = load_prompt_template("review/code_review.md",
-        task_description="实现登录功能",
-        file_path="js/login.js",
+    prompt = load_prompt_template("coding/chat_modify.md",
+        user_message="添加删除按钮",
+        file_list_text="- index.html\n- app.js",
         ...
     )
 """

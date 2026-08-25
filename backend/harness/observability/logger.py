@@ -52,11 +52,7 @@ def setup_logging(log_dir: str = "logs", level: str = "INFO"):
 
 
 def get_logger(name: str) -> logging.Logger:
-    """获取 logger 实例（兼容旧接口）"""
-    # 检查是否已配置过 handler
-    logger = logging.getLogger(name)
-    if logger.handlers:
-        return logger
+    """获取 logger 实例（继承 root 配置，无需重复挂 handler）"""
     return logging.getLogger(name)
 
 

@@ -52,22 +52,33 @@ class ToolCallLoop:
         if self.tools:
             self.tools.set_workspace(workspace)
 
+        # LLM 最大生成 token 数：从配置读取，支持 reasoning 模型的额外思考开销
+        from config import settings as _settings
+        self._max_tokens = _settings.LLM_MAX_TOKENS
+
     def run(self, state: AgentState) -> AgentState:
         client = get_client()
         trace_id = state.get("metadata", {}).get("trace_id", "")
 
-        # 每次进入 run() 重置运行时计数器，避免多轮调用（如修复循环）间状态污染
+        # 每次进入 run() 重置运行时计数器，避免多轮调用（如逐文件编码、修复循环）间状态污染
         state["no_progress_count"] = 0
         state["repeat_call_count"] = 0
         state["last_tool_signatures"] = set()
         state["tool_call_count"] = 0
+        # 重置缺失文件检测计数器：逐文件编码模式下每个文件独立计数，
+        # 避免上一个文件的计数器残留导致当前文件被误判为"连续缺失"而提前终止
+        state["_missing_files_rounds"] = 0
+        state["_same_missing_count"] = 0
+        state.pop("_last_missing_files_key", None)
 
         # 可配置的角色名称（多角色协作用，默认兼容旧行为）
         meta = state.get("metadata", {})
         coder_name = meta.get("coder_name", DEV_NAME)
         thinking_name = meta.get("thinking_name", DEV_NAME)
 
-        # 根据文件数动态计算迭代上限：文件数×2 + 3，上限 20
+        # 根据文件数动态计算迭代上限：文件数 + 3，上限 10
+        # （原先文件数×2+3 过于宽松，贪吃蛇这类 6 文件项目可跑到 15 轮；
+        #   收紧后 6 文件 → 9 轮，配合思考模式关闭，单轮成本已大幅下降）
         # simple 复杂度（单文件）使用固定 5 轮快速通道
         complexity = state.get("metadata", {}).get("complexity", "standard")
         plan_files = (state.get("implementation_order") or
@@ -77,7 +88,7 @@ class ToolCallLoop:
             effective_max_iterations = 5
         else:
             file_count = max(len(plan_files), 3)  # 至少按 3 个文件计算
-            effective_max_iterations = min(file_count * 2 + 3, 20)
+            effective_max_iterations = min(file_count + 3, 10)
 
         # 实例级上限：chat/逐文件编码会覆盖 MAX_ITERATIONS 以收紧轮数
         effective_max_iterations = min(effective_max_iterations, self.MAX_ITERATIONS)
@@ -97,13 +108,19 @@ class ToolCallLoop:
                     state["error"] = "操作已被用户取消"
                     break
 
+            # 追踪 LLM 调用：span 必须包住 chat_with_tools 才能记录真实耗时
+            # （原先在调用返回后才 start_span，导致 duration 恒为 0，无法观测耗时）
+            span = None
+            if self.tracer and trace_id:
+                span = self.tracer.start_span(trace_id, f"tool_coder_iter_{iteration}")
+
             # 调用 LLM with tools
             messages = self._build_messages(state)
             try:
                 response = client.chat_with_tools(
                     messages=messages,
                     tools=self.tools.get_schemas() if self.tools else [],
-                    max_tokens=8000,
+                    max_tokens=self._max_tokens,
                 )
             except Exception as e:
                 # 熔断器打开或其他 LLM 不可用异常 → 立即终止
@@ -111,6 +128,8 @@ class ToolCallLoop:
                 logger.error(
                     f"[ToolLoop] LLM 调用异常 (iter {iteration + 1}): {error_msg}"
                 )
+                if span:
+                    self.tracer.end_span(span, status="error", error=error_msg)
                 state["current_step"] = "llm_error"
                 state["error"] = f"LLM 调用失败（熔断或不可用）: {error_msg}"
                 break
@@ -121,13 +140,17 @@ class ToolCallLoop:
                     f"[ToolLoop] LLM 调用失败 (iter {iteration + 1}): "
                     f"{response.error or response.content[:200]}"
                 )
+                if span:
+                    self.tracer.end_span(
+                        span, status="error",
+                        error=response.error or response.content[:200]
+                    )
                 state["current_step"] = "llm_error"
                 state["error"] = f"LLM 调用失败: {response.error or response.content[:200]}"
                 break
 
-            # 追踪 LLM 调用
-            if self.tracer and trace_id:
-                span = self.tracer.start_span(trace_id, f"tool_coder_iter_{iteration}")
+            # 记录 token 用量 + 结束 span（真实耗时 = start_span 到此刻）
+            if span:
                 if response.usage and self.cost_tracker:
                     input_tokens, output_tokens = self.cost_tracker.extract_usage(
                         response.usage, client.provider
@@ -169,6 +192,46 @@ class ToolCallLoop:
                     iteration += 1
                     continue
                 state["current_step"] = "task_complete"
+                # 完成硬约束接线：Agent 以"无 tool_calls"声明完成时，触发
+                # PRE_TOOL_USE（约定信号 tool_name=None + current_step=task_complete），
+                # 由 block_premature_completion 校验 CompletionContract。
+                # 此前该 Hook 只挂在 _execute_tool 内部，真实完成路径完全绕过它。
+                if self.hooks:
+                    from harness.constraints.hooks import HookContext, HookPoint
+                    ctx = HookContext(
+                        requirement_id=state["requirement_id"],
+                        tool_name=None,
+                        state=state,
+                    )
+                    contract_failures = self.hooks.trigger(HookPoint.PRE_TOOL_USE, ctx)
+                    if contract_failures:
+                        block_rounds = state.get("_contract_block_rounds", 0) + 1
+                        state["_contract_block_rounds"] = block_rounds
+                        failure_msg = "\n".join(contract_failures)
+                        # 终止性保证：连续 3 轮阻断仍无法推进则放行并告警，
+                        # 避免约束本身把循环卡死到迭代上限
+                        if block_rounds >= 3:
+                            logger.warning(
+                                f"[ToolLoop] 完成约束连续 {block_rounds} 轮阻断仍未推进，"
+                                f"放行完成。原因: {failure_msg[:200]}"
+                            )
+                        else:
+                            state["dialogue_history"].append({
+                                "role": "system", "name": "System",
+                                "content": failure_msg,
+                                "hidden": True,
+                                "preserve": True,
+                            })
+                            logger.info(
+                                f"[ToolLoop] 完成约束阻断声明完成 (第 {block_rounds} 轮): "
+                                f"{failure_msg[:200]}"
+                            )
+                            state["current_step"] = "coding"
+                            iteration += 1
+                            continue
+                    else:
+                        state["_contract_block_rounds"] = 0
+
                 state["dialogue_history"].append({
                     "role": "agent", "name": coder_name,
                     "content": response.content or "任务完成"
@@ -200,6 +263,7 @@ class ToolCallLoop:
 
             # 执行所有工具调用（收集到 batch_tools，统一发送迭代批量事件）
             batch_tools: list[ToolCallEvent] = []
+            written_files: list[str] = []  # 本轮成功写入/编辑的文件（用于聚合 Git commit）
             for tc in response.tool_calls:
                 result = self._execute_tool(state, tc)
                 logger.info(f"[ToolLoop] 执行 {tc.name}: success={result.success} content={result.content[:100] if result.success else ''} error={result.error[:100] if not result.success else ''}")
@@ -215,6 +279,10 @@ class ToolCallLoop:
                     success=result.success,
                     blocked=result.blocked,
                 ))
+
+                if result.success and tc.name in ("write_file", "edit_file"):
+                    fname = tc.arguments.get("filename", "unknown") if isinstance(tc.arguments, dict) else "unknown"
+                    written_files.append(fname)
 
                 # 实时推送 code 事件（代码面板需要实时更新）
                 if self.sse:
@@ -240,9 +308,9 @@ class ToolCallLoop:
                 is_chat = state.get("metadata", {}).get("is_chat", False)
                 if tc.name == "read_file":
                     # read_file: 保留完整内容，只对超大文件做首尾保留
-                    max_len = 32000 if is_chat else 24000
+                    max_len = 32000 if is_chat else 12000
                 elif tc.name in ("write_file", "edit_file"):
-                    max_len = 8000
+                    max_len = 4000
                 else:
                     max_len = 300
                 if len(tool_summary) > max_len:
@@ -291,10 +359,14 @@ class ToolCallLoop:
                     "tools": [t.to_dict() for t in batch_tools],
                 })
 
-                # Git 自动 commit
-                if self.git and tc.name in ("write_file", "edit_file") and result.success:
-                    filename = tc.arguments.get("filename", "unknown")
-                    self.git.commit(f"[tool] {tc.name}: {filename}")
+                # Git 自动 commit（聚合本轮全部成功写入，避免依赖循环残留变量
+                # 导致"最后工具非写操作时不提交/消息只反映单文件"的问题）
+                if self.git and written_files:
+                    if len(written_files) <= 3:
+                        commit_msg = f"[tool] {', '.join(written_files)}"
+                    else:
+                        commit_msg = f"[tool] 写入 {len(written_files)} 个文件: {', '.join(written_files[:3])} 等"
+                    self.git.commit(commit_msg)
 
             # ===== 增强死循环检测：核心操作签名累积 + 读写比 =====
             # 提取当前轮的核心操作签名（tool_name:filename，忽略行范围等参数差异）
@@ -411,7 +483,8 @@ class ToolCallLoop:
                         state["requirement_id"], "tool_coder", state
                     )
                 except Exception as e:
-                    logger.warning("保存检查点失败（不阻断）：%s", e)
+                    # 不阻断主流程，但必须显式暴露——静默降级会让断点恢复名存实亡
+                    logger.error("保存检查点失败（不阻断，断点恢复将不可用）：%s", e)
 
             iteration += 1
 
@@ -610,6 +683,11 @@ class ToolCallLoop:
         handler = handler_map.get(tool_call.name)
         if handler:
             return handler()
+        if self.tools is None:
+            from harness.tools.registry import ToolResult
+            return ToolResult(
+                error=f"工具 '{tool_call.name}' 未注册且无工具注册表可用",
+            )
         return self.tools.execute(tool_call.name, tool_call.arguments)
 
     def _trigger_hooks(self, state: AgentState) -> list:
@@ -705,8 +783,10 @@ class ToolCallLoop:
             state["_recent_hook_failures"] = []
 
         # ---- 分层上下文压缩（替换简单截断） ----
+        # 预算从 56000 收紧到 24000：贪吃蛇实测 prompt_tokens 高达 20.9 万，
+        # 主要来自每轮重发完整 plan + 文件摘要 + 最近 30 条工具结果。
         from harness.instructions.compactor import ContextCompactor
-        compactor = ContextCompactor(budget=56000)
+        compactor = ContextCompactor(budget=24000)
         messages = compactor.maybe_compact(messages)
 
         return messages
@@ -748,17 +828,45 @@ class ToolCallLoop:
         plan_section = ""
         batch_hint = ""
         if plan:
-            plan_text = json.dumps(plan, ensure_ascii=False, indent=2) if isinstance(plan, dict) else str(plan)
-            plan_section = f"""## 实现计划（请严格遵循）
+            if state.get("tool_call_count", 1) > 1:
+                # 第 2 轮起：完整 plan 已在首轮下发，后续只保留文件清单与任务要点，
+                # 避免每轮把大段 plan JSON 重发给 LLM（实测 prompt_tokens 因此膨胀）
+                plan_text = self._compact_plan_text(plan)
+                plan_section = f"""## 实现计划（摘要）
 {plan_text}"""
-            
-            # 动态生成批量创建分组提示（基于依赖关系自动分组）
-            batch_hint = self._generate_batch_hint(plan)
+            else:
+                plan_text = json.dumps(plan, ensure_ascii=False, indent=2) if isinstance(plan, dict) else str(plan)
+                plan_section = f"""## 实现计划（请严格遵循）
+{plan_text}"""
+                # 动态生成批量创建分组提示（基于依赖关系自动分组）
+                batch_hint = self._generate_batch_hint(plan)
 
         if complexity == "simple":
             return self._build_simple_prompt(requirement, plan_section, existing_text, existing_files)
         else:
             return self._build_standard_prompt(requirement, plan_section, existing_text, existing_files, batch_hint)
+
+    def _compact_plan_text(self, plan: dict) -> str:
+        """紧凑版计划：仅保留文件清单与任务要点，用于第 2 轮起的上下文瘦身"""
+        if not isinstance(plan, dict):
+            return str(plan)
+        lines = []
+        fs = plan.get("file_structure", [])
+        if isinstance(fs, list) and fs:
+            lines.append("目标文件: " + ", ".join(str(f) for f in fs))
+        io = plan.get("implementation_order", [])
+        if isinstance(io, list) and io:
+            lines.append("实现顺序: " + ", ".join(str(f) for f in io))
+        tasks = plan.get("tasks", [])
+        if isinstance(tasks, list) and tasks:
+            lines.append("任务要点:")
+            for t in tasks[:10]:
+                if isinstance(t, dict):
+                    f = t.get("file", "")
+                    d = str(t.get("description", ""))[:60]
+                    if f:
+                        lines.append(f"- {f}: {d}")
+        return "\n".join(lines) if lines else "(计划已下发)"
 
     def _generate_batch_hint(self, plan: dict) -> str:
         """基于 Plan 的依赖关系，动态生成批量创建分组提示
@@ -910,9 +1018,14 @@ class ToolCallLoop:
                                 batch_hint: str = "") -> str:
         """standard 复杂度：架构先导 + 批量创建 + 完整的浏览器验证"""
         from harness.instructions.prompts import load_prompt_template
-        # 从 plan 中提取推荐的文件结构
+        # 从 plan 中提取推荐的文件结构。
+        # 注意：第 2 轮起 plan_section 为紧凑摘要（非 JSON），json.loads 会失败，
+        # 此时 file_hint 留空即可（摘要已包含"目标文件"清单）。
         file_hint = ""
-        plan_obj = json.loads(plan_section.split("\n", 1)[1]) if plan_section and "\n" in plan_section else {}
+        try:
+            plan_obj = json.loads(plan_section.split("\n", 1)[1]) if plan_section and "\n" in plan_section else {}
+        except (json.JSONDecodeError, ValueError):
+            plan_obj = {}
         if isinstance(plan_obj, dict):
             file_structure = plan_obj.get("file_structure", [])
             if file_structure:
@@ -970,9 +1083,25 @@ class ToolCallLoop:
 
         关键修复：当 contract 报告缺失但文件系统中文件已存在时，
         以文件系统为准，自动修复 contract 状态，避免死循环。
+
+        逐文件补全模式（_per_file_mode）：只检查当前目标文件是否已创建，
+        不检查 contract 中的其他文件（它们由外层 targeted_recovery 逐个处理）。
+        避免系统提示说"只创建一个文件"但 missing 检测说"还有 N 个文件缺失"的矛盾。
         """
         complexity = state.get("metadata", {}).get("complexity", "standard")
         existing = set(self.workspace.list())
+
+        # 逐文件编码模式：只关注当前目标文件
+        if state.get("_per_file_mode"):
+            current_file = state.get("_current_target_file", "")
+            if current_file and current_file not in existing:
+                # 检查文件名尾部匹配（路径差异）
+                basename = current_file.split("/")[-1]
+                if not any(e.endswith(basename) for e in existing):
+                    return [current_file]
+            # 当前文件已创建（或无需检查）→ 任务完成
+            return []
+
         if complexity == "simple":
             if existing:
                 return []
@@ -1060,20 +1189,11 @@ class ToolCallLoop:
                         missing.append(f)
             return sorted(missing)
 
-        # Fallback: S 复杂度只需确认有入口文件即可
-        if complexity == "S":
-            # 检查是否有 index.html（可能在根目录或子目录）
-            has_html = any(f.endswith("index.html") or f.endswith(".html") for f in existing)
-            if has_html:
-                return []
-            return ["index.html"]
-
-        # M/L: 回退为只检查入口文件存在
-        has_html = any(f.endswith("index.html") for f in existing)
-        missing = []
-        if not has_html:
-            missing.append("index.html")
-        return missing
+        # 无 plan 时的回退：只确认入口文件存在。
+        # 注意：complexity 已被 team_leader_node 归一化为 'simple'/'standard'，
+        # 历史遗留的 'S'/'M'/'L' 分支不可达，这里统一按"入口文件存在"兜底。
+        has_html = any(f.endswith("index.html") or f.endswith(".html") for f in existing)
+        return [] if has_html else ["index.html"]
 
     def _update_file_summary_cache(self, arguments: dict):
         """write_file 成功后增量更新单个文件的摘要缓存"""

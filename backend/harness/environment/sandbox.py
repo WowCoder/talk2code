@@ -3,6 +3,7 @@
 SandboxExecutor —— 代码执行沙箱（subprocess 隔离）
 """
 
+import resource
 import subprocess
 import tempfile
 import os
@@ -20,17 +21,32 @@ class SandboxExecutor:
     """
     HTML/CSS/JS 代码执行沙箱
 
-    方案：subprocess 调用 Node.js 进行基础语法检查
+    现状（如实说明）：当前实现只做 **静态语法检查**（node --check），
+    **并不真正执行用户代码**，因此不存在 RCE 面；也未实现网络隔离。
     安全措施：
-    - 每次执行在独立临时目录
-    - 进程级超时和内存限制
-    - 禁止网络访问
+    - subprocess 列表参数调用，无 shell=True，无命令注入面
+    - 进程级超时（TIMEOUT）
+    - 子进程 CPU/内存资源上限（RLIMIT，仅限 POSIX 平台）
+    - 每次执行在独立临时目录（execute 时可选绑定工作区文件）
+
+    注意：如需真正的"执行代码"能力，需另加网络命名空间 / seccomp /
+    独立容器等隔离手段，勿在现实现上直接开放执行。
     """
 
     TIMEOUT = 30  # 超时秒数
+    MAX_CPU_SECONDS = 10      # 子进程 CPU 上限
+    MAX_MEMORY_BYTES = 512 * 1024 * 1024  # 子进程地址空间上限 512MB
 
     def __init__(self, workspace=None):
         self.workspace = workspace
+
+    def _limits_preexec(self):
+        """子进程启动前的资源限制（POSIX；非 POSIX 平台静默跳过）"""
+        try:
+            resource.setrlimit(resource.RLIMIT_CPU, (self.MAX_CPU_SECONDS, self.MAX_CPU_SECONDS))
+            resource.setrlimit(resource.RLIMIT_AS, (self.MAX_MEMORY_BYTES, self.MAX_MEMORY_BYTES))
+        except (ValueError, OSError, AttributeError):
+            pass
 
     def execute(self, filename: str = "index.html") -> SandboxResult:
         """在沙箱中执行文件"""
@@ -53,7 +69,9 @@ class SandboxExecutor:
         try:
             result = subprocess.run(
                 ["node", "--check", "-"],
-                input=content, capture_output=True, text=True, timeout=self.TIMEOUT
+                input=content, capture_output=True, text=True,
+                timeout=self.TIMEOUT,
+                preexec_fn=self._limits_preexec if os.name == 'posix' else None,
             )
             if result.returncode == 0:
                 return SandboxResult(True, output="JS 语法检查通过")
@@ -74,5 +92,5 @@ class SandboxExecutor:
             return SandboxResult(False, error=f"HTML 错误: {e}")
 
     def cleanup(self):
-        """清理临时资源"""
+        """清理临时资源（当前实现无跨调用残留资源，保留接口占位）"""
         pass

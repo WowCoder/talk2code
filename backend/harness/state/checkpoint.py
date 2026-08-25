@@ -46,8 +46,27 @@ class CheckpointManager:
     _SKIP_KEYS = ("_tool_loop", "_workspace", "_completion_contract")
 
     @classmethod
+    def _to_jsonable(cls, obj, depth: int = 0):
+        """递归转换为 JSON 可序列化结构。
+
+        关键：set/frozenset → 排序后的 list（ToolLoop 状态里的
+        last_tool_signatures / _recent_core_sigs 含 set，此前会导致
+        json.dumps 抛 TypeError，检查点保存 100% 静默失败）。
+        恢复侧对这些字段只做迭代/成员判断，list 与 set 语义兼容。
+        """
+        if depth > 8:  # 防御性深度限制，避免循环引用拖垮进程
+            return None
+        if isinstance(obj, dict):
+            return {k: cls._to_jsonable(v, depth + 1) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [cls._to_jsonable(v, depth + 1) for v in obj]
+        if isinstance(obj, (set, frozenset)):
+            return sorted(cls._to_jsonable(v, depth + 1) for v in obj)
+        return obj
+
+    @classmethod
     def _sanitize_state(cls, state: dict) -> dict:
-        """序列化前剥离 metadata 中的对象引用。
+        """序列化前剥离 metadata 中的对象引用，并转换不可序列化类型。
 
         之前用 default=str 会把 ToolCallLoop/WorkspaceFS 等对象存成
         '<xxx object at 0x...>' 字符串，恢复后 tool_loop.run() 直接 AttributeError。
@@ -60,11 +79,17 @@ class CheckpointManager:
                 meta.pop(key, None)
             clean["metadata"] = meta
         clean.pop("_completion_contract", None)
-        return clean
+        return cls._to_jsonable(clean)
 
     def save(self, requirement_id: int, node_name: str, state: dict) -> str:
         checkpoint_id = f"cp_{requirement_id}_{time.time_ns()}"
-        state_json = json.dumps(self._sanitize_state(state), ensure_ascii=False)
+        try:
+            state_json = json.dumps(self._sanitize_state(state), ensure_ascii=False)
+        except (TypeError, ValueError) as e:
+            # 序列化失败必须显式暴露——静默吞掉会让"断点恢复"名存实亡
+            logger.exception("检查点序列化失败 (requirement=%s node=%s): %s",
+                             requirement_id, node_name, e)
+            raise
         cp = Checkpoint(
             id=checkpoint_id,
             requirement_id=requirement_id,

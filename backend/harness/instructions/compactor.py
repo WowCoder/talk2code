@@ -198,36 +198,3 @@ class ContextCompactor:
         chinese = len(re.findall(r'[\u4e00-\u9fff]', text))
         other = max(len(text) - chinese, 0)
         return int(chinese / 1.5 + other / 4)
-
-    def summarize_old_messages(self, old_messages: list, client=None) -> str:
-        """
-        将旧消息概括为摘要。
-
-        如果提供了 LLM client，使用 LLM 生成高质量摘要；
-        否则使用本地启发式方法。
-        """
-        if not old_messages:
-            return ""
-
-        content = "\n".join(
-            f"[{m.get('name', m.get('role', ''))}]: {m.get('content', '')[:300]}"
-            for m in old_messages[-30:]
-        )
-
-        if client:
-            try:
-                response = client.chat(
-                    prompt=(
-                        f"将以下对话历史概括为简洁摘要（保留关键技术决策、"
-                        f"文件操作和错误修复信息）：\n\n{content}"
-                    ),
-                    max_tokens=500,
-                    timeout=15,
-                )
-                if response and response.content:
-                    return f"[历史摘要] {response.content[:500]}"
-            except Exception as e:
-                logger.debug(f"[ContextCompactor] LLM 摘要生成失败，使用本地摘要: {e}")
-
-        # Fallback: 本地启发式摘要
-        return self._generate_summary_stub(old_messages)

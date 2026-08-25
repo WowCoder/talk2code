@@ -21,11 +21,13 @@
 import { computed } from 'vue'
 import { useRequirementStore } from '@/stores/requirement'
 import { useSettingsStore } from '@/stores/settings'
+import { useToast } from '@/composables/useToast'
 import FileTree from './FileTree.vue'
 import CodeEditor from './CodeEditor.vue'
 
 const store = useRequirementStore()
 const settingsStore = useSettingsStore()
+const { show } = useToast()
 
 const fileNames = computed(() => Object.keys(store.codeFiles))
 const activeFile = computed(() => store.activeFile)
@@ -43,7 +45,9 @@ function onContentChange(content: string) {
   if (!activeFile.value) return
   store.codeFiles[activeFile.value] = content
   if (settingsStore.autoSave) {
-    store.saveCodeFile(activeFile.value, content)
+    store.saveCodeFile(activeFile.value, content).catch((err: any) => {
+      show('保存失败: ' + (err.message || '未知错误'), 'error')
+    })
   }
 }
 </script>

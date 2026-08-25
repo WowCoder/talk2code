@@ -37,11 +37,22 @@ class WorkspaceFS:
         self.path = root / str(user_id) / str(requirement_id)
 
     def _validate(self, filename: str):
-        """防止路径穿越：拒绝 ../ 上级目录和绝对路径"""
-        if '..' in filename or filename.startswith('/'):
+        """防止路径穿越：拒绝上级目录（按路径段判断）与绝对路径。
+
+        说明：
+        - `'..' in filename` 是子串匹配，会误杀 foo..bar.js 这类合法文件名，
+          改为按路径分段判断"是否存在 '..' 段"；
+        - startswith 前缀比较无分隔符边界（/ws/u1/1234 会误命中 /ws/u1/12），
+          改用 Python 3.9+ 的 Path.is_relative_to() 做组件级包含判断。
+        """
+        filename = filename.replace('\\', '/')  # 归一化反斜杠，覆盖 Windows 风格穿越
+        if any(part == '..' for part in filename.split('/')):
             raise PermissionError(f"非法文件路径: {filename}")
+        if filename.startswith('/'):
+            raise PermissionError(f"非法文件路径: {filename}")
+        resolved_root = self.path.resolve()
         full_path = (self.path / filename).resolve()
-        if not str(full_path).startswith(str(self.path.resolve())):
+        if not full_path.is_relative_to(resolved_root):
             raise PermissionError(f"禁止访问工作目录外的文件: {filename}")
 
     def init(self, code_files: list[dict] = None):

@@ -147,8 +147,11 @@ class MemoryManager:
                 return system_prompt
 
             # L1: 混合检索（BGE-M3 或 pgvector）
-            self._index_memories(memories)
-            results = self._retriever.search(requirement, top_k=5)
+            # 与 _store 的 _index_memories 互斥：检索器内部索引非线程安全，
+            # 并发 index/search 会破坏索引一致性
+            with self._lock:
+                self._index_memories(memories)
+                results = self._retriever.search(requirement, top_k=5)
             if not results:
                 return system_prompt
 
@@ -291,10 +294,11 @@ class MemoryManager:
             return []
 
     def _store(self, memory: Memory):
-        """存储一条新记忆到数据库（含去重逻辑）"""
+        """存储一条新记忆到数据库（含去重逻辑，去重仅限同一用户）"""
         try:
-            # 去重: 如果已有高度相似的需求，标记旧记忆为 superseded
-            memories = self._get_active_memories()
+            # 去重: 如果同一用户已有高度相似的需求，标记旧记忆为 superseded。
+            # 必须按 user_id 过滤——否则用户 A 的新需求会把用户 B 的相似记忆淘汰掉。
+            memories = self._get_active_memories(user_id=memory.user_id)
             superseded_ids = set()
             for existing in memories:
                 if self._jaccard_similarity(memory.requirement, existing.requirement) > 0.6:
@@ -364,6 +368,7 @@ class MemoryManager:
                 use_memory=False,
                 max_tokens=400,
                 timeout=20,
+                thinking='enabled',
             )
             if response.is_error or not response.content:
                 return {}
@@ -402,6 +407,7 @@ class MemoryManager:
                 use_memory=False,
                 max_tokens=100,
                 timeout=15,
+                thinking='enabled',
             )
             if response.is_error or not response.content:
                 return candidates[:2]
@@ -458,6 +464,7 @@ class MemoryManager:
             use_memory=False,
             max_tokens=500,
             timeout=30,
+            thinking='enabled',
         )
 
         if response.is_error or not response.content:

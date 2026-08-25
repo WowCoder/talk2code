@@ -4,10 +4,9 @@
 使用 flask-limiter 实现 API 限流
 """
 
-from functools import wraps
-from typing import Optional, Callable
 from flask import request, jsonify, g
 
+from config import settings
 from harness.observability.logger import get_logger
 
 logger = get_logger(__name__)
@@ -19,15 +18,16 @@ def get_user_identity() -> str:
 
     优先级：
     1. JWT 用户 ID
-    2. IP 地址
+    2. IP 地址（仅在 TRUST_PROXY_HEADERS=true 时信任 X-Forwarded-For，
+       否则直接取 TCP 对端地址，防止伪造头绕过限流）
     """
     # 尝试从 g 对象获取用户 ID（由 JWT 认证设置）
     if hasattr(g, 'user_id') and g.user_id:
         return f"user:{g.user_id}"
 
-    # 降级到 IP 地址
-    if request.headers.get('X-Forwarded-For'):
-        ip = request.headers.get('X-Forwarded-For').split(',')[0].strip()
+    xff = request.headers.get('X-Forwarded-For')
+    if settings.TRUST_PROXY_HEADERS and xff:
+        ip = xff.split(',')[0].strip()
     else:
         ip = request.remote_addr or 'unknown'
     return f"ip:{ip}"
@@ -49,34 +49,9 @@ def rate_limit_handler(e=None):
     }), 429
 
 
-# 装饰器工厂函数
-def rate_limit(limit_str: str, **kwargs):
-    """
-    限流装饰器
-
-    Args:
-        limit_str: 限流字符串，如 "10 per minute", "100 per hour"
-        **kwargs: 传递给 flask-limiter 的其他参数
-
-    Returns:
-        装饰器函数
-
-    Example:
-        @app.route('/api/test')
-        @rate_limit("10 per minute")
-        def test():
-            ...
-    """
-    def decorator(f: Callable):
-        @wraps(f)
-        def wrapped(*args, **kwargs):
-            # 这里只是标记，实际限流由 flask-limiter 中间件处理
-            return f(*args, **kwargs)
-        return wrapped
-    return decorator
-
-
 # 预定义的限流配置
+# 实际限流由 factory.py 的 Limiter(key_func=get_user_identity) 按 RATE_LIMITS 执行；
+# 路由代码通过 rate_limit_auth / rate_limit_chat 等装饰器引用对应档位。
 RATE_LIMITS = {
     # 认证接口：防止暴力破解
     'auth': '5 per minute',

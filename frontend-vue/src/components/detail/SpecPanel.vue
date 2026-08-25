@@ -121,7 +121,7 @@ export interface AcceptanceCriterion {
   id: string
   label: string
   how_to_verify?: string
-  passed: boolean | null
+  passed?: boolean | null
   reason?: string
 }
 

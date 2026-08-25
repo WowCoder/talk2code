@@ -1,11 +1,11 @@
 import { useAuthStore } from '@/stores/auth'
+import router from '@/router'
 
 export function useApi() {
   async function api<T>(url: string, options: RequestInit = {}): Promise<T> {
     const authStore = useAuthStore()
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
-      ...authStore.getAuthHeaders(),
       ...(options.headers as Record<string, string> || {}),
     }
 
@@ -17,10 +17,10 @@ export function useApi() {
     const response = await fetch(url, { ...options, headers, credentials: 'include' })
 
     if (!response.ok) {
-      // Handle 401 - redirect to login
+      // Handle 401 - clear auth state and go to login (SPA 路由跳转，避免整页刷新)
       if (response.status === 401) {
         authStore.clearAuth()
-        window.location.href = '/login'
+        router.push('/login')
         throw new Error('未登录或登录已过期')
       }
       // Handle 429 - rate limit
@@ -33,7 +33,16 @@ export function useApi() {
       throw new Error(err.message || err.error || `HTTP ${response.status}`)
     }
 
-    return response.json()
+    // 204 或空响应体时不解析 JSON（否则会抛错）
+    if (response.status === 204) {
+      return undefined as unknown as T
+    }
+
+    const text = await response.text()
+    if (!text) {
+      return undefined as unknown as T
+    }
+    return JSON.parse(text) as T
   }
 
   return { api }

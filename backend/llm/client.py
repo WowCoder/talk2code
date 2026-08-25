@@ -19,6 +19,7 @@ from config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_PROVIDER, settings
 # 注意：llm.client 是底层模块，不能在模块顶层 import harness（harness 依赖 llm.client，
 # 会形成循环导入）。日志用标准 logging，harness 的日志系统会在应用启动时统一配置 root logger。
 import logging as _logging
+import logging.handlers as _logging_handlers
 logger = _logging.getLogger(__name__)
 
 # LLM 请求/响应专用日志（独立于应用日志，便于排查问题）
@@ -29,7 +30,11 @@ if not _llm_logger.handlers:
     import os as _os
     _log_dir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "..", "logs")
     _os.makedirs(_log_dir, exist_ok=True)
-    _fh = _logging.FileHandler(_os.path.join(_log_dir, "llm_traffic.log"), encoding="utf-8")
+    # 按天轮转、保留 7 天，避免明文流量日志无限增长
+    _fh = _logging_handlers.TimedRotatingFileHandler(
+        _os.path.join(_log_dir, "llm_traffic.log"),
+        when="midnight", backupCount=7, encoding="utf-8",
+    )
     _fh.setLevel(_logging.DEBUG)
     _fh.setFormatter(_logging.Formatter('%(asctime)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
     _llm_logger.addHandler(_fh)
@@ -202,6 +207,20 @@ class ToolCall:
     arguments: dict
 
 
+@dataclass(frozen=True)
+class _Endpoint:
+    """一次请求实际使用的端点参数（不可变）
+
+    failover 时通过参数传递备用端点，而不是改写单例实例的
+    base_url/api_key/model/provider——后者在多线程共享下会产生竞态，
+    导致并发请求被发到错误的模型/协议/密钥。
+    """
+    provider: str
+    base_url: str
+    api_key: str
+    model: str
+
+
 @dataclass
 class LLMResponse:
     """LLM 响应对象"""
@@ -326,6 +345,11 @@ class LLMClient:
         self.timeout = timeout if timeout is not None else settings.LLM_TIMEOUT
         self.max_retries = max_retries if max_retries is not None else settings.LLM_MAX_RETRIES
 
+        # 思考模式：DeepSeek V4 默认开启且 effort=high，会消耗大量 reasoning token。
+        # 默认关闭以提速；需要更高推理质量时通过 LLM_THINKING=enabled 开启。
+        self.thinking = settings.LLM_THINKING
+        self.reasoning_effort = settings.LLM_REASONING_EFFORT
+
         # 熔断器：防止 LLM API 不可用时持续无效重试
         self._circuit_breaker = CircuitBreaker(
             threshold=settings.LLM_CIRCUIT_BREAKER_THRESHOLD,
@@ -362,41 +386,21 @@ class LLMClient:
         else:
             logger.info(f"LLMClient 初始化：provider={self.provider}, model={self.model}, base_url={self.base_url}")
 
-    def _use_backup_params(self):
-        """上下文管理器：临时切换到备份模型参数，退出时自动恢复
+    def _primary_endpoint(self) -> _Endpoint:
+        """主模型端点参数（线程安全：只读快照，不修改实例状态）"""
+        return _Endpoint(
+            provider=self.provider, base_url=self.base_url,
+            api_key=self.api_key, model=self.model,
+        )
 
-        用法:
-            with self._use_backup_params():
-                self._do_request(messages)  # 使用备份模型
-        """
-        from contextlib import contextmanager
-
-        @contextmanager
-        def _swap():
-            # 保存主模型参数
-            orig_base_url = self.base_url
-            orig_model = self.model
-            orig_api_key = self.api_key
-            orig_provider = self.provider
-            # 切换到备份模型
-            self.base_url = self.backup_base_url
-            self.model = self.backup_model
-            self.api_key = self.backup_api_key
-            self.provider = self.backup_provider
-            logger.info(
-                f"[Failover] 切换到备用模型: provider={self.provider}, "
-                f"model={self.model}, base_url={self.base_url}"
-            )
-            try:
-                yield
-            finally:
-                # 恢复主模型参数
-                self.base_url = orig_base_url
-                self.model = orig_model
-                self.api_key = orig_api_key
-                self.provider = orig_provider
-
-        return _swap()
+    def _backup_endpoint(self) -> _Endpoint:
+        """备用模型端点参数（未配置备份时返回 None）"""
+        if not self._has_backup:
+            return None
+        return _Endpoint(
+            provider=self.backup_provider, base_url=self.backup_base_url,
+            api_key=self.backup_api_key, model=self.backup_model,
+        )
 
     def clear_memory(self):
         """清空会话记忆"""
@@ -446,32 +450,47 @@ class LLMClient:
         self,
         messages: List[Dict[str, str]],
         stream: bool = False,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
+        thinking: Optional[str] = None,
+        timeout: Optional[int] = None,
+        endpoint: Optional[_Endpoint] = None
     ) -> Generator[str, None, None]:
-        """发送 OpenAI 兼容 API 请求（带重试）"""
+        """发送 OpenAI 兼容 API 请求（带重试）
+
+        endpoint: 目标端点参数；None 时使用主模型配置。
+        timeout: 本次调用超时秒数；None 时使用实例默认。
+        """
+        ep = endpoint or self._primary_endpoint()
+        effective_timeout = timeout if timeout is not None else self.timeout
         headers = {
-            'Authorization': f'Bearer {self.api_key}',
+            'Authorization': f'Bearer {ep.api_key}',
             'Content-Type': 'application/json'
         }
 
+        # 思考模式：调用级覆盖 > 实例默认
+        _thinking = thinking or self.thinking
         data = {
-            'model': self.model,
+            'model': ep.model,
             'messages': messages,
             'stream': stream,
             'temperature': self.temperature,
             'max_tokens': max_tokens if max_tokens is not None else self.max_tokens
         }
+        # 思考模式开关（OpenAI 格式，DeepSeek 扩展字段）：仅 enabled 时发送，
+        # 避免不认识该字段的 OpenAI 兼容端点报 400 或静默忽略产生歧义
+        if _thinking == 'enabled':
+            data['thinking'] = {'type': _thinking}
+            data['reasoning_effort'] = self.reasoning_effort
 
-        url = f'{self.base_url}/chat/completions'
+        url = f'{ep.base_url}/chat/completions'
 
-        last_error = None
         for attempt in range(self.max_retries + 1):
             stream_yielded = False
             try:
                 if stream:
                     response = requests.post(
                         url, headers=headers, json=data,
-                        stream=True, timeout=self.timeout
+                        stream=True, timeout=effective_timeout
                     )
                     response.raise_for_status()
 
@@ -500,10 +519,10 @@ class LLMClient:
                     import uuid
                     call_id = uuid.uuid4().hex[:8]
                     t0 = time.time()
-                    _log_llm_request(call_id, self.provider, self.model, url, data)
+                    _log_llm_request(call_id, ep.provider, ep.model, url, data)
                     response = requests.post(
                         url, headers=headers, json=data,
-                        timeout=self.timeout
+                        timeout=effective_timeout
                     )
                     response.raise_for_status()
                     result = response.json()
@@ -526,7 +545,7 @@ class LLMClient:
                         retry_data['max_tokens'] = fallback_tokens
                         retry_response = requests.post(
                             url, headers=headers, json=retry_data,
-                            timeout=self.timeout
+                            timeout=effective_timeout
                         )
                         retry_response.raise_for_status()
                         retry_result = retry_response.json()
@@ -537,7 +556,6 @@ class LLMClient:
                 return
 
             except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
-                last_error = e
                 # 流式传输中途失败且已产出内容 → 不重试，避免前缀重复推送
                 if stream and stream_yielded:
                     logger.error(f"LLM 流式传输中断（已产出部分内容，不重试）：{str(e)}")
@@ -556,11 +574,19 @@ class LLMClient:
         self,
         messages: List[Dict[str, str]],
         stream: bool = False,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
+        thinking: Optional[str] = None,
+        timeout: Optional[int] = None,
+        endpoint: Optional[_Endpoint] = None
     ) -> Generator[str, None, None]:
-        """发送 Anthropic 兼容 API 请求（带重试）"""
+        """发送 Anthropic 兼容 API 请求（带重试）
+
+        endpoint/timeout 语义同 _request_openai。
+        """
+        ep = endpoint or self._primary_endpoint()
+        effective_timeout = timeout if timeout is not None else self.timeout
         headers = {
-            'x-api-key': self.api_key,
+            'x-api-key': ep.api_key,
             'Content-Type': 'application/json',
             'anthropic-version': '2023-06-01'
         }
@@ -575,24 +601,27 @@ class LLMClient:
                 api_messages.append(m)
 
         data = {
-            'model': self.model,
+            'model': ep.model,
             'messages': api_messages,
             'stream': stream,
             'max_tokens': max_tokens if max_tokens is not None else self.max_tokens
         }
+        # 思考模式开关（Anthropic 格式）：仅 enabled 时携带 reasoning 字段
+        _thinking = thinking or self.thinking
+        if _thinking == 'enabled':
+            data['reasoning'] = {'effort': self.reasoning_effort}
         if system_prompt:
             data['system'] = system_prompt
 
-        url = f'{self.base_url}/messages'
+        url = f'{ep.base_url}/messages'
 
-        last_error = None
         for attempt in range(self.max_retries + 1):
             stream_yielded = False
             try:
                 if stream:
                     response = requests.post(
                         url, headers=headers, json=data,
-                        stream=True, timeout=self.timeout
+                        stream=True, timeout=effective_timeout
                     )
                     response.raise_for_status()
 
@@ -617,10 +646,10 @@ class LLMClient:
                     import uuid
                     call_id = uuid.uuid4().hex[:8]
                     t0 = time.time()
-                    _log_llm_request(call_id, self.provider, self.model, url, data)
+                    _log_llm_request(call_id, ep.provider, ep.model, url, data)
                     response = requests.post(
                         url, headers=headers, json=data,
-                        timeout=self.timeout
+                        timeout=effective_timeout
                     )
                     response.raise_for_status()
                     result = response.json()
@@ -635,7 +664,6 @@ class LLMClient:
                 return
 
             except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
-                last_error = e
                 # 流式传输中途失败且已产出内容 → 不重试，避免前缀重复推送
                 if stream and stream_yielded:
                     logger.error(f"LLM 流式传输中断（已产出部分内容，不重试）：{str(e)}")
@@ -654,16 +682,24 @@ class LLMClient:
         self,
         messages: List[Dict[str, str]],
         stream: bool = False,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
+        thinking: Optional[str] = None,
+        timeout: Optional[int] = None,
+        endpoint: Optional[_Endpoint] = None
     ) -> Generator[str, None, None]:
-        """根据 provider 分发到对应的请求方法"""
-        if self.provider == 'anthropic_compatible':
-            yield from self._request_anthropic(messages, stream, max_tokens=max_tokens)
+        """根据端点 provider 分发到对应的请求方法"""
+        ep = endpoint or self._primary_endpoint()
+        if ep.provider == 'anthropic_compatible':
+            yield from self._request_anthropic(messages, stream, max_tokens=max_tokens,
+                                               thinking=thinking, timeout=timeout, endpoint=ep)
         else:
-            yield from self._request_openai(messages, stream, max_tokens=max_tokens)
+            yield from self._request_openai(messages, stream, max_tokens=max_tokens,
+                                            thinking=thinking, timeout=timeout, endpoint=ep)
 
     def _chat_request_loop(
-        self, messages: list, effective_max_tokens: int, effective_timeout: int
+        self, messages: list, effective_max_tokens: int, effective_timeout: int,
+        thinking: Optional[str] = None,
+        endpoint: Optional[_Endpoint] = None
     ) -> tuple:
         """单次请求（不在此层重试）。
 
@@ -681,6 +717,9 @@ class LLMClient:
             for chunk in self._do_request(
                 messages, stream=False,
                 max_tokens=effective_max_tokens,
+                thinking=thinking,
+                timeout=effective_timeout,
+                endpoint=endpoint,
             ):
                 content = chunk
 
@@ -703,7 +742,8 @@ class LLMClient:
         system_prompt: Optional[str] = None,
         use_memory: bool = False,
         max_tokens: Optional[int] = None,
-        timeout: Optional[int] = None
+        timeout: Optional[int] = None,
+        thinking: Optional[str] = None
     ) -> LLMResponse:
         """
         非流式聊天
@@ -718,6 +758,7 @@ class LLMClient:
                 开启记忆会导致跨请求串扰，仅在单线程场景显式开启）
             max_tokens: 最大生成 token 数（覆盖默认值）
             timeout: 超时时间（覆盖默认值）
+            thinking: 思考模式覆盖（'enabled'/'disabled'，默认 None 使用实例配置）
 
         Returns:
             LLMResponse 对象
@@ -743,7 +784,8 @@ class LLMClient:
 
         if primary_available:
             content, error, failed = self._chat_request_loop(
-                messages, effective_max_tokens, effective_timeout
+                messages, effective_max_tokens, effective_timeout, thinking,
+                endpoint=self._primary_endpoint()
             )
             if failed and (not content or content.startswith('[错误]')):
                 self._circuit_breaker.record_failure()
@@ -751,26 +793,28 @@ class LLMClient:
                 self._circuit_breaker.record_success()
 
         # ---- 主模型失败 → 尝试备用模型 ----
-        if (not content or content.startswith('[错误]')) and self._has_backup:
+        backup_ep = self._backup_endpoint()
+        if (not content or content.startswith('[错误]')) and backup_ep:
             logger.warning(
                 f"[Failover] 主模型失败，切换到备用模型 "
-                f"({self.backup_provider}/{self.backup_model}@{self.backup_base_url})"
+                f"({backup_ep.provider}/{backup_ep.model}@{backup_ep.base_url})"
             )
             try:
                 self._backup_circuit_breaker.check()
             except CircuitBreakerOpenError as e:
                 logger.error(f"[Failover] 备用模型熔断器也已打开: {e}")
             else:
-                with self._use_backup_params():
-                    content, error, failed = self._chat_request_loop(
-                        messages, effective_max_tokens, effective_timeout
-                    )
-                    if failed and (not content or content.startswith('[错误]')):
-                        self._backup_circuit_breaker.record_failure()
-                    elif content and not content.startswith('[错误]'):
-                        self._backup_circuit_breaker.record_success()
-                        tried_backup = True
-                        logger.info("[Failover] 备用模型请求成功")
+                # 端点经参数传递，不改写实例状态（多线程共享单例下安全）
+                content, error, failed = self._chat_request_loop(
+                    messages, effective_max_tokens, effective_timeout, thinking,
+                    endpoint=backup_ep
+                )
+                if failed and (not content or content.startswith('[错误]')):
+                    self._backup_circuit_breaker.record_failure()
+                elif content and not content.startswith('[错误]'):
+                    self._backup_circuit_breaker.record_success()
+                    tried_backup = True
+                    logger.info("[Failover] 备用模型请求成功")
 
         # 保存到记忆
         if use_memory and content and not content.startswith('[错误]'):
@@ -787,13 +831,15 @@ class LLMClient:
         self,
         prompt: str,
         system_prompt: Optional[str] = None,
-        use_memory: bool = True
+        use_memory: bool = False
     ) -> Generator[str, None, None]:
         """
         流式聊天，含主备模型自动切换
 
         注意：由于流式特性，只能在请求开始前判断主备（熔断器级别切换）。
         如果流式传输中途失败，本次请求无法重试。
+        use_memory 默认 False：单例客户端被多线程共享，开启记忆会跨请求串扰
+        （与 chat() 保持一致；单线程场景可显式开启）。
 
         Args:
             prompt: 用户输入
@@ -826,19 +872,19 @@ class LLMClient:
 
         # 流式请求
         stream_ok = False
-        if use_backup:
-            with self._use_backup_params():
-                full_content = ""
-                for chunk in self._do_request(messages, stream=True):
-                    if chunk:
-                        full_content += chunk
-                        stream_ok = True
-                        yield chunk
+        backup_ep = self._backup_endpoint()
+        if use_backup and backup_ep:
+            full_content = ""
+            for chunk in self._do_request(messages, stream=True, endpoint=backup_ep):
+                if chunk:
+                    full_content += chunk
+                    stream_ok = True
+                    yield chunk
 
-                if stream_ok and not full_content.startswith('[错误]'):
-                    self._backup_circuit_breaker.record_success()
-                else:
-                    self._backup_circuit_breaker.record_failure()
+            if stream_ok and not full_content.startswith('[错误]'):
+                self._backup_circuit_breaker.record_success()
+            else:
+                self._backup_circuit_breaker.record_failure()
         else:
             full_content = ""
             for chunk in self._do_request(messages, stream=True):
@@ -859,13 +905,20 @@ class LLMClient:
 
 
     def _chat_with_tools_request_loop(
-        self, messages: list, tools: list, tool_choice: str, effective_max_tokens: int
+        self, messages: list, tools: list, tool_choice: str, effective_max_tokens: int,
+        thinking: Optional[str] = None,
+        timeout: Optional[int] = None,
+        endpoint: Optional[_Endpoint] = None
     ) -> tuple:
         """chat_with_tools 核心请求+重试循环
+
+        重试策略：指数退避；HTTP 4xx（除 429）为非瞬时错误，立即终止不重试。
 
         Returns:
             (content, reasoning_content, tool_calls, usage, failed)
         """
+        ep = endpoint or self._primary_endpoint()
+        effective_timeout = timeout if timeout is not None else self.timeout
         content = ""
         reasoning_content = None
         tool_calls = None
@@ -874,20 +927,45 @@ class LLMClient:
 
         for attempt in range(self.max_retries + 1):
             try:
-                if self.provider == 'anthropic_compatible':
+                if ep.provider == 'anthropic_compatible':
                     content, reasoning_content, tool_calls, usage = self._request_anthropic_with_tools(
-                        messages, tools, max_tokens=effective_max_tokens)
+                        messages, tools, max_tokens=effective_max_tokens, thinking=thinking,
+                        tool_choice=tool_choice, timeout=effective_timeout, endpoint=ep)
                 else:
                     content, reasoning_content, tool_calls, usage = self._request_openai_with_tools(
-                        messages, tools, tool_choice, max_tokens=effective_max_tokens)
+                        messages, tools, tool_choice, max_tokens=effective_max_tokens, thinking=thinking,
+                        timeout=effective_timeout, endpoint=ep)
                 break
-            except Exception as e:
-                logger.error(f"chat_with_tools 失败：{e}")
-                failed = True
-                if attempt >= self.max_retries:
+            except requests.exceptions.HTTPError as e:
+                status = getattr(getattr(e, 'response', None), 'status_code', None)
+                if status and 400 <= status < 500 and status != 429:
+                    # 参数/鉴权/协议类错误，重试必然复现 → 立即失败
+                    logger.error(f"chat_with_tools 非瞬时错误(HTTP {status})，不再重试：{e}")
+                    failed = True
                     content = f"[错误] 工具调用失败：{e}"
+                    break
+                failed = True
+                if self._retry_backoff(attempt, e, context="chat_with_tools"):
+                    continue
+                content = f"[错误] 工具调用失败：{e}"
+            except Exception as e:
+                failed = True
+                if self._retry_backoff(attempt, e, context="chat_with_tools"):
+                    continue
+                content = f"[错误] 工具调用失败：{e}"
 
         return content, reasoning_content, tool_calls, usage, failed
+
+    def _retry_backoff(self, attempt: int, e: Exception, context: str = "LLM") -> bool:
+        """重试退避：还有剩余次数则指数退避等待并返回 True（继续重试），否则返回 False"""
+        logger.error(f"{context} 失败：{e}")
+        if attempt < self.max_retries:
+            import random
+            delay = min(1.0 * (2 ** attempt), 10.0) * (0.5 + random.random() * 0.5)
+            logger.warning(f"{context} {delay:.2f}秒后重试 ({attempt + 1}/{self.max_retries})")
+            time.sleep(delay)
+            return True
+        return False
 
     def chat_with_tools(
         self,
@@ -895,6 +973,7 @@ class LLMClient:
         tools: list,
         tool_choice: str = "auto",
         max_tokens: Optional[int] = None,
+        thinking: Optional[str] = None,
     ) -> LLMResponse:
         """
         支持 function calling 的聊天接口，含主备模型自动切换
@@ -904,6 +983,7 @@ class LLMClient:
             tools: 工具描述列表（OpenAI function calling 格式）
             tool_choice: "auto" / "none" / "required"
             max_tokens: 最大 token 数
+            thinking: 思考模式覆盖（'enabled'/'disabled'，默认 None 使用实例配置）
 
         Returns:
             LLMResponse 含 tool_calls 字段
@@ -929,7 +1009,8 @@ class LLMClient:
         if primary_available:
             content, reasoning_content, tool_calls, usage, failed = \
                 self._chat_with_tools_request_loop(
-                    messages, tools, tool_choice, effective_max_tokens
+                    messages, tools, tool_choice, effective_max_tokens, thinking,
+                    endpoint=self._primary_endpoint()
                 )
             if failed and (not content or content.startswith('[错误]')):
                 self._circuit_breaker.record_failure()
@@ -937,54 +1018,75 @@ class LLMClient:
                 self._circuit_breaker.record_success()
 
         # ---- 主模型失败 → 尝试备用模型 ----
-        if (not content or content.startswith('[错误]')) and self._has_backup:
+        backup_ep = self._backup_endpoint()
+        if (not content or content.startswith('[错误]')) and backup_ep:
             logger.warning(
                 f"[Failover] 主模型失败，切换到备用模型 "
-                f"({self.backup_provider}/{self.backup_model}@{self.backup_base_url})"
+                f"({backup_ep.provider}/{backup_ep.model}@{backup_ep.base_url})"
             )
             try:
                 self._backup_circuit_breaker.check()
             except CircuitBreakerOpenError as e:
                 logger.error(f"[Failover] 备用模型熔断器也已打开: {e}")
             else:
-                with self._use_backup_params():
-                    content, reasoning_content, tool_calls, usage, failed = \
-                        self._chat_with_tools_request_loop(
-                            messages, tools, tool_choice, effective_max_tokens
-                        )
-                    if failed and (not content or content.startswith('[错误]')):
-                        self._backup_circuit_breaker.record_failure()
-                    elif content and not content.startswith('[错误]'):
-                        self._backup_circuit_breaker.record_success()
-                        logger.info("[Failover] 备用模型 chat_with_tools 请求成功")
+                # 端点经参数传递，不改写实例状态（多线程共享单例下安全）
+                content, reasoning_content, tool_calls, usage, failed = \
+                    self._chat_with_tools_request_loop(
+                        messages, tools, tool_choice, effective_max_tokens, thinking,
+                        endpoint=backup_ep
+                    )
+                if failed and (not content or content.startswith('[错误]')):
+                    self._backup_circuit_breaker.record_failure()
+                elif content and not content.startswith('[错误]'):
+                    self._backup_circuit_breaker.record_success()
+                    logger.info("[Failover] 备用模型 chat_with_tools 请求成功")
+
+        # 错误语义与 chat() 对齐：请求失败时必须设置 error，
+        # 否则调用方（runtime.is_error 分支）会把 LLM 故障误判为任务正常完成
+        if not error:
+            if content.startswith('[错误]'):
+                error = content
+            elif not content:
+                error = "LLM 返回空响应"
 
         return LLMResponse(content=content, reasoning_content=reasoning_content,
                            usage=usage, finish_reason=finish_reason,
                            error=error, tool_calls=tool_calls)
 
     def _request_openai_with_tools(self, messages: list, tools: list, tool_choice: str,
-                                    max_tokens: Optional[int] = None):
+                                    max_tokens: Optional[int] = None,
+                                    thinking: Optional[str] = None,
+                                    timeout: Optional[int] = None,
+                                    endpoint: Optional[_Endpoint] = None):
         """OpenAI function calling 协议"""
         import uuid
+        ep = endpoint or self._primary_endpoint()
+        effective_timeout = timeout if timeout is not None else self.timeout
         headers = {
-            'Authorization': f'Bearer {self.api_key}',
+            'Authorization': f'Bearer {ep.api_key}',
             'Content-Type': 'application/json'
         }
+        # 思考模式：调用级覆盖 > 实例默认
+        _thinking = thinking or self.thinking
         data = {
-            'model': self.model,
+            'model': ep.model,
             'messages': messages,
             'temperature': self.temperature,
             'max_tokens': max_tokens if max_tokens is not None else self.max_tokens,
             'tools': tools,
             'tool_choice': tool_choice,
         }
-        url = f'{self.base_url}/chat/completions'
+        # 思考模式开关（OpenAI 格式，DeepSeek 扩展字段）：仅 enabled 时发送
+        if _thinking == 'enabled':
+            data['thinking'] = {'type': _thinking}
+            data['reasoning_effort'] = self.reasoning_effort
+        url = f'{ep.base_url}/chat/completions'
 
         call_id = uuid.uuid4().hex[:8]
         t0 = time.time()
-        _log_llm_request(call_id, self.provider, self.model, url, data)
+        _log_llm_request(call_id, ep.provider, ep.model, url, data)
 
-        response = requests.post(url, headers=headers, json=data, timeout=self.timeout)
+        response = requests.post(url, headers=headers, json=data, timeout=effective_timeout)
         response.raise_for_status()
         result = response.json()
 
@@ -998,32 +1100,36 @@ class LLMClient:
 
         # 如果 content 和 tool_calls 都为空但有 reasoning_content，
         # 说明 max_tokens 不足，所有 token 被 reasoning 消耗。
-        # 此时以默认 max_tokens 重试一次。
+        # 逐级增加 max_tokens 重试，适配 reasoning 模型的 token 消耗。
         raw_tool_calls = msg.get('tool_calls', [])
         if not content and not raw_tool_calls and reasoning_content:
             req_tokens = data.get('max_tokens', 0)
-            fallback_tokens = self.max_tokens
-            logger.warning(
-                f"[LLM] 检测到 reasoning 模型 token 耗尽 "
-                f"(reasoning={len(reasoning_content)} chars, content/tool_calls为空, "
-                f"req_max_tokens={req_tokens})，"
-                f"以默认 max_tokens={fallback_tokens} 重试"
-            )
-            retry_data = dict(data)
-            retry_data['max_tokens'] = fallback_tokens
-            retry_response = requests.post(
-                url, headers=headers, json=retry_data,
-                timeout=self.timeout
-            )
-            retry_response.raise_for_status()
-            retry_result = retry_response.json()
-            retry_choice = retry_result.get('choices', [{}])[0]
-            retry_msg = retry_choice.get('message', {})
-            content = retry_msg.get('content', '') or ''
-            reasoning_content = retry_msg.get('reasoning_content', '') or None
-            usage_data = retry_result.get('usage')
-            raw_tool_calls = retry_msg.get('tool_calls', [])
-            # 重试后仍然为空则放弃，让上层错误处理
+            for attempt, increment in enumerate([8000, 16000], 1):
+                retry_tokens = min(req_tokens + increment, 32000)
+                if retry_tokens <= req_tokens:
+                    break
+                logger.warning(
+                    f"[LLM] 检测到 reasoning 模型 token 耗尽 "
+                    f"(reasoning={len(reasoning_content)} chars, content/tool_calls为空, "
+                    f"req_max_tokens={req_tokens})，"
+                    f"第 {attempt} 次重试 max_tokens={retry_tokens}"
+                )
+                retry_data = dict(data)
+                retry_data['max_tokens'] = retry_tokens
+                retry_response = requests.post(
+                    url, headers=headers, json=retry_data,
+                    timeout=effective_timeout
+                )
+                retry_response.raise_for_status()
+                retry_result = retry_response.json()
+                retry_choice = retry_result.get('choices', [{}])[0]
+                retry_msg = retry_choice.get('message', {})
+                content = retry_msg.get('content', '') or ''
+                reasoning_content = retry_msg.get('reasoning_content', '') or None
+                usage_data = retry_result.get('usage')
+                raw_tool_calls = retry_msg.get('tool_calls', [])
+                if content or raw_tool_calls:
+                    break
         tool_calls = []
         for tc in raw_tool_calls:
             fn = tc.get('function', {})
@@ -1051,10 +1157,16 @@ class LLMClient:
         return content, reasoning_content, (tool_calls or None), usage_data
 
     def _request_anthropic_with_tools(self, messages: list, tools: list,
-                                       max_tokens: Optional[int] = None):
+                                       max_tokens: Optional[int] = None,
+                                       thinking: Optional[str] = None,
+                                       tool_choice: str = 'auto',
+                                       timeout: Optional[int] = None,
+                                       endpoint: Optional[_Endpoint] = None):
         """Anthropic tool use 协议"""
+        ep = endpoint or self._primary_endpoint()
+        effective_timeout = timeout if timeout is not None else self.timeout
         headers = {
-            'x-api-key': self.api_key,
+            'x-api-key': ep.api_key,
             'Content-Type': 'application/json',
             'anthropic-version': '2023-06-01'
         }
@@ -1078,22 +1190,32 @@ class LLMClient:
             })
 
         data = {
-            'model': self.model,
+            'model': ep.model,
             'messages': api_messages,
             'max_tokens': max_tokens if max_tokens is not None else self.max_tokens,
             'tools': anthropic_tools,
         }
+        # tool_choice 语义映射（OpenAI → Anthropic）：
+        # required → {"type": "any"}（必须调用工具）；none → {"type": "none"}；
+        # auto 为 Anthropic 默认行为，省略
+        _tc_map = {'required': {'type': 'any'}, 'none': {'type': 'none'}}
+        if tool_choice in _tc_map:
+            data['tool_choice'] = _tc_map[tool_choice]
+        # 思考模式开关（Anthropic 格式）：仅 enabled 时携带 reasoning 字段
+        _thinking = thinking or self.thinking
+        if _thinking == 'enabled':
+            data['reasoning'] = {'effort': self.reasoning_effort}
         if system_prompt:
             data['system'] = system_prompt
 
-        url = f'{self.base_url}/messages'
+        url = f'{ep.base_url}/messages'
 
         import uuid
         call_id = uuid.uuid4().hex[:8]
         t0 = time.time()
-        _log_llm_request(call_id, self.provider, self.model, url, data)
+        _log_llm_request(call_id, ep.provider, ep.model, url, data)
 
-        response = requests.post(url, headers=headers, json=data, timeout=self.timeout)
+        response = requests.post(url, headers=headers, json=data, timeout=effective_timeout)
         response.raise_for_status()
         result = response.json()
 

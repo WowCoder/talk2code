@@ -13,7 +13,12 @@ from harness.tools.registry import (
 # ==================== ToolHandler 子类 ====================
 
 class SearchDocsHandler(ToolHandler):
-    """搜索 MDN/CanIUse 文档获取 API 兼容性信息"""
+    """文档搜索工具（占位实现）
+
+    当前不发起真实网络请求（避免 SSRF/网络依赖），仅返回指向
+    MDN / CanIUse 的引导提示。如需真实检索，请接入受控的
+    文档 API 或本地索引后再开放。
+    """
 
     def execute(self, args: dict, workspace=None, state=None) -> ToolResult:
         return ToolResult(

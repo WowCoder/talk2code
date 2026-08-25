@@ -36,7 +36,6 @@ class CostTracker:
         pricing = self.PRICING.get(model)
         if pricing is None:
             # 前缀回退：deepseek-v4-* 等未知版本按 deepseek-v3 计价，避免落到任意默认价
-            prefix = model.split("-")[0] if "-" in model else ""
             if model.startswith("deepseek-"):
                 pricing = self.PRICING.get("deepseek-v3", {"input": 0.27, "output": 1.10})
             elif model.startswith("qwen-"):
@@ -65,6 +64,17 @@ class CostTracker:
 
     def get_report(self, trace_id: str) -> CostReport:
         return self._usage.get(trace_id, CostReport())
+
+    def clear(self, trace_id: str = None):
+        """清理用量记录。trace_id 为 None 时清空全部。
+
+        建议在 trace 结束时（end_trace）随 tracer 联动调用，
+        避免 _usage 按 trace_id 无界累积。
+        """
+        if trace_id is None:
+            self._usage.clear()
+        else:
+            self._usage.pop(trace_id, None)
 
     def extract_usage(self, response_usage: dict, provider: str) -> tuple:
         """从 LLM API 响应中提取 usage"""

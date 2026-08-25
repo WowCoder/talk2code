@@ -74,12 +74,11 @@ def login():
         access_token = create_access_token(identity=str(user.id), expires_delta=JWT_ACCESS_TOKEN_EXPIRES)
         logger.info(f"用户登录成功：{username}")
 
+        # token 仅通过 httpOnly cookie 下发（规避 XSS 窃取），不在 JSON body 回传
         resp = jsonify({
             'message': '登录成功',
-            'token': access_token,
             'user': {'id': user.id, 'username': user.username}
         })
-        # 写入 httpOnly cookie（前端不再把 token 存 localStorage，规避 XSS 窃取）
         set_access_cookies(resp, access_token)
         return resp, 200
 

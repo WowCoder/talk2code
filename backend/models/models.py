@@ -5,7 +5,7 @@
 """
 
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, ForeignKey, JSON, Float, text, Index
+from sqlalchemy import create_engine, event, Column, Integer, String, Text, DateTime, Boolean, ForeignKey, JSON, Float, text, Index
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.sql import func
@@ -17,6 +17,18 @@ engine = create_engine(
     connect_args=settings.DATABASE_CONNECT_ARGS,
     **settings.DATABASE_ENGINE_KWARGS,
 )
+
+if not settings.IS_POSTGRES:
+    @event.listens_for(engine, "connect")
+    def _sqlite_pragmas(dbapi_connection, connection_record):
+        """SQLite 并发写防护（TaskQueue 多 worker + 请求线程共享库文件）：
+        - WAL 模式：读写不互斥，避免 "database is locked"
+        - busy_timeout：写冲突时等待而非立即抛错
+        """
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.close()
 
 # 创建会话工厂
 SessionLocal = sessionmaker(bind=engine)

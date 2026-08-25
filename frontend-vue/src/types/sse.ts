@@ -131,6 +131,8 @@ export interface SSESpecData {
     id: string
     label: string
     how_to_verify?: string
+    passed?: boolean | null
+    reason?: string
   }>
   file_structure?: string[]
   tech_stack?: {
@@ -143,12 +145,14 @@ export interface SSESpecData {
   implementation_notes?: string
 }
 
+export interface SSETask {
+  file: string
+  description: string
+  status: TaskStatus
+}
+
 export interface SSETaskListData {
-  tasks: Array<{
-    file: string
-    description: string
-    status: 'pending' | 'in_progress' | 'completed'
-  }>
+  tasks: SSETask[]
 }
 
 export interface SSETaskUpdateData {

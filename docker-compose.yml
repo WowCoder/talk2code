@@ -10,7 +10,8 @@ services:
     container_name: talk2code-postgres
     restart: unless-stopped
     ports:
-      - "5432:5432"
+      # 宿主 5434 → 容器 5432（避开其他项目占用的 5432/5433）
+      - "5434:5432"
     environment:
       POSTGRES_USER: talk2code
       POSTGRES_PASSWORD: talk2code
@@ -29,7 +30,8 @@ services:
     container_name: talk2code-redis
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      # 宿主 6380 → 容器 6379（避开其他项目占用的 6379）
+      - "6380:6379"
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
     volumes:
       - redisdata:/data

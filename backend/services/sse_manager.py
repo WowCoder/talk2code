@@ -44,14 +44,15 @@ class SSEClient:
         self.last_heartbeat = datetime.now()
 
     def is_alive(self, timeout_seconds: int = 300) -> bool:
-        """检查连接是否仍然活跃"""
-        return (datetime.now() - self.last_heartbeat).seconds < timeout_seconds
+        """检查连接是否仍然活跃（total_seconds，避免跨天 .seconds 回绕）"""
+        return (datetime.now() - self.last_heartbeat).total_seconds() < timeout_seconds
 
     def send(self, message: str) -> bool:
-        """发送消息到客户端"""
+        """发送消息到客户端（发送即视为活跃，同步更新心跳）"""
         try:
             self.queue.put_nowait(message)
             self.message_count += 1
+            self.update_heartbeat()
             return True
         except queue.Full:
             logger.warning(f"SSE 队列已满，丢弃消息")
@@ -92,9 +93,11 @@ class SSEManager:
 
         # Redis Pub/Sub（延迟初始化）
         self._redis = None
-        self._pubsub = None
         self._redis_available = False
         self._redis_thread: Optional[threading.Thread] = None
+
+        # 消息缓冲最后访问时间（用于清理长时间无客户端且空闲的缓冲）
+        self._buffer_ts: Dict[str, float] = {}
 
         # 运行标志（必须在启动后台线程前设置，避免 _redis_subscribe_loop 提前访问）
         self._running = True
@@ -141,6 +144,8 @@ class SSEManager:
         from config import settings
 
         while self._running:
+            conn = None
+            pubsub = None
             try:
                 # 每次连接创建新的 pubsub 对象（避免重连问题）
                 conn = redis_lib.from_url(settings.REDIS_URL, decode_responses=True)
@@ -171,6 +176,18 @@ class SSEManager:
                     logger.error(f"SSE Redis 订阅异常，5 秒后重连: {e}")
                     import time
                     time.sleep(5)
+            finally:
+                # 无论正常退出还是异常，都要释放 conn/pubsub，避免连接泄漏
+                if pubsub is not None:
+                    try:
+                        pubsub.close()
+                    except Exception:
+                        pass
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
 
     def _local_broadcast(self, client_id: str, message: str) -> int:
         """本地广播: 发送给当前进程内的客户端（不写缓冲）"""
@@ -238,10 +255,12 @@ class SSEManager:
         3. publish 到 Redis（其他 worker 的客户端会收到）
         """
         with self._lock:
-            # 1. 写入消息缓冲（用于迟到客户端回放）
+            # 1. 写入消息缓冲（用于迟到客户端回放），并记录最后访问时间
             if client_id not in self._message_buffers:
                 self._message_buffers[client_id] = deque(maxlen=MAX_BUFFERED_MESSAGES)
             self._message_buffers[client_id].append(message)
+            import time as _t
+            self._buffer_ts[client_id] = _t.time()
 
         # 2. 本地广播
         local_count = self._local_broadcast(client_id, message)
@@ -299,14 +318,18 @@ class SSEManager:
                 else:
                     del self._clients[client_id]
 
-            # 清理无客户端且空闲超过 10 分钟的缓冲
+            # 清理无客户端且空闲超过 10 分钟的缓冲（给重连窗口留时间，
+            # 与 remove_client 中"保留缓冲一段时间"的注释意图一致）
+            import time as _t
             idle_buffer_ids = []
             for cid in list(self._message_buffers.keys()):
-                if cid not in self._clients:
+                last_ts = self._buffer_ts.get(cid, 0)
+                if cid not in self._clients and (_t.time() - last_ts) > 600:
                     idle_buffer_ids.append(cid)
 
             for cid in idle_buffer_ids:
                 del self._message_buffers[cid]
+                self._buffer_ts.pop(cid, None)
                 logger.debug(f"清理孤儿消息缓冲：client_id={cid}")
 
         if cleaned:
@@ -315,18 +338,21 @@ class SSEManager:
                 logger.debug(f"  - {info}")
 
     def shutdown(self):
-        """关闭管理器，停止后台线程"""
+        """关闭管理器，停止后台线程并释放连接"""
         self._running = False
         with self._lock:
             self._clients.clear()
             self._message_buffers.clear()
+            self._buffer_ts.clear()
 
-        # 关闭 Redis pubsub
-        if self._pubsub:
+        # 关闭 Redis 连接（订阅线程持有的 conn/pubsub 由线程内 finally 负责释放）
+        if self._redis is not None:
             try:
-                self._pubsub.close()
+                self._redis.close()
             except Exception:
                 pass
+            self._redis = None
+        self._redis_available = False
 
         logger.info("SSEManager 已关闭")
 

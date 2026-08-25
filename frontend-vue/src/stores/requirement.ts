@@ -5,7 +5,7 @@ import type {
   DialogueMessage,
   CodeFile,
 } from '@/types/api'
-import type { SSEQuestionFormData, SSEEvaluatorResultData, SSESpecData, SSETraceSummaryData } from '@/types/sse'
+import type { SSEQuestionFormData, SSEEvaluatorResultData, SSESpecData, SSETraceSummaryData, SSETask } from '@/types/sse'
 import { useApi } from '@/composables/useApi'
 
 export const useRequirementStore = defineStore('requirement', () => {
@@ -21,33 +21,63 @@ export const useRequirementStore = defineStore('requirement', () => {
   const pendingChatClarification = ref<{ originalMessage: string } | null>(null)
   // Evaluator 评估结果
   const evaluatorResult = ref<SSEEvaluatorResultData | null>(null)
-  // Hook 检查结果（仅存储当前迭代的失败项，每次 iteration_batch 时清除旧数据）
-  const hookChecks = ref<Array<{ hook_name: string; passed: boolean; message: string }>>([])
   // SPEC 和 Task 数据（从 dialogue_history 的 plan 字段恢复，或 SSE 推送）
   const _specData = ref<SSESpecData | null>(null)
-  const _taskList = ref<any[]>([])
+  const _taskList = ref<SSETask[]>([])
+  // spec 事件到达时记录确认卡片应插入的对话位置（TL 分析消息之前）
+  const _specInsertIndex = ref<number | null>(null)
   // Plan 确认状态: null=无plan, 'needs_confirmation'=等待确认, 'confirmed'=已确认
   const planStatus = ref<'needs_confirmation' | 'confirmed' | null>(null)
   // Trace 总结数据
   const _traceSummary = ref<SSETraceSummaryData | null>(null)
 
+  // ===== 竞态 / 幂等去重（会话内，非响应式）=====
+  // 递增请求序号：只有最新一次 loadRequirement 的结果允许写入 state
+  let loadSeq = 0
+  // 已入列消息的幂等键集合（防 SSE 重连重放整段历史导致重复入列）
+  const seenMessageKeys = new Set<string>()
+
   // ===== API (from shared composable) =====
   const { api } = useApi()
 
-  async function loadRequirement(id: number): Promise<{ requirement: Requirement; trace?: any; evaluator?: SSEEvaluatorResultData }> {
+  function messageKey(msg: DialogueMessage): string {
+    // SSE dialogue 事件携带时间戳，重放时同一事件的时间戳一致，可作幂等键；
+    // 迭代批量事件用 iteration 序号去重；无时间戳的本地消息（如用户连发"继续"）不去重
+    if (msg.timestamp) {
+      return `ts::${msg.role}::${msg.name || ''}::${msg.content}::${msg.timestamp}`
+    }
+    if (msg.role === 'iteration_batch' && msg.iteration !== undefined) {
+      return `iter::${msg.iteration}`
+    }
+    return ''
+  }
+
+  async function loadRequirement(id: number): Promise<{ requirement: Requirement; trace?: any; evaluator?: SSEEvaluatorResultData } | null> {
+    const seq = ++loadSeq
     // 先重置所有状态，避免旧需求数据残留
     dialogueMessages.value = []
+    seenMessageKeys.clear()
     Object.keys(codeFiles).forEach((k) => delete codeFiles[k])
+    activeFile.value = 'index.html'
     questionForm.value = null
     evaluatorResult.value = null
     _specData.value = null
     _taskList.value = []
+    _specInsertIndex.value = null
     planStatus.value = null
     _traceSummary.value = null
-    hookChecks.value = []
 
     const data = await api<{ requirement: Requirement; trace?: any; evaluator?: SSEEvaluatorResultData }>(`/api/requirements/${id}`)
+
+    // 竞态保护：期间又发起了新的 loadRequirement，本次结果作废
+    if (seq !== loadSeq) return null
+
     currentRequirement.value = data.requirement
+
+    // 恢复 trace（页面刷新后恢复 token/成本统计）
+    if (data.trace) {
+      _traceSummary.value = data.trace
+    }
 
     // 恢复 evaluator 评估结果（页面刷新后恢复评分展示）
     if (data.evaluator) {
@@ -83,10 +113,16 @@ export const useRequirementStore = defineStore('requirement', () => {
           _taskList.value = (plan.implementation_order || []).map((f: string) => ({
             file: f,
             description: f,
-            status: 'completed',
+            status: 'completed' as const,
           }))
           break
         }
+      }
+
+      // 建立幂等键集合，避免 SSE 重连重放整段历史时重复入列
+      for (const m of data.requirement.dialogue_history) {
+        const k = messageKey(m)
+        if (k) seenMessageKeys.add(k)
       }
     }
 
@@ -109,7 +145,12 @@ export const useRequirementStore = defineStore('requirement', () => {
   }
 
   function addDialogueMessage(msg: DialogueMessage) {
-    // 仅去重「连续」相同的消息（SSE 重放防御），
+    // 幂等去重（SSE 重连重放防御）：同一事件（时间戳/迭代号相同）只入列一次，
+    // 覆盖整段历史重放的场景；无时间戳的本地消息（如用户连发"继续"）不去重
+    const key = messageKey(msg)
+    if (key && seenMessageKeys.has(key)) return
+
+    // 仅去重「连续」相同的消息（兼容旧版后端无时间戳的重复推送），
     // 不全局按 role+content 去重——否则用户连发"继续"等相同内容会被误删
     const last = dialogueMessages.value[dialogueMessages.value.length - 1]
     const isConsecutiveDup =
@@ -118,23 +159,13 @@ export const useRequirementStore = defineStore('requirement', () => {
       last.content === msg.content &&
       last.name === msg.name
     if (isConsecutiveDup) return
+
+    if (key) seenMessageKeys.add(key)
     dialogueMessages.value.push(msg)
     // Keep last 100 messages
     if (dialogueMessages.value.length > 200) {
       dialogueMessages.value = dialogueMessages.value.slice(-100)
     }
-  }
-
-  function addHookCheck(check: { hook_name: string; passed: boolean; message: string }) {
-    // 避免重复添加相同 hook 的检查结果
-    const exists = hookChecks.value.some(h => h.hook_name === check.hook_name && h.message === check.message)
-    if (!exists) {
-      hookChecks.value.push(check)
-    }
-  }
-
-  function clearHookChecks() {
-    hookChecks.value = []
   }
 
   function updateCodeFiles(data: { filename?: string; content?: string; files?: Array<{ filename: string; content: string }> }) {
@@ -179,6 +210,10 @@ export const useRequirementStore = defineStore('requirement', () => {
     if (data.needs_clarification) {
       if (data.dialogue_history?.length) {
         dialogueMessages.value = data.dialogue_history
+        for (const m of data.dialogue_history) {
+          const k = messageKey(m)
+          if (k) seenMessageKeys.add(k)
+        }
       }
       if (data.question_form) {
         questionForm.value = data.question_form
@@ -195,8 +230,11 @@ export const useRequirementStore = defineStore('requirement', () => {
       for (const msg of data.dialogue_history) {
         const key = `${(msg as any).role || 'agent'}::${(msg as any).content || ''}`.slice(0, 120)
         if (!existingKeys.has(key)) {
-          dialogueMessages.value.push(msg as DialogueMessage)
+          const typed = msg as DialogueMessage
+          dialogueMessages.value.push(typed)
           existingKeys.add(key)
+          const mk = messageKey(typed)
+          if (mk) seenMessageKeys.add(mk)
         }
       }
     }
@@ -249,8 +287,10 @@ export const useRequirementStore = defineStore('requirement', () => {
   }
 
   function reset() {
+    loadSeq++ // 使进行中的旧 loadRequirement 失效，避免竞态写入
     currentRequirement.value = null
     dialogueMessages.value = []
+    seenMessageKeys.clear()
     Object.keys(codeFiles).forEach((k) => delete codeFiles[k])
     activeFile.value = 'index.html'
     isGenerating.value = false
@@ -260,9 +300,9 @@ export const useRequirementStore = defineStore('requirement', () => {
     evaluatorResult.value = null
     _specData.value = null
     _taskList.value = []
+    _specInsertIndex.value = null
     planStatus.value = null
     _traceSummary.value = null
-    hookChecks.value = []
   }
 
   return {
@@ -276,9 +316,6 @@ export const useRequirementStore = defineStore('requirement', () => {
     pendingChatClarification,
     loadRequirement,
     addDialogueMessage,
-    addHookCheck,
-    clearHookChecks,
-    hookChecks,
     updateCodeFiles,
     setActiveFile,
     saveCodeFile,
@@ -290,6 +327,7 @@ export const useRequirementStore = defineStore('requirement', () => {
     evaluatorResult,
     _specData,
     _taskList,
+    _specInsertIndex,
     _traceSummary,
     planStatus,
     confirmPlan,

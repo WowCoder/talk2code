@@ -1,0 +1,7 @@
+{
+  "name": "game",
+  "description": "游戏类需求开发规范：启动流程、就绪状态、游戏循环、遮罩层状态管理",
+  "type": "knowledge",
+  "trigger": "游戏|贪吃蛇|俄罗斯方块|2048|打地鼠|扫雷|井字棋|五子棋|连连看|消消乐|弹球|飞机大战|赛车|跑酷|跳跃|小游戏|game|snake|tetris|minesweeper",
+  "priority": 50
+}

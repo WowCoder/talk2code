@@ -27,6 +27,8 @@ const settingsStore = useSettingsStore()
 const editorContainer = ref<HTMLElement>()
 let view: EditorView | null = null
 let saveTimer: ReturnType<typeof setTimeout> | null = null
+// 程序化 setValue 时置位，跳过由此触发的 debounced emit（避免外部更新造成冗余回存）
+let suppressNextEmit = false
 
 function getLanguageExtension(filename: string): Extension {
   const ext = filename.split('.').pop()?.toLowerCase()
@@ -74,6 +76,15 @@ function buildExtensions(): Extension[] {
     languageCompartment.of(getLanguageExtension(props.filename)),
     EditorView.updateListener.of((update) => {
       if (update.docChanged) {
+        // 程序化更新（props.content 变化回填）不触发保存
+        if (suppressNextEmit) {
+          suppressNextEmit = false
+          if (saveTimer) {
+            clearTimeout(saveTimer)
+            saveTimer = null
+          }
+          return
+        }
         if (saveTimer) clearTimeout(saveTimer)
         saveTimer = setTimeout(() => {
           emit('update:content', update.state.doc.toString())
@@ -99,6 +110,7 @@ function updateContent(newContent: string) {
   if (!view) return
   const current = view.state.doc.toString()
   if (newContent !== current) {
+    suppressNextEmit = true
     view.dispatch({
       changes: { from: 0, to: view.state.doc.length, insert: newContent },
     })
