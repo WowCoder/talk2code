@@ -1,0 +1,49 @@
+{
+  "name": "scaffold",
+  "description": "项目脚手架：按本项目固定架构生成 index.html + css/ + js/ + storage.js 骨架，强制 IIFE / 相对路径 / 无 CDN / 无 ES Module，从源头规避常见错误。",
+  "trigger": "脚手架|初始化项目|项目结构|骨架|搭建项目|创建项目|初始结构|文件结构|scaffold|新建页面",
+  "type": "workflow",
+  "priority": 10,
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "project_name": {
+        "type": "string",
+        "description": "项目/页面名称"
+      },
+      "page_type": {
+        "type": "string",
+        "enum": ["landing", "game", "dashboard", "form", "general"],
+        "description": "页面类型，决定骨架规模"
+      },
+      "needs_storage": {
+        "type": "boolean",
+        "description": "是否需要数据持久化（生成 js/storage.js）"
+      },
+      "modules": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "需要的业务模块名，生成对应 js/xxx.js"
+      }
+    },
+    "required": ["project_name"]
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "structure": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "生成的文件清单（相对路径）"
+      },
+      "conventions_applied": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "已落实的项目约束清单"
+      }
+    }
+  },
+  "tools": ["write_file", "list_files", "read_file"],
+  "composes": [],
+  "entry": "run_skill"
+}

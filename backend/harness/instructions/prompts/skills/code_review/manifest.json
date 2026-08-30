@@ -1,0 +1,45 @@
+{
+  "name": "code_review",
+  "description": "代码审查：对生成的前端代码做多维度审查（正确性 / XSS 安全 / 可访问性 / 性能 / 可维护性），输出结构化 findings。",
+  "trigger": "审查|代码质量|检查代码|代码评审|代码检查|review|找 ?(bug|问题)|优化代码|code review",
+  "type": "workflow",
+  "priority": 20,
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "target": {
+        "type": "string",
+        "description": "待审查的文件或目录，默认审查工作区全部文件"
+      },
+      "focus": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "重点关注维度，可选：security / accessibility / performance / correctness / maintainability"
+      }
+    },
+    "required": ["target"]
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "summary": { "type": "string", "description": "总体评价" },
+      "findings": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "severity": { "type": "string", "enum": ["critical", "major", "minor"] },
+            "category": { "type": "string" },
+            "file": { "type": "string" },
+            "issue": { "type": "string" },
+            "suggestion": { "type": "string" }
+          }
+        }
+      },
+      "score": { "type": "number", "description": "0-100 质量分" }
+    }
+  },
+  "tools": ["read_file", "list_files", "lint_js", "lint_css", "validate_html", "execute_code"],
+  "composes": [],
+  "entry": "run_skill"
+}

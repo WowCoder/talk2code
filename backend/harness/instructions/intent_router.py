@@ -30,6 +30,7 @@ class IntentType(Enum):
     SEARCH = "search"
     TASK = "task"
     AMBIGUOUS = "ambiguous"
+    SKILL = "skill"
 
 
 @dataclass
@@ -38,6 +39,7 @@ class IntentResult:
     intent: IntentType
     confidence: float = 0.8  # 置信度 0-1
     quick_answer: str = ""   # QUICK/SEARCH 的预生成答案（可选）
+    skill_name: str = ""     # SKILL 意图命中时，匹配到的工作流技能名
 
 
 # ==================== 分类 Prompt（从 .md 文件加载）====================
@@ -75,6 +77,23 @@ class IntentRouter:
         """
         # 截断过长输入，分类不需要完整文本
         short_text = requirement[:500] if len(requirement) > 500 else requirement
+
+        # 确定性 SKILL 匹配：若需求命中某个工作流技能的 trigger，直接路由到 SKILL，
+        # 不依赖 LLM，避免误判；返回最高优先级的命中技能名。
+        try:
+            from harness.instructions.skill_loader import get_skill_loader
+            wf = get_skill_loader().match_workflow_skills(short_text)
+            if wf:
+                logger.info(
+                    f"[IntentRouter] 命中工作流技能: {wf[0].name}，路由 SKILL"
+                )
+                return IntentResult(
+                    intent=IntentType.SKILL,
+                    confidence=0.95,
+                    skill_name=wf[0].name,
+                )
+        except Exception as e:
+            logger.warning(f"[IntentRouter] SKILL 预匹配异常（忽略）: {e}")
 
         system_prompt = INTENT_CLASSIFY_CHAT_SYSTEM if is_chat else INTENT_CLASSIFY_SYSTEM
 

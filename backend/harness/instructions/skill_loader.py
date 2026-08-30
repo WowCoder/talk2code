@@ -28,6 +28,7 @@ class SkillManifest:
 
     __slots__ = (
         'name', 'trigger', 'type', 'priority', 'description',
+        'input_schema', 'output_schema', 'tools', 'composes', 'entry',
         'dir_path', 'skill_md_path', 'manifest_path',
         '_body_cache', '_trigger_re',
     )
@@ -38,6 +39,12 @@ class SkillManifest:
         self.type: str = data.get("type", "knowledge")
         self.priority: int = data.get("priority", 0)
         self.description: str = data.get("description", "")
+        # 扩展字段（向后兼容：旧 knowledge skill 不填则为空）
+        self.input_schema: Optional[dict] = data.get("input_schema") or None
+        self.output_schema: Optional[dict] = data.get("output_schema") or None
+        self.tools: List[str] = data.get("tools", []) or []
+        self.composes: List[str] = data.get("composes", []) or []
+        self.entry: str = data.get("entry", "") or ""
         self.dir_path: Path = dir_path
         self.manifest_path: Path = dir_path / "manifest.json"
         self.skill_md_path: Path = dir_path / "SKILL.md"
@@ -62,6 +69,10 @@ class SkillManifest:
         if not requirement:
             return False
         return bool(self.get_trigger_re().search(requirement))
+
+    def is_workflow(self) -> bool:
+        """是否为可被 Agent 规划/调用/组合的工作流技能"""
+        return self.type == "workflow"
 
     def load_body(self) -> str:
         """加载 SKILL.md 正文（惰性缓存）"""
@@ -196,6 +207,15 @@ class SkillLoader:
 
         return matched
 
+    def match_workflow_skills(self, requirement: str) -> List[SkillManifest]:
+        """仅匹配可被 Agent 调用的工作流技能（按 priority 降序）"""
+        return [m for m in self.match_skills(requirement) if m.is_workflow()]
+
+    def get_workflow_skills(self) -> List[SkillManifest]:
+        """列出所有工作流技能"""
+        self._ensure_loaded()
+        return [m for m in self._manifests if m.is_workflow()]
+
     def load_for_task(self, requirement: str) -> str:
         """根据任务需求加载匹配的 Skill 正文
 
@@ -266,3 +286,73 @@ def load_for_task(requirement: str) -> str:
 def match_skills(requirement: str) -> List[SkillManifest]:
     """便捷函数：匹配适用的 Skill"""
     return get_skill_loader().match_skills(requirement)
+
+
+def build_skill_dispatch(skill_name: str, args: Optional[dict] = None) -> str:
+    """Skill Dispatcher：把一个工作流技能编排为 Coder 可直接执行的上下文。
+
+    返回结构化文本（执行步骤 + 输入/输出契约 + 工具白名单 + 组合子技能），
+    供 `run_skill` 工具喂给 Coder，使其能规划、调用并按 `composes` 组合子技能。
+
+    Args:
+        skill_name: 技能名（对应 manifest 的 name）
+        args: 调用方已收集的参数（可选，仅做回显提示）
+
+    Returns:
+        可注入 Coder 上下文的技能执行说明；技能不存在/非工作流时返回提示信息。
+    """
+    loader = get_skill_loader()
+    m = loader.get_skill(skill_name)
+    if not m:
+        return f"[run_skill] 未找到技能: {skill_name}"
+    if not m.is_workflow():
+        return (
+            f"[run_skill] 技能 {skill_name} 不是可调用的工作流技能"
+            f"（type={m.type}），它仅作为知识注入到编码 Prompt。"
+        )
+
+    parts: List[str] = []
+    parts.append(f"# 技能执行：{m.name}")
+    if m.description:
+        parts.append(m.description)
+
+    if args:
+        parts.append("## 已提供的参数")
+        parts.append(json.dumps(args, ensure_ascii=False, indent=2))
+
+    if m.input_schema:
+        parts.append("## 输入契约 (input_schema)")
+        parts.append(json.dumps(m.input_schema, ensure_ascii=False, indent=2))
+
+    body = m.load_body()
+    if body:
+        parts.append("## 执行步骤 (SKILL.md)")
+        parts.append(body)
+
+    if m.tools:
+        parts.append("## 允许使用的工具 (tools 白名单)")
+        parts.append("、".join(m.tools))
+
+    # 组合子技能：递归展开 composes 中声明的子技能说明
+    for child in (m.composes or []):
+        child_m = loader.get_skill(child)
+        if not child_m:
+            continue
+        parts.append(f"\n---\n## 组合子技能：{child}")
+        cbody = child_m.load_body()
+        if cbody:
+            parts.append(cbody)
+        if child_m.input_schema:
+            parts.append(
+                "输入契约: " + json.dumps(child_m.input_schema, ensure_ascii=False)
+            )
+
+    if m.output_schema:
+        parts.append("## 输出契约 (output_schema)")
+        parts.append(json.dumps(m.output_schema, ensure_ascii=False, indent=2))
+
+    parts.append(
+        "\n> 请严格按上述步骤执行，仅使用白名单内的工具，"
+        "并最终产出符合 output_schema 的结果。"
+    )
+    return "\n\n".join(parts)

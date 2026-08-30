@@ -234,11 +234,13 @@ def create_tool_registry() -> ToolRegistry:
     from harness.tools.web_tools import register_web_tools
     from harness.tools.preview_tools import register_preview_tools
     from harness.tools.edit_tools import register_edit_tools
+    from harness.tools.skill_tools import register_skill_tools
 
     register_file_tools(registry)
     register_code_tools(registry)
     register_web_tools(registry)
     register_preview_tools(registry)
     register_edit_tools(registry)
+    register_skill_tools(registry)
 
     return registry

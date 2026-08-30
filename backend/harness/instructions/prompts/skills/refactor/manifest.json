@@ -1,0 +1,39 @@
+{
+  "name": "refactor",
+  "description": "前端代码重构：把生成/迭代后的代码重构成项目规范结构（IIFE 包裹、模块拆分、命名统一、去重、常量提取、storage 封装），功能保持不变，并接 lint 验证。",
+  "trigger": "重构|refactor|整理代码|规范代码|调整结构|拆分文件|模块化|代码太乱|优化结构|理顺",
+  "type": "workflow",
+  "priority": 10,
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "target": {
+        "type": "string",
+        "description": "待重构的文件或目录"
+      },
+      "goals": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "重构目标，可选：iife / module_split / naming / dedupe / const_extract / storage_encap"
+      }
+    },
+    "required": ["target"]
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "changed_files": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "改动的文件清单"
+      },
+      "summary": {
+        "type": "string",
+        "description": "改动摘要与验证结果"
+      }
+    }
+  },
+  "tools": ["read_file", "write_file", "edit_file", "list_files", "lint_js", "lint_css", "validate_html"],
+  "composes": [],
+  "entry": "run_skill"
+}
