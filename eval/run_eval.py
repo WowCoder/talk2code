@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import shutil
 import sys
 import time
@@ -80,6 +82,30 @@ class AssertionChecker:
         except Exception:
             return None
 
+    def _resolve_content(self, filename: str):
+        """返回用于内容检查的文件内容，兼容脚手架把资源放在子目录的约定。
+
+        - 精确文件存在 → 返回其内容（exact=True）
+        - 否则回退到工作区内所有「同扩展名」文件拼接内容（exact=False）：
+          ``style.css`` → 所有 ``*.css``，``script.js`` → 所有 ``*.js``。
+          这样断言「样式表含 gradient / JS 含 localStorage」不再因路径
+          （``css/style.css``、``js/main.js``）或文件名差异而假阴性。
+        """
+        if self.ws.exists(filename):
+            try:
+                return self.ws.read(filename), True
+            except Exception:
+                pass
+        ext = os.path.splitext(filename)[1].lower()
+        parts = []
+        for f in self.ws.list():
+            if ext and f.lower().endswith(ext):
+                try:
+                    parts.append(self.ws.read(f))
+                except Exception:
+                    continue
+        return "\n".join(parts), False
+
     def check(self, assertion: dict) -> AssertionResult:
         t = assertion["type"]
         try:
@@ -95,23 +121,29 @@ class AssertionChecker:
                                "" if ok else f"{a['filename']} 不存在")
 
     def _check_content_contains(self, a) -> AssertionResult:
-        content = self._read(a["filename"])
-        if content is None:
+        content, exact = self._resolve_content(a["filename"])
+        if not content:
             return AssertionResult("content_contains", False,
-                                   f"{a['filename']} 不存在")
+                                   f"{a['filename']} 不存在（含同扩展名回退）")
         ok = a["text"] in content
+        where = "" if exact else "（回退匹配同扩展名文件）"
         return AssertionResult("content_contains", ok,
-                               "" if ok else f"未找到: {a['text']!r}")
+                               "" if ok else f"未找到: {a['text']!r}{where}")
 
     def _check_content_not_contains(self, a) -> AssertionResult:
-        content = self._read(a["filename"]) or ""
-        ok = a["text"] not in content
+        content, exact = self._resolve_content(a["filename"])
+        if not content:
+            return AssertionResult("content_not_contains", True,
+                                   f"{a['filename']} 不存在，视为不包含")
+        # 词边界匹配，避免把 reveal / medieval 等误判为含 eval
+        ok = not re.search(r"(?:\b|(?<![\w.]))" + re.escape(a["text"]) + r"(?:\b|(?![\w.]))", content)
+        where = "" if exact else "（同扩展名回退）"
         return AssertionResult("content_not_contains", ok,
-                               "" if ok else f"发现禁用内容: {a['text']!r}")
+                               "" if ok else f"发现禁用内容: {a['text']!r}{where}")
 
     def _check_file_min_lines(self, a) -> AssertionResult:
-        content = self._read(a["filename"])
-        if content is None:
+        content, exact = self._resolve_content(a["filename"])
+        if not content:
             return AssertionResult("file_min_lines", False,
                                    f"{a['filename']} 不存在")
         lines = content.count("\n") + 1

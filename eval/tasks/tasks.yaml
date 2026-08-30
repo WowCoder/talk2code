@@ -196,3 +196,20 @@ tasks:
       - {type: file_exists, filename: index.html}
       - {type: content_contains, filename: script.js, text: "localStorage"}
       - {type: preview_no_error}
+
+  # ===== 回归专项：需求 #110-116 七连败失败模式固化 =====
+  # 同一需求连续 7 次 finished_with_issues（2026-08-18），失败模式：
+  # ES module CORS 全灭 / CDN 依赖 / ERR_FILE_NOT_FOUND / 遮罩层 hidden /
+  # 点击即死。本组断言在写入时刻即可判定，防止同类缺陷再次漏网。
+  - id: t21
+    name: 贪吃蛇七连败回归
+    level: 3
+    requirement: "创建一个 贪吃蛇 小游戏，要求有排行榜功能，可以分享，画风要Q一点"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: html_has_element, selector: "canvas"}
+      # ENV-3：file:// 下 ES Module 被 CORS 拦截（#115 直接死因）
+      - {type: content_not_contains, filename: index.html, text: "type=\"module\""}
+      # ENV-2：无网络沙箱，CDN 必挂（#110-116 多次踩坑）
+      - {type: content_not_contains, filename: index.html, text: "cdn.tailwindcss.com"}
+      - {type: preview_no_error}
