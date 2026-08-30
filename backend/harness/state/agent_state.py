@@ -121,8 +121,15 @@ class AgentState(TypedDict, total=False):
     verify_passed: Optional[bool]
 
     # 通用冒烟测试发现的确定性缺陷（浏览器实测复现，非 LLM 判断）
-    # 由 verify_node 设置，route_after_verify 据此路由到 defect_repair 节点
+    # 由 verify_node 设置，route_after_verify 据此路由到 defect_repair 节点。
+    # 只含局部类缺陷（storage_crash 等小上下文可修的）；
+    # 架构类经 architectural_defects 路由回 coder 重构
     smoke_defects: Optional[List[dict]]
+
+    # 架构类确定性缺陷（ES module CORS / CDN 依赖 / 文件缺失 / 入口断裂）
+    # 由 verify_node 分类产出，携带根因卡片回 coder 做跨文件重构——
+    # defect_repair 被禁止新建/重构文件，结构上修不了架构问题
+    architectural_defects: Optional[List[dict]]
 
     # 修复轮次计数
     repair_count: Optional[int]

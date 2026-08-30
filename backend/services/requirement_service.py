@@ -145,6 +145,13 @@ class RequirementService:
                         return self._handle_search_answer(db, requirement, requirement_id, intent_result)
                     elif intent_result.intent == IntentType.AMBIGUOUS:
                         return self._handle_ambiguous_direct(db, requirement, requirement_id)
+                    elif intent_result.intent == IntentType.SKILL:
+                        # SKILL 进入完整工作流：SkillLoader 会将该技能的 SKILL.md
+                        # 注入编码 Prompt，Coder 可经 run_skill 工具编排/组合子技能。
+                        logger.info(
+                            f"需求 {requirement_id} 命中工作流技能: "
+                            f"{intent_result.skill_name}，进入完整工作流"
+                        )
     
                 # 初始化 harness 各层
                 workspace = WorkspaceFS(requirement.user_id, requirement_id)
@@ -708,14 +715,16 @@ class RequirementService:
                 for file_data in code_files:
                     self._send_code(requirement_id, file_data['filename'], file_data['content'])
 
-            # 检查 verify_passed：如果 Evaluator 明确返回 NEEDS_WORK，标记为 finished_with_issues
-            # （区别于 failed：代码已生成但质量未达标，用户可自行判断是否可用）
+            # 检查 verify_passed：如果 Evaluator 明确返回 NEEDS_WORK，
+            # 按交付门禁（审查报告 Phase 3.3）决定最终状态：
+            # - critical 缺陷未清零且门禁开启 → needs_user_input + 差异报告
+            #   （不再自动放行为 finished_with_issues——假完成是对用户信任的最大消耗）
+            # - 仅剩 major/minor → finished_with_issues（用户可自行判断可用性）
             verify_passed = final_state.get("verify_passed")
             if verify_passed is False:
-                eval_error = "代码评估未通过"
                 repair_count = final_state.get("metadata", {}).get("repair_count", 0)
-                eval_error += f"（经 {repair_count} 轮修复后仍未达标）"
-                # 尝试从 Evaluator 结果中提取具体失败原因
+                eval_error = f"代码评估未通过（经 {repair_count} 轮修复后仍未达标）"
+                # 从 Evaluator 结果中提取具体失败原因
                 role_outputs = final_state.get("role_outputs", {}) or {}
                 evaluator_data_for_failure = {}
                 if "Evaluator" in role_outputs:
@@ -723,22 +732,76 @@ class RequirementService:
                         import json as _json
                         evaluator_raw = role_outputs["Evaluator"]
                         evaluator_data_for_failure = _json.loads(evaluator_raw) if isinstance(evaluator_raw, str) else evaluator_raw
-                        findings = evaluator_data_for_failure.get("findings", [])
-                        if findings:
-                            critical_findings = [f for f in findings if f.get("severity") == "critical"]
-                            if critical_findings:
-                                eval_error += "。关键问题: " + "; ".join(
-                                    f['description'][:100] for f in critical_findings[:3]
-                                )
                     except Exception:
-                        pass
+                        evaluator_data_for_failure = {}
+
+                findings_for_failure = evaluator_data_for_failure.get("findings", [])
+                critical_findings = [f for f in findings_for_failure if f.get("severity") == "critical"]
+                unmet_acs = [
+                    r for r in (evaluator_data_for_failure.get("ac_results") or [])
+                    if not r.get("passed")
+                ]
+                if critical_findings:
+                    eval_error += "。关键问题: " + "; ".join(
+                        f['description'][:100] for f in critical_findings[:3]
+                    )
+
+                # ---- 交付门禁：critical 未清零不自动放行 ----
+                from config import settings as _settings
+                gate_blocks = bool(critical_findings) and _settings.DELIVERY_GATE_STRICT
+
+                # 构建用户可读的差异报告（未达成的 AC + 关键缺陷清单）
+                diff_report_lines = []
+                if unmet_acs:
+                    diff_report_lines.append("**未达成的验收条件**:")
+                    diff_report_lines += [
+                        f"- ❌ [{r.get('ac_id', '?')}] {r.get('label', '')}"
+                        + (f" — {'; '.join(r.get('failures', []))}" if r.get("failures") else "")
+                        for r in unmet_acs
+                    ]
+                if critical_findings:
+                    diff_report_lines.append("**关键缺陷**:")
+                    diff_report_lines += [
+                        f"- 🔴 {f.get('description', '')[:120]}"
+                        for f in critical_findings[:5]
+                    ]
+                diff_report = "\n".join(diff_report_lines) if diff_report_lines else "（无明细）"
 
                 logger.warning(
-                    f"需求 {requirement_id} verify_passed=False（Evaluator 判定 NEEDS_WORK），"
-                    f"标记为 finished_with_issues"
+                    f"需求 {requirement_id} verify_passed=False "
+                    f"(critical={len(critical_findings)}, 未达成AC={len(unmet_acs)}, "
+                    f"交付门禁={'拦截' if gate_blocks else '放行'})"
                 )
-                requirement.status = 'finished_with_issues'
                 requirement.error_message = eval_error
+                if gate_blocks:
+                    requirement.status = 'needs_user_input'
+                    # 差异报告写入对话历史，前端可见"哪些没做完"
+                    dialogue_history = final_state.get('dialogue_history') or \
+                        list(requirement.dialogue_history or [])
+                    dialogue_history.append({
+                        'role': 'agent',
+                        'name': 'QA',
+                        'content': (
+                            "## ⚠️ 交付拦截：存在未解决的关键缺陷\n\n"
+                            f"经 {repair_count} 轮修复仍未清零 critical 缺陷，"
+                            "系统不会将此结果标记为已完成。\n\n"
+                            f"{diff_report}\n\n"
+                            "**你可以选择**: 在对话中描述调整方向继续修复，"
+                            "或自行修改代码后使用。"
+                        ),
+                        'status': 'completed',
+                        'delivery_gate': {
+                            'blocked': True,
+                            'critical_count': len(critical_findings),
+                            'unmet_acs': len(unmet_acs),
+                        },
+                    })
+                    requirement.dialogue_history = dialogue_history
+                    from sqlalchemy.orm.attributes import flag_modified
+                    flag_modified(requirement, 'dialogue_history')
+                else:
+                    requirement.status = 'finished_with_issues'
+
                 # 仍然保存代码产物（用户可以使用部分成果）
                 code_files = workspace.snapshot()
                 if code_files:
@@ -762,7 +825,7 @@ class RequirementService:
                         pass
                 self._send_complete(requirement_id)
 
-                # 经验学习（即使未达标，也记录以供后续改进）
+                # 经验学习（负样本同样入库——七连败必须沉淀为教训）
                 try:
                     complexity = final_state.get("metadata", {}).get("complexity", "S")
                     _mgr = _get_memory_manager()

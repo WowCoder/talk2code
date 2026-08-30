@@ -141,11 +141,13 @@ class TestProjectImportsClean:
         from harness.instructions.prompts import load_prompt, load_prompt_template
         assert load_prompt
         assert load_prompt_template
-        # 验证加载实际 Prompt (coding/tl_analysis.md)
-        s = load_prompt("coding/tl_analysis.md")
+        # 验证加载实际 Prompt (verify/evaluator.md，纯文本不做 format)
+        s = load_prompt("verify/evaluator.md")
         assert len(s) > 0
-        # 验证模板加载
-        result = load_prompt_template("coding/coder_xs.md",
-            requirement="test", plan_section="", existing_text="",
-            craft_rules="", skill_instructions="")
+        # 验证模板加载（coder_base.md 统一模板）
+        result = load_prompt_template("coding/coder_base.md",
+            requirement="test", plan_section="", api_contracts="",
+            file_hint="", batch_hint="",
+            existing_text="", craft_rules="", environment_contract="",
+            mode_section="", max_repair_rounds=2)
         assert "test" in result

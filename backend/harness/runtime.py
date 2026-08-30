@@ -54,6 +54,7 @@ class ToolCallLoop:
 
         # LLM 最大生成 token 数：从配置读取，支持 reasoning 模型的额外思考开销
         from config import settings as _settings
+        self._settings = _settings
         self._max_tokens = _settings.LLM_MAX_TOKENS
 
     def run(self, state: AgentState) -> AgentState:
@@ -121,6 +122,12 @@ class ToolCallLoop:
                     messages=messages,
                     tools=self.tools.get_schemas() if self.tools else [],
                     max_tokens=self._max_tokens,
+                    # 显式开启思考模式：deepseek-v4 系列不传该参数时会以服务端默认
+                    # 强度自动思考（实测单轮 6.7 万字符、把全部代码在思考链里写一遍），
+                    # 触发多次 token 耗尽扩容重试，单轮编码耗时 5-10 分钟。
+                    # 显式 enabled + 配置的 reasoning_effort(low) 后思考长度可控，
+                    # 与 TL/记忆节点的既有调用行为对齐。
+                    thinking='enabled',
                 )
             except Exception as e:
                 # 熔断器打开或其他 LLM 不可用异常 → 立即终止
@@ -198,10 +205,15 @@ class ToolCallLoop:
                 # 此前该 Hook 只挂在 _execute_tool 内部，真实完成路径完全绕过它。
                 if self.hooks:
                     from harness.constraints.hooks import HookContext, HookPoint
+                    # 注入 _workspace / file_list：完成时刻的契约校验
+                    # （引用闭合 ENV-6、AC 预检）需要读取工作区真实状态
+                    completion_ctx_state = dict(state)
+                    completion_ctx_state["_workspace"] = self.workspace
+                    completion_ctx_state["file_list"] = self.workspace.list()
                     ctx = HookContext(
                         requirement_id=state["requirement_id"],
                         tool_name=None,
-                        state=state,
+                        state=completion_ctx_state,
                     )
                     contract_failures = self.hooks.trigger(HookPoint.PRE_TOOL_USE, ctx)
                     if contract_failures:
@@ -789,16 +801,22 @@ class ToolCallLoop:
         compactor = ContextCompactor(budget=24000)
         messages = compactor.maybe_compact(messages)
 
+        # ---- 冷启动兜底：保证至少一个 user 角色消息 ----
+        # agnes 等 OpenAI 兼容端点要求 messages 中必须含 user 角色内容，
+        # 否则返回 400 "No user query found in messages"。对话历史为空时
+        # （eval 冷启动、首轮无用户消息），需求虽已嵌进 system prompt 但仍缺
+        # user turn，这里兜底补一条。生产环境对话历史恒含 user 消息，本分支为 no-op。
+        if not any(m.get("role") == "user" for m in messages):
+            req = state.get("requirement_content", "") or "请根据以上系统提示开始任务。"
+            messages.append({"role": "user", "content": req})
+
         return messages
 
-    def _get_craft_context(self, requirement: str = '') -> tuple:
+    def _get_craft_context(self, requirement: str = '') -> str:
         """渐进式加载 Skills，注入到编码 Prompt 中。
 
         使用 SkillLoader（基于 manifest.json）替代旧的 LLM 选择机制。
         同一任务只做一次匹配，后续轮次复用缓存。
-
-        Returns:
-            (rules_text: str, _unused: str)
         """
         try:
             if not hasattr(self, '_skill_cache'):
@@ -807,9 +825,9 @@ class ToolCallLoop:
             if cache_key not in self._skill_cache:
                 from harness.instructions.skill_loader import load_for_task
                 self._skill_cache[cache_key] = load_for_task(requirement) if requirement else ''
-            return self._skill_cache[cache_key], ''
+            return self._skill_cache[cache_key]
         except Exception:
-            return '', ''
+            return ''
 
     def _build_system_prompt(self, state: AgentState) -> str:
         """构建 Coder 系统提示词（含文件内容概要，避免 Agent 重复 read_file）
@@ -844,7 +862,12 @@ class ToolCallLoop:
         if complexity == "simple":
             return self._build_simple_prompt(requirement, plan_section, existing_text, existing_files)
         else:
-            return self._build_standard_prompt(requirement, plan_section, existing_text, existing_files, batch_hint)
+            # 跨文件 API 契约：从 plan.tasks[].exports 渲染，每轮都注入
+            # （体积小且是硬约束，不参与第 2 轮起的 plan 摘要压缩）
+            from harness.constraints.plan_validator import build_api_contracts_section
+            api_contracts = build_api_contracts_section(plan if isinstance(plan, dict) else None)
+            return self._build_standard_prompt(requirement, plan_section, existing_text, existing_files, batch_hint,
+                                               api_contracts=api_contracts)
 
     def _compact_plan_text(self, plan: dict) -> str:
         """紧凑版计划：仅保留文件清单与任务要点，用于第 2 轮起的上下文瘦身"""
@@ -1003,21 +1026,28 @@ class ToolCallLoop:
     def _build_simple_prompt(self, requirement: str, plan_section: str,
                               existing_text: str, existing_files: list) -> str:
         """simple 复杂度：自由文件结构，极简流程，5 轮快速通道"""
-        from harness.instructions.prompts import load_prompt_template
-        craft_rules, skill_instructions = self._get_craft_context(requirement)
-        return load_prompt_template("coding/coder_xs.md",
+        from harness.instructions.prompts import load_prompt, load_prompt_template
+        from harness.constraints.environment_contract import render_environment_contract
+        craft_rules = self._get_craft_context(requirement)
+        return load_prompt_template("coding/coder_base.md",
             requirement=requirement,
             plan_section=plan_section,
+            api_contracts="",
+            file_hint="",
+            batch_hint="",
             existing_text=existing_text,
             craft_rules=craft_rules,
-            skill_instructions=skill_instructions,
+            environment_contract=render_environment_contract(),
+            mode_section=load_prompt("coding/coder_mode_simple.md"),
+            max_repair_rounds=self._settings.CODER_MAX_REPAIR_ROUNDS,
         )
 
     def _build_standard_prompt(self, requirement: str, plan_section: str,
                                 existing_text: str, existing_files: list,
-                                batch_hint: str = "") -> str:
+                                batch_hint: str = "", api_contracts: str = "") -> str:
         """standard 复杂度：架构先导 + 批量创建 + 完整的浏览器验证"""
-        from harness.instructions.prompts import load_prompt_template
+        from harness.instructions.prompts import load_prompt, load_prompt_template
+        from harness.constraints.environment_contract import render_environment_contract
         # 从 plan 中提取推荐的文件结构。
         # 注意：第 2 轮起 plan_section 为紧凑摘要（非 JSON），json.loads 会失败，
         # 此时 file_hint 留空即可（摘要已包含"目标文件"清单）。
@@ -1030,17 +1060,18 @@ class ToolCallLoop:
             file_structure = plan_obj.get("file_structure", [])
             if file_structure:
                 file_hint = "## 推荐文件结构\n" + "\n".join(f"- {f}" for f in file_structure)
-        craft_rules, skill_instructions = self._get_craft_context(requirement)
-        return load_prompt_template("coding/coder_ml.md",
+        craft_rules = self._get_craft_context(requirement)
+        return load_prompt_template("coding/coder_base.md",
             requirement=requirement,
             plan_section=plan_section,
+            api_contracts=api_contracts,
             file_hint=file_hint,
             batch_hint=batch_hint,
             existing_text=existing_text,
-            max_repair_rounds=1,
-            complexity="standard",
             craft_rules=craft_rules,
-            skill_instructions=skill_instructions,
+            environment_contract=render_environment_contract(),
+            mode_section=load_prompt("coding/coder_mode_standard.md"),
+            max_repair_rounds=self._settings.CODER_MAX_REPAIR_ROUNDS,
         )
 
     def _build_file_summaries(self, existing_files: list) -> str:
@@ -1231,11 +1262,11 @@ class ToolCallLoop:
             else:
                 return  # 不支持的文件类型，跳过
 
-            if not lint_result.success:
-                return  # lint 工具本身失败，静默跳过
-
-            # 从 lint 结果中提取错误信息
-            lint_content = lint_result.content or ""
+            # 提取检查结论：语法错误/契约违规以 error 结果返回（success=False），
+            # 属于要注入的发现而非工具故障；真正无法执行时 content 与 error 均为空
+            lint_content = lint_result.error or lint_result.content or ""
+            if not lint_content:
+                return  # 工具未产出任何结论（如 Node 未安装），跳过
             if "通过" in lint_content or "pass" in lint_content.lower():
                 return  # 无错误，跳过
 

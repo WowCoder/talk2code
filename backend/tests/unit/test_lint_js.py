@@ -38,11 +38,11 @@ class TestLintJsESModule:
         })
         result = handler.lint_js("js/app.js")
 
-        assert result.success
-        # 验证传入了 --input-type=module
+        # 环境契约 ENV-3：ES Module 是确定性违规，与语法错误同级
+        assert not result.success
         called_args = mock_run.call_args[0][0]
         assert "--input-type=module" in called_args
-        assert "ES Module" in result.content
+        assert "ENV-3" in result.error and "ES Module" in result.error
 
     @patch('subprocess.run')
     def test_commonjs_file_uses_default_mode(self, mock_run):
@@ -107,7 +107,8 @@ class TestLintJsESModule:
         })
         result = handler.lint_js("js/game.js")
 
-        assert result.success
+        assert not result.success
+        assert "ENV-3" in result.error
         called_args = mock_run.call_args[0][0]
         assert "--input-type=module" in called_args
 
@@ -124,7 +125,8 @@ class TestLintJsESModule:
         })
         result = handler.lint_js("js/types.js")
 
-        assert result.success
+        assert not result.success
+        assert "ENV-3" in result.error
         called_args = mock_run.call_args[0][0]
         assert "--input-type=module" in called_args
 
@@ -150,8 +152,8 @@ class TestLintJsESModule:
         assert "超时" in result.error
 
     @patch('subprocess.run')
-    def test_es_module_syntax_correct_passes(self, mock_run):
-        """ES Module 语法正确时通过检查"""
+    def test_es_module_syntax_correct_still_violates_contract(self, mock_run):
+        """ES Module 语法正确也违反环境契约 ENV-3（file:// 下 CORS 全灭）"""
         mock_result = Mock()
         mock_result.returncode = 0
         mock_result.stderr = ""
@@ -171,5 +173,5 @@ class TestLintJsESModule:
         })
         result = handler.lint_js("js/storage.js")
 
-        assert result.success
-        assert "ES Module" in result.content
+        assert not result.success
+        assert "ENV-3" in result.error and "IIFE" in result.error

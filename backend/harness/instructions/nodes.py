@@ -15,7 +15,7 @@ from harness.state.agent_state import AgentState
 from harness.agent_names import TL_NAME, DEV_NAME, QA_NAME
 from llm.client import get_client
 from llm.client import _try_fix_json as try_fix_json
-from harness.instructions.prompts import load_prompt
+from harness.instructions.prompts import load_prompt, load_prompt_template
 from harness.observability.logger import get_logger
 from harness.harness_context import get_tool_loop, get_workspace
 
@@ -211,6 +211,8 @@ def _generate_clarify_questions(client, requirement: str) -> list:
     如果需求已经很详细，只问 1-2 个最关键的问题（如视觉风格偏好）；
     如果需求模糊，问 2-3 个问题帮助明确方向。
     """
+    from harness.instructions.prompts import load_prompt_template
+
     is_detailed = not _is_vague_requirement(requirement)
     detail_hint = (
         "用户的需求已经很详细了，只需要确认 1-2 个最关键的选择（如视觉风格偏好）。"
@@ -218,28 +220,11 @@ def _generate_clarify_questions(client, requirement: str) -> list:
         "用户的需求比较模糊，请分析缺少哪些关键信息，生成 2-3 个澄清问题帮助明确方向。"
     )
 
-    prompt = f"""用户提出需求："{requirement}"
-
-{detail_hint}
-
-注意：
-- 用户已经明确说过的信息不要再问（比如用户说了"做一个待办清单"，就不要再问"你想做什么类型的应用"）
-- 如果需求涉及 UI/页面/界面，必须询问视觉风格偏好
-- 只问真正能影响实现方案的关键问题
-
-视觉风格问题的选项固定为（如果需要问的话）：
-{{"id": "visual_style", "type": "radio",
-  "label": "你偏好哪种视觉风格？",
-  "options": [
-    "极简白 -- 白色背景，灰黑文字，大量留白，功能优先",
-    "暖柔风格 -- 暖色调、圆角卡片、柔和阴影 (默认)",
-    "暗黑科技 -- 深色背景、霓虹强调色、终端风格",
-    "活泼多彩 -- 明亮渐变、大色块、趣味性设计",
-    "无偏好，自动选择"
-  ]
-}}
-
-只返回 JSON 数组，不要其他文字。"""
+    prompt = load_prompt_template(
+        "intent/clarify_generate.md",
+        requirement=requirement,
+        detail_hint=detail_hint,
+    )
 
     response = client.chat(
         prompt=prompt,
@@ -372,16 +357,22 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
 
     try:
         client = get_client()
-        system_prompt = load_prompt("coding/tl_analysis.md")
+        from harness.constraints.environment_contract import render_environment_contract
+        from harness.constraints.plan_validator import validate_plan, build_plan_retry_feedback
+        system_prompt = load_prompt_template(
+            "coding/tl_analysis.md",
+            environment_contract=render_environment_contract(),
+        )
         user_prompt = f"请分析以下需求并生成开发计划：\n\n{requirement}"
 
         # L0: 前置检测 + 分层容错
-        # 策略：检测截断 → 重试(最多2次) → 降级修复 → 完整性校验
+        # 策略：检测截断 → 重试(最多2次) → 降级修复 → 完整性校验 → DoD 程序化校验
 
-        def _fetch_and_extract(max_tokens: int) -> tuple[dict | None, bool, object]:
+        def _fetch_and_extract(max_tokens: int, prompt_override: str = None) -> tuple[dict | None, bool, object]:
             """获取响应并提取 JSON，返回 (plan, is_truncated, resp)"""
             resp = client.chat(
-                prompt=user_prompt, system_prompt=system_prompt,
+                prompt=prompt_override or user_prompt,
+                system_prompt=system_prompt,
                 use_memory=False, max_tokens=max_tokens, timeout=60,
                 thinking='enabled',  # 结构化 plan JSON 需要思考模式保证格式正确
             )
@@ -443,6 +434,31 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
                 f"响应总长度: {len(response.content) if response else 0} 字符"
             )
 
+        # L4: DoD 程序化校验（机器可校验的完成定义）。
+        # 不合格打回 TL 重出最多 1 次；仍不合格则带病放行但记录问题——
+        # 让下游知道哪些 AC 是弱 AC，避免静默放水。
+        plan_ok, plan_issues = validate_plan(plan)
+        if not plan_ok:
+            logger.warning(
+                f"[TeamLeader] plan 未通过 DoD 校验 ({len(plan_issues)} 个问题)，打回重出 1 次: "
+                f"{plan_issues[:3]}"
+            )
+            retry_prompt = (
+                user_prompt
+                + "\n\n---\n\n"
+                + build_plan_retry_feedback(plan_issues)
+            )
+            retry_plan, _, retry_resp = _fetch_and_extract(8000, prompt_override=retry_prompt)
+            if retry_plan is not None:
+                ok2, issues2 = validate_plan(retry_plan)
+                if ok2 or len(issues2) < len(plan_issues):
+                    plan = retry_plan
+                    plan_ok, plan_issues = ok2, issues2
+        if not plan_ok:
+            logger.warning(
+                f"[TeamLeader] plan 带病放行（DoD 校验仍失败）: {plan_issues}"
+            )
+
         visual_style = state.get('visual_style', '') or \
             state.get('metadata', {}).get('visual_style', '')
 
@@ -489,6 +505,8 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
                 'team_leader_success': True,
                 'visual_style': visual_style,
                 'complexity': complexity,
+                # DoD 校验结果：带病放行时记录弱 AC 清单，供 verify/交付门禁参考
+                'plan_dod_issues': plan_issues if not plan_ok else [],
             },
             'tasks': tasks,
             'interfaces': interfaces,
@@ -691,11 +709,13 @@ def coder_node(state: AgentState) -> Dict[str, Any]:
             workspace = get_workspace(state)
             if not workspace:
                 workspace = tool_loop.workspace
+            plan = state.get("plan") or {}
+            acs = plan.get("acceptance_criteria") or [] if isinstance(plan, dict) else []
             contract = CompletionContract(workspace)
             if contract.exists():
-                contract.initialize_incremental(impl_order)
+                contract.initialize_incremental(impl_order, acceptance_criteria=acs)
             else:
-                contract.initialize(impl_order)
+                contract.initialize(impl_order, acceptance_criteria=acs)
             state["_completion_contract"] = contract
             state.setdefault("metadata", {})["_completion_contract"] = contract
 
@@ -821,48 +841,14 @@ def _translate_acs_to_scripts(acceptance_criteria: list, code_text: str, require
     for m in class_pattern.finditer(code_text):
         for cls in m.group(1).split():
             selectors_hint.append(f".{cls}")
+
+    from harness.instructions.prompts import load_prompt_template
     selector_text = ", ".join(list(set(selectors_hint))[:40]) if selectors_hint else "(从代码中提取)"
-
-    prompt = f"""将以下验收条件翻译为 Playwright DOM 操作序列。
-
-## 可用 CSS 选择器（从实际代码中提取）
-{selector_text}
-
-## 验收条件
-{ac_text}
-
-## 翻译规则
-- 每个步骤的 action 必须是: type | click | select | press | wait | assert_exists | assert_visible | assert_text | assert_count | assert_value | assert_canvas_change
-- selector 必须从"可用 CSS 选择器"中选择，或从 AC 描述中合理推断
-- type 需要 value 字段；只用于 input/textarea，禁止对 canvas/普通元素使用
-- press 需要 key 字段（如 ArrowUp/ArrowDown/Enter/Space）：键盘交互（游戏方向键、快捷键）必须用 press，禁止用 type 模拟
-- wait 需要 ms 字段（默认 500）
-- assert_text 需要 contains 字段
-- assert_count 需要 min_count 字段
-- assert_value 需要 value 字段
-- assert_canvas_change 需要 wait_ms 字段（默认 2000）：验证 canvas 画面随操作变化（游戏移动/动画）
-- 游戏类 AC 的标准模式：click 开始按钮 → wait 800ms → press 方向键 → wait 1500ms → assert_canvas_change(wait_ms=2000)
-- 【重要】游戏类 AC 严禁断言精确分数文本（如 contains="10"），因为蛇吃到食物需要时间和多次操作，分数值不确定。
-  验证"得分/吃食物"改为：assert_canvas_change 验证画面变化（蛇移动/变长），或 assert_exists 验证分数元素存在即可，不要断言具体数字。
-- 【重要】分享类 AC：游戏可能设计为"有成绩才能分享"（score=0 时提示"先玩一局"）。这是合理设计，不要断言 toast 必须包含"复制"等特定文本。
-  验证"分享"改为：assert_exists/assert_visible 验证分享按钮存在，点击后 assert_exists/assert_visible 验证有反馈提示（toast）出现即可，不断言具体文案。
-
-## 输出格式
-只返回 JSON 数组:
-```json
-[
-  {{
-    "ac_id": "AC-1",
-    "label": "...",
-    "steps": [
-      {{"action": "type", "selector": "#input", "value": "测试文字"}},
-      {{"action": "click", "selector": "#add-btn"}},
-      {{"action": "wait", "ms": 500}},
-      {{"action": "assert_exists", "selector": ".result-item", "label": "新项目出现在列表中"}}
-    ]
-  }}
-]
-```"""
+    prompt = load_prompt_template(
+        "verify/ac_translator.md",
+        selector_text=selector_text,
+        ac_text=ac_text,
+    )
 
     try:
         from llm.client import get_client
@@ -916,6 +902,69 @@ def _translate_acs_to_scripts(acceptance_criteria: list, code_text: str, require
 # ==================== Verify 节点（Fresh-Context Evaluator） ====================
 
 
+def _mark_acs_checked(state: AgentState, ac_ids: list) -> None:
+    """把 Playwright 实测通过的 AC 回写进两级契约（evidence_found=true）"""
+    if not ac_ids:
+        return
+    try:
+        contract = (state.get("metadata") or {}).get("_completion_contract") \
+            or state.get("_completion_contract")
+        if contract is not None and hasattr(contract, "mark_ac_checked"):
+            for ac_id in ac_ids:
+                contract.mark_ac_checked(ac_id)
+    except Exception as e:
+        logger.debug(f"[Verify] 回写 AC 证据失败（不阻断）: {e}")
+
+
+# ==================== 节点级 trace span（审查报告 Phase 4.3） ====================
+# 此前 trace 只覆盖编码阶段的迭代轮次，verify 评估 / defect_repair 修复
+# 完全没有 span——线上质量问题无法归因。用装饰器统一补齐，
+# 不侵入节点函数体。
+
+def _traced_node(name: str):
+    """给 LangGraph 节点函数包一层 trace span
+
+    成功静默（status=success），失败喧哗（status=error + error 信息）。
+    tracer/trace_id 缺失时静默降级为直通。
+    """
+    import functools
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(state: AgentState, *args, **kwargs):
+            span = None
+            tracer = None
+            try:
+                tl = get_tool_loop(state)
+                tracer = getattr(tl, "tracer", None) if tl else None
+                trace_id = (state.get("metadata") or {}).get("trace_id", "")
+                if tracer is not None and trace_id:
+                    span = tracer.start_span(
+                        trace_id, name,
+                        metadata={"complexity": (state.get("metadata") or {}).get("complexity", "")},
+                    )
+            except Exception as e:
+                logger.debug(f"[Trace] {name} span 创建失败（跳过）: {e}")
+
+            try:
+                result = fn(state, *args, **kwargs)
+                if span is not None and tracer is not None:
+                    error = result.get("error") if isinstance(result, dict) else None
+                    tracer.end_span(span, status="error" if error else "success",
+                                    error=str(error) if error else None)
+                return result
+            except Exception as e:
+                if span is not None and tracer is not None:
+                    try:
+                        tracer.end_span(span, status="error", error=str(e))
+                    except Exception:
+                        pass
+                raise
+        return wrapper
+    return decorator
+
+
+@_traced_node("verify")
 def verify_node(state: AgentState) -> Dict[str, Any]:
     """
     Fresh-Context Evaluator: 独立上下文评估代码质量
@@ -942,6 +991,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
         logger.error("[Verify] 无法获取 workspace")
         return {"verify_passed": False, "current_step": "verify_done",
                 "smoke_defects": [],
+                "architectural_defects": [],
                 "error": "无法获取 workspace，评估流程异常"}
 
     requirement = state.get("requirement_content", "")
@@ -1098,7 +1148,8 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
         meta["repair_count"] = meta.get("repair_count", 0) + 1
         state["metadata"] = meta  # 原地同步（兼容当前 langgraph 浅拷贝语义）
         return {"verify_passed": False, "current_step": "verify_done",
-                "smoke_defects": [], "metadata": meta}  # 显式返回：不依赖浅拷贝副作用
+                "smoke_defects": [], "architectural_defects": [],
+                "metadata": meta}  # 显式返回：不依赖浅拷贝副作用
 
     # 运行 run_preview 获取浏览器执行结果
     browser_result = {"available": False, "errors": [], "warnings": []}
@@ -1205,6 +1256,32 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             logger.warning(f"[Verify] 通用冒烟异常（跳过）: {e}")
     smoke_defects = smoke_result.get("defects", [])
 
+    # 跨文件 API 契约检查（确定性，零 LLM）：引用了未导出的方法/未定义的全局
+    # 属于架构类缺陷，经 classify_defects 路由回 coder 携带根因卡片重构
+    # （需求 124 事故：app.js 调用 utils.js 未实现的 toast/copyText）
+    contract_warnings = []
+    try:
+        js_css_files = {}
+        for f in code_files:
+            if f.endswith((".js", ".css", ".html")) and not f.startswith(".task"):
+                try:
+                    js_css_files[f] = workspace.read(f)
+                except Exception:
+                    pass
+        if js_css_files:
+            from harness.constraints.environment_contract import check_cross_file_contract
+            contract_defects, contract_warnings = check_cross_file_contract(js_css_files)
+            if contract_defects:
+                logger.warning(
+                    f"[Verify] 跨文件契约检查发现 {len(contract_defects)} 处断裂: "
+                    + "; ".join(f"{d['type']}:{d.get('evidence', '')}" for d in contract_defects[:6])
+                )
+            if contract_warnings:
+                logger.info(f"[Verify] 类名契约警告 {len(contract_warnings)} 条")
+            smoke_defects = smoke_defects + contract_defects
+    except Exception as e:
+        logger.debug(f"[Verify] 契约检查异常（跳过）: {e}")
+
     # 判断是否可以走快速通道
     preview_clean = len(browser_result.get("errors", [])) == 0
     ac_all_passed = (
@@ -1214,21 +1291,42 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
     fast_pass = preview_clean and ac_all_passed and not smoke_defects
 
     if fast_pass:
-        # 快速通道：preview 零错误 + 所有 AC 通过 → 跳过深度 LLM 评估
+        # 快速通道：preview 零错误 + 所有 AC 通过 → 跳过深度 LLM 评估。
+        # 评分诚实化（审查报告根因 5）：只给确定性证据覆盖到的维度打分，
+        # ui_quality / code_quality 置 null（此通道未评估），并截图留档供查看，
+        # 不再用硬编码 8/9.2 伪装"视觉质量已评"。
+        screenshot_path = None
+        try:
+            from harness.tools.preview_runner import capture_screenshot
+            screenshot_path = capture_screenshot(
+                workspace.path / "index.html",
+                workspace.path / ".task" / "evaluator" / "screenshot.png",
+                preview_url=preview_url,
+            )
+        except Exception as e:
+            logger.debug(f"[Verify] fast_pass 截图失败（跳过）: {e}")
+
+        measured = {"functionality": 10, "runtime": 10, "acceptance": 10}
         logger.info(f"[Verify] 快速通道: preview 零错误 + {len(ac_check_results)} 条 AC 全部通过 → PASS")
         evaluator_result = {
             "verdict": "PASS",
-            "summary": f"浏览器验证无错误，{len(ac_check_results)} 条验收条件全部通过",
-            "score": {"functionality": 10, "runtime": 10, "ui_quality": 8, "acceptance": 10, "code_quality": 8},
-            "overall_score": 9.2,
+            "summary": (
+                f"浏览器验证无错误，{len(ac_check_results)} 条验收条件全部通过"
+                f"（确定性证据判定；UI/代码质量未做深度评估）"
+            ),
+            "score": {"functionality": 10, "runtime": 10, "ui_quality": None, "acceptance": 10, "code_quality": None},
+            "overall_score": round(sum(measured.values()) / len(measured), 1),
             "findings": [],
             "ac_results": ac_check_results,
             "browser_result": browser_result,
+            "screenshot": screenshot_path,
             "fast_pass": True,
             "timestamp": __import__('time').time(),
         }
         state["verify_passed"] = True
         state["current_step"] = "verify_done"
+        # AC 全过 → 契约中标记对应 AC 已有满足证据（两级契约第二级）
+        _mark_acs_checked(state, [r["ac_id"] for r in ac_check_results])
         # 持久化
         try:
             workspace.write(".task/evaluator/result.json", json.dumps(evaluator_result, ensure_ascii=False, indent=2))
@@ -1250,7 +1348,8 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             ),
             "status": "completed",
         })
-        return {"verify_passed": True, "current_step": "verify_done"}
+        return {"verify_passed": True, "current_step": "verify_done",
+                "smoke_defects": [], "architectural_defects": []}
 
     # 构建评估 prompt（含 AC 验收结果供 LLM 参考）
     ac_results_text = ""
@@ -1443,30 +1542,86 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             f"[Verify] 评估完成: verdict={verdict}, overall_score={overall_score}, findings={len(findings)}"
         )
 
-        # 层1 冒烟缺陷是确定性结论：直接并入 findings 并强制 NEEDS_WORK（进入修复循环）
-        if smoke_defects:
-            smoke_findings = [
-                {
-                    "severity": d.get("severity", "major"),
-                    "dimension": d.get("dimension", "runtime"),
-                    "description": f"[{d['type']}] {d['message']}",
-                    "evidence": d.get("evidence", ""),
-                    "suggestion": d.get("suggestion", ""),
-                }
-                for d in smoke_defects
+        # ---- 确定性证据下限（证据等级模型核心，审查报告 Phase 3.1） ----
+        # 冒烟缺陷 / 浏览器错误 / AC 实测失败是机器实测事实，LLM verdict 无权推翻：
+        # 任一存在而 LLM 判 PASS → 强制翻转为 NEEDS_WORK 并把证据并入 findings。
+        # AC 有 harness_errors（如沙箱 iframe 空白致全 selector timeout）时，其 failures
+        # 多为驱动失败的级联（连 createBtn 都点不到 → 后续 assert 必然"元素不存在"），
+        # 属"无法可靠执行"而非产品缺陷——不计入确定性 critical，交由 LLM 评估裁量。
+        ac_failed_results = [
+            r for r in ac_check_results
+            if r.get("failures") and not r.get("harness_errors")
+        ]
+        browser_errors = [
+            f"[{e.get('type', 'error')}] {e.get('message', '')}"
+            for e in browser_result.get("errors", [])
+            if e.get("message")
+        ]
+        deterministic_findings: list[dict] = []
+        deterministic_findings += [
+            {
+                "severity": d.get("severity", "major"),
+                "dimension": d.get("dimension", "runtime"),
+                "description": f"[{d['type']}] {d['message']}",
+                "evidence": d.get("evidence", ""),
+                "suggestion": d.get("suggestion", ""),
+                "_source": "smoke",
+            }
+            for d in smoke_defects
+        ]
+        deterministic_findings += [
+            {
+                "severity": "critical",
+                "dimension": "runtime",
+                "description": f"浏览器运行时错误: {msg[:160]}",
+                "evidence": msg,
+                "suggestion": "定位报错源文件并修复后重新 run_preview 验证",
+                "_source": "browser",
+            }
+            for msg in browser_errors
+        ]
+        deterministic_findings += [
+            {
+                "severity": "critical",
+                "dimension": "acceptance",
+                "description": f"验收条件未达成 {r['ac_id']}: {r.get('label', '')} — {'; '.join(r.get('failures', []))}",
+                "evidence": "; ".join(r.get("failures", [])),
+                "suggestion": "按 how_to_verify 描述补齐该场景的界面元素与交互逻辑",
+                "_source": "ac",
+            }
+            for r in ac_failed_results
+        ]
+
+        if deterministic_findings:
+            seen_desc = {f.get("description") for f in findings}
+            findings = deterministic_findings + [
+                f for f in findings if f.get("description") not in seen_desc
             ]
-            findings = smoke_findings + findings
+            if verdict == "PASS":
+                logger.warning(
+                    f"[Verify] LLM 判定 PASS 被确定性证据推翻"
+                    f"(冒烟={len(smoke_defects)}, 浏览器错误={len(browser_errors)}, "
+                    f"AC失败={len(ac_failed_results)}) → 强制 NEEDS_WORK"
+                )
             verdict = "NEEDS_WORK"
             if not overall_score or overall_score >= 6:
                 overall_score = 5.5
-            logger.warning(
-                f"[Verify] 通用冒烟发现 {len(smoke_defects)} 个确定性缺陷，"
-                f"强制判定 NEEDS_WORK: {[d['type'] for d in smoke_defects]}"
-            )
 
         # 将 verdict 转为 verify_passed
         state["verify_passed"] = (verdict == "PASS")
         state["current_step"] = "verify_done"
+
+        # 截图留档：确定性证据 + 截图一起构成评估证据链（多模态评估的前置资产）
+        screenshot_path = None
+        try:
+            from harness.tools.preview_runner import capture_screenshot
+            screenshot_path = capture_screenshot(
+                workspace.path / "index.html",
+                workspace.path / ".task" / "evaluator" / "screenshot.png",
+                preview_url=preview_url,
+            )
+        except Exception as e:
+            logger.debug(f"[Verify] 截图失败（跳过）: {e}")
 
         # 构建评估结果对象（始终构建，供后续 QA 反馈使用）
         evaluator_result = {
@@ -1477,6 +1632,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             "findings": findings,
             "ac_results": ac_check_results,  # Playwright 实际执行的逐条 AC 结果
             "browser_result": browser_result,
+            "screenshot": screenshot_path,
             "smoke_result": {
                 "available": smoke_result.get("available", False),
                 "checks": smoke_result.get("checks", {}),
@@ -1509,115 +1665,37 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
         ) if score else f"overall: {overall_score}/10"
 
         if verdict != "PASS":
-            # 防御验证器矛盾输出：score < 6 但 findings 为空时，尝试重试一次
-            # 这是一种 LLM 评估失败，不应让 coder 承担"无问题可修"的代价
-            if overall_score < 6 and not findings:
-                verifier_errors = state.get("metadata", {}).get("_verifier_error_count", 0)
-
-                if verifier_errors == 0:
-                    # 第一次矛盾：用更强的 prompt 重试，要求必须给出具体 findings
-                    logger.warning(
-                        f"[Verify] ⚠️ 验证器返回矛盾结果 (verdict=NEEDS_WORK, score={overall_score}, "
-                        f"findings=[])，将以更强约束重试 evaluator"
-                    )
-                    retry_prompt = user_prompt + (
-                        "\n\n⚠️ 重要：你上一次的评估返回了 NEEDS_WORK 但没有给出任何具体的 findings。"
-                        "\n根据硬性规则，NEEDS_WORK 必须伴随至少一个具体的 finding（包含 severity/description/evidence/suggestion）。"
-                        "\n请重新评估：如果代码确实有问题，必须逐条列出具体 findings；"
-                        "\n如果找不到任何具体问题，verdict 必须改为 PASS。"
-                        "\n特别注意检查：入口函数是否被调用、事件监听器是否绑定、run_preview 是否报告错误。"
-                    )
-                    try:
-                        retry_response = client.chat(
-                            prompt=retry_prompt,
-                            system_prompt=evaluator_prompt,
-                            use_memory=False,
-                            max_tokens=4000,
-                            timeout=90,
-                            thinking='enabled',
-                        )
-                        if not retry_response.is_error and retry_response.content:
-                            retry_content = retry_response.content.strip()
-                            try:
-                                retry_result = json.loads(retry_content)
-                            except json.JSONDecodeError:
-                                match = re.search(r'\{[\s\S]*\}', retry_content)
-                                if match:
-                                    try:
-                                        retry_result = json.loads(match.group())
-                                    except json.JSONDecodeError:
-                                        retry_result = {}
-                            verdict = retry_result.get("verdict", "NEEDS_WORK")
-                            findings = retry_result.get("findings", [])
-                            overall_score = retry_result.get("overall_score", overall_score)
-                            score = retry_result.get("score", score)
-                            # 重试翻转 verdict 后必须同步 verify_passed，
-                            # 否则 QA 反馈显示 PASS 但图仍会拉回 coder 多跑一轮
-                            state["verify_passed"] = (verdict == "PASS")
-                            logger.info(
-                                f"[Verify] 重试后: verdict={verdict}, score={overall_score}, "
-                                f"findings={len(findings)}"
-                            )
-                    except Exception as retry_err:
-                        logger.warning(f"[Verify] 重试 evaluator 失败: {retry_err}")
-
-                # 重试后仍然矛盾
-                if overall_score < 6 and not findings:
-                    verifier_errors += 1
-                    logger.warning(
-                        f"[Verify] ⚠️ 验证器返回矛盾结果: verdict=NEEDS_WORK, "
-                        f"score={overall_score}, 但 findings 为空。"
-                        f"连续矛盾次数={verifier_errors}"
-                    )
-                    state.setdefault("metadata", {})["_verifier_error"] = True
-                    state["metadata"]["_verifier_error_count"] = verifier_errors
-                    # 连续 2 次矛盾 → 保守标记为 PASS（避免无限循环）
-                    if verifier_errors >= 2:
-                        logger.warning(
-                            f"[Verify] 连续 {verifier_errors} 次矛盾结果，"
-                            f"保守标记为 PASS 以终止修复循环"
-                        )
-                        state["verify_passed"] = True
-                        state["metadata"].pop("_verifier_error", None)
-                        state["metadata"]["_verifier_error_count"] = 0
-                    # 更新 evaluator_result（重试后可能变化）
-                    try:
-                        evaluator_result.update({
-                            "verdict": verdict,
-                            "score": score,
-                            "overall_score": overall_score,
-                            "findings": findings,
-                        })
-                        workspace.write(
-                            ".task/evaluator/result.json",
-                            json.dumps(evaluator_result, ensure_ascii=False, indent=2)
-                        )
-                    except Exception:
-                        pass
-                else:
-                    # 重试后找到了具体 findings，走正常 NEEDS_WORK 流程
-                    state["metadata"].pop("_verifier_error", None)
-                    state["metadata"]["_verifier_error_count"] = 0
-                    meta = dict(state.get("metadata") or {})
-                    meta["repair_count"] = meta.get("repair_count", 0) + 1
-                    state["metadata"] = meta
-            elif findings:
-                # NEEDS_WORK 且有具体 findings：递增 repair_count
-                meta = dict(state.get("metadata") or {})
-                meta["repair_count"] = meta.get("repair_count", 0) + 1
-                state["metadata"] = meta
-                state["metadata"].pop("_verifier_error", None)
-                state["metadata"]["_verifier_error_count"] = 0
-            else:
-                # 边缘情况：NEEDS_WORK 但 score >= 6 且 findings 为空
-                # 可能是 evaluator 输出异常，保守处理为 PASS
-                logger.warning(
-                    f"[Verify] 边缘矛盾: verdict=NEEDS_WORK, score={overall_score}, "
-                    f"findings 为空，保守标记为 PASS"
+            # NEEDS_WORK 必须伴随具体 findings——不再重试 LLM、更不放水
+            # （原「矛盾→保守 PASS」放水阀已按证据等级模型删除）。
+            # findings 为空时从确定性证据合成；连确定性证据都没有，
+            # 则合成一条"评估不可判定"，交由交付门禁按 critical 清零规则处理。
+            if not findings:
+                findings = [
+                    f for f in deterministic_findings if f.get("_source")
+                ] or [{
+                    "severity": "major",
+                    "dimension": "runtime",
+                    "description": (
+                        f"评估器给出 NEEDS_WORK（{overall_score}/10）但未列出具体问题，"
+                        f"按评估异常处理"
+                    ),
+                    "evidence": "LLM 评估输出自相矛盾（低分无 findings）",
+                    "suggestion": "对照验收条件自查：入口调用、事件绑定、浏览器 console 错误、引用完整性",
+                }]
+                logger.info(
+                    f"[Verify] NEEDS_WORK 缺少 findings，已合成 {len(findings)} 条"
                 )
-                state["verify_passed"] = True
-                state["metadata"].pop("_verifier_error", None)
-                state["metadata"]["_verifier_error_count"] = 0
+            # NEEDS_WORK：递增 repair_count（graph 路由的修复预算依据）
+            meta = dict(state.get("metadata") or {})
+            meta["repair_count"] = meta.get("repair_count", 0) + 1
+            state["metadata"] = meta
+
+        # AC 实测通过的条目回写两级契约（evidence_found=true）
+        _mark_acs_checked(
+            state,
+            [r["ac_id"] for r in ac_check_results
+             if r.get("passed") and not r.get("harness_errors")],
+        )
 
         # 构建 QA 反馈消息（对话式注入，coder 在下一轮 ToolCallLoop 中自然看到）
         # 增强修复指令：对每种 severity 级别给出精确的修复提示
@@ -1674,18 +1752,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                 "- 修复完成后调用 run_preview 确认所有问题已解决\n"
             )
         else:
-            if overall_score < 6:
-                # 验证器矛盾：评分低但无具体问题 → 要求 coder 自行检查
-                qa_feedback += (
-                    "⚠️ **验证器未发现具体问题，但评分较低。请自行检查以下方面：**\n"
-                    "- 所有函数是否被正确调用（特别是初始化/入口函数）\n"
-                    "- 事件监听器是否已绑定\n"
-                    "- 页面加载后功能是否正常启动\n"
-                    "- 所有引用的函数/变量是否已定义\n"
-                    "请用 run_preview 验证后报告结果。"
-                )
-            else:
-                qa_feedback += "无问题发现"
+            qa_feedback += "无问题发现"
 
         state.setdefault("dialogue_history", []).append({
             "role": "agent",
@@ -1700,6 +1767,33 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                 evaluator_result, ensure_ascii=False
             )
 
+        # ---- 缺陷类别路由准备（审查报告 Phase 3.2） ----
+        # 架构类缺陷（模块加载/CDN/文件缺失/入口断裂）结构上超出
+        # defect_repair 的能力（禁止新建/重构文件），必须携带根因卡片
+        # 回 coder 做跨文件重构；局部类才走小上下文定向修复。
+        architectural_defects: list = []
+        local_defects: list = list(smoke_defects)
+        try:
+            from harness.constraints.environment_contract import (
+                classify_defects, build_root_cause_card,
+            )
+            architectural_defects, local_defects = classify_defects(smoke_defects)
+            if architectural_defects:
+                card = build_root_cause_card(architectural_defects)
+                state.setdefault("dialogue_history", []).append({
+                    "role": "system", "name": QA_NAME,
+                    "content": card,
+                    "hidden": True,
+                    "preserve": True,
+                })
+                logger.info(
+                    f"[Verify] {len(architectural_defects)} 个架构类缺陷将回 coder 重构"
+                    f"（根因卡片已注入）: {[d.get('type') for d in architectural_defects]}"
+                )
+        except Exception as e:
+            logger.warning(f"[Verify] 缺陷分类失败（按全部局部处理）: {e}")
+            architectural_defects, local_defects = [], list(smoke_defects)
+
         logger.info(
             f"[Verify] 评估完成: verdict={verdict}, "
             f"score={overall_score}, findings={len(findings)}"
@@ -1709,15 +1803,19 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
         logger.warning(f"[Verify] 评估异常: {e}，保守判定为 NEEDS_WORK")
         return {"verify_passed": False, "current_step": "verify_done",
                 "smoke_defects": [],
+                "architectural_defects": [],
                 "error": f"评估异常: {e}",
                 "metadata": state.get("metadata") or {}}
 
     # verify_node 原地修改了 state（dialogue_history, role_outputs 等），
     # 只返回变更字段，避免 add reducer 重复拼接 dialogue_history；
-    # metadata 显式返回，避免依赖 langgraph 未文档化的浅拷贝副作用
+    # metadata 显式返回，避免依赖 langgraph 未文档化的浅拷贝副作用。
+    # smoke_defects 只保留局部类（defect_repair 的输入）；
+    # 架构类经 architectural_defects 由 graph 路由回 coder。
     return {"verify_passed": state.get("verify_passed", False),
             "current_step": state.get("current_step", "verify_done"),
-            "smoke_defects": smoke_defects,
+            "smoke_defects": local_defects,
+            "architectural_defects": architectural_defects,
             "metadata": state.get("metadata") or {}}
 
 
@@ -1829,6 +1927,7 @@ def _collect_defect_repair_context(workspace) -> tuple[str, list[str]]:
     return "\n\n".join(blocks) if blocks else "(无文件)", ordered
 
 
+@_traced_node("defect_repair")
 def defect_repair_node(state: AgentState) -> Dict[str, Any]:
     """小上下文定向修复：针对通用冒烟测试发现的确定性缺陷
 

@@ -185,7 +185,11 @@ class MemoryManager:
                    code_files: list, qa_result: dict = None,
                    user_id: int = 0):
         """
-        任务后: LLM 反思 + 存储记忆。
+        任务后: LLM 反思 + 存储记忆（正负经验都沉淀，审查报告 Phase 4.2）。
+
+        失败任务（passed=False 或低分）显式标记为负样本：
+        - reflection prompt 会收到失败上下文，引导提取"为什么没做成"
+        - 记忆打上 failure 标签，before_task 注入时作为 ⚠️ 警示案例呈现
 
         Args:
             requirement: 用户需求
@@ -197,13 +201,24 @@ class MemoryManager:
         rating = self._extract_rating(qa_result)
         code_summary = self._build_code_summary(code_files)
 
-        # LLM 反思
+        # 失败判定：显式 passed 标记优先，其次按评分阈值
+        qa_passed = qa_result.get("passed") if isinstance(qa_result, dict) else None
+        is_failure = (qa_passed is False) or (qa_passed is None and rating < 6.0)
+
+        # LLM 反思（失败任务注入失败上下文，引导提取负面教训）
         reflection_data = {}
         if self._llm:
             try:
-                reflection_data = self._reflect(requirement, code_summary, rating)
+                reflection_data = self._reflect(
+                    requirement, code_summary, rating,
+                    failure_context=self._build_failure_context(qa_result) if is_failure else "",
+                )
             except Exception as e:
                 logger.warning(f"[MemoryManager] LLM 反思失败，使用默认值: {e}")
+
+        tags = list(reflection_data.get("tags", []))
+        if is_failure and "failure" not in tags:
+            tags.append("failure")
 
         memory = Memory(
             user_id=user_id,
@@ -214,8 +229,9 @@ class MemoryManager:
             reflection=reflection_data.get("reflection", ""),
             lesson=reflection_data.get("lesson", ""),
             reusable_pattern=reflection_data.get("reusable_pattern", ""),
-            tags=reflection_data.get("tags", []),
-            importance=reflection_data.get("importance", rating / 10.0),
+            tags=tags,
+            importance=max(reflection_data.get("importance", 0), 0.7) if is_failure
+            else reflection_data.get("importance", rating / 10.0),
             created_at=time.time(),
         )
 
@@ -225,12 +241,24 @@ class MemoryManager:
             self._new_since_consolidate += 1
             logger.info(
                 f"[MemoryManager] 存储记忆: rating={rating}, "
-                f"tags={memory.tags}, total_new_since_maintain={self._new_since_consolidate}"
+                f"failure={is_failure}, tags={memory.tags}, "
+                f"total_new_since_maintain={self._new_since_consolidate}"
             )
 
         # 定期维护
         if self._new_since_consolidate >= self.CONSOLIDATE_INTERVAL:
             self._maintain()
+
+    @staticmethod
+    def _build_failure_context(qa_result: dict | None) -> str:
+        """把失败证据压缩成反思 prompt 的上下文块"""
+        if not isinstance(qa_result, dict):
+            return ""
+        issues = qa_result.get("critical_issues") or []
+        lines = []
+        for issue in issues[:5]:
+            lines.append(f"- {str(issue)[:150]}")
+        return "\n".join(lines)
 
     def stats(self) -> dict:
         """统计信息"""
@@ -350,8 +378,9 @@ class MemoryManager:
         except Exception as e:
             logger.warning(f"[MemoryManager] 标记 superseded 失败: {e}")
 
-    def _reflect(self, requirement: str, code_summary: str, rating: float) -> dict:
-        """LLM 3 问自答"""
+    def _reflect(self, requirement: str, code_summary: str, rating: float,
+                 failure_context: str = "") -> dict:
+        """LLM 3 问自答（失败任务附带失败上下文引导负面教训提取）"""
         if not self._llm:
             return {}
 
@@ -359,6 +388,11 @@ class MemoryManager:
             requirement=requirement[:300],
             code_summary=code_summary[:500],
             rating=rating,
+            failure_context=(
+                f"\n\n## ⚠️ 本次任务未通过验收，以下是确定性缺陷证据\n{failure_context}\n"
+                f"请重点分析这些缺陷的成因——下次遇到同类需求时如何从架构层面避免。"
+                if failure_context else ""
+            ),
         )
 
         try:
@@ -449,11 +483,17 @@ class MemoryManager:
         logger.info(f"[MemoryManager] 维护完成: {len(active)} 条活跃记忆")
 
     def _llm_consolidate(self, memories: list[Memory]):
-        """LLM 驱动的记忆合并"""
+        """LLM 驱动的记忆合并
+
+        LLM 返回的 merge_groups/deprecate 索引都相对于展示给它的
+        最近 40 条窗口；本方法真正执行合并——每组保留第一条为代表，
+        其余标记 superseded，并把权重让渡给代表记忆。
+        """
+        window = memories[-40:]  # 只看最近 40 条，索引以此窗口为准
         memory_text = "\n".join(
             f"[{i}] 需求: {m.requirement[:80]} | 评分: {m.rating} | "
             f"标签: {m.tags} | 教训: {m.lesson[:100]}"
-            for i, m in enumerate(memories[-40:])  # 只看最近 40 条
+            for i, m in enumerate(window)
         )
 
         prompt = CONSOLIDATE_PROMPT.format(memories=memory_text)
@@ -478,19 +518,48 @@ class MemoryManager:
                 return
             plan = json.loads(m.group())
 
-            # 执行合并
+            # 执行合并：每组 [a, b, c] 保留 a 为代表，b/c 淘汰，
+            # 代表记忆 importance 上调（吸收了被合并条目的价值）
             merge_groups = plan.get("merge_groups", [])
-            if merge_groups:
-                logger.info(f"[MemoryManager] 合并 {len(merge_groups)} 组相似记忆")
+            merged_count = 0
+            for group in merge_groups:
+                if not isinstance(group, list):
+                    continue
+                valid = [i for i in group
+                         if isinstance(i, int) and 0 <= i < len(window)]
+                if len(valid) < 2:
+                    continue
+                representative = window[valid[0]]
+                for idx in valid[1:]:
+                    self._mark_superseded(window[idx].id)
+                    merged_count += 1
+                if merged_count:
+                    self._boost_importance(representative.id, 0.05 * len(valid[1:]))
+            if merged_count:
+                logger.info(f"[MemoryManager] 合并完成: {merged_count} 条相似记忆被代表记忆吸收")
 
             # 执行淘汰
             deprecate_ids = plan.get("deprecate", [])
             for idx in deprecate_ids:
-                if 0 <= idx < len(memories):
-                    self._mark_superseded(memories[idx].id)
+                if isinstance(idx, int) and 0 <= idx < len(window):
+                    self._mark_superseded(window[idx].id)
 
         except Exception as e:
             logger.warning(f"[MemoryManager] 解析合并计划失败: {e}")
+
+    def _boost_importance(self, mem_id: int, delta: float):
+        """合并后上调代表记忆的重要性（封顶 1.0）"""
+        if not mem_id or delta <= 0:
+            return
+        try:
+            db = SessionLocal()
+            row = db.query(AgentMemoryV2).filter_by(id=mem_id).first()
+            if row:
+                row.importance = min(1.0, (row.importance or 0.5) + delta)
+                db.commit()
+            db.close()
+        except Exception as e:
+            logger.warning(f"[MemoryManager] 上调代表记忆重要性失败: {e}")
 
     def _decay(self, memories: list[Memory]):
         """重要性衰减 + 清理低分旧记忆"""
@@ -554,19 +623,26 @@ class MemoryManager:
 
     @staticmethod
     def _format_few_shot(memories: list[Memory]) -> str:
-        """将选中的记忆格式化为 few-shot 注入文本"""
+        """将选中的记忆格式化为 few-shot 注入文本
+
+        正负经验分开展示（审查报告 Phase 4.2）：
+        - failure 标签的案例以 ⚠️ 警示形式呈现，教训置顶
+        - 正常案例作为可复用参考
+        """
         if not memories:
             return ""
 
-        parts = ["\n\n## 参考案例（历史成功经验）"]
+        parts = ["\n\n## 参考案例（历史经验，含成功与失败教训）"]
         for i, m in enumerate(memories, 1):
+            is_failure = "failure" in (m.tags or []) or m.rating < 6.0
+            badge = "⚠️ 失败案例（务必避免重蹈覆辙）" if is_failure else "✅ 成功案例"
             parts.append(
                 f"### 案例 {i}：{m.requirement[:80]} (评分: {m.rating}/10)\n"
-                f"复杂度: {m.complexity} | 文件数: {len(m.tags)} 个标签\n"
+                f"{badge} | 复杂度: {m.complexity}\n"
             )
             if m.lesson:
                 parts.append(f"**关键教训**: {m.lesson}")
-            if m.reusable_pattern and m.reusable_pattern != "无":
+            if not is_failure and m.reusable_pattern and m.reusable_pattern != "无":
                 parts.append(f"**可复用模式**: {m.reusable_pattern[:300]}")
 
         return "\n\n".join(parts)

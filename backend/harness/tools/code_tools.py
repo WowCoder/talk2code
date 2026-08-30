@@ -62,7 +62,12 @@ class LintCssHandler(ToolHandler):
 
 
 class LintJsHandler(ToolHandler):
-    """检查 JavaScript 语法错误（自动检测 ES Module）"""
+    """检查 JavaScript 语法错误（与环境契约对齐：ES Module 按违规判定）
+
+    运行环境契约（ENV-3）：预览用 file:// 协议加载，ES Module 被 CORS
+    拦截导致所有脚本不执行。因此 export/import 不是「风格提示」而是
+    确定性缺陷，与语法错误同级返回 error。
+    """
 
     def execute(self, args: dict, workspace=None, state=None) -> ToolResult:
         ws = workspace or self.workspace
@@ -76,6 +81,8 @@ class LintJsHandler(ToolHandler):
                 content
             ))
             node_args = ["node", "--check"]
+            # 用 module 模式解析，保证 import/export 本身不触发 node 语法误报，
+            # 让契约检查（而非解析器差异）来给出权威结论
             if is_es_module:
                 node_args.append("--input-type=module")
             node_args.append("-")
@@ -87,12 +94,11 @@ class LintJsHandler(ToolHandler):
             if result.returncode != 0:
                 return ToolResult(error=f"JavaScript 语法错误 ({filename}): {result.stderr[:300]}")
             if is_es_module:
-                # 语法合法但 ES Module 无法在 file:// 预览环境加载（CORS 拦截），
-                # 提示改用普通 <script> + IIFE/全局变量
-                return ToolResult(content=(
-                    f"⚠️ JavaScript 语法通过，但检测到 ES Module（import/export）。"
-                    f"预览环境用 file:// 协议加载，ES Module 会被 CORS 拦截导致脚本不执行。"
-                    f"请改用普通 <script> 标签 + IIFE (function(global){{...}})(window) + window.XXX 暴露接口 ({filename})"
+                from harness.constraints.environment_contract import get_rule
+                rule = get_rule("ENV-3")
+                return ToolResult(error=(
+                    f"环境契约违规 ENV-3 ({filename}): 检测到 ES Module（import/export）。"
+                    f"{rule['detail'] if rule else ''}"
                 ))
             return ToolResult(content=f"JavaScript 语法检查通过 ({filename})")
         except FileNotFoundError:
@@ -206,7 +212,7 @@ def register_code_tools(registry):
 
     registry.register(ToolDefinition(
         name="lint_js",
-        description="检查 JavaScript 语法错误（自动检测 ES Module, 使用 Node.js AST 解析）",
+        description="检查 JavaScript 语法错误；按环境契约判定 ES Module（import/export）为确定性违规",
         parameters={
             "type": "object",
             "properties": {

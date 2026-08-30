@@ -30,11 +30,28 @@ from harness.observability.logger import get_logger
 logger = get_logger(__name__)
 
 
-# 小上下文定向修复最大轮数（独立于 coder 修复轮次：单次小 LLM 调用，成本低）
-MAX_DEFECT_REPAIR_ROUNDS = 2
-
-
 # ==================== 路由函数 ====================
+
+def _get_max_repair_rounds(state: AgentState) -> int:
+    """coder 回环修复轮次上限（config 单一来源，prompt 文案同步注入）
+
+    simple=0（无修复循环），standard=config.CODER_MAX_REPAIR_ROUNDS（默认 2）。
+    每轮修复后 verify 会重新评估，PASS 则正常结束。
+    """
+    from config import settings
+    complexity = state.get("metadata", {}).get("complexity", "standard")
+    rounds = {
+        "simple": 0,
+        "standard": settings.CODER_MAX_REPAIR_ROUNDS,
+    }
+    return rounds.get(complexity, settings.CODER_MAX_REPAIR_ROUNDS)
+
+
+def _get_max_defect_repair_rounds() -> int:
+    """小上下文定向修复轮次上限（config 单一来源）"""
+    from config import settings
+    return settings.DEFECT_REPAIR_MAX_ROUNDS
+
 
 def route_after_tl(state: AgentState) -> str:
     """TeamLeader 完成后的路由决策"""
@@ -50,44 +67,52 @@ def route_after_tl(state: AgentState) -> str:
     return "coder"
 
 
-def _get_max_repair_rounds(state: AgentState) -> int:
-    """根据复杂度计算最大修复轮次
-
-    simple=0（无修复循环），standard=2（2轮修复后仍不通过则finished_with_issues）。
-    每轮修复后 verify 会重新评估，PASS 则正常结束。
-    """
-    complexity = state.get("metadata", {}).get("complexity", "standard")
-    rounds = {
-        "simple": 0,
-        "standard": 2,
-    }
-    return rounds.get(complexity, 2)
-
-
 def route_after_verify(state: AgentState) -> str:
-    """Verify 完成后的路由决策
+    """Verify 完成后的路由决策（按缺陷类别路由，审查报告 Phase 3.2）
 
     PASS → 结束
-    冒烟确定性缺陷 → defect_repair（小上下文定向修复，成本低，优先消耗）
+    架构类缺陷（模块加载/CDN/文件缺失/入口断裂）→ coder 携根因卡片重构
+      （defect_repair 被禁止新建/重构文件，结构上修不了架构问题）
+    局部确定性缺陷 → defect_repair 小上下文定向修复（成本低，优先消耗）
     其他 NEEDS_WORK → 重新进入 coder（QA 反馈已写入 dialogue_history）
-    两条修复路径都有独立预算，任一耗尽后落到 coder 预算判断，全部耗尽则强制结束
+    各路径预算独立；全部耗尽后 done，由服务层交付门禁决定最终状态
     """
     if state.get("verify_passed", False):
         return "done"
 
-    # 路径 1: 冒烟确定性缺陷 → 小上下文定向修复（不进 ToolCallLoop）
+    repair_count = state.get("metadata", {}).get("repair_count", 0)
+    max_rounds = _get_max_repair_rounds(state)
+
+    # 路径 0: 架构类缺陷 → 回 coder 重构（根因卡片已由 verify 注入对话）
+    architectural_defects = state.get("architectural_defects") or []
+    if architectural_defects:
+        complexity = state.get("metadata", {}).get("complexity", "?")
+        if repair_count < max_rounds:
+            logger.info(
+                f"[Graph] {len(architectural_defects)} 个架构类缺陷"
+                f" ({[d.get('type') for d in architectural_defects]}) "
+                f"→ 回 coder 重构 (第 {repair_count + 1}/{max_rounds} 轮, "
+                f"complexity={complexity})"
+            )
+            return "coder"
+        logger.warning(
+            f"[Graph] 架构类缺陷未修复且 coder 预算耗尽 "
+            f"(repair_count={repair_count}/{max_rounds})，交由交付门禁处理"
+        )
+        return "done"
+
+    # 路径 1: 局部确定性缺陷 → 小上下文定向修复（不进 ToolCallLoop）
     smoke_defects = state.get("smoke_defects") or []
     defect_repair_count = state.get("metadata", {}).get("defect_repair_count", 0)
-    if smoke_defects and defect_repair_count < MAX_DEFECT_REPAIR_ROUNDS:
+    max_defect_rounds = _get_max_defect_repair_rounds()
+    if smoke_defects and defect_repair_count < max_defect_rounds:
         logger.info(
-            f"[Graph] 检测到 {len(smoke_defects)} 个冒烟确定性缺陷 "
+            f"[Graph] 检测到 {len(smoke_defects)} 个局部确定性缺陷 "
             f"(类型: {[d.get('type') for d in smoke_defects]})，"
-            f"进入小上下文定向修复 (第 {defect_repair_count + 1}/{MAX_DEFECT_REPAIR_ROUNDS} 轮)"
+            f"进入小上下文定向修复 (第 {defect_repair_count + 1}/{max_defect_rounds} 轮)"
         )
         return "defect_repair"
 
-    repair_count = state.get("metadata", {}).get("repair_count", 0)
-    max_rounds = _get_max_repair_rounds(state)
     if repair_count >= max_rounds:
         complexity = state.get("metadata", {}).get("complexity", "?")
         logger.warning(
@@ -138,8 +163,15 @@ def create_workflow_v5() -> StateGraph:
         }
     )
 
-    # Coder → verify
-    workflow.add_edge("coder", "verify")
+    # Coder → verify / 终止（LLM 故障、用户取消不进评估）
+    workflow.add_conditional_edges(
+        "coder",
+        route_after_coder,
+        {
+            "verify": "verify",
+            "abort": END,
+        }
+    )
 
     # Verify → done / defect_repair (冒烟确定性缺陷) / coder (QA 反馈修复)
     workflow.add_conditional_edges(
@@ -161,6 +193,20 @@ def create_workflow_v5() -> StateGraph:
         "(4 节点: team_leader → coder → verify ⇄ defect_repair, QA 反馈作为对话注入)"
     )
     return app
+
+
+def route_after_coder(state: AgentState) -> str:
+    """coder 之后的路由
+
+    - LLM 调用失败（llm_error）/ 用户取消 → 直接终止。
+      此前 coder→verify 是无条件边，基础设施故障会导致 verify
+      对空工作区跑"代码评估"，烧光修复预算后给出误导性结论。
+    - 其余情况（正常完成 / 编码异常）→ verify 兜底校验
+    """
+    step = state.get("current_step", "")
+    if step in ("llm_error", "cancelled"):
+        return "abort"
+    return "verify"
 
 
 # ==================== 兼容旧接口 ====================
@@ -194,7 +240,14 @@ def create_workflow_post_plan() -> StateGraph:
 
     workflow.set_entry_point("coder")
 
-    workflow.add_edge("coder", "verify")
+    workflow.add_conditional_edges(
+        "coder",
+        route_after_coder,
+        {
+            "verify": "verify",
+            "abort": END,
+        }
+    )
 
     workflow.add_conditional_edges(
         "verify",

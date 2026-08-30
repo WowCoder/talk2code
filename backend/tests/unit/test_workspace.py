@@ -183,3 +183,19 @@ class TestWorkspaceFSIsolation:
         assert ws1.path != ws2.path
         assert str(ws1.req_id) in str(ws1.path)
         assert str(ws2.req_id) in str(ws2.path)
+
+
+def test_snapshot_skips_binary_files(tmp_path):
+    """二进制文件（如验收截图 PNG）不进快照、不炸解码（需求 121 事故）"""
+    from harness.state.workspace import WorkspaceFS
+    ws = WorkspaceFS.__new__(WorkspaceFS)
+    from pathlib import Path
+    ws.path = tmp_path
+    (tmp_path / "index.html").write_text("<html></html>", encoding="utf-8")
+    (tmp_path / ".task").mkdir()
+    (tmp_path / ".task" / "evaluator").mkdir()
+    (tmp_path / ".task" / "evaluator" / "screenshot.png").write_bytes(b"\x89PNG\r\n\x1a\nbinary")
+    snap = ws.snapshot()
+    names = [s["filename"] for s in snap]
+    assert "index.html" in names
+    assert all(not n.endswith(".png") for n in names)

@@ -3,7 +3,7 @@
 Targeted Recovery —— 批量编码后的定向补全模块
 
 Batch-First with Targeted Recovery 架构：
-1. coder_node 始终走批量编码（ToolCallLoop + coder_ml.md + batch_hint）
+1. coder_node 始终走批量编码（ToolCallLoop + coder_base.md + batch_hint）
 2. 批量编码完成后，检查文件系统是否有缺失文件
 3. 对缺失文件调用 targeted_recovery 逐个补全
 
@@ -65,7 +65,7 @@ def _get_completed_files(workspace, implementation_order: list,
 
 def _build_coding_context(requirement: str, plan: dict, current_task: dict,
                            interfaces: dict, completed_files: list,
-                           errors: list, task_package: str) -> dict:
+                           errors: list) -> dict:
     """
     构建单文件编码的完整上下文。
 
@@ -110,7 +110,6 @@ def _build_coding_context(requirement: str, plan: dict, current_task: dict,
         "completed_text": completed_text,
         "interface_text": interface_text,
         "error_text": error_text,
-        "task_package": task_package,
     }
 
 
@@ -199,7 +198,6 @@ def targeted_recovery(state: AgentState, tool_loop, missing_files: list[str]) ->
             interfaces=interfaces,
             completed_files=_get_completed_files(workspace, implementation_order, file_path),
             errors=code_errors,
-            task_package=state.get("metadata", {}).get("task_package", ""),
         )
 
         # 2. 注入文件感知提示 + 逐文件模式标记

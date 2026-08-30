@@ -255,6 +255,64 @@ def run_preview_in_browser(
     }
 
 
+def _resolve_selector(doc, selector: str):
+    """选择器自适应解析（需求 126 事故：AC 脚本 `#start-btn` vs 产物 id `startBtn`）
+
+    产品能跑但选择器因命名习惯差异（短横线 vs 驼峰、btn-vs-Button）失配时，
+    首次直接 query 失败不立即返回——按级联策略定位真实可点击目标：
+
+    1. 原样选择器
+    2. 前缀/规范化变体：#add-btn → #addBtn / #add_btn / 去装饰后含 `add`
+    3. 含文本/类的按钮兜底（用 JS 在页面内探测）
+    返回可作用元素；全部失败返回 None。
+    """
+    try:
+        if doc.query_selector(selector):
+            return selector
+    except Exception:
+        pass
+
+    candidates = []
+    # 规范化的 hash 变体：去掉分隔符比较
+    tag = selector.lstrip("#.").lower()
+    stripped = tag.replace("-", "").replace("_", "")
+    for cand in [f"#{tag}", f"#{tag.replace('-', '_')}", f"#{tag.replace('_', '-')}"]:
+        candidates.append(cand)
+    for cand in candidates:
+        try:
+            if doc.query_selector(cand):
+                return cand
+        except Exception:
+            pass
+
+    # 兜底：把选择器尾部当作语义关键词，在 id/文本中模糊匹配
+    if tag:
+        stem = max(stripped, key=len)
+        try:
+            found = doc.evaluate(
+                """(keyword) => {
+                    const kw = keyword;
+                    const roots = document.querySelectorAll('button, a, [role=button], input, [id]');
+                    for (const el of roots) {
+                        const id = (el.id || '').toLowerCase();
+                        const txt = (el.textContent || '').toLowerCase();
+                        const cls = (el.className || '').toString().toLowerCase();
+                        if (id.replace(/[-_]/g,'') === kw) return '#' + CSS.escape(el.id);
+                        if (cls.replace(/[-_]/g,'').includes(kw)) return '#' + CSS.escape(el.id);
+                        const k = kw.replace(/_/g, '');
+                        if (txt.replace(/\\s/g,'').includes(k)) return '#' + CSS.escape(el.id);
+                    }
+                    return null;
+                }""",
+                stripped,
+            )
+            if found:
+                return found
+        except Exception:
+            pass
+    return None
+
+
 def run_ac_checks(
     html_path: Path,
     ac_scripts: list[dict],
@@ -362,24 +420,37 @@ def run_ac_checks(
 
                             try:
                                 if action == "type":
-                                    doc.fill(selector, step.get("value", ""))
+                                    eff = _resolve_selector(doc, selector) or selector
+                                    doc.fill(eff, step.get("value", ""))
                                 elif action == "click":
-                                    doc.click(selector)
+                                    eff = _resolve_selector(doc, selector) or selector
+                                    doc.click(eff)
                                 elif action == "select":
-                                    doc.select_option(selector, step.get("value", ""))
+                                    eff = _resolve_selector(doc, selector) or selector
+                                    doc.select_option(eff, step.get("value", ""))
                                 elif action == "press":
-                                    doc.press(selector or "body", step.get("key", "Enter"))
+                                    key = step.get("key", "Enter")
+                                    # 沙箱 iframe：doc.press 到内层 canvas 无法送达键盘事件，
+                                    # keydown 监听在 document 上，需用 page 级全局键盘。
+                                    # 方向/功能键尤其如此（需求 126：游戏能玩但 AC 的 press 失效，
+                                    # assert_canvas_change 全部假阴性）。
+                                    if key.startswith("Arrow") or key in ("Enter", "Space", "Tab") or preview_url:
+                                        page.locator("body").press(key)
+                                    else:
+                                        doc.press(selector or "body", key)
                                 elif action == "wait":
                                     page.wait_for_timeout(step.get("ms", 500))
                                 elif action == "assert_exists":
-                                    elem = doc.query_selector(selector)
-                                    if not elem:
+                                    eff = _resolve_selector(doc, selector)
+                                    if not eff or not doc.query_selector(eff):
                                         failures.append(f"元素不存在: {step.get('label', selector)}")
                                 elif action == "assert_visible":
-                                    if not doc.is_visible(selector):
+                                    eff = _resolve_selector(doc, selector)
+                                    if not eff or not doc.is_visible(eff):
                                         failures.append(f"元素不可见: {step.get('label', selector)}")
                                 elif action == "assert_text":
-                                    elem = doc.query_selector(selector)
+                                    eff = _resolve_selector(doc, selector) or selector
+                                    elem = doc.query_selector(eff)
                                     text = elem.inner_text() if elem else ""
                                     contains = step.get("contains", "")
                                     if contains not in text:
@@ -387,14 +458,17 @@ def run_ac_checks(
                                             f"文本不匹配: 期望包含 '{contains}', 实际 '{text[:100]}'"
                                         )
                                 elif action == "assert_count":
-                                    count = len(doc.query_selector_all(selector))
+                                    eff = _resolve_selector(doc, selector)
+                                    sel = eff or selector
+                                    count = len(doc.query_selector_all(sel))
                                     expected = step.get("min_count", 1)
                                     if count < expected:
                                         failures.append(
                                             f"元素数量不足: {selector} 期望 ≥{expected}, 实际 {count}"
                                         )
                                 elif action == "assert_value":
-                                    value = doc.input_value(selector)
+                                    eff = _resolve_selector(doc, selector) or selector
+                                    value = doc.input_value(eff)
                                     expected = step.get("value", "")
                                     if value != expected:
                                         failures.append(
@@ -449,6 +523,62 @@ def _loc(loc) -> str:
         return f"{loc.url}:{loc.line_number}:{loc.column_number}"
     except Exception:
         return ""
+
+
+def capture_screenshot(html_path: Path, out_path: Path,
+                       timeout_ms: int = 12_000, preview_url: str = None) -> str | None:
+    """对 index.html 截图（与用户一致的沙箱预览链路），保存为 PNG。
+
+    用途：fast_pass 通道不再硬编码 ui_quality——截图落盘到
+    .task/evaluator/screenshot.png，供用户查看与后续多模态评估使用。
+
+    Returns:
+        截图文件路径字符串；浏览器不可用等失败时返回 None（不抛异常）。
+    """
+    try:
+        from playwright.sync_api import sync_playwright, Error as PWError
+    except ImportError:
+        return None
+
+    url = Path(html_path).resolve().as_uri()
+    wrapper_uri, wrapper_tmp = (None, None)
+    if preview_url:
+        wrapper_uri, wrapper_tmp = _make_sandbox_wrapper_uri(preview_url)
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                context = browser.new_context(viewport={"width": 1280, "height": 800})
+                page = context.new_page()
+                page.set_default_timeout(timeout_ms)
+                target = page
+                if preview_url:
+                    page.goto(wrapper_uri, wait_until="domcontentloaded", timeout=timeout_ms)
+                    page.wait_for_timeout(1500)
+                    target = _resolve_preview_frame(page) or page
+                else:
+                    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    page.wait_for_timeout(1200)
+                # 对内层 frame 截图时截整页宿主（包含 iframe 内容）
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                page.screenshot(path=str(out_path), full_page=False)
+                return str(out_path)
+            finally:
+                browser.close()
+    except PWError as e:
+        logger.warning(f"[Screenshot] 浏览器不可用，跳过截图: {e}")
+        return None
+    except Exception as e:
+        logger.warning(f"[Screenshot] 截图失败（跳过）: {e}")
+        return None
+    finally:
+        if wrapper_tmp:
+            try:
+                import os as _os
+                _os.unlink(wrapper_tmp)
+            except OSError:
+                pass
 
 
 # ==================== 预览链路沙箱加载 ====================
@@ -664,6 +794,55 @@ def run_universal_smoke(html_path: Path, timeout_ms: int = 15_000, preview_url: 
                     result["logs"].append(f"[smoke] CTA 查找异常: {e}")
 
                 if cta:
+                    # ---- 入口遮挡检测：Playwright 严格 actionability 会拒绝被遮罩覆盖的
+                    # 点击（需求 129：结束遮罩 endOverlay 默认可见盖住 startBtn，玩家点不到开始）。
+                    # smoke 用 JS 直点绕过遮挡会漏报，这里用 elementFromPoint 显式探测。 ----
+                    blocked = None
+                    try:
+                        blocked = doc.evaluate("""
+                            (idx) => {
+                                const els = [...document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')];
+                                const el = els[idx];
+                                if (!el) return null;
+                                const r = el.getBoundingClientRect();
+                                if (r.width <= 0 || r.height <= 0) return null;
+                                const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+                                const top = document.elementFromPoint(cx, cy);
+                                if (!top) return null;
+                                if (top === el || el.contains(top) || top.contains(el)) return null;
+                                const topTag = top.tagName;
+                                const topText = (top.innerText || '').trim().slice(0, 24);
+                                const topCls = (top.className || '').toString().slice(0, 40);
+                                return { tag: topTag, text: topText, cls: topCls };
+                            }
+                        """, cta["i"])
+                    except Exception:
+                        pass
+                    if blocked:
+                        result["checks"]["interactive"] = False
+                        result["defects"].append({
+                            "type": "entry_blocked",
+                            "severity": "critical",
+                            "dimension": "functionality",
+                            "message": (
+                                f"主交互入口 '<{cta['tag']}> {cta['text']}' 被其他元素遮挡无法点击"
+                                f"（中心点命中 <{blocked['tag']}> 文本='{blocked['text']}' class='{blocked['cls']}'）。"
+                                "用户点不到主入口，等同于不可用"
+                            ),
+                            "evidence": f"elementFromPoint 命中遮挡元素 <{blocked['tag']}>",
+                            "suggestion": (
+                                "检查是否有遮罩/弹层默认可见且覆盖主入口：开始按钮在初始化前不得被"
+                                "结束遮罩/欢迎遮罩/半透明层挡住。遮罩必须默认隐藏（display:none 或"
+                                "hidden 类），仅游戏结束时显示；或让主入口 z-index 高于遮罩"
+                            ),
+                        })
+                        result["logs"].append(
+                            f"[smoke] 主入口 '<{cta['tag']}> {cta['text']}' 被遮挡: "
+                            f"<{blocked['tag']}> text='{blocked['text']}' cls='{blocked['cls']}'"
+                        )
+                    else:
+                        result["logs"].append(f"[smoke] 主入口 '<{cta['tag']}> {cta['text']}' 未被遮挡")
+
                     # ---- 安装观察器：DOM 变动计数 ----
                     doc.evaluate("""
                         () => {
@@ -690,54 +869,56 @@ def run_universal_smoke(html_path: Path, timeout_ms: int = 15_000, preview_url: 
                     sig_before = _canvas_sig()
                     text_before = (doc.inner_text("body") or "").lower()
 
-                    # ---- 不变量 2+3: 点击主交互并观察 ----
-                    try:
-                        # cta["i"] 是 querySelectorAll 原始列表中的索引，直接按索引点击
-                        doc.evaluate("""
-                            (idx) => {
-                                const els = [...document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')];
-                                els[idx]?.click();
-                            }
-                        """, cta["i"])
-                        page.wait_for_timeout(2500)
-                    except Exception as e:
-                        result["logs"].append(f"[smoke] 点击主交互异常: {e}")
+                    # 入口被遮挡时已判 interactive=False，跳过 JS 直点观察（避免覆盖判定）
+                    if not blocked:
+                        # ---- 不变量 2+3: 点击主交互并观察 ----
+                        try:
+                            # cta["i"] 是 querySelectorAll 原始列表中的索引，直接按索引点击
+                            doc.evaluate("""
+                                (idx) => {
+                                    const els = [...document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')];
+                                    els[idx]?.click();
+                                }
+                            """, cta["i"])
+                            page.wait_for_timeout(2500)
+                        except Exception as e:
+                            result["logs"].append(f"[smoke] 点击主交互异常: {e}")
 
-                    mutations = doc.evaluate("() => window.__t2c_mutations || 0")
-                    sig_after = _canvas_sig()
-                    text_after = (doc.inner_text("body") or "").lower()
+                        mutations = doc.evaluate("() => window.__t2c_mutations || 0")
+                        sig_after = _canvas_sig()
+                        text_after = (doc.inner_text("body") or "").lower()
 
-                    changed = mutations > 0 or sig_before != sig_after
-                    result["checks"]["interactive"] = bool(changed)
-                    if not changed:
-                        result["defects"].append({
-                            "type": "no_interaction",
-                            "severity": "critical",
-                            "dimension": "functionality",
-                            "message": f"点击主交互入口 '{cta['text']}' 后 2.5s 内页面无任何可观察变化（DOM 与 canvas 均静止）",
-                            "evidence": f"mutations={mutations}, canvas_changed={sig_before != sig_after}",
-                            "suggestion": "检查事件绑定是否生效（元素选择器、脚本加载顺序、初始化调用）；主按钮必须驱动可见的状态变化",
-                        })
+                        changed = mutations > 0 or sig_before != sig_after
+                        result["checks"]["interactive"] = bool(changed)
+                        if not changed:
+                            result["defects"].append({
+                                "type": "no_interaction",
+                                "severity": "critical",
+                                "dimension": "functionality",
+                                "message": f"点击主交互入口 '{cta['text']}' 后 2.5s 内页面无任何可观察变化（DOM 与 canvas 均静止）",
+                                "evidence": f"mutations={mutations}, canvas_changed={sig_before != sig_after}",
+                                "suggestion": "检查事件绑定是否生效（元素选择器、脚本加载顺序、初始化调用）；主按钮必须驱动可见的状态变化",
+                            })
 
-                    new_terminal = [m for m in _TERMINAL_MARKERS if m not in text_before and m in text_after]
-                    result["checks"]["no_instant_death"] = not new_terminal
-                    if new_terminal:
-                        result["defects"].append({
-                            "type": "instant_death",
-                            "severity": "major",
-                            "dimension": "functionality",
-                            "message": f"点击主交互 '{cta['text']}' 后立即进入终止/失败态（出现: {', '.join(new_terminal[:3])}），用户来不及操作",
-                            "evidence": f"新出现的终止标记: {new_terminal}",
-                            "suggestion": (
-                                "主流程启动必须有缓冲，二选一实现："
-                                "(a) 等待首次输入——点击开始后画面就绪但角色不移动，提示「按方向键开始」，"
-                                "首次方向键 keydown 才触发游戏循环；"
-                                "(b) 3-2-1 倒计时——倒计时结束才启动移动定时器。"
-                                "实现要点：把「启动移动」的调用从 start()/click 处理器中拆出，"
-                                "由首次 keydown 或 setTimeout(3000) 触发。注意：这不是样式问题，"
-                                "是流程问题，必须在 JS 逻辑中修改"
-                            ),
-                        })
+                        new_terminal = [m for m in _TERMINAL_MARKERS if m not in text_before and m in text_after]
+                        result["checks"]["no_instant_death"] = not new_terminal
+                        if new_terminal:
+                            result["defects"].append({
+                                "type": "instant_death",
+                                "severity": "major",
+                                "dimension": "functionality",
+                                "message": f"点击主交互 '{cta['text']}' 后立即进入终止/失败态（出现: {', '.join(new_terminal[:3])}），用户来不及操作",
+                                "evidence": f"新出现的终止标记: {new_terminal}",
+                                "suggestion": (
+                                    "主流程启动必须有缓冲，二选一实现："
+                                    "(a) 等待首次输入——点击开始后画面就绪但角色不移动，提示「按方向键开始」，"
+                                    "首次方向键 keydown 才触发游戏循环；"
+                                    "(b) 3-2-1 倒计时——倒计时结束才启动移动定时器。"
+                                    "实现要点：把「启动移动」的调用从 start()/click 处理器中拆出，"
+                                    "由首次 keydown 或 setTimeout(3000) 触发。注意：这不是样式问题，"
+                                    "是流程问题，必须在 JS 逻辑中修改"
+                                ),
+                            })
                 else:
                     result["logs"].append("[smoke] 页面无可点击交互入口，跳过交互/瞬死检查（纯展示页可接受）")
                     interactive, no_instant_death = None, None

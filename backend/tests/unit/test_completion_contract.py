@@ -54,9 +54,54 @@ class TestCompletionContract:
 
         assert result is True
         data = json.loads(ws._storage[".task/contract.json"])
-        assert data["js/app.js"] == {"created": False, "validated": False}
-        assert data["css/style.css"] == {"created": False, "validated": False}
-        assert data["index.html"] == {"created": False, "validated": False}
+        # v2 结构：files + acceptance_criteria 两级
+        assert data["version"] == 2
+        assert data["files"]["js/app.js"] == {"created": False, "validated": False}
+        assert data["files"]["css/style.css"] == {"created": False, "validated": False}
+        assert data["files"]["index.html"] == {"created": False, "validated": False}
+
+    def test_initialize_with_acceptance_criteria(self):
+        """带 AC 初始化：两级契约同时落盘"""
+        ws = self._mock_workspace()
+        contract = CompletionContract(ws)
+        acs = [
+            {"id": "AC-1", "label": "可添加待办", "how_to_verify": "点击添加按钮，列表出现新项目"},
+            {"id": "AC-2", "label": "可删除待办", "how_to_verify": "点击删除按钮，条目消失"},
+        ]
+        result = contract.initialize(["index.html"], acceptance_criteria=acs)
+        assert result is True
+        progress = contract.ac_progress()
+        assert progress["total"] == 2
+        assert progress["checked"] == 0
+        assert sorted(progress["pending"]) == ["AC-1", "AC-2"]
+
+    def test_mark_ac_checked(self):
+        """Playwright 通过后回写 AC 证据"""
+        ws = self._mock_workspace()
+        contract = CompletionContract(ws)
+        contract.initialize(["index.html"], acceptance_criteria=[
+            {"id": "AC-1", "label": "可添加待办", "how_to_verify": "点击添加按钮"}
+        ])
+        assert contract.mark_ac_checked("AC-1") is True
+        progress = contract.ac_progress()
+        assert progress["checked"] == 1
+        assert progress["pending"] == []
+        # 幂等
+        assert contract.mark_ac_checked("AC-1") is False
+
+    def test_v1_contract_backward_compat(self):
+        """读取旧版扁平格式 contract 不报错，写回时升级为 v2"""
+        ws = self._mock_workspace({
+            ".task/contract.json": json.dumps({
+                "js/app.js": {"created": False, "validated": False},
+            })
+        })
+        contract = CompletionContract(ws)
+        assert contract.total_files() == 1
+        assert contract.mark_created("js/app.js") is True
+        data = json.loads(ws._storage[".task/contract.json"])
+        assert data["version"] == 2
+        assert data["files"]["js/app.js"]["created"] is True
 
     def test_initialize_empty_order(self):
         """空 implementation_order 不创建 contract"""
@@ -73,7 +118,9 @@ class TestCompletionContract:
         """标记已创建的文件"""
         ws = self._mock_workspace({
             ".task/contract.json": json.dumps({
-                "js/app.js": {"created": False, "validated": False},
+                "version": 2,
+                "files": {"js/app.js": {"created": False, "validated": False}},
+                "acceptance_criteria": [],
             })
         })
         contract = CompletionContract(ws)
@@ -82,7 +129,7 @@ class TestCompletionContract:
         assert result is True
 
         data = json.loads(ws._storage[".task/contract.json"])
-        assert data["js/app.js"]["created"] is True
+        assert data["files"]["js/app.js"]["created"] is True
 
     def test_mark_created_idempotent(self):
         """重复标记不会出错"""
@@ -114,14 +161,16 @@ class TestCompletionContract:
         """标记已验证"""
         ws = self._mock_workspace({
             ".task/contract.json": json.dumps({
-                "js/app.js": {"created": True, "validated": False},
+                "version": 2,
+                "files": {"js/app.js": {"created": True, "validated": False}},
+                "acceptance_criteria": [],
             })
         })
         contract = CompletionContract(ws)
 
         contract.mark_validated("js/app.js")
         data = json.loads(ws._storage[".task/contract.json"])
-        assert data["js/app.js"]["validated"] is True
+        assert data["files"]["js/app.js"]["validated"] is True
 
     # ---- all_completed ----
 

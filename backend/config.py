@@ -163,24 +163,26 @@ class Settings(BaseSettings):
 
     # LLM 调用配置
     LLM_TEMPERATURE: float = Field(default=0.7, ge=0, le=2, description='LLM 温度参数')
-    LLM_MAX_TOKENS: int = Field(default=12000, ge=100, le=32000, description='LLM 最大生成 token 数')
+    LLM_MAX_TOKENS: int = Field(default=12000, ge=100, le=65500, description='LLM 最大生成 token 数（输出上限，非上下文窗口）')
     LLM_TIMEOUT: int = Field(default=60, ge=10, le=300, description='LLM 调用超时时间（秒）')
     LLM_MAX_RETRIES: int = Field(default=2, ge=0, le=5, description='LLM 调用最大重试次数')
     LLM_CRAFT_ENABLED: bool = Field(default=True, description='是否启用 Craft 设计质量规则注入')
 
-    # 思考模式（reasoning 模型）：DeepSeek V4 默认开启思考且 effort=high，
-    # 会消耗大量 reasoning token（被程序过滤丢弃，纯浪费）。默认关闭以提速。
+    # 思考模式（reasoning 模型）：coder 节点在 runtime 中强制 thinking=enabled，
+    # 不依赖此全局开关。此处保持 disabled：让 team_leader/verify/memory 等小预算
+    # 调用（AC 翻译 2000、评估 4000）不发思考字段，避免 reasoning token 挤占输出
+    # 导致内容为空。coder 的思考由其调用参数保证。
     LLM_THINKING: Literal['enabled', 'disabled'] = Field(
         default='disabled',
         description='LLM 思考模式开关（OpenAI 格式 {"thinking": {"type": ...}}）'
     )
-    # 思考强度（仅当 LLM_THINKING=enabled 时生效）
-    # 注意：effort=high 会消耗大量 reasoning token，对 max_tokens 较小的调用
-    # （如 AC 翻译 2000、评估 4000）会把 token 全耗在思考上导致内容为空。
-    # 默认用 low：既保证 JSON 格式正确，又避免 reasoning token 挤占输出预算。
+    # 思考强度（仅当该次调用 thinking=enabled 时生效；thinking=disabled 时忽略）。
+    # coder 强制开思考，effort=high 已实证显著降低运行时逻辑缺陷
+    # （贪吃蛇 A/B 实验：effort=low 时 preview 报 1 个运行错误，effort=high 时零错误，
+    #   同模型同框架同 plan）。小预算节点 thinking=disabled，effort 对其无影响。
     LLM_REASONING_EFFORT: Literal['low', 'high', 'max'] = Field(
-        default='low',
-        description='思考强度（low/high/max），仅当 LLM_THINKING=enabled 时生效'
+        default='high',
+        description='思考强度（low/high/max），仅当 thinking=enabled 时生效'
     )
 
     # LLM 熔断器配置
@@ -191,6 +193,26 @@ class Settings(BaseSettings):
     LLM_CIRCUIT_BREAKER_TIMEOUT: int = Field(
         default=30, ge=10, le=300,
         description='熔断器打开后等待多少秒进入半开状态'
+    )
+
+    # ==================== Agent 质量门禁配置 ====================
+
+    # coder 回环修复轮数上限（graph 路由与 prompt 文案共用同一配置源，
+    # 避免「prompt 说 1 轮、graph 实际跑 2 轮」的文案漂移）
+    CODER_MAX_REPAIR_ROUNDS: int = Field(
+        default=2, ge=0, le=5,
+        description='verify NEEDS_WORK 后允许回到 coder 修复的最大轮数'
+    )
+    # 小上下文定向修复最大轮数（graph 与文档共用）
+    DEFECT_REPAIR_MAX_ROUNDS: int = Field(
+        default=2, ge=0, le=5,
+        description='冒烟确定性缺陷走小上下文定向修复的最大轮数'
+    )
+    # 交付门禁：critical 缺陷未清零时不自动放行为 finished_with_issues，
+    # 而是转 needs_user_input 并附差异报告（Phase 3 行为变更开关）
+    DELIVERY_GATE_STRICT: bool = Field(
+        default=True,
+        description='true 时 critical 缺陷未清零的需求转 needs_user_input，不自动标记完成'
     )
 
     # 备用 LLM 配置（主模型不可用时自动切换，可选）

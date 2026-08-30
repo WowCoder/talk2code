@@ -42,19 +42,93 @@ if not _llm_logger.handlers:
 
 
 def _log_llm_request(call_id: str, provider: str, model: str, url: str, payload: dict):
-    """记录 LLM 请求"""
-    _llm_logger.info(
-        f"[{call_id}] REQUEST | provider={provider} model={model} url={url}\n"
-        f"[{call_id}] PAYLOAD | {json.dumps(payload, ensure_ascii=False, default=str)[:8000]}"
-    )
+    """记录 LLM 请求（结构化 JSON Lines，便于程序化分析）"""
+    record = {
+        "call_id": call_id,
+        "dir": "request",
+        "provider": provider,
+        "model": model,
+        "url": url,
+        "payload": json.dumps(payload, ensure_ascii=False, default=str)[:8000],
+    }
+    _llm_logger.info(json.dumps(record, ensure_ascii=False, default=str))
 
 
 def _log_llm_response(call_id: str, status: int, body: dict, duration_ms: float):
-    """记录 LLM 响应"""
-    _llm_logger.info(
-        f"[{call_id}] RESPONSE | status={status} duration={duration_ms:.0f}ms\n"
-        f"[{call_id}] BODY | {json.dumps(body, ensure_ascii=False, default=str)[:8000]}"
-    )
+    """记录 LLM 响应（结构化 JSON Lines，便于程序化分析）"""
+    record = {
+        "call_id": call_id,
+        "dir": "response",
+        "status": status,
+        "duration_ms": round(duration_ms),
+        "body": json.dumps(body, ensure_ascii=False, default=str)[:8000],
+    }
+    _llm_logger.info(json.dumps(record, ensure_ascii=False, default=str))
+
+
+def _sanitize_messages_for_replay(messages):
+    """DeepSeek thinking 模式强制校验：assistant 消息回传时必须携带产生时的
+    reasoning_content（实测 deepseek-v4-flash 报 400："The reasoning_content
+    in the thinking mode must be passed back to the API"）。
+
+    我们的对话历史（dialogue_history / SSE / DB）只存正文，无法回传思考链，
+    因此发送前把缺 reasoning_content 的 assistant 历史降级为 user 角色上下文：
+    内容完整保留、仅角色降级并加来源标注；连续 user 消息合并以兼容
+    Anthropic 等要求严格交替的协议。带 reasoning_content 或 tool_calls 的
+    消息原样保留。
+    """
+    if not isinstance(messages, list):
+        return messages
+    sanitized = []
+    for m in messages:
+        if (isinstance(m, dict) and m.get('role') == 'assistant'
+                and not m.get('reasoning_content')):
+            if m.get('tool_calls'):
+                sanitized.append(m)
+                continue
+            sanitized.append({
+                'role': 'user',
+                'content': (
+                    "[历史助手产出（供上下文参考，非本轮指令）]\n"
+                    + str(m.get('content', ''))
+                ),
+            })
+        else:
+            sanitized.append(m)
+    # 合并连续 user 消息（协议兼容 + 减少消息条数）
+    merged = []
+    for m in sanitized:
+        if (merged and isinstance(m, dict) and m.get('role') == 'user'
+                and merged[-1].get('role') == 'user'
+                and isinstance(m.get('content'), str)
+                and isinstance(merged[-1].get('content'), str)):
+            merged[-1] = dict(merged[-1])
+            merged[-1]['content'] = merged[-1]['content'] + '\n\n' + m['content']
+        else:
+            merged.append(m)
+    return merged
+
+
+def _log_and_raise(response, call_id: str = 'unknown', t0=None):
+    """非 2xx 时先把响应体写入流量日志再抛出异常。
+
+    此前 HTTPError 只留下 "400 Client Error" 级别的摘要，provider 给出的
+    关键校验原因（如 reasoning_content 回传要求）全部丢失，只能靠抓包定位。
+    """
+    try:
+        status = int(response.status_code)
+    except (TypeError, ValueError):
+        # status_code 非数值（如测试 Mock），退回原始行为
+        response.raise_for_status()
+        return
+    if status >= 400:
+        try:
+            body = {"error_body": response.text[:2000]}
+        except Exception:
+            body = {"error_body": "<unreadable>"}
+        duration_ms = (time.time() - t0) * 1000 if t0 else 0.0
+        _log_llm_response(call_id, response.status_code, body, duration_ms)
+    response.raise_for_status()
 
 
 def _try_fix_json(raw: str) -> dict | None:
@@ -471,7 +545,7 @@ class LLMClient:
         _thinking = thinking or self.thinking
         data = {
             'model': ep.model,
-            'messages': messages,
+            'messages': _sanitize_messages_for_replay(messages),
             'stream': stream,
             'temperature': self.temperature,
             'max_tokens': max_tokens if max_tokens is not None else self.max_tokens
@@ -524,7 +598,7 @@ class LLMClient:
                         url, headers=headers, json=data,
                         timeout=effective_timeout
                     )
-                    response.raise_for_status()
+                    _log_and_raise(response, call_id, t0)
                     result = response.json()
                     _log_llm_response(call_id, response.status_code, result, (time.time() - t0) * 1000)
                     msg = result.get('choices', [{}])[0].get('message', {})
@@ -547,7 +621,7 @@ class LLMClient:
                             url, headers=headers, json=retry_data,
                             timeout=effective_timeout
                         )
-                        retry_response.raise_for_status()
+                        _log_and_raise(retry_response, call_id, t0)
                         retry_result = retry_response.json()
                         retry_msg = retry_result.get('choices', [{}])[0].get('message', {})
                         content = retry_msg.get('content', '')
@@ -651,7 +725,7 @@ class LLMClient:
                         url, headers=headers, json=data,
                         timeout=effective_timeout
                     )
-                    response.raise_for_status()
+                    _log_and_raise(response, call_id, t0)
                     result = response.json()
                     _log_llm_response(call_id, response.status_code, result, (time.time() - t0) * 1000)
                     content_blocks = result.get('content', [])
@@ -1042,11 +1116,13 @@ class LLMClient:
                     logger.info("[Failover] 备用模型 chat_with_tools 请求成功")
 
         # 错误语义与 chat() 对齐：请求失败时必须设置 error，
-        # 否则调用方（runtime.is_error 分支）会把 LLM 故障误判为任务正常完成
+        # 否则调用方（runtime.is_error 分支）会把 LLM 故障误判为任务正常完成。
+        # 注意：tool-only 响应（content 为空但带 tool_calls，finish_reason=tool_calls）
+        # 是 thinking 模型的常态输出，不是空响应——此前被误杀导致整轮编码中断
         if not error:
             if content.startswith('[错误]'):
                 error = content
-            elif not content:
+            elif not content and not tool_calls:
                 error = "LLM 返回空响应"
 
         return LLMResponse(content=content, reasoning_content=reasoning_content,
@@ -1070,7 +1146,7 @@ class LLMClient:
         _thinking = thinking or self.thinking
         data = {
             'model': ep.model,
-            'messages': messages,
+            'messages': _sanitize_messages_for_replay(messages),
             'temperature': self.temperature,
             'max_tokens': max_tokens if max_tokens is not None else self.max_tokens,
             'tools': tools,
@@ -1087,7 +1163,7 @@ class LLMClient:
         _log_llm_request(call_id, ep.provider, ep.model, url, data)
 
         response = requests.post(url, headers=headers, json=data, timeout=effective_timeout)
-        response.raise_for_status()
+        _log_and_raise(response, call_id, t0)
         result = response.json()
 
         _log_llm_response(call_id, response.status_code, result, (time.time() - t0) * 1000)
@@ -1120,7 +1196,7 @@ class LLMClient:
                     url, headers=headers, json=retry_data,
                     timeout=effective_timeout
                 )
-                retry_response.raise_for_status()
+                _log_and_raise(retry_response, call_id, t0)
                 retry_result = retry_response.json()
                 retry_choice = retry_result.get('choices', [{}])[0]
                 retry_msg = retry_choice.get('message', {})
@@ -1216,7 +1292,7 @@ class LLMClient:
         _log_llm_request(call_id, ep.provider, ep.model, url, data)
 
         response = requests.post(url, headers=headers, json=data, timeout=effective_timeout)
-        response.raise_for_status()
+        _log_and_raise(response, call_id, t0)
         result = response.json()
 
         _log_llm_response(call_id, response.status_code, result, (time.time() - t0) * 1000)

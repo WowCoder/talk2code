@@ -344,3 +344,99 @@ class TestLLMClientRetry:
         # 主模型 2 次 + 备份模型 2 次 = 4 次
         assert mock_post.call_count == 4
         assert response.is_error is True  # 备模型也失败了
+
+class TestSanitizeMessagesForReplay:
+    """DeepSeek thinking 模式 reasoning_content 回传校验的消息消毒（需求 118 事故修复）"""
+
+    def test_bare_assistant_converted_to_user(self):
+        from llm.client import _sanitize_messages_for_replay
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "assistant", "content": "TL 的分析结果"},
+            {"role": "user", "content": "开始编码"},
+        ]
+        out = _sanitize_messages_for_replay(msgs)
+        assert out[1]["role"] == "user"
+        assert "TL 的分析结果" in out[1]["content"]
+        assert "历史助手产出" in out[1]["content"]
+
+    def test_assistant_with_reasoning_content_kept(self):
+        from llm.client import _sanitize_messages_for_replay
+        msgs = [{"role": "assistant", "content": "hi", "reasoning_content": "think..."}]
+        out = _sanitize_messages_for_replay(msgs)
+        assert out == msgs
+
+    def test_assistant_with_tool_calls_kept(self):
+        from llm.client import _sanitize_messages_for_replay
+        msgs = [{"role": "assistant", "content": "", "tool_calls": [{"id": "t1"}]}]
+        out = _sanitize_messages_for_replay(msgs)
+        assert out == msgs
+
+    def test_consecutive_user_merged(self):
+        from llm.client import _sanitize_messages_for_replay
+        msgs = [
+            {"role": "user", "content": "需求 A"},
+            {"role": "user", "content": "已确认计划"},
+            {"role": "assistant", "content": "产出"},
+        ]
+        out = _sanitize_messages_for_replay(msgs)
+        # user 合并 + assistant 降级为 user → 全部并为一条
+        assert len(out) == 1
+        assert "需求 A" in out[0]["content"]
+        assert "历史助手产出" in out[0]["content"]
+
+    def test_non_list_passthrough(self):
+        from llm.client import _sanitize_messages_for_replay
+        assert _sanitize_messages_for_replay("not a list") == "not a list"
+
+    def test_empty_list(self):
+        from llm.client import _sanitize_messages_for_replay
+        assert _sanitize_messages_for_replay([]) == []
+
+
+class TestLogAndRaise:
+    """非 2xx 响应体写入流量日志后再抛出"""
+
+    def test_error_body_logged_before_raise(self):
+        from llm.client import _log_and_raise, _llm_logger
+        resp = Mock()
+        resp.status_code = 400
+        resp.text = '{"error":{"message":"The reasoning_content..."}}'
+        resp.raise_for_status.side_effect = requests.exceptions.HTTPError("400")
+        with patch.object(_llm_logger, 'info') as mock_log:
+            with pytest.raises(requests.exceptions.HTTPError):
+                _log_and_raise(resp, call_id="test1234", t0=0.0)
+            # 错误体必须先于异常写入流量日志
+            logged = mock_log.call_args[0][0]
+            assert "reasoning_content" in logged
+            assert '"status": 400' in logged
+
+    def test_2xx_passes_through(self):
+        from llm.client import _log_and_raise
+        resp = Mock()
+        resp.status_code = 200
+        resp.raise_for_status = Mock()
+        _log_and_raise(resp)
+        resp.raise_for_status.assert_called_once()
+
+
+class TestToolOnlyResponse:
+    """thinking 模型常态输出：content 空 + tool_calls 非空，不得误判为空响应（需求 119 事故）"""
+
+    def test_tool_only_response_is_not_error(self):
+        client = LLMClient(api_key='test_key')
+        tc = [{"id": "c1", "type": "function",
+               "function": {"name": "write_file", "arguments": "{\"filename\":\"a.html\",\"content\":\"x\"}"}}]
+        with patch.object(client, '_chat_with_tools_request_loop',
+                          return_value=("", None, tc, {"total_tokens": 10}, False)):
+            resp = client.chat_with_tools([{"role": "user", "content": "hi"}], tools=[{"x": 1}])
+        assert resp.is_error is False
+        assert resp.tool_calls == tc
+
+    def test_genuinely_empty_response_still_error(self):
+        client = LLMClient(api_key='test_key')
+        with patch.object(client, '_chat_with_tools_request_loop',
+                          return_value=("", None, None, None, False)):
+            resp = client.chat_with_tools([{"role": "user", "content": "hi"}], tools=[{"x": 1}])
+        assert resp.is_error is True
+        assert "空响应" in (resp.error or "")

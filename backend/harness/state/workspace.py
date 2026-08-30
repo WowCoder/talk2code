@@ -99,17 +99,26 @@ class WorkspaceFS:
         return (self.path / filename).exists()
 
     def snapshot(self) -> list[dict]:
-        """获取当前所有文件的快照 [{filename, content}]"""
+        """获取当前所有文件的快照 [{filename, content}]
+
+        跳过无法按 UTF-8 解码的文件（如验收截图 screenshot.png 等二进制产物）——
+        此前 PNG 魔数 0x89 直接让快照解码崩溃，整个交付流程功亏一篑。
+        """
         if not self.path.exists():
             return []
-        return [
-            {
+        out = []
+        for f in self.path.rglob("*"):
+            if not f.is_file() or '.git' in f.parts:
+                continue
+            try:
+                content = f.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            out.append({
                 "filename": str(f.relative_to(self.path)),
-                "content": f.read_text(encoding="utf-8"),
-            }
-            for f in self.path.rglob("*")
-            if f.is_file() and '.git' not in f.parts
-        ]
+                "content": content,
+            })
+        return out
 
     def cleanup(self):
         """清理工作目录"""

@@ -86,15 +86,16 @@ def block_unnecessary_read(ctx: HookContext) -> str | None:
 
 
 def block_premature_completion(ctx: HookContext) -> str | None:
-    """阻断未完成的 task_complete 声明
+    """阻断未完成的 task_complete 声明（两级契约校验）
 
-    当 Agent 尝试声明任务完成时，检查 CompletionContract：
-    - 所有文件 created=true → 允许通过
-    - 还有未完成文件 → 阻断，返回未完成文件列表
+    当 Agent 尝试声明任务完成时：
+    1. 文件级：CompletionContract 中所有文件 created=true？
+    2. AC 级（v2）：每条验收条件在 index.html 中能找到交互元素证据？
+       （静态启发式预检，真正的 DOM 验证由 verify_node Playwright 承担）
 
     Returns:
         None = 允许通过
-        str = 阻断原因（含未完成文件列表）
+        str = 阻断原因（含未完成清单/AC 缺口）
     """
     # 通过 tool_name 检测 task_complete 声明
     # Agent 声明完成有两种方式：返回无 tool_calls 的文本、或 task_complete 工具
@@ -110,21 +111,57 @@ def block_premature_completion(ctx: HookContext) -> str | None:
     if not contract or not contract.exists():
         return None  # 无 contract，不阻断
 
-    if contract.all_completed():
-        return None  # 全部完成，放行
+    messages = []
 
-    pending = contract.pending_files()
-    msg = (
-        f"[硬约束] 任务尚未完成！以下 {len(pending)} 个文件尚未创建：\n"
-        + "\n".join(f"  - {f}" for f in pending)
-        + f"\n\n进度: {contract.completed_count()}/{contract.total_files()} 已完成。"
-        f"请继续用 write_file 创建剩余文件，全部完成后才能声明任务完成。"
-    )
-    logger.info(
-        f"[ProgressHook] 阻断 task_complete: "
-        f"pending={len(pending)}/{contract.total_files()}"
-    )
-    return msg
+    # ---- 第一级：文件创建完整性 ----
+    if not contract.all_completed():
+        pending = contract.pending_files()
+        messages.append(
+            f"以下 {len(pending)} 个文件尚未创建：\n"
+            + "\n".join(f"  - {f}" for f in pending)
+            + f"\n进度: {contract.completed_count()}/{contract.total_files()} 已完成。"
+            f"请继续用 write_file 创建剩余文件。"
+        )
+        logger.info(
+            f"[ProgressHook] 阻断 task_complete: "
+            f"pending={len(pending)}/{contract.total_files()}"
+        )
+
+    # ---- 第二级：AC 交互元素证据预检（零 LLM） ----
+    acs_pending = contract.pending_acs()
+    if acs_pending:
+        workspace = ctx.state.get("_workspace") if ctx.state else None
+        index_html = ""
+        if workspace is not None:
+            try:
+                index_html = workspace.read("index.html")
+            except Exception:
+                index_html = ""
+        from harness.constraints.completion_contract import find_ac_evidence
+        no_evidence = [
+            ac for ac in acs_pending
+            if not find_ac_evidence(ac, index_html)
+        ]
+        if no_evidence:
+            messages.append(
+                "以下验收条件在 index.html 中找不到对应的交互元素证据：\n"
+                + "\n".join(
+                    f"  - [{ac['id']}] {ac.get('label', '')}"
+                    f"（验证方式: {ac.get('how_to_verify', '')[:60]}）"
+                    for ac in no_evidence
+                )
+                + "\n请确认这些功能的界面元素与交互逻辑确实已实现——"
+                  "缺少元素的 AC 在最终验收时必然失败。"
+            )
+            logger.info(
+                f"[ProgressHook] AC 预检发现 {len(no_evidence)} 条无证据: "
+                f"{[ac['id'] for ac in no_evidence]}"
+            )
+
+    if not messages:
+        return None
+
+    return "[硬约束] 任务尚未完成！\n" + "\n\n".join(messages)
 
 
 def track_write_success(ctx: HookContext) -> str | None:

@@ -26,6 +26,35 @@ _chat_inflight: dict = {}
 _chat_inflight_lock = threading.Lock()
 _CHAT_ACQUIRE_TIMEOUT = 30  # 等待并发名额的最长秒数，超时返回 429
 
+
+def _chat_quality_gate(workspace) -> tuple[list[dict], str]:
+    """Chat 修改后的轻量质量闸门（审查报告 Phase 3.4）
+
+    修改完成后自动跑一次通用冒烟（一次 15 秒内的无头浏览器调用）：
+    - 无缺陷 → 通过，返回 ([], "")
+    - 发现确定性缺陷 → 由调用方回滚本次修改并把缺陷清单告知用户
+      （人工调整越多越离标准的旧痛点由此闸门兜住）
+
+    Returns:
+        (defects, human_summary)：浏览器不可用时返回 ([], "") 即放行降级。
+    """
+    try:
+        index_path = workspace.path / "index.html"
+        if not index_path.exists():
+            return [], ""
+        from harness.tools.preview_runner import run_universal_smoke
+        result = run_universal_smoke(index_path)
+        if not result.get("available", False):
+            return [], ""
+        defects = result.get("defects", [])
+        summary = "; ".join(
+            f"[{d.get('type')}] {d.get('message', '')[:80]}" for d in defects[:3]
+        )
+        return defects, summary
+    except Exception as e:
+        logger.warning(f"Chat 质量闸门异常（放行降级）: {e}")
+        return [], ""
+
 @app.route('/api/requirements', methods=['POST'])
 @rate_limit_requirement
 @jwt_required()
@@ -311,7 +340,12 @@ def chat_with_requirement(req_id):
                 return _handle_chat_ambiguous(
                     req_id, requirement, user_message, db
                 )
-            # TASK: 继续以下流程（意图分类统一由 IntentRouter 处理，
+            elif chat_intent.intent == IntentType.SKILL:
+                # SKILL 进入完整工作流（见 requirement_service 的同名处理）
+                logger.info(
+                    f"Chat 命中工作流技能: {chat_intent.skill_name} (req_id={req_id})"
+                )
+            # TASK / SKILL: 继续以下流程（意图分类统一由 IntentRouter 处理，
             # 不再重复调用 _is_vague_requirement 做二次检测）
 
         # 初始化 harness 层
@@ -424,6 +458,10 @@ def chat_with_requirement(req_id):
             return jsonify({'error': '系统繁忙（并发对话已满），请稍后重试'}), 429
 
         try:
+            # 修改前快照：闸门判定引入新缺陷时用于回滚（零成本，纯内存）
+            pre_chat_files = {
+                f['filename']: f['content'] for f in workspace.snapshot()
+            }
             final_state = tool_loop.run(state)
         except Exception as e:
             # 关键：同步长跑异常时不能把 requirement 永久卡死 processing
@@ -438,11 +476,43 @@ def chat_with_requirement(req_id):
             with _chat_inflight_lock:
                 _chat_inflight.pop(req_id, None)
 
+        # ---- 轻量质量闸门：改完自动跑一次 smoke，引入缺陷则回滚本次修改 ----
+        gate_note = None
+        if final_state.get('current_step') == 'task_complete':
+            defects, defect_summary = _chat_quality_gate(workspace)
+            if defects:
+                logger.warning(
+                    f"Chat 质量闸门拦截 (req_id={req_id}): {len(defects)} 个确定性缺陷，"
+                    f"回滚本次修改。{defect_summary[:200]}"
+                )
+                # 回滚到修改前快照：恢复旧文件、删除新增文件
+                try:
+                    current_files = set(workspace.list())
+                    for fname, content in pre_chat_files.items():
+                        workspace.write(fname, content)
+                    for fname in current_files - set(pre_chat_files.keys()):
+                        workspace.delete(fname)
+                except Exception as rollback_err:
+                    logger.error(f"Chat 质量闸门回滚失败 (req_id={req_id}): {rollback_err}")
+                gate_note = (
+                    "## ⛔ 本次修改已被质量闸门回滚\n\n"
+                    f"修改后的代码在浏览器冒烟测试中发现了确定性缺陷：\n"
+                    f"{defect_summary}\n\n"
+                    "已自动恢复为修改前的版本。请换一种描述方式，"
+                    "或把改动拆得更小再试。"
+                )
+
         # 获取更新后的文件
         updated_files = workspace.snapshot()
 
         # 保存结果
         final_dialogue = final_state.get('dialogue_history', [])
+        if gate_note:
+            final_dialogue = list(final_dialogue) + [{
+                'role': 'system', 'name': 'System',
+                'content': gate_note,
+                'type': 'quality_gate_rollback',
+            }]
         requirement.dialogue_history = final_dialogue
         requirement.code_files = updated_files
         # 检查 current_step：只有真正完成才标记 finished
