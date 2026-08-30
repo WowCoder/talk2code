@@ -8,7 +8,7 @@
 import { computed } from 'vue'
 
 const props = defineProps<{
-  status: 'pending' | 'processing' | 'planning' | 'finished' | 'finished_with_issues' | 'failed'
+  status: 'pending' | 'processing' | 'planning' | 'finished' | 'finished_with_issues' | 'needs_user_input' | 'failed'
 }>()
 
 const labels: Record<string, string> = {
@@ -17,6 +17,7 @@ const labels: Record<string, string> = {
   planning: '待确认',
   finished: '已完成',
   finished_with_issues: '已完成 (有问题)',
+  needs_user_input: '待用户处理',
   failed: '失败',
 }
 
@@ -55,6 +56,11 @@ const label = computed(() => labels[props.status] || props.status)
 .status-badge.finished_with_issues {
   background: oklch(92% 0.04 65);
   color: oklch(45% 0.14 55);
+}
+
+.status-badge.needs_user_input {
+  background: oklch(92% 0.05 30);
+  color: oklch(45% 0.16 25);
 }
 
 .status-badge.planning {

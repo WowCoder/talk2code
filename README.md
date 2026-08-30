@@ -30,9 +30,12 @@ talk2code/
 │   ├── harness/                  # Agent 运行时框架
 │   │   ├── instructions/         #   LLM 指令与 Prompt 管理
 │   │   │   ├── compactor.py     #     上下文压缩（支持 preserve 标记保护关键消息）
-│   │   │   ├── skill_loader.py  #     声明式 Skill 加载（manifest.json 触发）
+│   │   │   ├── skill_loader.py  #     声明式 Skill 加载（manifest.json 触发，knowledge/workflow 双类型）
+│   │   │   ├── prompts/skills/  #     9 个技能：6 knowledge（generic/color/typography/accessibility/anti-ai-slop/game）
+│   │   │   │                    #     + 3 workflow（scaffold 脚手架 / refactor 重构 / code_review 前端审查，可被 run_skill 调用组合）
 │   │   │   └── nodes.py         #     LangGraph 节点（支持 Agent 委派）
 │   │   ├── tools/                #   工具注册表（ToolHandler + @register_tool 装饰器）
+│   │   │   └── skill_tools.py    #     run_skill：Agent 可调用/组合工作流技能的入口
 │   │   ├── state/                #   状态管理 / 工作区 / 记忆系统
 │   │   ├── constraints/          #   Hook 与质量约束
 │   │   ├── events.py             #   类型化事件模型（Pydantic）
@@ -144,22 +147,60 @@ cd backend && python app.py
 | 等级 | 触发条件 | 流程 |
 |------|---------|------|
 | 🟢 **simple** | 单个 HTML 页面、极简交互 | `TeamLeader` 轻量分析 → `Coder` 5 轮快速通道 → `run_preview` 验证 → 完成 |
-| 🔵 **standard** | 多文件、交互式应用 | `TeamLeader` 完整 Plan + AC → 用户确认 → `Coder` 批量创建（文件数×2+3 轮）→ `Verify` AC 逐条验收 → 1 轮修复 → PASS 或 finished_with_issues |
+| 🔵 **standard** | 多文件、交互式应用 | `TeamLeader` 完整 Plan + AC（DoD 程序化校验）→ 用户确认 → `Coder` 批量创建（文件数驱动轮数）→ `Verify` AC 逐条验收 → 按缺陷类别路由修复 → PASS / needs_user_input（交付门禁）|
 
 ### 代码质量验收系统
 
-Verify 节点采用 **Playwright 真实浏览器执行 + LLM 评估** 双层验证：
+Verify 节点采用 **确定性证据优先 + LLM 增量判断** 的证据等级模型：
 
-**L3 交互式验收**（新增）：
+**L0 环境契约（写入时刻拦截）**：
+- 运行环境硬约束单一事实源 `constraints/environment_contract.py`（禁止 ES Module/CDN、
+  存储兜底、入口可见、引用闭合），渲染注入 TL/Coder prompt，程序化检查供 Hook/lint 复用
+- PRE_WRITE Hook 零 LLM 成本拦截 `<script type="module">`、外部 CDN、import/export——
+  file:// 沙箱必炸的代码在写入瞬间就被打回，不再等浏览器报错
+
+**L3 交互式验收**：
 - LLM 将每条验收条件翻译为 Playwright DOM 操作序列（type/click/assert_exists...）
 - 在 headless Chromium 中逐条执行，收集 passed/failed/截图
-- 全部 AC 通过 + preview 零错误 → **快速通道 PASS**（跳过 LLM 深度评估）
+- 全部 AC 通过 + preview 零错误 → **快速通道 PASS**（跳过 LLM 深度评估；
+  UI/代码质量诚实标记为未评估，截图落盘 `.task/evaluator/screenshot.png`）
 - 结果实时推送到前端 Spec 面板（AC 级别 ✅/❌）
 
 **L2 深度评估**（AC 未全通过时触发）：
 - 双视角 LLM 评估（功能正确性 + 代码/UI 质量），5 维度 1-10 分
-- 综合评分 ≥ 6 且无 critical 问题 → PASS
-- 未通过 + 1 轮修复后仍不达标 → **finished_with_issues**（保留代码产物）
+- 确定性证据定下限：冒烟缺陷/浏览器错误/AC 失败是机器实测事实，LLM 无权推翻为 PASS
+- 未通过时缺陷按类别路由：架构类（模块加载/CDN/文件缺失）携带根因卡片回 Coder 重构，
+  局部语法类走小上下文定向修复
+
+### 交付门禁
+
+critical 缺陷未清零的需求不再自动放行为 finished_with_issues，而是转
+**needs_user_input** 并附差异报告（未达成 AC 清单 + 关键缺陷明细）。
+可用 `DELIVERY_GATE_STRICT=false` 关闭。Chat 人工修改路径同样有轻量闸门：
+修改后自动跑一次冒烟，引入确定性缺陷则回滚本次修改并告知用户。
+
+### 跨文件 API 契约（导出闭合）
+
+多文件批量生成的最大风险是「A 文件调用了 B 文件没实现的方法」——页面不报错，
+按钮静默失效（需求 124 事故：app.js 用了 utils.js 从没定义的 toast/copyText）。
+三层确定性防护：
+
+1. **计划期** `tl_analysis.md` 强制 tasks 声明 `exports`（每文件挂载到 window 的
+   全局对象+方法清单）；`plan_validator` 校验被依赖的 js 未声明 exports 即打回。
+2. **编码期** `build_api_contracts_section(plan)` 把 exports 渲染成「跨文件 API
+   契约」注入 coder prompt——coder 只允许调用清单内方法，未声明能力必须在自己
+   文件里实现。
+3. **验收期** `check_cross_file_contract()`（确定性、零 LLM）解析各 JS 的实际
+   导出与全项目引用，比对缺失；未定义的全局对象（如 `Game is not defined`）
+   一并拦截。断裂属架构类缺陷，携根因卡片路由回 coder 重构；`classList` 动态
+   类名与 CSS 无匹配则发警告。挂在 verify 冒烟 + task_complete 完成校验两道关。
+
+### Plan DoD 校验
+
+TeamLeader 产出的开发计划在进入 Coder 前经过程序化校验
+（`constraints/plan_validator.py`）：文件引用闭合、每个任务有 purpose、
+每条 AC 的 how_to_verify 含可操作动词、复杂度与文件数一致。
+不合格打回 TL 重出最多 1 次；带病放行会记录弱 AC 清单供下游参考。
 
 ### 上下文效率优化
 
@@ -170,7 +211,27 @@ Verify 节点采用 **Playwright 真实浏览器执行 + LLM 评估** 双层验�
 
 ### 记忆系统
 
-跨会话经验积累 — AI 会在任务前检索相关历史经验辅助编码，任务后自动总结关键模式供后续复用，持续优化生成质量。
+跨会话经验积累 — AI 会在任务前检索相关历史经验辅助编码，任务后自动总结关键模式供后续复用。
+正负经验都沉淀：失败任务显式打 failure 标签、提高重要度，检索命中时以 ⚠️ 警示案例呈现，
+避免同类缺陷重蹈覆辙。相似记忆定期由 LLM 合并去重。
+
+### 学习闭环
+
+- `eval/tasks/tasks.yaml` 固化 21 个回归任务（含贪吃蛇七连败失败模式专项 t21），
+  改动 harness 核心前后跑基线对比 `pass_rate`。标准命令（在 `backend/` 目录下执行）：
+
+  ```bash
+  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+      -u ALL_PROXY -u all_proxy PYTHONPATH=. \
+      ../venv/bin/python ../eval/run_eval.py --no-preview
+  ```
+
+  - 虚拟环境在**仓库根目录** `venv/`（不是 `backend/venv/`）；
+  - eval 是独立进程，必须显式清掉系统代理变量，否则会继承代理、导致 LLM 请求 ProxyError（同生产环境 req #134 根因）；
+  - `--no-preview` 跳过 Playwright 浏览器验收（仅跑 file/结构/内容断言），速度快、无 429 限流风险；
+  - 完整链路（含浏览器预览）去掉该开关即可，但耗时 30–60 分钟且 agnes 端点有 429 限流风险。
+- trace 覆盖全流程：编码迭代 / verify 评估 / defect_repair 修复均有 span 可归因
+- `logs/llm_traffic.log` 为 JSON Lines 结构化格式，按天轮转保留 7 天
 
 ### 快速问答
 
@@ -192,3 +253,9 @@ Verify 节点采用 **Playwright 真实浏览器执行 + LLM 评估** 双层验�
 5. 建议使用现代浏览器（Chrome/Edge/Safari）
 6. 前端开发模式：`cd frontend-vue && npm run dev` 启动 Vite 热更新开发服务器
 7. README 中出现的 `test / 123456` 仅为本地演示账号，生产环境请删除或替换
+8. **冷启动兼容性**：部分 OpenAI 兼容端点（如 agnes）强制要求 messages 中至少有一条 `user` 消息，
+   否则首轮请求返回 400（`No user query found in messages.`）。`harness/runtime.py` 的
+   `_build_messages()` 在对话历史为空（冷启动）时自动补一条 user 消息，生产环境因需求本就
+   作为 user 消息进入历史而 no-op，零副作用。
+9. **LLM 流量诊断**：`logs/llm_traffic.log`（仓库根目录，非 `backend/logs`）为 JSON Lines 格式，
+   按天轮转保留 7 天，每条含完整请求/响应体，可用于定位 400/500 等端点校验问题。

@@ -40,17 +40,25 @@ export const useRequirementStore = defineStore('requirement', () => {
   // ===== API (from shared composable) =====
   const { api } = useApi()
 
-  function messageKey(msg: DialogueMessage): string {
-    // SSE dialogue 事件携带时间戳，重放时同一事件的时间戳一致，可作幂等键；
-    // 迭代批量事件用 iteration 序号去重；无时间戳的本地消息（如用户连发"继续"）不去重
-    if (msg.timestamp) {
-      return `ts::${msg.role}::${msg.name || ''}::${msg.content}::${msg.timestamp}`
-    }
-    if (msg.role === 'iteration_batch' && msg.iteration !== undefined) {
-      return `iter::${msg.iteration}`
-    }
-    return ''
+function messageKey(msg: DialogueMessage): string {
+  // SSE dialogue 事件携带时间戳，重放时同一事件的时间戳一致，可作幂等键；
+  // 无时间戳的本地消息（如用户连发"继续"）不去重
+  if (msg.timestamp) {
+    return `ts::${msg.role}::${msg.name || ''}::${msg.content}::${msg.timestamp}`
   }
+  if (msg.role === 'iteration_batch') {
+    // 必须带上 content：需求被「重跑」时两组迭代都从第 1 轮开始，
+    // 若只用 iter::N 会跨轮次碰撞，把新一轮卡片误判为重复而丢弃/错位。
+    // 同一轮次的精确重放（content 相同）仍可正常去重。
+    return `iter::${msg.iteration ?? ''}::${msg.content ?? ''}`
+  }
+  if (msg.role === 'hook_check') {
+    // hook_check 事件没有时间戳，必须按内容去重，否则 SSE 重连/回放时会反复入列，
+    // 表现为「一直收到同一条消息」
+    return `${msg.role}::${msg.name || ''}::${msg.content ?? ''}`
+  }
+  return ''
+}
 
   async function loadRequirement(id: number): Promise<{ requirement: Requirement; trace?: any; evaluator?: SSEEvaluatorResultData } | null> {
     const seq = ++loadSeq

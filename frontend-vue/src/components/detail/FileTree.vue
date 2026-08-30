@@ -5,48 +5,43 @@
       <div v-if="!files.length" class="file-empty">
         暂无文件
       </div>
-      <div
-        v-for="file in files"
-        :key="file"
-        :class="['tree-file', { active: file === activeFile }]"
-        @click="$emit('select', file)"
-      >
-        <span :class="['tree-file-icon', fileExt(file)]">{{ fileLabel(file) }}</span>
-        {{ file }}
-      </div>
+      <FileTreeNode
+        v-for="node in files"
+        :key="node.path"
+        :node="node"
+        :depth="0"
+        :active-file="activeFile"
+        @select="$emit('select', $event)"
+      />
     </div>
   </div>
 </template>
 
+<script lang="ts">
+export interface TreeNode {
+  name: string
+  path: string
+  type: 'file' | 'folder'
+  children: TreeNode[]
+}
+</script>
+
 <script setup lang="ts">
+import FileTreeNode from './FileTreeNode.vue'
+
 defineProps<{
-  files: string[]
+  files: TreeNode[]
   activeFile: string
 }>()
 
 defineEmits<{
   select: [filename: string]
 }>()
-
-function fileExt(filename: string): string {
-  const ext = filename.split('.').pop() || ''
-  if (['html', 'htm'].includes(ext)) return 'html'
-  if (['css'].includes(ext)) return 'css'
-  if (['js', 'mjs'].includes(ext)) return 'js'
-  if (['md'].includes(ext)) return 'md'
-  return 'html'
-}
-
-function fileLabel(filename: string): string {
-  const ext = filename.split('.').pop() || ''
-  const labels: Record<string, string> = { html: 'H', htm: 'H', css: 'C', js: 'J', mjs: 'J', md: 'M' }
-  return labels[ext] || ext[0]?.toUpperCase() || '?'
-}
 </script>
 
 <style scoped>
 .file-tree {
-  width: 200px;
+  width: 220px;
   flex-shrink: 0;
   background: var(--dark-surface);
   border-right: 1px solid var(--dark-border);
@@ -85,58 +80,5 @@ function fileLabel(filename: string): string {
   padding: 12px 14px;
   font-size: 12px;
   color: var(--dark-muted);
-}
-
-.tree-file {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 14px;
-  font-size: 13px;
-  color: var(--dark-muted);
-  cursor: pointer;
-  transition: color 0.15s, background 0.15s;
-}
-
-.tree-file:hover {
-  color: var(--dark-fg);
-  background: var(--dark-hover);
-}
-
-.tree-file.active {
-  color: var(--accent);
-  background: var(--dark-hover);
-}
-
-.tree-file-icon {
-  width: 16px;
-  height: 16px;
-  border-radius: 3px;
-  font-size: 9px;
-  font-weight: 700;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-}
-
-.tree-file-icon.html {
-  background: oklch(50% 0.12 35);
-  color: #fff;
-}
-
-.tree-file-icon.css {
-  background: oklch(50% 0.12 260);
-  color: #fff;
-}
-
-.tree-file-icon.js {
-  background: oklch(50% 0.12 100);
-  color: #000;
-}
-
-.tree-file-icon.md {
-  background: oklch(50% 0.08 260);
-  color: #fff;
 }
 </style>

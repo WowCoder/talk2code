@@ -96,6 +96,7 @@ const statusText = computed(() => {
   }
   if (store.currentRequirement?.status === 'finished') return '已完成'
   if (store.currentRequirement?.status === 'finished_with_issues') return '已完成 (有问题)'
+  if (store.currentRequirement?.status === 'needs_user_input') return '待用户处理（存在关键缺陷）'
   if (store.currentRequirement?.status === 'failed') return '失败'
   return '准备中'
 })
@@ -124,7 +125,7 @@ onMounted(async () => {
     const req = store.currentRequirement
     if (!req) return
 
-    if (req.status === 'finished' || req.status === 'finished_with_issues') {
+    if (req.status === 'finished' || req.status === 'finished_with_issues' || req.status === 'needs_user_input') {
       store.isGenerating = false
       store.progress = { currentAgent: '', percent: 100 }
       // trace / evaluator 已在 loadRequirement 内恢复

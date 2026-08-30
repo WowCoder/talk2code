@@ -8,7 +8,7 @@ export interface User {
 }
 
 // ===== Requirement Types =====
-export type RequirementStatus = 'pending' | 'processing' | 'planning' | 'finished' | 'finished_with_issues' | 'failed'
+export type RequirementStatus = 'pending' | 'processing' | 'planning' | 'finished' | 'finished_with_issues' | 'needs_user_input' | 'failed'
 
 export interface RequirementSummary {
   id: number

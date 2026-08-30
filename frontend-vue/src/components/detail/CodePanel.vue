@@ -1,7 +1,7 @@
 <template>
   <div class="code-layout">
     <FileTree
-      :files="fileNames"
+      :files="fileTree"
       :active-file="activeFile"
       @select="onSelectFile"
     />
@@ -23,13 +23,14 @@ import { useRequirementStore } from '@/stores/requirement'
 import { useSettingsStore } from '@/stores/settings'
 import { useToast } from '@/composables/useToast'
 import FileTree from './FileTree.vue'
+import type { TreeNode } from './FileTree.vue'
 import CodeEditor from './CodeEditor.vue'
 
 const store = useRequirementStore()
 const settingsStore = useSettingsStore()
 const { show } = useToast()
 
-const fileNames = computed(() => Object.keys(store.codeFiles))
+const fileTree = computed<TreeNode[]>(() => buildTree(Object.keys(store.codeFiles)))
 const activeFile = computed(() => store.activeFile)
 
 const currentContent = computed(() => {
@@ -39,6 +40,40 @@ const currentContent = computed(() => {
 
 function onSelectFile(filename: string) {
   store.setActiveFile(filename)
+}
+
+// Build a nested directory tree from flat "dir/file.ext" path keys.
+function buildTree(paths: string[]): TreeNode[] {
+  const root: TreeNode = { name: '', path: '', type: 'folder', children: [] }
+  for (const full of paths) {
+    const parts = full.split('/').filter(Boolean)
+    if (!parts.length) continue
+    let node = root
+    let cur = ''
+    parts.forEach((part, i) => {
+      cur = cur ? `${cur}/${part}` : part
+      const isFile = i === parts.length - 1
+      let child = node.children.find((c) => c.name === part)
+      if (!child) {
+        child = { name: part, path: cur, type: isFile ? 'file' : 'folder', children: [] }
+        node.children.push(child)
+      } else if (!isFile && child.type === 'file') {
+        // A segment previously seen as a file is actually a directory.
+        child.type = 'folder'
+      }
+      node = child
+    })
+  }
+  sortNodes(root.children)
+  return root.children
+}
+
+function sortNodes(nodes: TreeNode[]) {
+  nodes.sort((a, b) => {
+    if (a.type !== b.type) return a.type === 'folder' ? -1 : 1
+    return a.name.localeCompare(b.name)
+  })
+  nodes.forEach((n) => sortNodes(n.children))
 }
 
 function onContentChange(content: string) {

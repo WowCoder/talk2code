@@ -118,7 +118,7 @@
           <span class="role-icon">{{ roleIcon }}</span>
           {{ displayName }}
         </span>
-        <span class="iteration-label">第 {{ msg.iteration }} 轮</span>
+        <span v-if="msg.iteration != null" class="iteration-label">第 {{ msg.iteration }} 轮</span>
         <span class="iteration-tool-count">{{ toolsList.length }} 个操作</span>
         <span v-if="msg.thinking_preview" class="iteration-thinking-dot" title="有思考内容">💭</span>
       </div>

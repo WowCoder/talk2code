@@ -30,6 +30,7 @@ ENV/
 .idea/
 .vscode/
 .claude/
+.workbuddy/
 *.swp
 *.swo
 *~

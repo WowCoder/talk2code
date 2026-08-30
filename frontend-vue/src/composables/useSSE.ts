@@ -131,14 +131,20 @@ export function useSSE(reqId: Ref<number | null>) {
 
     es.addEventListener('iteration_batch', (e: MessageEvent) => {
       const data: SSEIterationBatchData = JSON.parse(e.data)
+      const batchTools = data.tools || []
+      // 跳过畸形事件：既无轮次也无工具列表、也无文本（旧版缓冲/字段缺失）。
+      // 否则会渲染出「第 轮 / 0 个操作」空卡片，且 SSE 重连回放会反复出现。
+      if (data.iteration == null && batchTools.length === 0 && !(data as any).content) {
+        return
+      }
       store.addDialogueMessage({
         role: 'iteration_batch',
         name: data.coder_name || 'Agent',
-        content: (data as any).content || `第 ${data.iteration} 轮迭代 — ${data.tools.length} 个操作`,
+        content: (data as any).content || `第 ${data.iteration ?? '?'} 轮迭代 — ${batchTools.length} 个操作`,
         iteration: data.iteration,
         thinking_preview: data.thinking_preview,
         agent_text: data.agent_text,
-        tools: data.tools,
+        tools: batchTools,
       })
     })
 
