@@ -2,11 +2,41 @@
   <img src="docs/images/logo.png" alt="Talk2Code Logo" width="120" />
 </p>
 
-# Talk2Code
+<h1 align="center">Talk2Code</h1>
 
-一个 AI 驱动的一站式网站生成平台，用户输入自然语言需求 → AI 多智能体协同处理 → 实时生成可运行的产品代码。
+<p align="center">
+  <b>用一句话，生成一个能跑的应用。</b>
+</p>
 
-![首页](docs/images/index.png)
+<p align="center">
+  输入自然语言需求 → AI 多智能体协同（需求分析 / 批量编码 / 真实浏览器验收）→ 实时产出可运行、可下载的产品代码。
+</p>
+
+<p align="center">
+  <img src="docs/talk2code_pitch.gif" alt="Talk2Code 演示：一句话生成贪吃蛇小游戏" width="100%" />
+</p>
+
+<p align="center">
+  🎬 <a href="https://github.com/WowCoder/talk2code/blob/main/docs/talk2code_pitch.mp4">观看高清视频（MP4）</a>
+  &nbsp;·&nbsp; 📐 <a href="#架构一览">架构一览</a>
+  &nbsp;·&nbsp; ⚡ <a href="#快速开始">3 步跑起来</a>
+</p>
+
+---
+
+## 为什么不一样
+
+多数「AI 写代码」工具止步于吐出一堆片段。Talk2Code 把<b>工程质量</b>当成一等公民：
+
+| 能力 | 做法 |
+|------|------|
+| 🧠 多智能体分工 | LangGraph 编排 TeamLeader / Coder / Verify，职责分离而非一次生成了事 |
+| ✅ 真实验收 | Verify 用 Playwright 在 headless Chromium 里逐条执行 AC，不是「看着像对的」 |
+| 🛡️ 交付门禁 | critical 缺陷未清零不放行，转 `needs_user_input` 并附差异报告 |
+| 🔗 跨文件契约 | 计划期声明 exports → 编码期契约注入 → 验收期闭合校验，杜绝「按钮静默失效」 |
+| 🚫 写入即拦截 | PRE_WRITE Hook 零 LLM 成本拦掉 `type="module"` / 外部 CDN 等沙箱必炸写法 |
+| 🔁 缺陷自动回炉 | 验收不通过按缺陷类别路由回 Coder 重构，架构类附根因卡片，修完再验 |
+| 📊 回归纪律 | 固化 21 个回归任务（含贪吃蛇失败模式专项），改核心前后跑基线对照；失败经验入库 |
 
 ## 技术栈
 
@@ -17,6 +47,12 @@
 - **认证**: JWT
 - **AI 模型**: 兼容 OpenAI/Anthropic 接口协议，配置驱动切换
 - **向量检索**: BGE-M3 混合检索
+
+## 架构一览
+
+<p align="center">
+  <img src="docs/architecture.svg" alt="Talk2Code 架构流程图" width="100%" />
+</p>
 
 ## 项目结构
 
@@ -217,8 +253,20 @@ TeamLeader 产出的开发计划在进入 Coder 前经过程序化校验
 
 ### 学习闭环
 
-- `eval/tasks/tasks.yaml` 固化 21 个回归任务（含贪吃蛇七连败失败模式专项 t21），
-  改动 harness 核心前后跑基线对比 `pass_rate`。标准命令（在 `backend/` 目录下执行）：
+`eval/tasks/tasks.yaml` 里固化的 21 个回归任务，覆盖的都是**历史上真实踩过的坑**，
+而不是凑数的样例：
+
+- `t21` 贪吃蛇 —— 曾连续七次失败的失败模式专项
+- `ENV-3` —— `file://` 下 ES Module 被 CORS 拦截（需求 #115 的直接死因）
+- `ENV-2` —— 无网络沙箱里 CDN 必挂（#110–116 反复踩坑）
+
+改 harness 核心时前后各跑一次基线做对照，用数据判断「这次改动到底更好还是更差」，
+而不是靠感觉。
+
+最近一次全量基线（2026-08-31）：20/21 通过，唯一未通过项定位为上游模型端点读超时，
+非架构缺陷。完整报告见 `eval/results/baseline_20260831_113741.md`。
+
+标准命令（在 `backend/` 目录下执行）：
 
   ```bash
   env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
