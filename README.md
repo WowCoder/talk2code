@@ -278,6 +278,7 @@ TeamLeader 产出的开发计划在进入 Coder 前经过程序化校验
   - eval 是独立进程，必须显式清掉系统代理变量，否则会继承代理、导致 LLM 请求 ProxyError（同生产环境 req #134 根因）；
   - `--no-preview` 跳过 Playwright 浏览器验收（仅跑 file/结构/内容断言），速度快、无 429 限流风险；
   - 完整链路（含浏览器预览）去掉该开关即可，但耗时 30–60 分钟且 agnes 端点有 429 限流风险。
+  - 预览验证在 headless Chromium 中**真实加载生成页面**，捕获 `pageerror` / `console_error` / `request_failed` 等运行时错误（含跨文件导出未定义导致的崩溃），与静态结构审计互补，构成「静态 + 运行时」双保险质量信号。
 - trace 覆盖全流程：编码迭代 / verify 评估 / defect_repair 修复均有 span 可归因
 - `logs/llm_traffic.log` 为 JSON Lines 结构化格式，按天轮转保留 7 天
 
