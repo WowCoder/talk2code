@@ -9,6 +9,7 @@ Eval Runner —— 生成质量基线评估
     cd backend && PYTHONPATH=. python ../eval/run_eval.py
     cd backend && PYTHONPATH=. python ../eval/run_eval.py --tasks t01 t02   # 只跑指定任务
     cd backend && PYTHONPATH=. python ../eval/run_eval.py --no-preview       # 跳过浏览器验证（CI 快跑）
+    cd backend && PYTHONPATH=. python ../eval/run_eval.py --resume eval/results/baseline_xxx.json  # 断点续跑（只重跑失败项）
 
 输出：
     eval/results/baseline_<timestamp>.json   # 完整结果
@@ -207,8 +208,9 @@ def run_one_task(task: dict, args) -> TaskResult:
     result = TaskResult(id=tid, name=task["name"], level=task["level"], passed=False)
     t0 = time.time()
 
-    # 每个任务独立临时工作区
-    eval_base = Path("/tmp/talk2code_eval")
+    # 工作区隔离：每次 run 用唯一目录，避免并发/重跑互相覆盖污染结果
+    run_id = getattr(args, "run_id", time.strftime("%Y%m%d_%H%M%S"))
+    eval_base = Path("/tmp") / "talk2code_eval_runs" / run_id
     ws = WorkspaceFS(user_id=0, requirement_id=int(tid.lstrip("t")), base_dir=eval_base)
     if ws.path.exists():
         shutil.rmtree(ws.path)
@@ -348,7 +350,12 @@ def main():
     parser.add_argument("--tasks", nargs="*", help="只跑指定任务 id（如 t01 t02）")
     parser.add_argument("--no-preview", action="store_true", help="跳过浏览器验证（快）")
     parser.add_argument("--compare", metavar="BASELINE_JSON", help="对比历史基线")
+    parser.add_argument("--resume", metavar="BASELINE_JSON",
+                        help="断点续跑：复用该报告中已 PASS 的任务结果，只重跑未通过的")
     args = parser.parse_args()
+
+    # 工作区隔离：每次 run 用唯一目录（时间戳+PID），避免并发/重跑互相覆盖
+    args.run_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
 
     tasks = yaml.safe_load((_HERE / "tasks" / "tasks.yaml").read_text())["tasks"]
     if args.tasks:
@@ -358,12 +365,55 @@ def main():
             print(f"未找到任务: {args.tasks}")
             sys.exit(1)
 
+    # 断点续跑：加载历史结果，已 PASS 的直接复用，不重跑
+    resume_map = {}
+    if args.resume:
+        try:
+            rd = json.loads(Path(args.resume).read_text())
+            resume_map = {r["id"]: r for r in rd.get("results", [])}
+            print(f"断点续跑：已加载 {len(resume_map)} 个历史结果\n")
+        except Exception as e:
+            print(f"resume 读取失败，忽略: {e}")
+
     print(f"Eval: {len(tasks)} 个任务 (preview={'off' if args.no_preview else 'on'})\n")
 
     results = []
     for i, task in enumerate(tasks, 1):
-        print(f"[{i}/{len(tasks)}] {task['id']} {task['name']} ... ", end="", flush=True)
-        r = run_one_task(task, args)
+        rid = task["id"]
+        # 断点续跑：已 PASS 的任务直接复用结果，跳过生成（省配额、省时）
+        if rid in resume_map and resume_map[rid].get("passed"):
+            old = resume_map[rid]
+            r = TaskResult(
+                id=rid, name=old["name"], level=old.get("level"),
+                passed=True, error=old.get("error"),
+                duration_s=old.get("duration_s"),
+                files=old.get("files", []),
+                assertions=old.get("assertions", []),
+            )
+            print(f"[{i}/{len(tasks)}] {rid} {task['name']} ... ⏭️ (resume PASS)")
+            results.append(r)
+            continue
+
+        print(f"[{i}/{len(tasks)}] {rid} {task['name']} ... ", end="", flush=True)
+        try:
+            r = run_one_task(task, args)
+        except Exception as e:
+            import traceback
+            r = TaskResult(
+                id=rid, name=task["name"], level=task.get("level"),
+                passed=False, error=f"任务级未捕获异常: {e}\n{traceback.format_exc()}",
+            )
+        # LLM 读超时（agnes 偶发抖动）自动重试一次：基础设施问题，非质量缺陷
+        if (not r.passed) and r.error and ("timed out" in r.error.lower()):
+            print("↻ LLM 超时，自动重试 1 次... ", end="", flush=True)
+            try:
+                r = run_one_task(task, args)
+            except Exception as e:
+                import traceback
+                r = TaskResult(
+                    id=rid, name=task["name"], level=task.get("level"),
+                    passed=False, error=f"任务级未捕获异常: {e}\n{traceback.format_exc()}",
+                )
         mark = "✅" if r.passed else "❌"
         print(f"{mark} ({r.duration_s}s)" + (f"  {r.error}" if r.error else ""))
         results.append(r)
