@@ -360,9 +360,7 @@ def run_ac_checks(
         return [{"ac_id": s["ac_id"], "passed": False, "failures": [], "harness_errors": ["playwright 未安装"], "steps_executed": 0} for s in ac_scripts]
 
     url = html_path.resolve().as_uri()
-    wrapper_uri, wrapper_tmp = (None, None)
-    if preview_url:
-        wrapper_uri, wrapper_tmp = _make_sandbox_wrapper_uri(preview_url)
+    sandbox, wrapper_uri, wrapper_tmp = _prepare_sandbox(preview_url)
     results = []
 
     try:
@@ -377,15 +375,33 @@ def run_ac_checks(
                 page = context.new_page()
                 page.set_default_timeout(timeout_ms)
 
-                def _load():
+                def _load(use_sandbox: bool):
                     """每个 AC 从干净状态加载（沙箱模式返回内层 frame）"""
-                    if preview_url:
+                    if use_sandbox:
                         page.goto(wrapper_uri, wait_until="domcontentloaded", timeout=timeout_ms)
                         page.wait_for_timeout(1500)  # 等待 iframe 资源拉取
                         return _resolve_preview_frame(page)
                     page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
                     page.wait_for_timeout(1000)  # 等待初始化
                     return page
+
+                # ---- 前置探测：沙箱链路是否真的能加载出应用 ----
+                # 不探测的话，链路一断（URL 不可达/相对路径/服务未起）所有 AC 都在
+                # 空白页上执行，失败被归类为「脚本驱动失败」不计缺陷 → 静默假绿
+                sandbox_on = sandbox
+                degraded_reason = None
+                if sandbox_on:
+                    try:
+                        degraded_reason = _frame_load_failure(_load(True))
+                    except Exception as e:
+                        degraded_reason = f"宿主页加载异常: {e}"
+                    if degraded_reason:
+                        sandbox_on = False
+                        logger.warning(
+                            "[AC] 沙箱预览链路不可用（%s），本轮回退直读工作区文件执行 AC。"
+                            "请检查预览地址是否可达: %s",
+                            degraded_reason, preview_url,
+                        )
 
                 for script in ac_scripts:
                     ac_id = script.get("ac_id", "?")
@@ -397,7 +413,12 @@ def run_ac_checks(
                     doc = None
 
                     try:
-                        doc = _load()
+                        doc = _load(sandbox_on)
+                        _load_fail = _frame_load_failure(doc)
+                        if _load_fail:
+                            # 页面本身打不开 = 真实缺陷（用户看到的就是白屏），
+                            # 必须记进 failures 而不是当成脚本问题吞掉
+                            failures.append(f"页面无法加载: {_load_fail}")
 
                         def _canvas_sig():
                             return doc.evaluate("""
@@ -430,14 +451,12 @@ def run_ac_checks(
                                     doc.select_option(eff, step.get("value", ""))
                                 elif action == "press":
                                     key = step.get("key", "Enter")
-                                    # 沙箱 iframe：doc.press 到内层 canvas 无法送达键盘事件，
-                                    # keydown 监听在 document 上，需用 page 级全局键盘。
-                                    # 方向/功能键尤其如此（需求 126：游戏能玩但 AC 的 press 失效，
-                                    # assert_canvas_change 全部假阴性）。
-                                    if key.startswith("Arrow") or key in ("Enter", "Space", "Tab") or preview_url:
-                                        page.locator("body").press(key)
-                                    else:
-                                        doc.press(selector or "body", key)
+                                    # 关键修正（需求 140）：沙箱 iframe 内，游戏 keydown 监听
+                                    # 在内层 document 上。page.locator("body").press 只打外层宿主页，
+                                    # 内层收不到 → assert_canvas_change 全部假阴性（"游戏能玩但 AC 失效"）。
+                                    # 统一用 doc.press（沙箱模式 doc 即内层 frame）投到内层，
+                                    # 按键冒泡到内层 document 监听即可触发。
+                                    doc.press(selector or "body", key)
                                 elif action == "wait":
                                     page.wait_for_timeout(step.get("ms", 500))
                                 elif action == "assert_exists":
@@ -500,6 +519,8 @@ def run_ac_checks(
                         "failures": failures,
                         "harness_errors": harness_failures,
                         "steps_executed": steps_executed,
+                        # 沙箱链路降级时标注，便于区分「产品坏」与「验证环境坏」
+                        "preview_degraded": degraded_reason,
                     })
 
             finally:
@@ -541,9 +562,7 @@ def capture_screenshot(html_path: Path, out_path: Path,
         return None
 
     url = Path(html_path).resolve().as_uri()
-    wrapper_uri, wrapper_tmp = (None, None)
-    if preview_url:
-        wrapper_uri, wrapper_tmp = _make_sandbox_wrapper_uri(preview_url)
+    sandbox, wrapper_uri, wrapper_tmp = _prepare_sandbox(preview_url)
 
     try:
         with sync_playwright() as p:
@@ -553,10 +572,16 @@ def capture_screenshot(html_path: Path, out_path: Path,
                 page = context.new_page()
                 page.set_default_timeout(timeout_ms)
                 target = page
-                if preview_url:
+                if sandbox:
                     page.goto(wrapper_uri, wait_until="domcontentloaded", timeout=timeout_ms)
                     page.wait_for_timeout(1500)
                     target = _resolve_preview_frame(page) or page
+                    # 沙箱链路打不开就截到一张空白图，等于没留档 → 回退直读文件
+                    fail = _frame_load_failure(target)
+                    if fail:
+                        logger.warning("[Screenshot] 沙箱预览不可用（%s），回退直读文件", fail)
+                        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                        page.wait_for_timeout(1200)
                 else:
                     page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
                     page.wait_for_timeout(1200)
@@ -588,8 +613,8 @@ def capture_screenshot(html_path: Path, out_path: Path,
 _SANDBOX_ATTRS = "allow-scripts allow-forms"
 
 
-def _make_sandbox_wrapper_uri(preview_url: str) -> str:
-    """生成与前端预览 iframe 属性一致的宿主页，返回 file:// URI"""
+def _make_sandbox_wrapper_uri(preview_url: str) -> tuple[str, str]:
+    """生成与前端预览 iframe 属性一致的宿主页，返回 (file:// URI, 临时文件路径)"""
     import tempfile
     wrapper = (
         '<!DOCTYPE html><html><head><meta charset="utf-8"></head>'
@@ -605,6 +630,53 @@ def _make_sandbox_wrapper_uri(preview_url: str) -> str:
     tmp.write(wrapper)
     tmp.close()
     return Path(tmp.name).resolve().as_uri(), tmp.name
+
+
+def _prepare_sandbox(preview_url: str | None) -> tuple[bool, str | None, str | None]:
+    """准备沙箱宿主页。
+
+    宿主页是 file:// 临时文件，iframe src 必须是**绝对** URL，否则相对路径
+    会解析成 `file:///api/pt/...` → chrome-error 空白页，所有后续检查都在
+    空白页上执行（需求 140 假绿事故）。这里前置拦掉非绝对地址。
+
+    Returns:
+        (是否启用沙箱, 宿主页 file:// URI, 宿主页临时文件路径)
+    """
+    if not preview_url:
+        return False, None, None
+    if not preview_url.startswith(("http://", "https://")):
+        logger.warning(
+            "[Preview] preview_url 非绝对地址（%s），file:// 宿主页无法解析 "
+            "—— 禁用沙箱模式，回退直读工作区文件",
+            preview_url[:80],
+        )
+        return False, None, None
+    uri, tmp = _make_sandbox_wrapper_uri(preview_url)
+    return True, uri, tmp
+
+
+def _frame_load_failure(doc) -> str | None:
+    """检测 frame/page 是否真的加载出了内容。
+
+    返回失败原因字符串，加载正常时返回 None。
+    没有这道检查，chrome-error 空白页会让 CTA 查找返回空、检查项被静默
+    跳过，最终 available=True / defects=0 的「假绿」。
+    """
+    try:
+        url = doc.url or ""
+    except Exception:
+        url = ""
+    if url.startswith("chrome-error://"):
+        return f"页面加载失败 (url={url})"
+    if url in ("", "about:blank"):
+        return f"页面未导航 (url={url or '空'})"
+    try:
+        n = doc.evaluate("() => document.body ? document.body.children.length : -1")
+    except Exception as e:
+        return f"文档不可访问: {e}"
+    if not isinstance(n, int) or n <= 0:
+        return f"文档为空 (body 子元素数={n})"
+    return None
 
 
 def _resolve_preview_frame(page):
@@ -717,13 +789,9 @@ def run_universal_smoke(html_path: Path, timeout_ms: int = 15_000, preview_url: 
         return result
 
     url = Path(html_path).resolve().as_uri()
-    wrapper_uri, wrapper_tmp = (None, None)
-    if preview_url:
-        wrapper_uri, wrapper_tmp = _make_sandbox_wrapper_uri(preview_url)
+    sandbox, wrapper_uri, wrapper_tmp = _prepare_sandbox(preview_url)
+    if sandbox:
         result["logs"].append(f"[smoke] 沙箱预览模式: {preview_url.split('/api/pt/')[-1][:40]}")
-    interactive = None
-    no_instant_death = None
-    storage_safe = None
 
     try:
         with sync_playwright() as p:
@@ -747,9 +815,9 @@ def run_universal_smoke(html_path: Path, timeout_ms: int = 15_000, preview_url: 
                 page.on("console", lambda m: _err(f"console_error: {m.text}") if m.type == "error" else None)
                 page.on("dialog", lambda d: d.accept())
 
-                def _open():
+                def _open(use_sandbox: bool):
                     """加载页面（沙箱模式返回内层 frame），并安装错误收集器"""
-                    if preview_url:
+                    if use_sandbox:
                         page.goto(wrapper_uri, wait_until="domcontentloaded", timeout=timeout_ms)
                         page.wait_for_timeout(1500)  # 等待 iframe 资源拉取
                         fr = _resolve_preview_frame(page)
@@ -759,7 +827,34 @@ def run_universal_smoke(html_path: Path, timeout_ms: int = 15_000, preview_url: 
                     page.wait_for_timeout(1200)
                     return page
 
-                doc = _open()
+                sandbox_on = sandbox
+                doc = _open(sandbox_on)
+
+                # ---- 不变量 0: 页面真的加载出内容了 ----
+                # 这是所有后续检查的前提。缺了它，空白页会让 CTA 查找返回空、
+                # interactive/no_instant_death 被静默跳过，最终 defects=0 假绿
+                # （需求 140：iframe 落到 chrome-error，验证全绿但用户看到死页面）
+                load_fail = _frame_load_failure(doc)
+                if load_fail and sandbox_on:
+                    result["logs"].append(f"[smoke] 沙箱预览不可用（{load_fail}），回退直读文件")
+                    logger.warning("[smoke] 沙箱预览链路不可用（%s），回退直读文件: %s",
+                                   load_fail, preview_url)
+                    sandbox_on = False
+                    doc = _open(False)
+                    load_fail = _frame_load_failure(doc)
+                result["checks"]["page_loads"] = not load_fail
+                if load_fail:
+                    result["defects"].append({
+                        "type": "preview_unloadable",
+                        "severity": "critical",
+                        "dimension": "runtime",
+                        "message": f"预览页面加载不出任何内容（{load_fail}），用户打开就是白屏",
+                        "evidence": load_fail,
+                        "suggestion": (
+                            "确认 index.html 存在且 <body> 有实际内容；检查 css/js 引用路径"
+                            "（相对路径、大小写、目录层级）是否与实际文件一致"
+                        ),
+                    })
 
                 # ---- 找主交互入口（品类无关启发式） ----
                 cta = None
@@ -919,12 +1014,127 @@ def run_universal_smoke(html_path: Path, timeout_ms: int = 15_000, preview_url: 
                                     "是流程问题，必须在 JS 逻辑中修改"
                                 ),
                             })
+
+                        # ---- 不变量 5: 键盘驱动型应用的输入响应 ----
+                        # 需求 140 事故：点「开始游戏」后 renderReady() 画出蛇（interactive
+                        # 判绿），但循环从未启动，按方向键永远不动。只看「点击后有变化」
+                        # 抓不到，必须显式验证键盘输入后画面持续变化。
+                        # 品类门禁：仅当页面有 canvas 且文案提示键盘操作时才检查。
+                        _kbd_gate = False
+                        try:
+                            _kbd_gate = bool(doc.evaluate("""
+                                () => {
+                                    if (!document.querySelector('canvas')) return false;
+                                    const t = ((document.body.innerText || '')).toLowerCase();
+                                    return /方向键|方向鍵|箭头键|上下左右|wasd|arrow key|arrow keys|↑|←|→|↓/.test(t);
+                                }
+                            """))
+                        except Exception:
+                            _kbd_gate = False
+
+                        if _kbd_gate:
+                            # 关键修正（需求 140）：真实按键必须通过「内层 frame」投递。
+                            # page.keyboard.press 只打外层宿主页，沙箱 iframe 的 document
+                            # 收不到 keydown，循环永远起不来——这是 harness 焦点问题而非
+                            # 产品缺陷。改用 doc.press("body", key)，按键会冒泡到内层
+                            # document 的 keydown 监听。
+                            try:
+                                _cv = doc.query_selector("canvas")
+                                if _cv:
+                                    _cv.click(timeout=3000)  # 先把焦点交给 canvas/内层 frame
+                            except Exception:
+                                pass
+                            k0 = _canvas_sig()
+                            for _k in ("ArrowRight", "ArrowDown"):
+                                try:
+                                    doc.press("body", _k)  # 帧级真实按键
+                                except Exception:
+                                    pass
+                                page.wait_for_timeout(350)
+                            page.wait_for_timeout(1600)
+                            k1 = _canvas_sig()
+                            page.wait_for_timeout(1200)
+                            k2 = _canvas_sig()
+                            real_alive = (k0 != k1) or (k1 != k2)
+
+                            if real_alive:
+                                alive = True
+                                result["logs"].append(
+                                    "[smoke] 真实按键（帧级投递）已驱动画面，键盘响应通过"
+                                )
+                            else:
+                                # 兜底：真实帧投递可能因沙箱焦点限制失败，再用合成 keydown
+                                # 直接派发到内层 document 确认循环逻辑本身是否可驱动。
+                                # 合成能驱动 → 产品逻辑没问题，记为通过（标注 harness 限制）；
+                                # 合成也不动 → 循环确实没启动，记真实缺陷。
+                                try:
+                                    doc.evaluate("""
+                                        () => ['ArrowRight','ArrowDown'].forEach(k =>
+                                            document.dispatchEvent(new KeyboardEvent('keydown', {
+                                                key: k, code: k, bubbles: true,
+                                                keyCode: k === 'ArrowRight' ? 39 : 40
+                                            })))
+                                    """)
+                                except Exception:
+                                    pass
+                                page.wait_for_timeout(1800)
+                                k3 = _canvas_sig()
+                                if k3 != k2:
+                                    alive = True
+                                    result["logs"].append(
+                                        "[smoke] 真实帧投递受限，但合成 keydown 已驱动画面，"
+                                        "判定键盘响应通过（沙箱焦点限制，非产品缺陷）"
+                                    )
+                                else:
+                                    alive = False
+                                    result["logs"].append(
+                                        "[smoke] 真实按键与合成事件均未驱动画面，循环确未启动"
+                                    )
+
+                            result["checks"]["keyboard_responsive"] = bool(alive)
+                            if alive is False:
+                                result["defects"].append({
+                                    "type": "input_no_response",
+                                    "severity": "critical",
+                                    "dimension": "functionality",
+                                    "message": (
+                                        "点击开始后按方向键，画面在 2.8s 内完全静止 —— "
+                                        "游戏循环从未启动，应用打开能看但根本玩不了"
+                                    ),
+                                    "evidence": f"canvas 签名连续三次采样一致: {k0} == {k1} == {k2}",
+                                    "suggestion": (
+                                        "就绪(ready)状态必须由首次方向输入切换到运行(playing)并启动循环。"
+                                        "检查点：(1) 是否存在独立的 startLoop() 且内部真的调用了 "
+                                        "setInterval/requestAnimationFrame；(2) 方向键处理函数里是否有 "
+                                        "`if (state === 'ready') { state = 'playing'; startLoop(); }`；"
+                                        "(3) 不要只在 tick() 内部重设定时器——首次启动就没人调用 tick。"
+                                        "这是流程缺陷，必须改 JS 逻辑"
+                                    ),
+                                })
+
+                        # 键盘驱动型应用：交互性以键盘响应为准。点击「开始」后进入 ready 态
+                        # 画面静态（蛇已画好但不移动）属正常设计，不能用 no_interaction 误杀。
+                        if _kbd_gate and result["checks"].get("keyboard_responsive") is True:
+                            result["checks"]["interactive"] = True
+                            result["defects"] = [
+                                d for d in result["defects"]
+                                if d.get("type") != "no_interaction"
+                            ]
+                            result["logs"].append(
+                                "[smoke] 键盘驱动型应用：交互性由 keyboard_responsive 证明，"
+                                "抑制 ready 态静态导致的 no_interaction 误报"
+                            )
                 else:
-                    result["logs"].append("[smoke] 页面无可点击交互入口，跳过交互/瞬死检查（纯展示页可接受）")
-                    interactive, no_instant_death = None, None
+                    if load_fail:
+                        result["logs"].append("[smoke] 页面未加载出内容，交互检查无法进行")
+                    else:
+                        result["logs"].append("[smoke] 页面无可点击交互入口，跳过交互/瞬死检查（纯展示页可接受）")
 
                 # ---- 不变量 4: localStorage 禁用（模拟预览沙箱） ----
+                # 页面本身都加载不出来时这项检查没有意义（空白页恒过 = 假绿）
                 try:
+                    if load_fail:
+                        raise RuntimeError("页面未加载，跳过 storage 检查")
                     poison = (
                         "try{Object.defineProperty(window,'localStorage',{"
                         "get(){throw new DOMException('SecurityError: localStorage blocked','SecurityError')},"
@@ -932,7 +1142,7 @@ def run_universal_smoke(html_path: Path, timeout_ms: int = 15_000, preview_url: 
                     )
                     page.add_init_script(poison)
                     before_set = set(load_errors)
-                    doc = _open()
+                    doc = _open(sandbox_on)
                     page.wait_for_timeout(1200)
                     new_errors = [e for e in load_errors if e not in before_set]
                     new_errors = _collect_frame_errors(doc, new_errors)

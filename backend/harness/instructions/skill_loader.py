@@ -224,6 +224,9 @@ class SkillLoader:
         """
         matched = self.match_skills(requirement)
         if not matched:
+            logger.info(
+                f"[SkillLoader] 无 Skill 命中（需求前 60 字: {requirement[:60]}）"
+            )
             return ""
 
         parts = []
@@ -232,7 +235,13 @@ class SkillLoader:
             if body:
                 parts.append(body)
 
-        return "\n\n---\n\n".join(parts) if parts else ""
+        text = "\n\n---\n\n".join(parts) if parts else ""
+        # 命中情况必须可观测：此前无日志，导致"技能到底注进去了吗"只能靠猜
+        logger.info(
+            f"[SkillLoader] 命中 {len(matched)} 个 Skill: "
+            f"{[m.name for m in matched]}，注入 {len(text)} chars"
+        )
+        return text
 
     def list_all(self) -> List[SkillManifest]:
         """列出所有已加载的 Skill"""

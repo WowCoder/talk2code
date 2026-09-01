@@ -39,14 +39,30 @@ def verify_preview_token(token: str, user_id: int, req_id: int) -> bool:
     return False
 
 
-def make_preview_url(user_id: int, req_id: int, filepath: str = "index.html") -> str:
+def make_preview_url(
+    user_id: int,
+    req_id: int,
+    filepath: str = "index.html",
+    absolute: bool = False,
+) -> str:
     """构造预览能力 URL。
 
-    默认返回同源相对路径（Agent 内嵌 iframe / 前端页面均同源使用），
-    彻底规避把 127.0.0.1 硬编码进 URL 导致非本机部署不可达的问题。
+    默认返回同源相对路径（前端页面同源使用），彻底规避把 127.0.0.1
+    硬编码进 URL 导致非本机部署不可达的问题。
     若配置了 PREVIEW_PUBLIC_BASE_URL（如 https://preview.example.com），
     则生成该域下的绝对 URL。
+
+    absolute=True：强制返回绝对 URL（无 PREVIEW_PUBLIC_BASE_URL 时回落到
+    本机监听地址）。**Playwright 验证链路必须用这个**——验证宿主页是
+    `file:///tmp/xxx.html`，相对路径会被解析成 `file:///api/pt/...`，
+    iframe 直接落到 chrome-error 空白页，导致「AC 全失败但归类为脚本错误、
+    冒烟静默变绿」的假绿事故（需求 140）。
     """
     base = (settings.PREVIEW_PUBLIC_BASE_URL or "").rstrip("/")
+    if not base and absolute:
+        host = (settings.APP_HOST or "").strip()
+        if host in ("", "0.0.0.0", "::", "[::]"):
+            host = "127.0.0.1"
+        base = f"http://{host}:{int(settings.APP_PORT)}"
     path = f"/api/pt/{int(req_id)}/{make_preview_token(user_id, req_id)}/{filepath}"
     return f"{base}{path}"

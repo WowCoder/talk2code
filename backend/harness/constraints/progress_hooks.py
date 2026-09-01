@@ -34,11 +34,28 @@ def _get_contract(ctx: HookContext):
     return None
 
 
+def _in_fix_phase(state: dict) -> bool:
+    """是否处于「修复/调试」阶段
+
+    首轮编码时禁止回读是对的（防止 Agent 空转刷 read）；但验证已经失败、
+    正在按缺陷卡片改代码时，禁止回读会逼 Agent 盲改——它明明已经诊断出
+    「循环没启动」，却读不到 js/game.js 定位不到那几行（需求 140 事故）。
+    """
+    meta = state.get("metadata") or {}
+    if meta.get("repair_count", 0) or meta.get("defect_repair_count", 0):
+        return True
+    # 验证跑过且失败 → 后续都算修复阶段
+    if state.get("verify_passed") is False:
+        return True
+    return False
+
+
 def block_unnecessary_read(ctx: HookContext) -> str | None:
     """阻断刚写入文件的 read_file 调用
 
     基于 _recent_writes 追踪（写入文件名 → 写入时的轮次），
     在 READ_BLOCK_WINDOW 轮内阻断对同一文件的 read_file。
+    修复阶段（验证失败后 / repair 轮次中）一律放行。
 
     Returns:
         None = 允许通过
@@ -48,6 +65,10 @@ def block_unnecessary_read(ctx: HookContext) -> str | None:
         return None
 
     state = ctx.state or {}
+
+    if _in_fix_phase(state):
+        return None
+
     recent_writes = state.get("_recent_writes", {})
     if not recent_writes:
         return None

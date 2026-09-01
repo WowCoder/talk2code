@@ -1173,7 +1173,10 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
     preview_url = None
     try:
         from utils.preview_token import make_preview_url
-        preview_url = make_preview_url(workspace.user_id, workspace.req_id, "index.html")
+        # absolute=True：验证宿主页是 file:// 临时文件，相对路径无法解析
+        preview_url = make_preview_url(
+            workspace.user_id, workspace.req_id, "index.html", absolute=True
+        )
     except Exception as e:
         logger.warning(f"[Verify] 构造预览 URL 失败，回退直读文件: {e}")
 
