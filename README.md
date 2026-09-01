@@ -42,7 +42,7 @@
 
 - **前端**: Vue 3 + TypeScript + Vite
 - **后端**: Python 3.11+ + Flask + LangGraph
-- **数据库**: SQLite
+- **数据库**: PostgreSQL + pgvector（`docker compose up -d` 一键起）；未配置 `DATABASE_URL` 时自动回退 SQLite
 - **实时通信**: SSE (Server-Sent Events)
 - **认证**: JWT
 - **AI 模型**: 兼容 OpenAI/Anthropic 接口协议，配置驱动切换
