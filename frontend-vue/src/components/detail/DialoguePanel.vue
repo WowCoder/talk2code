@@ -66,7 +66,11 @@ const store = useRequirementStore()
 const messages = computed(() => {
   const raw = store.dialogueMessages.filter(
     (m: DialogueMessageType) =>
-      m.content !== '__QUESTION_FORM__' && !(m as any).hidden && !(m as any).plan_feedback
+      m.content !== '__QUESTION_FORM__' && !(m as any).hidden && !(m as any).plan_feedback &&
+      // 「0 个操作」幽灵卡片兜底：无论消息从哪条路径进入 store（SSE 实时推送、
+      // 历史恢复、chat 响应合并），只要迭代批次没有操作列表就不渲染。
+      // useSSE 与后端 sse_reporter 已在源头过滤，这里是最后一条防线。
+      !(m.role === 'iteration_batch' && !((m as any).tools?.length))
   )
 
   // 合并连续的 tool_call 消息为一个可展开组（兼容旧版后端/页面刷新时的历史数据）

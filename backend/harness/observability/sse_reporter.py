@@ -74,6 +74,16 @@ class SSEReporter:
             data = batch.to_dict()
         else:
             data = batch  # 兼容旧的 dict 调用方式
+        # 根因防御（「开发工程师 0 个操作」幽灵卡片）：没有操作列表的迭代卡片对前端
+        # 毫无意义，且会写入 SSE 缓冲，断线重连/页面重连整段回放时放大成一批空卡片。
+        # 在唯一出口统一丢弃，保护所有客户端（含未刷新的旧版前端 bundle）。
+        # 正常轮次不会误杀：runtime.py 只在 batch_tools 非空时才构造事件。
+        if not (data.get("tools") or []):
+            logger.warning(
+                f"丢弃无操作列表的 iteration_batch 事件 (req_id={requirement_id}, "
+                f"iteration={data.get('iteration')}, coder_name={data.get('coder_name')})"
+            )
+            return
         self._send(requirement_id, "iteration_batch", data)
 
     def complete(self, requirement_id: int, code_files: list = None):
