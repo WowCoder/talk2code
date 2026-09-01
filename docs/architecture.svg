@@ -72,11 +72,11 @@
     <text x="464" y="330" font-size="12.5" fill="#c7cad1">跨文件 API 契约注入防断裂</text>
     <text x="464" y="350" font-size="12" fill="#7d8494">write_file 返回预览，免回读</text>
 
-    <!-- Verify -->
+    <!-- QA -->
     <rect x="810" y="212" width="320" height="150" rx="18" fill="url(#nodeBlue)" stroke="#3a4152" stroke-width="1"/>
     <rect x="834" y="238" width="42" height="42" rx="11" fill="#232733"/>
     <text x="855" y="266" font-size="20" text-anchor="middle">✅</text>
-    <text x="892" y="256" font-size="17" font-weight="700" fill="#f3f4f6">Verify</text>
+    <text x="892" y="256" font-size="17" font-weight="700" fill="#f3f4f6">QA</text>
     <text x="892" y="277" font-size="12" fill="#ff7a45">Catherine · 质量工程师</text>
     <text x="834" y="310" font-size="12.5" fill="#c7cad1">Playwright 真实浏览器验收</text>
     <text x="834" y="330" font-size="12.5" fill="#c7cad1">AC 逐条执行 DOM 操作序列</text>

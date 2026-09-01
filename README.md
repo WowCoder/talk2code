@@ -30,8 +30,8 @@
 
 | 能力 | 做法 |
 |------|------|
-| 🧠 多智能体分工 | LangGraph 编排 TeamLeader / Coder / Verify，职责分离而非一次生成了事 |
-| ✅ 真实验收 | Verify 用 Playwright 在 headless Chromium 里逐条执行 AC，不是「看着像对的」 |
+| 🧠 多智能体分工 | LangGraph 编排 技术负责人 / 开发工程师 / 质量工程师，职责分离而非一次生成了事 |
+| ✅ 真实验收 | 质量工程师用 Playwright 在 headless Chromium 里逐条执行 AC，不是「看着像对的」 |
 | 🛡️ 交付门禁 | critical 缺陷未清零不放行，转 `needs_user_input` 并附差异报告 |
 | 🔗 跨文件契约 | 计划期声明 exports → 编码期契约注入 → 验收期闭合校验，杜绝「按钮静默失效」 |
 | 🚫 写入即拦截 | PRE_WRITE Hook 零 LLM 成本拦掉 `type="module"` / 外部 CDN 等沙箱必炸写法 |
@@ -176,14 +176,14 @@ cd backend && python app.py
 |-------|------|------|
 | **TeamLeader** | Leon（技术负责人） | 需求分析 → 结构化 Plan → 复杂度分级（simple/standard） |
 | **Coder** | Henry（开发工程师） | 批量创建文件 + 自适应迭代上限（文件数驱动），write_file 返回内容预览避免回读 |
-| **Verify** | Catherine（质量工程师） | Playwright 真实浏览器 AC 逐条验收 → 快速通道（全部通过则跳过 LLM 评估） |
+| **QA** | Catherine（质量工程师） | Playwright 真实浏览器 AC 逐条验收 → 快速通道（全部通过则跳过 LLM 评估） |
 
-**两种复杂度 SOP**，由 TeamLeader 自动判断：
+**两种复杂度 SOP**，由技术负责人自动判断：
 
 | 等级 | 触发条件 | 流程 |
 |------|---------|------|
-| 🟢 **simple** | 单个 HTML 页面、极简交互 | `TeamLeader` 轻量分析 → `Coder` 5 轮快速通道 → `run_preview` 验证 → 完成 |
-| 🔵 **standard** | 多文件、交互式应用 | `TeamLeader` 完整 Plan + AC（DoD 程序化校验）→ 用户确认 → `Coder` 批量创建（文件数驱动轮数）→ `Verify` AC 逐条验收 → 按缺陷类别路由修复 → PASS / needs_user_input（交付门禁）|
+| 🟢 **simple** | 单个 HTML 页面、极简交互 | `技术负责人` 轻量分析 → `开发工程师` 5 轮快速通道 → `run_preview` 验证 → 完成 |
+| 🔵 **standard** | 多文件、交互式应用 | `技术负责人` 完整 Plan + AC（DoD 程序化校验）→ 用户确认 → `开发工程师` 批量创建（文件数驱动轮数）→ `质量工程师` AC 逐条验收 → 按缺陷类别路由修复 → PASS / needs_user_input（交付门禁）|
 
 ### 代码质量验收系统
 
