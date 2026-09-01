@@ -132,9 +132,20 @@ export function useSSE(reqId: Ref<number | null>) {
     es.addEventListener('iteration_batch', (e: MessageEvent) => {
       const data: SSEIterationBatchData = JSON.parse(e.data)
       const batchTools = data.tools || []
-      // 跳过畸形事件：既无轮次也无工具列表、也无文本（旧版缓冲/字段缺失）。
-      // 否则会渲染出「第 轮 / 0 个操作」空卡片，且 SSE 重连回放会反复出现。
-      if (data.iteration == null && batchTools.length === 0 && !(data as any).content) {
+      // 跳过畸形事件：**只要没有操作列表，这张迭代卡片就没有存在意义**。
+      //
+      // 历史教训：早期只挡「轮次 / 工具 / 文本三者全空」的事件，结果仍会成批渲染出
+      // 「Henry（开发工程师） 0 个操作」的幽灵卡片——那些事件带着 content 或 iteration，
+      // 三者不全空，于是漏网；SSE 断线重连回放整段缓冲时更是一次性冒出七八张。
+      // 后端 runtime.py 发 iteration_batch 前已用 `if batch_tools` 兜底，
+      // 数据库里也不会存空 tools 的迭代记录，所以这里丢弃是安全的，不会误杀正常轮次。
+      if (batchTools.length === 0) {
+        // 不静默吞掉：留痕便于定位上游到底是谁在发无 tools 的事件
+        console.warn('[SSE] 丢弃无操作列表的 iteration_batch 事件', {
+          iteration: data.iteration,
+          coder_name: data.coder_name,
+          content: (data as any).content,
+        })
         return
       }
       store.addDialogueMessage({
