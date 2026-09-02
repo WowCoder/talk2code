@@ -17,7 +17,6 @@
   <img src="https://img.shields.io/badge/Python-3.11%2B-blue" alt="Python">
   <img src="https://img.shields.io/badge/LangGraph-1.x-005571" alt="LangGraph">
   <img src="https://img.shields.io/badge/License-MIT-green" alt="License">
-  <img src="https://img.shields.io/github/stars/WowCoder/talk2code?style=social" alt="Stars">
 </p>
 
 <p align="center">
