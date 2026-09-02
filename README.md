@@ -43,7 +43,6 @@
 - [架构一览](#架构一览)
 - [项目结构](#项目结构)
 - [快速开始](#快速开始)
-- [界面截图](#界面截图)
 - [核心功能](#核心功能)
 - [注意事项](#注意事项)
 - [路线图](#路线图)
@@ -180,23 +179,6 @@ cd backend && python app.py
 
 - 用户名：`test`
 - 密码：`123456`
-
-## 界面截图
-
-### 首页 — 需求输入
-![首页](docs/images/index.png)
-
-### 详情页 — 代码 + 对话 + 预览
-![详情页](docs/images/detail.png)
-
-### 预览 — 浏览器实时运行
-![预览](docs/images/detail_preview.png)
-
-### 预览 — Spec
-![预览](docs/images/detail_spec.png)
-
-### 历史对话
-![历史](docs/images/history.png)
 
 ## 核心功能
 
