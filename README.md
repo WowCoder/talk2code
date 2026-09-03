@@ -230,6 +230,24 @@ cd backend && python app.py
 9. **LLM 流量诊断**：`logs/llm_traffic.log`（仓库根目录，非 `backend/logs`）为 JSON Lines 格式，
    按天轮转保留 7 天，每条含完整请求/响应体，可用于定位 400/500 等端点校验问题。
 
+## 质量保障（eval + CI 门禁）
+
+`eval/tasks/tasks.yaml` 固化 21 个回归任务，覆盖历史上真实踩过的坑（ES Module/CORS、CDN 沙箱、跨文件导出断裂、贪吃蛇七连败等）。
+
+标准命令（在 `backend/` 下执行，虚拟环境在仓库根 `venv/`）：
+
+  ```bash
+  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+      -u ALL_PROXY -u all_proxy PYTHONPATH=. \
+      ../venv/bin/python ../eval/run_eval.py --no-preview
+  ```
+
+- `--no-preview` 跳过 Playwright 浏览器验收（仅 file/结构/内容断言），快且避免 429；
+- 去掉该开关即启用**预览运行时验证**：headless Chromium 真实加载生成页面，捕获 `pageerror` / `console_error` / `request_failed` 等运行时错误，与静态结构审计互补构成「静态 + 运行时」双保险；
+- eval 是独立进程，必须显式清代理变量，否则继承系统代理导致 LLM 请求 ProxyError（同生产 req #134 根因）。
+
+**CI 质量门禁**：`.github/workflows/eval.yml` 在每次向 `main` 提 PR 时自动跑全量 eval，对比 `eval/baseline_golden.json` 黄金基线（20/21 = 95.2%），通过率低于基线即判定质量回归、门禁失败。需在 GitHub Secrets 配置 `LLM_API_KEY`（agnes 端点 Key）。
+
 ## 路线图
 
 - 更多智能体角色与专用工具（数据库 / API 集成智能体）

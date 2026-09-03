@@ -1,0 +1,707 @@
+{
+  "timestamp": "20260831_113741",
+  "total": 21,
+  "passed": 20,
+  "pass_rate": 95.2,
+  "by_level": {
+    "1": {
+      "pass": 5,
+      "total": 5
+    },
+    "2": {
+      "pass": 6,
+      "total": 7
+    },
+    "3": {
+      "pass": 6,
+      "total": 6
+    },
+    "4": {
+      "pass": 3,
+      "total": 3
+    }
+  },
+  "results": [
+    {
+      "id": "t01",
+      "name": "个人名片页",
+      "level": 1,
+      "passed": true,
+      "assertions": [
+        {
+          "type": "file_exists",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "file_min_lines",
+          "passed": true,
+          "detail": "73 行 (要求 ≥20)"
+        },
+        {
+          "type": "content_contains",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "preview_no_error",
+          "passed": true,
+          "detail": "跳过(--no-preview)"
+        }
+      ],
+      "duration_s": 577.4,
+      "error": "",
+      "files": [
+        "index.html",
+        "css/style.css",
+        "js/app.js",
+        ".task/contract.json"
+      ]
+    },
+    {
+      "id": "t02",
+      "name": "产品着陆页",
+      "level": 1,
+      "passed": true,
+      "assertions": [
+        {
+          "type": "file_exists",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "html_has_element",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "content_not_contains",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "preview_no_error",
+          "passed": true,
+          "detail": "跳过(--no-preview)"
+        }
+      ],
+      "duration_s": 648.4,
+      "error": "",
+      "files": [
+        "index.html",
+        "css/style.css",
+        "js/main.js",
+        ".task/contract.json"
+      ]
+    },
+    {
+      "id": "t03",
+      "name": "文章排版页",
+      "level": 1,
+      "passed": true,
+      "assertions": [
+        {
+          "type": "file_exists",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "html_has_element",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "preview_no_error",
+          "passed": true,
+          "detail": "跳过(--no-preview)"
+        }
+      ],
+      "duration_s": 582.9,
+      "error": "",
+      "files": [
+        "index.html",
+        "css/style.css",
+        "js/main.js",
+        ".task/contract.json"
+      ]
+    },
+    {
+      "id": "t04",
+      "name": "定价表",
+      "level": 1,
+      "passed": true,
+      "assertions": [
+        {
+          "type": "file_exists",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "html_has_element",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "preview_no_error",
+          "passed": true,
+          "detail": "跳过(--no-preview)"
+        }
+      ],
+      "duration_s": 538.5,
+      "error": "",
+      "files": [
+        "index.html",
+        "css/style.css",
+        "js/app.js",
+        ".task/contract.json"
+      ]
+    },
+    {
+      "id": "t05",
+      "name": "图片画廊",
+      "level": 1,
+      "passed": true,
+      "assertions": [
+        {
+          "type": "file_exists",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "content_contains",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "preview_no_error",
+          "passed": true,
+          "detail": "跳过(--no-preview)"
+        }
+      ],
+      "duration_s": 356.0,
+      "error": "",
+      "files": [
+        "index.html",
+        "css/style.css",
+        "js/gallery.js",
+        "js/data.js",
+        ".task/contract.json"
+      ]
+    },
+    {
+      "id": "t06",
+      "name": "待办清单",
+      "level": 2,
+      "passed": false,
+      "assertions": [
+        {
+          "type": "file_exists",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "content_contains",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "content_not_contains",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "content_not_contains",
+          "passed": false,
+          "detail": "发现禁用内容: 'innerHTML'（同扩展名回退）"
+        },
+        {
+          "type": "preview_no_error",
+          "passed": true,
+          "detail": "跳过(--no-preview)"
+        }
+      ],
+      "duration_s": 371.7,
+      "error": "",
+      "files": [
+        "index.html",
+        "css/style.css",
+        "js/task-store.js",
+        "js/app.js",
+        "js/storage.js",
+        ".task/contract.json"
+      ]
+    },
+    {
+      "id": "t07",
+      "name": "计数器",
+      "level": 2,
+      "passed": true,
+      "assertions": [
+        {
+          "type": "file_exists",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "html_has_element",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "content_contains",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "preview_no_error",
+          "passed": true,
+          "detail": "跳过(--no-preview)"
+        }
+      ],
+      "duration_s": 66.7,
+      "error": "",
+      "files": [
+        "index.html",
+        "css/style.css",
+        "js/app.js",
+        "js/storage.js",
+        ".task/contract.json"
+      ]
+    },
+    {
+      "id": "t08",
+      "name": "简单计算器",
+      "level": 2,
+      "passed": true,
+      "assertions": [
+        {
+          "type": "file_exists",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "preview_no_error",
+          "passed": true,
+          "detail": "跳过(--no-preview)"
+        }
+      ],
+      "duration_s": 108.5,
+      "error": "",
+      "files": [
+        "index.html",
+        "css/style.css",
+        "js/calculator.js",
+        ".task/contract.json"
+      ]
+    },
+    {
+      "id": "t09",
+      "name": "颜色选择器",
+      "level": 2,
+      "passed": true,
+      "assertions": [
+        {
+          "type": "file_exists",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "html_has_element",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "preview_no_error",
+          "passed": true,
+          "detail": "跳过(--no-preview)"
+        }
+      ],
+      "duration_s": 244.7,
+      "error": "",
+      "files": [
+        "index.html",
+        "css/style.css",
+        "js/app.js",
+        ".task/contract.json"
+      ]
+    },
+    {
+      "id": "t10",
+      "name": "留言板",
+      "level": 2,
+      "passed": true,
+      "assertions": [
+        {
+          "type": "file_exists",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "content_contains",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "preview_no_error",
+          "passed": true,
+          "detail": "跳过(--no-preview)"
+        }
+      ],
+      "duration_s": 163.1,
+      "error": "",
+      "files": [
+        "index.html",
+        "css/style.css",
+        "js/app.js",
+        "js/storage.js",
+        ".task/contract.json"
+      ]
+    },
+    {
+      "id": "t11",
+      "name": "标签页切换",
+      "level": 2,
+      "passed": true,
+      "assertions": [
+        {
+          "type": "file_exists",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "preview_no_error",
+          "passed": true,
+          "detail": "跳过(--no-preview)"
+        }
+      ],
+      "duration_s": 367.9,
+      "error": "",
+      "files": [
+        "index.html",
+        "css/style.css",
+        "js/tabs.js",
+        ".task/contract.json"
+      ]
+    },
+    {
+      "id": "t12",
+      "name": "番茄钟",
+      "level": 2,
+      "passed": true,
+      "assertions": [
+        {
+          "type": "file_exists",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "preview_no_error",
+          "passed": true,
+          "detail": "跳过(--no-preview)"
+        }
+      ],
+      "duration_s": 134.9,
+      "error": "",
+      "files": [
+        "index.html",
+        "css/style.css",
+        "js/timer.js",
+        "js/storage.js",
+        ".task/contract.json"
+      ]
+    },
+    {
+      "id": "t13",
+      "name": "购物车",
+      "level": 3,
+      "passed": true,
+      "assertions": [
+        {
+          "type": "file_exists",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "content_contains",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "preview_no_error",
+          "passed": true,
+          "detail": "跳过(--no-preview)"
+        }
+      ],
+      "duration_s": 114.7,
+      "error": "",
+      "files": [
+        "index.html",
+        "css/style.css",
+        "js/cart.js",
+        "js/app.js",
+        "js/storage.js",
+        ".task/contract.json"
+      ]
+    },
+    {
+      "id": "t14",
+      "name": "天气展示卡",
+      "level": 3,
+      "passed": true,
+      "assertions": [
+        {
+          "type": "file_exists",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "preview_no_error",
+          "passed": true,
+          "detail": "跳过(--no-preview)"
+        }
+      ],
+      "duration_s": 125.7,
+      "error": "",
+      "files": [
+        "index.html",
+        "css/style.css",
+        "js/weather.js",
+        "js/data.js",
+        ".task/contract.json"
+      ]
+    },
+    {
+      "id": "t15",
+      "name": "表单验证",
+      "level": 3,
+      "passed": true,
+      "assertions": [
+        {
+          "type": "file_exists",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "content_contains",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "preview_no_error",
+          "passed": true,
+          "detail": "跳过(--no-preview)"
+        }
+      ],
+      "duration_s": 107.1,
+      "error": "",
+      "files": [
+        "index.html",
+        "css/style.css",
+        "js/form.js",
+        ".task/contract.json"
+      ]
+    },
+    {
+      "id": "t16",
+      "name": "排序可视化",
+      "level": 3,
+      "passed": true,
+      "assertions": [
+        {
+          "type": "file_exists",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "html_has_element",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "preview_no_error",
+          "passed": true,
+          "detail": "跳过(--no-preview)"
+        }
+      ],
+      "duration_s": 74.9,
+      "error": "",
+      "files": [
+        "index.html",
+        "css/style.css",
+        "js/app.js",
+        ".task/contract.json"
+      ]
+    },
+    {
+      "id": "t17",
+      "name": "搜索过滤列表",
+      "level": 3,
+      "passed": true,
+      "assertions": [
+        {
+          "type": "file_exists",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "html_has_element",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "preview_no_error",
+          "passed": true,
+          "detail": "跳过(--no-preview)"
+        }
+      ],
+      "duration_s": 84.0,
+      "error": "",
+      "files": [
+        "index.html",
+        "css/style.css",
+        "js/app.js",
+        "js/storage.js",
+        ".task/contract.json"
+      ]
+    },
+    {
+      "id": "t18",
+      "name": "个人仪表盘",
+      "level": 4,
+      "passed": true,
+      "assertions": [
+        {
+          "type": "file_exists",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "file_min_lines",
+          "passed": true,
+          "detail": "205 行 (要求 ≥50)"
+        },
+        {
+          "type": "preview_no_error",
+          "passed": true,
+          "detail": "跳过(--no-preview)"
+        }
+      ],
+      "duration_s": 130.8,
+      "error": "",
+      "files": [
+        "index.html",
+        "css/style.css",
+        "js/tasks.js",
+        "js/dashboard.js",
+        "js/storage.js",
+        ".task/contract.json"
+      ]
+    },
+    {
+      "id": "t19",
+      "name": "笔记应用",
+      "level": 4,
+      "passed": true,
+      "assertions": [
+        {
+          "type": "file_exists",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "content_contains",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "preview_no_error",
+          "passed": true,
+          "detail": "跳过(--no-preview)"
+        }
+      ],
+      "duration_s": 100.5,
+      "error": "",
+      "files": [
+        "index.html",
+        "css/style.css",
+        "js/app.js",
+        "js/storage.js",
+        ".task/contract.json"
+      ]
+    },
+    {
+      "id": "t20",
+      "name": "看板",
+      "level": 4,
+      "passed": true,
+      "assertions": [
+        {
+          "type": "file_exists",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "content_contains",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "preview_no_error",
+          "passed": true,
+          "detail": "跳过(--no-preview)"
+        }
+      ],
+      "duration_s": 138.8,
+      "error": "",
+      "files": [
+        "index.html",
+        "css/style.css",
+        "js/kanban.js",
+        "js/storage.js",
+        ".task/contract.json"
+      ]
+    },
+    {
+      "id": "t21",
+      "name": "贪吃蛇七连败回归",
+      "level": 3,
+      "passed": true,
+      "assertions": [
+        {
+          "type": "file_exists",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "html_has_element",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "content_not_contains",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "content_not_contains",
+          "passed": true,
+          "detail": ""
+        },
+        {
+          "type": "preview_no_error",
+          "passed": true,
+          "detail": "跳过(--no-preview)"
+        }
+      ],
+      "duration_s": 131.5,
+      "error": "",
+      "files": [
+        "index.html",
+        "css/style.css",
+        "js/game.js",
+        "js/storage.js",
+        ".task/contract.json"
+      ]
+    }
+  ]
+}

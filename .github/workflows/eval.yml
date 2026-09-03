@@ -1,0 +1,71 @@
+name: Eval Quality Gate
+
+# 每次向 main 提 PR 自动跑 21 任务生成质量 eval，对比黄金基线（95.2%），
+# 通过率低于黄金基线即判定为质量回归、门禁失败。
+#
+# 前置：在仓库 Settings → Secrets 配置 LLM_API_KEY（agnes 端点 Key）。
+#       LLM_BASE_URL / LLM_MODEL 有默认值（agnes），如需换模型可覆盖同名 Secret。
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  eval:
+    name: Generation quality eval (21 regression tasks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      LLM_PROVIDER: openai_compatible
+      LLM_BASE_URL: https://apihub.agnes-ai.com/v1
+      LLM_MODEL: agnes-2.5-flash
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      LLM_THINKING: disabled
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Run eval (fast gate, no browser preview)
+        working-directory: backend
+        env:
+          # 清掉可能继承的代理，避免 LLM 请求被代理拦死（同本地 req #134 根因）
+          HTTP_PROXY: ""
+          HTTPS_PROXY: ""
+          http_proxy: ""
+          https_proxy: ""
+          ALL_PROXY: ""
+          all_proxy: ""
+        run: |
+          PYTHONPATH=. python ../eval/run_eval.py --no-preview \
+            --compare "${{ github.workspace }}/eval/baseline_golden.json"
+
+      - name: Quality gate (fail if below golden baseline)
+        run: |
+          python - <<'PY'
+          import json, sys
+          cur = json.load(open("eval/results/latest.json"))
+          gold = json.load(open("eval/baseline_golden.json"))
+          if cur["pass_rate"] < gold["pass_rate"]:
+              print(f"❌ 通过率 {cur['pass_rate']}% < 黄金基线 {gold['pass_rate']}% —— 疑似质量回归")
+              sys.exit(1)
+          print(f"✅ 通过率 {cur['pass_rate']}% >= 黄金基线 {gold['pass_rate']}%")
+          PY
+
+      - name: Upload eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: eval/results/
+          retention-days: 14
