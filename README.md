@@ -1,3 +1,5 @@
+> [English](README.en.md) · 中文
+
 <p align="center">
   <img src="docs/images/logo.png" alt="Talk2Code Logo" width="120" />
 </p>
