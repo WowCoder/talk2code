@@ -119,8 +119,15 @@ def _inject_coding_context(tool_loop, context: dict):
 
     替换 _build_system_prompt 为 file_aware_coder.md 模板，
     返回原始 builder 以便调用方在使用后恢复。
+
+    注意：这里是整体替换，不是包装 —— 所以必须自行把调用方此前挂上去的
+    内容重新拼回来（目前是历史经验记忆块）。此前缺少这一步，定向补全阶段
+    的记忆注入被静默丢弃：不报错、不告警，只是悄悄不生效。
     """
     original_builder = tool_loop._build_system_prompt
+    # requirement_service 在任务开始时就已算好并挂上，这里直接复用即可，
+    # 不重新检索（注入内容在一个任务内不会变化）
+    memory_block = getattr(tool_loop, "_memory_block", "") or ""
 
     def _file_aware_prompt(state):
         plan_section = ""
@@ -133,7 +140,7 @@ def _inject_coding_context(tool_loop, context: dict):
                 f"- {e}" for e in context["exports"]
             )
 
-        return load_prompt_template("coding/file_aware_coder.md",
+        prompt = load_prompt_template("coding/file_aware_coder.md",
             requirement=context["requirement"],
             plan_section=plan_section,
             file_path=context["file_path"],
@@ -144,6 +151,7 @@ def _inject_coding_context(tool_loop, context: dict):
             completed_text=context["completed_text"],
             error_text=context["error_text"],
         )
+        return prompt + memory_block if memory_block else prompt
 
     tool_loop._build_system_prompt = _file_aware_prompt
     return original_builder

@@ -142,6 +142,36 @@ class AgentMemoryV2(Base):
         return f"<MemoryV2 {self.id}: {self.requirement[:50]}... rating={self.rating}>"
 
 
+class MemoryHit(Base):
+    """记忆注入记账表 —— "注入即记账"，让每条记忆的价值可归因。
+
+    在此之前，判断记忆有没有用只有 eval 整体通过率这一个粗糙指标，无法
+    归因到单条记忆：100 条记忆里是哪 5 条在拖后腿，没有事实依据。
+    本表把每次注入记成一行 pending，任务出结果后回填 outcome，于是每条
+    记忆都能算出"被注入 N 次、其中 M 次任务通过"。
+
+    归因边界（避免过度解读）：一条记忆被注入到通过的任务里，不等于任务
+    通过是它的功劳 —— 这里记的是相关性不是因果性。证明因果要靠 A/B
+    （eval --with-memory），本表只负责把相关性变成可查询的事实。
+    """
+    __tablename__ = "memory_hits"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    memory_id = Column(Integer, ForeignKey("agent_memories_v2.id"), nullable=False, index=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    requirement_id = Column(Integer, nullable=True, index=True)
+    run_id = Column(String(64), nullable=True, index=True)  # eval 的 run_id，便于按批次聚合
+
+    # 注入快照
+    inject_position = Column(Integer, default=0)   # 在注入块中的排序（1..6）
+    inject_tokens = Column(Integer, default=0)     # 该条注入的估算 token 数
+    injected_at = Column(DateTime, default=func.now())
+
+    # 结果回填（任务结束后由 resolve_hits 写入）
+    outcome = Column(String(16), default="pending", index=True)  # pending / pass / fail
+    resolved_at = Column(DateTime, nullable=True)
+
+
 class AgentTrace(Base):
     """Agent 链路追踪表"""
     __tablename__ = "agent_traces"

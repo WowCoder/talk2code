@@ -47,6 +47,29 @@ def _get_memory_manager() -> MemoryManager:
     return _memory_manager
 
 
+def _build_injected_memory_block(requirement_content: str, user_id: int,
+                                 requirement_id: Optional[int] = None):
+    """检索并渲染待注入的历史经验文本块 + 记账行 id。
+
+    任何失败都返回 ("", [])，绝不阻断主流程。
+
+    抽成独立函数是因为生成阶段与定向补全阶段都要用，且必须与"每任务算一次、
+    结果缓存复用"的策略配合 —— 放进 _build_system_prompt 里会导致每个
+    LLM turn 重新检索。
+
+    返回的 hit_ids 是本次注入写下的记账行主键。**生产侧目前只记账、不回填
+    结果**：生产的"任务成功"语义模糊（澄清 / planning / 取消都是正常中间态），
+    现在回填只会用错误口径污染数据。归因数据由 eval 侧提供（那里有明确的
+    passed 判定），等 P1 明确生产口径后再补 resolve_hits 调用。
+    """
+    try:
+        return _get_memory_manager().inject_with_receipt(
+            requirement_content, user_id, requirement_id=requirement_id)
+    except Exception as e:
+        logger.warning(f"记忆检索失败（不阻断，降级为无记忆注入）：{e}")
+        return "", []
+
+
 class RequirementService:
     """需求管理服务（集成 harness 6 层）"""
 
@@ -196,16 +219,26 @@ class RequirementService:
                     on_iteration=_persist_dialogue,
                 )
     
-                # 记忆注入：将历史成功经验作为 few-shot 示例追加到 System Prompt
+                # 记忆注入：将历史经验作为 few-shot 示例追加到 System Prompt
+                #
+                # 注入内容在一个任务内不会变化，所以必须在任务开始时算一次并缓存。
+                # 若像以前那样放在 _build_system_prompt 内部计算，由于 system prompt
+                # 是每个 LLM turn 重建一次的，检索开销会被放大到每个 turn
+                # （全表查询 + 索引一致性检查 + LLM 校验）。
                 _original_builder = tool_loop._build_system_prompt
                 _req_content = requirement.content
                 _req_user_id = requirement.user_id
-                _mgr = _get_memory_manager()
-    
+                _memory_block, _memory_hit_ids = _build_injected_memory_block(
+                    _req_content, _req_user_id, requirement_id=requirement_id)
+
+                # 挂到 loop 上供 file_coder 的逐文件编码阶段复用：
+                # 该阶段会整体替换 _build_system_prompt，拿不到这里的包装结果。
+                tool_loop._memory_block = _memory_block
+
                 def _memory_aware_prompt(state):
                     base = _original_builder(state)
-                    return _mgr.before_task(_req_content, base, user_id=_req_user_id)
-    
+                    return base + _memory_block if _memory_block else base
+
                 tool_loop._build_system_prompt = _memory_aware_prompt
     
                 # 构建初始状态
@@ -558,16 +591,18 @@ class RequirementService:
                     checkpoint=checkpoint, on_iteration=_persist_dialogue,
                 )
     
-                # 记忆注入
+                # 记忆注入（每任务算一次并缓存，不要放进 builder 内部逐 turn 计算）
                 _original_builder = tool_loop._build_system_prompt
                 _req_content = requirement.content
                 _req_user_id = requirement.user_id
-                _mgr = _get_memory_manager()
-    
+                _memory_block, _memory_hit_ids = _build_injected_memory_block(
+                    _req_content, _req_user_id, requirement_id=requirement_id)
+                tool_loop._memory_block = _memory_block
+
                 def _memory_aware_prompt(state):
                     base = _original_builder(state)
-                    return _mgr.before_task(_req_content, base, user_id=_req_user_id)
-    
+                    return base + _memory_block if _memory_block else base
+
                 tool_loop._build_system_prompt = _memory_aware_prompt
     
                 # ---- 从检查点恢复 TL 后的状态 ----

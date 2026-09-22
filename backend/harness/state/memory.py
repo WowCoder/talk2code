@@ -12,16 +12,81 @@ MemoryManager —— 统一的记忆管理核心
 
 import json
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional
 
-from models import SessionLocal, AgentMemoryV2
+from models import SessionLocal, AgentMemoryV2, MemoryHit
+from sqlalchemy import func
 from harness.state.memory_retriever import create_retriever
 from harness.observability.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+# ==================== 注入预算 ====================
+#
+# 背景：记忆以 few-shot 形式追加在 system prompt 末尾，直接挤占主任务的
+# 上下文与注意力。经验口径是"注意点越多，模型注意力越碎，主任务越差"，
+# 所以这里必须设硬上限，而不是任由记忆增长。
+# 预算值参考业界分层注入的常用配比（顶层摘要 ≤500、事实层 ≤800）。
+
+INJECT_MAX_ITEMS = 6            # 单次最多注入的记忆条数
+INJECT_MAX_TOKENS = 1200        # 注入文本的总预算（token）
+INJECT_ITEM_MAX_TOKENS = 200    # 单条记忆的预算（token）
+
+# ==================== 相关性门禁 ====================
+#
+# 背景：探针（tmp/verify_ab_probe.py）发现，开启记忆后几乎所有 eval 任务都
+# 注入了不相关的记忆（名片页任务被注入了贪吃蛇游戏经验）——因为 search 返回的
+# 相似度分数此前被直接丢弃、top_k 全入选、没有任何相关性门槛。这正是方案文档
+# 反复诊断的"信噪比"问题：注入不相关记忆比不注入更糟。
+#
+# 两层门禁（score 是余弦相似度，约 0-1）：
+#  - 绝对下限 MIN_RELEVANCE：连最相关的候选都不够相关，整体不注入。
+#  - 相对门槛 REL_RELEVANCE_RATIO：只保留与最相关结果相似度达到其一定比例的项，
+#    避免 top_k 全入选导致的同质化注入（记忆库小、语义稀疏时尤其明显）。
+# 两层配合，对 BGE-M3 / TF-IDF 等后端都鲁棒。阈值偏保守——宁可少注入，
+# 也不把不相关记忆硬塞进无关任务。
+MIN_RELEVANCE = 0.25
+REL_RELEVANCE_RATIO = 0.5
+
+_ESTIMATE_CJK = re.compile(r'[\u4e00-\u9fff]')
+
+
+def _estimate_tokens(text: str) -> int:
+    """粗略估算 token 数。
+
+    口径与 harness/instructions/compactor.py 的 _estimate_text_tokens 保持一致
+    （中文约 1.5 字/token，英文与符号约 4 字/token），避免两处估算漂移。
+    """
+    if not text:
+        return 0
+    chinese = len(_ESTIMATE_CJK.findall(text))
+    other = max(len(text) - chinese, 0)
+    return int(chinese / 1.5 + other / 4)
+
+
+def _truncate_to_tokens(text: str, max_tokens: int) -> str:
+    """按 token 预算截断文本，超出部分以省略号标记。
+
+    用二分而非逐字累加，长文本下开销可忽略。
+    """
+    if not text or max_tokens <= 0:
+        return ""
+    if _estimate_tokens(text) <= max_tokens:
+        return text
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _estimate_tokens(text[:mid]) <= max_tokens:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo].rstrip() + "…"
 
 
 # ==================== Memory 数据类 ====================
@@ -74,6 +139,18 @@ class Memory:
         )
 
 
+def _has_injectable_content(m: "Memory") -> bool:
+    """记忆至少要有 lesson 或 reusable_pattern 之一有真实内容，才值得注入。
+
+    完全空（二者皆空或仅占位符"无"）的记忆注入后只是空块，浪费预算且是噪声；
+    其 rating 往往来自 LLM 自评、不可信（见 P1 #8）。
+    宽松策略：保留"有 lesson 但缺 pattern"的记忆，不在这里砍（那是 P1 #8 治理决策）。
+    """
+    lesson = (m.lesson or "").strip()
+    pattern = (m.reusable_pattern or "").strip()
+    return (bool(lesson) and lesson != "无") or (bool(pattern) and pattern != "无")
+
+
 from harness.instructions.prompts import load_prompt
 
 # ==================== 反思 Prompt（从 .md 文件加载）====================
@@ -120,18 +197,127 @@ class MemoryManager:
         self._lock = threading.Lock()
         self._new_since_consolidate = 0
 
+        # 当前索引对应的活跃记忆快照（全局视图，检索时按 user_id 过滤结果）。
+        # None 表示索引尚未建立或已失效，下次检索前会重建。
+        self._indexed_memories: Optional[list[Memory]] = None
+
         # 启动时从数据库加载所有记忆，建立索引
         self._rebuild_index()
 
     # ==================== 公有 API ====================
 
+    def _select_and_render(self, requirement: str, user_id: int = 0):
+        """检索 → 校验 → 渲染，返回 (block, injected_items)。只渲染，不记账。"""
+        try:
+            with self._lock:
+                memories = self._ensure_index()
+                if not memories:
+                    return "", []
+                results = self._retriever.search(requirement, top_k=5)
+            if not results:
+                return "", []
+
+            # 防御：部分检索后端（BGE-M3 / PGVector）的 search 结果未按 score 排序，
+            # 门禁依赖"最相关"判断，这里统一排序以保证正确。
+            results.sort(key=lambda x: x[1], reverse=True)
+
+            # 相关性门禁（绝对层）：连最相关的候选都不够相关，整体不注入。
+            # 避免把不相关记忆硬塞进无关任务——探针实证：名片页任务被注入了
+            # 贪吃蛇游戏经验。score 是余弦相似度（约 0-1），<MIN_RELEVANCE 视为无关。
+            top_score = results[0][1]
+            if top_score < MIN_RELEVANCE:
+                logger.info(
+                    f"[MemoryManager] 最相关记忆相似度 {top_score:.2f} < {MIN_RELEVANCE}，"
+                    f"跳过注入（避免不相关噪声）for: {requirement[:50]}...")
+                return "", []
+
+            # 相关性门禁（相对层）：只保留与最相关结果相似度达到其一定比例的项，
+            # 避免 top_k 全入选导致的同质化注入（记忆库小、语义稀疏时尤其明显）。
+            rel_floor = top_score * REL_RELEVANCE_RATIO
+
+            # 用户隔离：索引是全局视图，检索结果按 user_id 过滤。
+            # 不能反过来用单用户记忆去建索引，那会让索引退化成单用户视图，
+            # 污染其他用户的检索结果。
+            # 同时丢弃完全无内容的记忆（lesson 与 reusable_pattern 皆空/占位符），
+            # 这类记忆注入后只是空块、纯噪声（见 _has_injectable_content）。
+            candidates = []
+            for i, score in results:
+                if i >= len(memories):
+                    continue
+                m = memories[i]
+                if m.user_id != user_id:
+                    continue
+                if not _has_injectable_content(m):
+                    continue
+                if score < rel_floor:
+                    continue
+                candidates.append(m)
+            if not candidates:
+                return "", []
+
+            # L2: LLM 校验 + 排序
+            selected = self._llm_verify(requirement, candidates)
+            if not selected:
+                # LLM 不可用或返回空 → 直接用 L1 的 top 2
+                selected = candidates[:2]
+
+            self._touch_memories([m.id for m in selected if m.id])
+
+            block, injected_items = self._render_few_shot(selected)
+            if block:
+                logger.info(
+                    f"[MemoryManager] 注入 {len(injected_items)} 条记忆 "
+                    f"(用户 {user_id} 候选 {len(candidates)}/{len(memories)} 条) "
+                    f"for: {requirement[:50]}...")
+            return block, injected_items
+
+        except Exception as e:
+            logger.warning(f"[MemoryManager] 记忆检索异常（降级跳过）: {e}")
+            return "", []
+
+    def build_memory_block(self, requirement: str, user_id: int = 0) -> str:
+        """检索相关记忆，渲染为可注入的 few-shot 文本块（已完成 token 预算裁剪）。
+
+        与 before_task 的区别：本方法只负责"算出该注入什么"，不负责拼接。
+        调用方应在一个任务开始时调用一次并缓存结果 —— 注入内容在任务内
+        不会变化，而 system prompt 是每个 LLM turn 重建一次的，不缓存就
+        意味着每个 turn 都要全表查库并重建检索索引。
+
+        不记账：记账需要 requirement_id / run_id 才能归因，本方法拿不到这些
+        上下文。需要度量时用 inject_with_receipt()。
+
+        Returns:
+            few-shot 文本块；无可用记忆或检索失败时返回空串（调用方可安全拼接）。
+        """
+        block, _ = self._select_and_render(requirement, user_id)
+        return block
+
+    def inject_with_receipt(self, requirement: str, user_id: int = 0,
+                            requirement_id: Optional[int] = None,
+                            run_id: Optional[str] = None):
+        """检索 + 渲染 + 记账（"注入即记账"），返回 (block, hit_ids)。
+
+        hit_ids 是本次注入写下的记账行主键，任务结束后用 resolve_hits()
+        回填结果，于是每条记忆都能算出"被注入 N 次、其中 M 次任务通过"。
+
+        归因粒度的边界（避免过度解读）：一条记忆被注入到通过的任务里，
+        不代表任务通过是它的功劳 —— 这里记的是相关性，不是因果性。
+        要证明因果必须靠 A/B（见 eval --with-memory）。
+
+        记账失败不影响注入：会计挂了不代表不该卖货，block 照常返回。
+        """
+        block, injected_items = self._select_and_render(requirement, user_id)
+        if not block or not injected_items:
+            return block, []
+        hit_ids = self._record_hits(injected_items, user_id, requirement_id, run_id)
+        return block, hit_ids
+
     def before_task(self, requirement: str, system_prompt: str, user_id: int = 0) -> str:
         """
         任务前: 检索相关记忆，注入 System Prompt。
 
-        两阶段检索:
-        L1: BGE-M3 混合检索 → Top 5
-        L2: LLM 校验排序 → 精选 2-3 条
+        提示：优先在任务开始时调用一次 build_memory_block() 缓存结果，再自行
+        拼接。反复调用本方法会导致每个 LLM turn 都重新检索一遍。
 
         Args:
             requirement: 用户需求文本
@@ -141,45 +327,8 @@ class MemoryManager:
         Returns:
             增强后的系统提示词（追加 few-shot 示例）
         """
-        try:
-            memories = self._get_active_memories(user_id)
-            if not memories:
-                return system_prompt
-
-            # L1: 混合检索（BGE-M3 或 pgvector）
-            # 与 _store 的 _index_memories 互斥：检索器内部索引非线程安全，
-            # 并发 index/search 会破坏索引一致性
-            with self._lock:
-                self._index_memories(memories)
-                results = self._retriever.search(requirement, top_k=5)
-            if not results:
-                return system_prompt
-
-            candidates = [memories[i] for i, _ in results]
-
-            # L2: LLM 校验 + 排序
-            selected = self._llm_verify(requirement, candidates)
-            if not selected:
-                # LLM 不可用或返回空 → 直接用 L1 的 top 2
-                selected = candidates[:2]
-
-            # 更新访问计数
-            for m in selected:
-                m.access_count += 1
-
-            # 组装 few-shot 注入文本
-            few_shot = self._format_few_shot(selected)
-            if few_shot:
-                logger.info(
-                    f"[MemoryManager] 注入了 {len(selected)} 条相关记忆 "
-                    f"(共 {len(memories)} 条) for: {requirement[:50]}..."
-                )
-                return system_prompt + few_shot
-
-        except Exception as e:
-            logger.warning(f"[MemoryManager] before_task 异常（降级跳过）: {e}")
-
-        return system_prompt
+        block = self.build_memory_block(requirement, user_id)
+        return system_prompt + block if block else system_prompt
 
     def after_task(self, requirement: str, complexity: str,
                    code_files: list, qa_result: dict = None,
@@ -295,16 +444,56 @@ class MemoryManager:
             # BGEM3Retriever.index() 不接受 memory_ids 参数
             self._retriever.index(documents)
 
+    def _ensure_index(self) -> list[Memory]:
+        """确保检索索引与数据库一致，返回当前活跃记忆（全局视图）。
+
+        索引始终覆盖全部用户的活跃记忆，检索命中后再按 user_id 过滤。
+        不能反过来只用单个用户的记忆去建索引 —— 那会让索引退化成单用户
+        视图，把其他用户可检索的记忆挤掉。
+
+        只在活跃记忆数量变化时重建：稳定期每次检索仅一次 COUNT 查询，
+        避免"每轮全表 SELECT + 重建索引"的开销。
+
+        注意：调用方必须已持有 self._lock，本方法内部不再加锁。
+        """
+        db_count = self._count_active_memories()
+        if self._indexed_memories is None or db_count != len(self._indexed_memories):
+            self._indexed_memories = self._get_active_memories()
+            self._index_memories(self._indexed_memories)
+            logger.info(
+                f"[MemoryManager] 检索索引已重建: {len(self._indexed_memories)} 条活跃记忆"
+            )
+        return self._indexed_memories
+
+    def _invalidate_index(self):
+        """标记索引失效（写入或淘汰后调用），下次检索前自动重建"""
+        self._indexed_memories = None
+
+    def _count_active_memories(self) -> int:
+        """活跃记忆条数。查询失败返回 -1，以强制下次重建索引"""
+        db = None
+        try:
+            db = SessionLocal()
+            return db.query(AgentMemoryV2).filter_by(superseded=False).count()
+        except Exception as e:
+            logger.warning(f"[MemoryManager] 统计活跃记忆失败: {e}")
+            return -1
+        finally:
+            if db is not None:
+                db.close()
+
     def _rebuild_index(self):
         """启动时从数据库加载所有活跃记忆，建立检索索引"""
         try:
             memories = self._get_active_memories()
+            self._indexed_memories = memories
             if memories:
                 self._index_memories(memories)
                 logger.info(f"[MemoryManager] 初始索引构建完成: {len(memories)} 条记忆")
             else:
                 logger.info("[MemoryManager] 记忆库为空，等待首次任务完成")
         except Exception as e:
+            self._indexed_memories = None
             logger.warning(f"[MemoryManager] 索引构建失败（降级为空库）: {e}")
 
     def _get_active_memories(self, user_id: int = None) -> list[Memory]:
@@ -323,15 +512,14 @@ class MemoryManager:
 
     def _store(self, memory: Memory):
         """存储一条新记忆到数据库（含去重逻辑，去重仅限同一用户）"""
+        db = None
         try:
             # 去重: 如果同一用户已有高度相似的需求，标记旧记忆为 superseded。
             # 必须按 user_id 过滤——否则用户 A 的新需求会把用户 B 的相似记忆淘汰掉。
             memories = self._get_active_memories(user_id=memory.user_id)
-            superseded_ids = set()
             for existing in memories:
                 if self._jaccard_similarity(memory.requirement, existing.requirement) > 0.6:
                     self._mark_superseded(existing.id)
-                    superseded_ids.add(existing.id)
                     logger.debug(f"[MemoryManager] 去重: 标记记忆 {existing.id} 为 superseded")
                     break
 
@@ -352,31 +540,159 @@ class MemoryManager:
             db.add(row)
             db.commit()
             memory.id = row.id
-            db.close()
 
-            # 更新检索索引（增量构建，避免二次全量查库）
-            active = [m for m in memories if m.id not in superseded_ids] + [memory]
-            self._index_memories(active)
+            # 索引失效，下次检索前重建。
+            # 注意：不能在这里用 memories（单用户视图）去重建索引，那会把全局
+            # 索引覆盖成单用户视图，让其他用户的记忆无从检索。
+            self._invalidate_index()
 
         except Exception as e:
             logger.warning(f"[MemoryManager] 存储记忆失败: {e}")
-            try:
-                db.rollback()
-                db.close()
-            except Exception:
-                pass
+            self._invalidate_index()
+            if db is not None:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
 
     def _mark_superseded(self, mem_id: int):
         """标记一条记忆已被替代"""
+        db = None
         try:
             db = SessionLocal()
             row = db.query(AgentMemoryV2).filter_by(id=mem_id).first()
             if row:
                 row.superseded = True
                 db.commit()
-            db.close()
+                self._invalidate_index()
         except Exception as e:
             logger.warning(f"[MemoryManager] 标记 superseded 失败: {e}")
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
+    def _touch_memories(self, memory_ids: list[int]):
+        """把"这些记忆被注入过"这件事真正写进数据库。
+
+        此前只在内存对象上自增、从不 commit，access_count 恒为 0，导致所有
+        基于使用频率的治理（零引用归档、按热度淘汰）都拿不到事实依据。
+
+        待办：last_accessed_at 需要给 agent_memories_v2 加列，而项目当前只用
+        create_all（不会给已存在的表补列），故 P0 阶段先落 access_count，
+        时间戳随 P1 的迁移一并补上。
+        """
+        if not memory_ids:
+            return
+        db = None
+        try:
+            db = SessionLocal()
+            db.query(AgentMemoryV2).filter(AgentMemoryV2.id.in_(memory_ids)).update(
+                {AgentMemoryV2.access_count: AgentMemoryV2.access_count + 1},
+                synchronize_session=False,
+            )
+            db.commit()
+        except Exception as e:
+            logger.warning(f"[MemoryManager] 记录记忆命中失败: {e}")
+            if db is not None:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
+    def _record_hits(self, injected_items: list, user_id: int,
+                     requirement_id: Optional[int] = None,
+                     run_id: Optional[str] = None) -> list[int]:
+        """把"这些记忆被注入了"批量写成 pending 记账行，返回行主键列表。
+
+        只记真正进入 prompt 的条目（injected_items 来自 _render_few_shot，
+        已经过预算裁剪），候选但未入选的不记 —— 否则命中率会被凭空抬高。
+
+        任何失败都返回空列表：记账是旁路，绝不能阻断记忆注入本身。
+        """
+        if not injected_items:
+            return []
+        db = None
+        try:
+            db = SessionLocal()
+            rows = []
+            for mem, position, tokens in injected_items:
+                if not getattr(mem, "id", None):
+                    continue
+                row = MemoryHit(
+                    memory_id=mem.id,
+                    user_id=user_id,
+                    requirement_id=requirement_id,
+                    run_id=run_id,
+                    inject_position=position,
+                    inject_tokens=tokens,
+                    outcome="pending",
+                )
+                db.add(row)
+                rows.append(row)
+            db.commit()
+            return [r.id for r in rows if r.id]
+        except Exception as e:
+            logger.warning(f"[MemoryManager] 记忆注入记账失败（不阻断注入）: {e}")
+            if db is not None:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+            return []
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
+    def resolve_hits(self, hit_ids: list[int], passed: bool):
+        """任务结束后回填记账结果：passed=True 记 pass，否则记 fail。
+
+        任务异常中断时这些行会一直是 pending —— 这是有意的：pending 既不
+        算命中也不算未命中，不会污染统计，同时留出了"任务没跑完"的线索。
+        """
+        if not hit_ids:
+            return
+        outcome = "pass" if passed else "fail"
+        db = None
+        try:
+            db = SessionLocal()
+            db.query(MemoryHit).filter(MemoryHit.id.in_(hit_ids)).update(
+                {MemoryHit.outcome: outcome,
+                 MemoryHit.resolved_at: func.now()},
+                synchronize_session=False,
+            )
+            db.commit()
+            logger.info(f"[MemoryManager] 记账回填 {len(hit_ids)} 条 → {outcome}")
+        except Exception as e:
+            logger.warning(f"[MemoryManager] 记账回填失败: {e}")
+            if db is not None:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
 
     def _reflect(self, requirement: str, code_summary: str, rating: float,
                  failure_context: str = "") -> dict:
@@ -477,9 +793,11 @@ class MemoryManager:
         self._decay(memories)
 
         self._new_since_consolidate = 0
-        # 重建索引
+        # 重建索引：维护后活跃集合已变化。检索索引非线程安全，必须持锁。
         active = self._get_active_memories()
-        self._index_memories(active)
+        with self._lock:
+            self._indexed_memories = active
+            self._index_memories(active)
         logger.info(f"[MemoryManager] 维护完成: {len(active)} 条活跃记忆")
 
     def _llm_consolidate(self, memories: list[Memory]):
@@ -622,27 +940,79 @@ class MemoryManager:
         return len(ta & tb) / len(ta | tb)
 
     @staticmethod
-    def _format_few_shot(memories: list[Memory]) -> str:
-        """将选中的记忆格式化为 few-shot 注入文本
+    def _format_few_shot(memories: list[Memory],
+                         max_items: int = INJECT_MAX_ITEMS,
+                         max_tokens: int = INJECT_MAX_TOKENS) -> str:
+        """将选中的记忆格式化为 few-shot 注入文本（受 token 预算硬约束）
 
-        正负经验分开展示（审查报告 Phase 4.2）：
-        - failure 标签的案例以 ⚠️ 警示形式呈现，教训置顶
-        - 正常案例作为可复用参考
+        仅返回文本。需要记账时用 _render_few_shot()，它额外返回实际注入的条目。
+        """
+        block, _ = MemoryManager._render_few_shot(memories, max_items, max_tokens)
+        return block
+
+    @staticmethod
+    def _render_few_shot(memories: list[Memory],
+                         max_items: int = INJECT_MAX_ITEMS,
+                         max_tokens: int = INJECT_MAX_TOKENS):
+        """格式化 + 记账回执，返回 (block, injected_items)。
+
+        injected_items: [(Memory, position, tokens), ...] —— 真正进入 block 的
+        记忆。必须与 block 严格一致：预算裁剪会丢弃尾部候选项，记账若按
+        "候选列表"记，就会把被筛掉的记忆也算成命中，凭空抬高命中率。
         """
         if not memories:
-            return ""
+            return "", []
 
-        parts = ["\n\n## 参考案例（历史经验，含成功与失败教训）"]
+        header = "\n\n## 参考案例（历史经验，含成功与失败教训）"
+        parts = [header]
+        used = _estimate_tokens(header)
+        injected = 0
+        injected_items = []
+
         for i, m in enumerate(memories, 1):
+            if injected >= max_items or used >= max_tokens:
+                break
+
             is_failure = "failure" in (m.tags or []) or m.rating < 6.0
             badge = "⚠️ 失败案例（务必避免重蹈覆辙）" if is_failure else "✅ 成功案例"
-            parts.append(
-                f"### 案例 {i}：{m.requirement[:80]} (评分: {m.rating}/10)\n"
-                f"{badge} | 复杂度: {m.complexity}\n"
-            )
-            if m.lesson:
-                parts.append(f"**关键教训**: {m.lesson}")
-            if not is_failure and m.reusable_pattern and m.reusable_pattern != "无":
-                parts.append(f"**可复用模式**: {m.reusable_pattern[:300]}")
+            head = (f"### 案例 {i}：{m.requirement[:80]} (评分: {m.rating}/10)\n"
+                    f"{badge} | 复杂度: {m.complexity}\n")
+            head_cost = _estimate_tokens(head)
 
-        return "\n\n".join(parts)
+            # 单条预算：标题优先，正文按剩余额度截断。
+            # 注意 lesson 与 reusable_pattern 共享同一份 body 预算，
+            # 否则两者各自吃满额度，单条实际会翻倍（2 × 200 token）。
+            body_budget = INJECT_ITEM_MAX_TOKENS - head_cost
+            body_parts = []
+            if body_budget > 0 and m.lesson:
+                lesson = _truncate_to_tokens(m.lesson, body_budget)
+                body_parts.append(f"**关键教训**: {lesson}")
+                body_budget -= _estimate_tokens(lesson)
+            if (body_budget > 0 and not is_failure
+                    and m.reusable_pattern and m.reusable_pattern != "无"):
+                body_parts.append(
+                    f"**可复用模式**: {_truncate_to_tokens(m.reusable_pattern, body_budget)}")
+
+            block = head + "\n\n".join(body_parts)
+            cost = _estimate_tokens(block)
+
+            if used + cost > max_tokens:
+                # 总预算装不下整条 → 退化为只保留标题行；标题也装不下就停止
+                if used + head_cost > max_tokens:
+                    break
+                block, cost = head, head_cost
+
+            parts.append(block)
+            used += cost
+            injected += 1
+            injected_items.append((m, injected, cost))
+
+        if injected == 0:
+            return "", []
+
+        if injected < len(memories):
+            logger.info(
+                f"[MemoryManager] 注入预算裁剪: {len(memories)} 条候选中注入 "
+                f"{injected} 条，约 {used} token"
+            )
+        return "\n\n".join(parts), injected_items

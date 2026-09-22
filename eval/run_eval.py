@@ -10,6 +10,14 @@ Eval Runner —— 生成质量基线评估
     cd backend && PYTHONPATH=. python ../eval/run_eval.py --tasks t01 t02   # 只跑指定任务
     cd backend && PYTHONPATH=. python ../eval/run_eval.py --no-preview       # 跳过浏览器验证（CI 快跑）
     cd backend && PYTHONPATH=. python ../eval/run_eval.py --resume eval/results/baseline_xxx.json  # 断点续跑（只重跑失败项）
+    cd backend && PYTHONPATH=. python ../eval/run_eval.py --with-memory      # 开启记忆注入（A/B 对照）
+
+记忆 A/B 说明：
+    默认不开记忆 —— 与历史基线一致（eval 从未走过 requirement_service 的
+    monkey-patch 注入路径，历史上跑的就是 memory-off）。加 --with-memory 后
+    复刻生产注入模式：任务开始时检索一次 build_memory_block()，缓存后包装
+    _build_system_prompt，并挂 loop._memory_block 供 file_coder 复用。
+    报告中每条结果带 memory_enabled / memory_block_chars，便于对照。
 
 输出：
     eval/results/baseline_<timestamp>.json   # 完整结果
@@ -65,6 +73,8 @@ class TaskResult:
     duration_s: float = 0.0
     error: str = ""
     files: list = field(default_factory=list)
+    memory_enabled: bool = False      # 生成该结果时是否开启记忆注入
+    memory_block_chars: int = 0       # 实际注入的记忆块长度（0 = 没检索到东西）
 
 
 # ---------- 断言检查器 ----------
@@ -200,6 +210,66 @@ class AssertionChecker:
         return bool(re.search(rf"<{re.escape(sel)}[\s>]", html, re.IGNORECASE))
 
 
+# ---------- 记忆注入（A/B 开关） ----------
+
+# eval 侧独立持有 MemoryManager 单例：不导入 requirement_service（那会连带
+# 拉起 SSE 管理器等一堆服务模块），只复用其注入模式 —— 与生产
+# requirement_service._build_injected_memory_block 完全等价的 try/except 包装。
+_eval_memory_mgr = None
+
+
+def _ensure_hits_table():
+    """确保 memory_hits 记账表存在。
+
+    eval 是独立进程，不会跑 init_db()（那是应用启动时的事）。表不存在时
+    记账会静默降级 —— 注入照常工作，但归因数据全丢，等跑完 20 题才发现
+    白跑就晚了。这里提前建一次，代价只是一次 checkfirst 的 DDL 检查。
+    """
+    try:
+        from models import engine, MemoryHit
+        MemoryHit.__table__.create(bind=engine, checkfirst=True)
+    except Exception as e:
+        print(f"[memory] 记账表检查失败（注入照常，但归因数据可能丢失）: {e}", flush=True)
+
+
+def _get_eval_memory_manager():
+    global _eval_memory_mgr
+    if _eval_memory_mgr is None:
+        _ensure_hits_table()
+        from harness.state.memory import MemoryManager
+        from llm.client import get_client
+        _eval_memory_mgr = MemoryManager(llm_client=get_client())
+    return _eval_memory_mgr
+
+
+def _inject_memory(loop: ToolCallLoop, requirement_content: str, user_id: int,
+                   requirement_id: Optional[int] = None,
+                   run_id: Optional[str] = None) -> tuple[str, list[int]]:
+    """开启记忆时调用：检索一次并包装 _build_system_prompt（与生产同模式）。
+
+    返回 (注入块文本, 记账行 id 列表)。空串 = 检索失败或无记忆，降级为无记忆。
+    记账行 id 用于任务结束后回填结果（注入即记账），让每条记忆可归因。
+    任何异常都不允许阻断 eval 主流程。
+    """
+    try:
+        block, hit_ids = _get_eval_memory_manager().inject_with_receipt(
+            requirement_content, user_id,
+            requirement_id=requirement_id, run_id=run_id)
+    except Exception as e:
+        print(f"[memory] 检索失败，本任务降级为无记忆: {e}", flush=True)
+        return "", []
+    _original_builder = loop._build_system_prompt
+    # 挂到 loop 上供 file_coder 的逐文件编码阶段复用（与生产一致）
+    loop._memory_block = block
+
+    def _memory_aware_prompt(state):
+        base = _original_builder(state)
+        return base + block if block else base
+
+    loop._build_system_prompt = _memory_aware_prompt
+    return block, hit_ids
+
+
 # ---------- 单任务执行 ----------
 
 def run_one_task(task: dict, args) -> TaskResult:
@@ -219,6 +289,16 @@ def run_one_task(task: dict, args) -> TaskResult:
     tools = create_tool_registry()
     hooks = create_default_hook_manager()
     loop = ToolCallLoop(workspace=ws, git=None, tools=tools, hooks=hooks)
+
+    # 记忆 A/B：默认关（与历史基线一致）；--with-memory 时走生产注入模式
+    mem_hit_ids: list[int] = []
+    if getattr(args, "with_memory", False):
+        mem_user = getattr(args, "memory_user", 0) or 0
+        result.memory_enabled = True
+        block, mem_hit_ids = _inject_memory(
+            loop, task["requirement"], mem_user,
+            requirement_id=int(tid.lstrip("t")), run_id=run_id)
+        result.memory_block_chars = len(block)
 
     state: AgentState = {
         "requirement_id": int(tid.lstrip("t")),
@@ -256,6 +336,15 @@ def run_one_task(task: dict, args) -> TaskResult:
         result.assertions.append(asdict(checker.check(a)))
 
     result.passed = all(ar["passed"] for ar in result.assertions) and not result.error
+
+    # 记账回填：把这个任务的结果写回本次注入的每一行记账记录。
+    # 有了它，每条记忆都能算出"被注入 N 次、其中 M 次任务通过"。
+    if mem_hit_ids:
+        try:
+            _get_eval_memory_manager().resolve_hits(mem_hit_ids, result.passed)
+        except Exception as e:
+            print(f"[memory] 记账回填失败（不影响结果）: {e}", flush=True)
+
     # 清理临时工作区
     try:
         shutil.rmtree(ws.path)
@@ -286,17 +375,23 @@ def write_reports(results: list[TaskResult], tasks_run: int):
         "total": len(results),
         "passed": passed,
         "pass_rate": round(passed / len(results) * 100, 1) if results else 0,
+        "memory_enabled": any(r.memory_enabled for r in results),
         "by_level": by_level,
         "results": [asdict(r) for r in results],
     }
     json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
     # Markdown 摘要
+    mem_note = []
+    if data["memory_enabled"]:
+        injected = sum(1 for r in results if r.memory_block_chars > 0)
+        mem_note = [f"- **记忆注入**: 开启（{injected}/{len(results)} 个任务实际检索到内容）", ""]
     lines = [
         f"# Eval 基线报告 ({ts})",
         "",
         f"- **通过率**: {passed}/{len(results)} ({data['pass_rate']}%)",
         f"- **任务数**: {len(results)}",
+        *mem_note,
         "",
         "## 按难度",
         "",
@@ -352,6 +447,10 @@ def main():
     parser.add_argument("--compare", metavar="BASELINE_JSON", help="对比历史基线")
     parser.add_argument("--resume", metavar="BASELINE_JSON",
                         help="断点续跑：复用该报告中已 PASS 的任务结果，只重跑未通过的")
+    parser.add_argument("--with-memory", action="store_true",
+                        help="开启记忆注入（A/B 对照；默认关闭，与历史基线一致）")
+    parser.add_argument("--memory-user", type=int, default=0, metavar="USER_ID",
+                        help="记忆检索使用的 user_id（默认 0，即 eval 专用用户）")
     args = parser.parse_args()
 
     # 工作区隔离：每次 run 用唯一目录（时间戳+PID），避免并发/重跑互相覆盖
@@ -375,7 +474,8 @@ def main():
         except Exception as e:
             print(f"resume 读取失败，忽略: {e}")
 
-    print(f"Eval: {len(tasks)} 个任务 (preview={'off' if args.no_preview else 'on'})\n")
+    mem_status = f"on(user={args.memory_user})" if args.with_memory else "off"
+    print(f"Eval: {len(tasks)} 个任务 (preview={'off' if args.no_preview else 'on'}, memory={mem_status})\n")
 
     results = []
     for i, task in enumerate(tasks, 1):
@@ -389,6 +489,8 @@ def main():
                 duration_s=old.get("duration_s"),
                 files=old.get("files", []),
                 assertions=old.get("assertions", []),
+                memory_enabled=old.get("memory_enabled", False),
+                memory_block_chars=old.get("memory_block_chars", 0),
             )
             print(f"[{i}/{len(tasks)}] {rid} {task['name']} ... ⏭️ (resume PASS)")
             results.append(r)
@@ -415,7 +517,8 @@ def main():
                     passed=False, error=f"任务级未捕获异常: {e}\n{traceback.format_exc()}",
                 )
         mark = "✅" if r.passed else "❌"
-        print(f"{mark} ({r.duration_s}s)" + (f"  {r.error}" if r.error else ""))
+        mem_tag = f" [mem:{r.memory_block_chars}c]" if r.memory_enabled else ""
+        print(f"{mark} ({r.duration_s}s){mem_tag}" + (f"  {r.error}" if r.error else ""))
         results.append(r)
 
     json_path, md_path, data = write_reports(results, len(tasks))
