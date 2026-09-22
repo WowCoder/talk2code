@@ -2,6 +2,13 @@
 .env
 .env.local
 .env.*.local
+.env.prod
+
+# 部署方案：尚未在真实服务器验证完成，验证通过后再纳入版本控制
+deploy/
+
+# 本地文档（含服务器 IP / 成本等内部信息，不公开）
+*.local.md
 
 # Eval 运行产物（基线报告不纳入版本控制，保持 results/ 为生成态）
 eval/results/
