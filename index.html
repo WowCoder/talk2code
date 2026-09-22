@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Talk2Code · 用一句话，生成一个能跑的应用</title>
+<meta name="description" content="Talk2Code：输入自然语言需求，AI 多智能体协同完成需求分析、批量编码与真实浏览器验收，实时产出可运行、可下载的应用代码。" />
+<meta name="theme-color" content="#E23B2E" />
+<link rel="icon" href="assets/logo.png" />
+<style>
+  :root{
+    --red:#E23B2E;
+    --red-deep:#C22A1E;
+    --orange:#F08A1D;
+    --ink:#17171A;
+    --ink-2:#3D3D45;
+    --muted:#6E6E78;
+    --bg:#FFFFFF;
+    --soft:#FAFAF8;
+    --soft-2:#F4F2EE;
+    --line:#E8E6E1;
+    --dark:#1A1A1E;
+    --radius:16px;
+    --maxw:1120px;
+    --font:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans SC",sans-serif;
+    --mono:"SFMono-Regular",Menlo,Consolas,"JetBrains Mono","Courier New",monospace;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;font-family:var(--font);color:var(--ink);background:var(--bg);
+    -webkit-font-smoothing:antialiased;line-height:1.65;
+  }
+  a{color:inherit;text-decoration:none}
+  img{max-width:100%;display:block}
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 24px}
+
+  /* ---------- nav ---------- */
+  .nav{
+    position:sticky;top:0;z-index:50;
+    background:rgba(255,255,255,.82);backdrop-filter:saturate(180%) blur(12px);
+    border-bottom:1px solid transparent;transition:border-color .25s,box-shadow .25s;
+  }
+  .nav.scrolled{border-bottom-color:var(--line);box-shadow:0 1px 12px rgba(20,20,25,.05)}
+  .nav-in{display:flex;align-items:center;gap:24px;height:64px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px;letter-spacing:-.01em}
+  .brand img{width:30px;height:30px;border-radius:7px}
+  .nav-links{display:flex;gap:28px;margin-left:auto;font-size:14.5px;color:var(--ink-2)}
+  .nav-links a{transition:color .2s}
+  .nav-links a:hover{color:var(--red)}
+  .btn-gh{
+    display:inline-flex;align-items:center;gap:8px;
+    background:var(--ink);color:#fff;padding:9px 16px;border-radius:10px;
+    font-size:14px;font-weight:600;transition:transform .2s,background .2s;
+  }
+  .btn-gh:hover{background:var(--dark);transform:translateY(-1px)}
+  .btn-gh svg{width:16px;height:16px;fill:#fff}
+
+  /* ---------- hero ---------- */
+  .hero{padding:88px 0 64px;text-align:center;position:relative;overflow:hidden}
+  .hero::before{
+    content:"";position:absolute;top:0;left:0;right:0;height:100%;z-index:-1;pointer-events:none;
+    background:
+      radial-gradient(560px 300px at 20% 26%, rgba(242,138,29,.16), transparent 72%),
+      radial-gradient(620px 340px at 80% 18%, rgba(226,59,46,.14), transparent 72%);
+  }
+  .pill{
+    display:inline-flex;align-items:center;gap:8px;
+    border:1px solid var(--line);background:#fff;border-radius:999px;
+    padding:6px 14px;font-size:13px;color:var(--ink-2);box-shadow:0 1px 3px rgba(20,20,25,.04);
+  }
+  .dot{width:6px;height:6px;border-radius:50%;background:var(--red);
+       box-shadow:0 0 0 4px rgba(226,59,46,.16)}
+  h1{
+    font-size:clamp(34px,5.4vw,58px);line-height:1.18;letter-spacing:-.025em;
+    margin:22px 0 0;font-weight:800;
+  }
+  h1 em{font-style:normal;background:linear-gradient(96deg,var(--red),var(--orange));
+        -webkit-background-clip:text;background-clip:text;color:transparent}
+  .lead{
+    max-width:680px;margin:20px auto 0;font-size:clamp(15.5px,1.6vw,18px);color:var(--muted);
+  }
+  .lead b{color:var(--ink);font-weight:600}
+  .cta-row{display:flex;gap:14px;justify-content:center;flex-wrap:wrap;margin-top:32px}
+  .btn{
+    display:inline-flex;align-items:center;gap:9px;padding:13px 26px;border-radius:12px;
+    font-size:15px;font-weight:600;transition:transform .2s,box-shadow .2s,background .2s;
+  }
+  .btn-primary{
+    background:linear-gradient(96deg,var(--red),var(--orange));color:#fff;
+    box-shadow:0 6px 20px rgba(226,59,46,.28);
+  }
+  .btn-primary:hover{transform:translateY(-2px);box-shadow:0 10px 26px rgba(226,59,46,.34)}
+  .btn-ghost{background:#fff;color:var(--ink);border:1px solid var(--line)}
+  .btn-ghost:hover{transform:translateY(-2px);border-color:var(--ink);}
+  .stats{
+    display:flex;justify-content:center;gap:0;margin:52px auto 0;max-width:760px;
+    border-top:1px solid var(--line);border-bottom:1px solid var(--line);
+  }
+  .stat{flex:1;padding:20px 12px}
+  .stat + .stat{border-left:1px solid var(--line)}
+  .stat b{display:block;font-size:24px;font-weight:750;letter-spacing:-.02em}
+  .stat span{font-size:13px;color:var(--muted)}
+
+  /* ---------- sections ---------- */
+  section{padding:84px 0}
+  .soft{background:var(--soft);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+  .eyebrow{
+    display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:650;
+    color:var(--red);letter-spacing:.02em;margin-bottom:12px;
+  }
+  .eyebrow::before{content:"";width:14px;height:2px;background:var(--red);border-radius:2px}
+  h2{font-size:clamp(26px,3.2vw,36px);letter-spacing:-.02em;margin:0 0 12px;font-weight:750}
+  .sec-lead{color:var(--muted);max-width:660px;margin:0 0 40px;font-size:15.5px}
+  .center{text-align:center}
+  .center .sec-lead{margin-left:auto;margin-right:auto}
+
+  /* ---------- demo ---------- */
+  .video-card{
+    max-width:940px;margin:0 auto;border-radius:var(--radius);overflow:hidden;
+    background:var(--dark);box-shadow:0 20px 50px rgba(20,20,25,.18);
+    border:1px solid rgba(0,0,0,.06);
+  }
+  .video-bar{display:flex;align-items:center;gap:7px;padding:11px 16px;background:#23232A}
+  .video-bar i{width:11px;height:11px;border-radius:50%;display:block}
+  .video-bar .t{margin-left:10px;font:12px var(--mono);color:#8A8A96}
+  .video-card video{width:100%;display:block;background:#000}
+  .video-note{margin:22px auto 0;max-width:720px;font-size:14px;color:var(--muted);text-align:center}
+  .video-note b{color:var(--ink);font-weight:600}
+
+  /* ---------- agents ---------- */
+  .grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
+  .card{
+    background:#fff;border:1px solid var(--line);border-radius:var(--radius);padding:26px 24px;
+    transition:transform .25s,box-shadow .25s,border-color .25s;
+  }
+  .card:hover{transform:translateY(-4px);box-shadow:0 14px 34px rgba(20,20,25,.09);border-color:#DAD7D1}
+  .avatar{
+    width:42px;height:42px;border-radius:12px;display:flex;align-items:center;justify-content:center;
+    font-weight:700;font-size:16px;color:#fff;margin-bottom:16px;
+  }
+  .a1{background:linear-gradient(135deg,var(--red),var(--red-deep))}
+  .a2{background:linear-gradient(135deg,var(--orange),#D9701A)}
+  .a3{background:linear-gradient(135deg,#2E2E38,#17171A)}
+  .role{font-size:12.5px;color:var(--muted);font-family:var(--mono);letter-spacing:.02em}
+  .card h3{margin:2px 0 10px;font-size:19px;font-weight:700;letter-spacing:-.01em}
+  .card p{margin:0;font-size:14.5px;color:var(--muted)}
+  .card p b{color:var(--ink);font-weight:600}
+  .sop{
+    margin-top:28px;display:grid;grid-template-columns:1fr 1fr;gap:16px;
+  }
+  .sop-item{
+    background:#fff;border:1px solid var(--line);border-left:3px solid var(--orange);
+    border-radius:12px;padding:18px 20px;font-size:14px;color:var(--muted);
+  }
+  .sop-item strong{display:block;color:var(--ink);font-size:15px;margin-bottom:4px}
+  .sop-item.g{border-left-color:var(--red)}
+
+  /* ---------- table ---------- */
+  .tbl-wrap{
+    background:#fff;border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;
+  }
+  table{width:100%;border-collapse:collapse;font-size:14.5px}
+  th,td{text-align:left;padding:16px 22px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{background:var(--soft-2);font-size:13px;color:var(--muted);font-weight:650;
+     letter-spacing:.04em;text-transform:uppercase}
+  tr:last-child td{border-bottom:none}
+  td:first-child{font-weight:650;white-space:nowrap;width:150px}
+  td:first-child span{color:var(--red);margin-right:7px}
+  tbody tr{transition:background .2s}
+  tbody tr:hover{background:#FDFCFA}
+
+  /* ---------- architecture ---------- */
+  .arch{
+    background:#fff;border:1px solid var(--line);border-radius:var(--radius);
+    padding:22px;overflow:auto;
+  }
+  .arch img{width:100%;min-width:720px}
+  .arch-hint{display:none;margin-top:12px;font-size:12.5px;color:var(--muted);text-align:center}
+  .stack{display:flex;flex-wrap:wrap;gap:10px;margin-top:26px;justify-content:center}
+  .chip{
+    border:1px solid var(--line);background:#fff;border-radius:999px;
+    padding:7px 15px;font-size:13px;color:var(--ink-2);
+  }
+  .chip b{color:var(--ink);font-weight:650}
+
+  /* ---------- quickstart ---------- */
+  .qs{display:grid;grid-template-columns:1fr 1.15fr;gap:28px;align-items:start}
+  .steps{counter-reset:s;list-style:none;padding:0;margin:0}
+  .steps li{
+    counter-increment:s;position:relative;padding:0 0 22px 44px;font-size:15px;color:var(--muted);
+  }
+  .steps li::before{
+    content:counter(s);position:absolute;left:0;top:-2px;
+    width:28px;height:28px;border-radius:9px;
+    background:linear-gradient(135deg,var(--red),var(--orange));color:#fff;
+    display:flex;align-items:center;justify-content:center;font-size:13.5px;font-weight:700;
+  }
+  .steps li b{color:var(--ink);font-weight:650;display:block;margin-bottom:2px}
+  .term{
+    background:var(--dark);border-radius:var(--radius);overflow:hidden;
+    box-shadow:0 18px 44px rgba(20,20,25,.28);
+  }
+  .term-bar{display:flex;align-items:center;gap:7px;padding:11px 16px;background:#23232A}
+  .term-bar i{width:11px;height:11px;border-radius:50%;display:block}
+  .term-bar .t{margin-left:8px;font:12px var(--mono);color:#8A8A96}
+  pre{
+    margin:0;padding:20px 22px;overflow:auto;font:13px/1.85 var(--mono);color:#E6E6EA;
+  }
+  pre .c{color:#7C7C88}
+  pre .k{color:#F5A65B}
+  pre .g{color:#8FD67A}
+  pre .p{color:#7FB4E8}
+
+  /* ---------- footer ---------- */
+  footer{background:var(--dark);color:#A8A8B4;padding:44px 0 36px;font-size:14px}
+  .foot{display:flex;flex-wrap:wrap;gap:20px;align-items:center}
+  .foot .brand{color:#fff}
+  .foot-links{display:flex;gap:22px;margin-left:auto;flex-wrap:wrap}
+  .foot-links a:hover{color:#fff}
+  .fine{width:100%;margin-top:24px;padding-top:20px;border-top:1px solid #2A2A32;
+        font-size:12.5px;color:#75757F}
+
+  /* ---------- reveal ---------- */
+  .rv{opacity:0;transform:translateY(18px);transition:opacity .6s ease,transform .6s ease}
+  .rv.in{opacity:1;transform:none}
+
+  /* ---------- responsive ---------- */
+  @media (max-width:880px){
+    .grid-3{grid-template-columns:1fr}
+    .sop{grid-template-columns:1fr}
+    .qs{grid-template-columns:1fr}
+    .nav-links{display:none}
+    section{padding:64px 0}
+    .hero{padding:64px 0 48px}
+    .stats{flex-wrap:wrap}
+    .stat{flex:1 1 50%}
+    .stat:nth-child(3){border-left:none;border-top:1px solid var(--line);flex-basis:100%}
+    th{display:none}
+    .arch-hint{display:block}
+    .arch img{min-width:660px}
+    td{display:block;border-bottom:none;padding:6px 22px}
+    td:first-child{padding-top:16px;font-weight:700;white-space:normal;width:auto}
+    td:last-child{padding-bottom:16px;border-bottom:1px solid var(--line)}
+  }
+</style>
+<noscript><style>.rv{opacity:1;transform:none}</style></noscript>
+</head>
+<body>
+
+<!-- ============ NAV ============ -->
+<nav class="nav" id="nav">
+  <div class="wrap nav-in">
+    <a class="brand" href="#top"><img src="assets/logo.png" alt="Talk2Code" />Talk2Code</a>
+    <div class="nav-links">
+      <a href="#demo">演示</a>
+      <a href="#agents">智能体</a>
+      <a href="#why">为什么不一样</a>
+      <a href="#arch">架构</a>
+      <a href="#start">快速开始</a>
+    </div>
+    <a class="btn-gh" href="https://github.com/WowCoder/talk2code" target="_blank" rel="noopener">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.42 7.42 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A7.995 7.995 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      GitHub
+    </a>
+  </div>
+</nav>
+
+<!-- ============ HERO ============ -->
+<header class="hero" id="top">
+  <div class="wrap">
+    <span class="pill"><span class="dot"></span>LangGraph 多智能体 · 真实浏览器验收</span>
+    <h1>用一句话，<em>生成一个能跑的应用</em></h1>
+    <p class="lead">
+      输入自然语言需求 → 多智能体协同完成 <b>需求分析 / 批量编码 / 真实浏览器验收</b>
+      → 实时产出<b>可运行、可下载</b>的产品代码。
+    </p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="https://github.com/WowCoder/talk2code" target="_blank" rel="noopener">查看 GitHub 仓库</a>
+      <a class="btn btn-ghost" href="#demo">观看 60 秒演示 ↓</a>
+    </div>
+    <div class="stats">
+      <div class="stat"><b>3</b><span>个智能体分工协作</span></div>
+      <div class="stat"><b>21</b><span>个回归任务守护质量</span></div>
+      <div class="stat"><b>真实</b><span>浏览器逐条验收</span></div>
+    </div>
+  </div>
+</header>
+
+<!-- ============ DEMO ============ -->
+<section id="demo" class="soft">
+  <div class="wrap center">
+    <span class="eyebrow">端到端演示</span>
+    <h2>60 秒看完整流程</h2>
+    <p class="sec-lead">从一句话需求，到验收通过的可运行应用——全程真实录屏，可复现。</p>
+    <div class="video-card rv">
+      <div class="video-bar">
+        <i style="background:#FF5F57"></i><i style="background:#FEBC2E"></i><i style="background:#28C840"></i>
+        <span class="t">talk2code · 输入需求 → 生成 → 验收 → 放行</span>
+      </div>
+      <video src="assets/talk2code_pitch.mp4" autoplay muted loop playsinline preload="metadata"></video>
+    </div>
+    <p class="video-note">
+      流程说明：<b>输入一句话需求</b> → 技术负责人拆解方案 → 开发工程师批量产出文件
+      → 质量工程师在浏览器里逐条执行验收条件 → <b>评分放行</b>，交付可运行代码。
+    </p>
+  </div>
+</section>
+
+<!-- ============ AGENTS ============ -->
+<section id="agents">
+  <div class="wrap">
+    <div class="center">
+      <span class="eyebrow">三个角色，一套流程</span>
+      <h2>不是一次生成了事，而是分工协作</h2>
+      <p class="sec-lead">LangGraph 编排三个智能体，职责分离、相互校验，把工程质量当成一等公民。</p>
+    </div>
+    <div class="grid-3">
+      <div class="card rv">
+        <div class="avatar a1">TL</div>
+        <div class="role">TeamLeader</div>
+        <h3>技术负责人</h3>
+        <p>把一句自然语言需求拆成<b>结构化 Plan 与验收条件（AC）</b>，并判定复杂度等级，决定走快速通道还是完整流程。</p>
+      </div>
+      <div class="card rv">
+        <div class="avatar a2">CD</div>
+        <div class="role">Coder</div>
+        <h3>开发工程师</h3>
+        <p><b>批量创建文件</b>，迭代轮数由文件数自适应决定；写入即返回内容预览，避免重复回读浪费上下文。</p>
+      </div>
+      <div class="card rv">
+        <div class="avatar a3">QA</div>
+        <div class="role">QA Engineer</div>
+        <h3>质量工程师</h3>
+        <p>用 Playwright 在真实 headless Chromium 里<b>逐条执行验收条件</b>，全部通过走快速通道，否则按缺陷类别路由回炉。</p>
+      </div>
+    </div>
+    <div class="sop">
+      <div class="sop-item rv">
+        <strong>🟢 simple 快速通道</strong>
+        单个页面、极简交互：轻量分析 → 5 轮快速编码 → 预览验证 → 完成。
+      </div>
+      <div class="sop-item g rv">
+        <strong>🔵 standard 完整流程</strong>
+        多文件交互式应用：完整 Plan + AC → 用户确认 → 批量编码 → AC 逐条验收 → 交付门禁放行。
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ WHY ============ -->
+<section id="why" class="soft">
+  <div class="wrap">
+    <div class="center">
+      <span class="eyebrow">为什么不一样</span>
+      <h2>交付前，先过工程质量这一关</h2>
+      <p class="sec-lead">多数工具止步于吐出代码片段；Talk2Code 要求生成结果<b>能打开、能点、能用</b>，才允许放行。</p>
+    </div>
+    <div class="tbl-wrap rv">
+      <table>
+        <thead><tr><th>能力</th><th>做法</th></tr></thead>
+        <tbody>
+          <tr><td><span>◆</span>多智能体分工</td><td>LangGraph 编排技术负责人 / 开发工程师 / 质量工程师，职责分离而非一次生成了事</td></tr>
+          <tr><td><span>◆</span>真实验收</td><td>质量工程师用 Playwright 在 headless Chromium 里逐条执行 AC，以运行结果为准</td></tr>
+          <tr><td><span>◆</span>交付门禁</td><td>关键缺陷清零才放行，未达标则转人工确认并附差异报告</td></tr>
+          <tr><td><span>◆</span>跨文件契约</td><td>计划期声明 exports → 编码期契约注入 → 验收期闭合校验，保证模块间真正接通</td></tr>
+          <tr><td><span>◆</span>写入即拦截</td><td>PRE_WRITE Hook 零 LLM 成本拦掉沙箱环境必失败的写法，把问题挡在生成之前</td></tr>
+          <tr><td><span>◆</span>缺陷自动回炉</td><td>验收不通过时按缺陷类别路由回开发工程师重构，架构类附根因卡片，修完再验</td></tr>
+          <tr><td><span>◆</span>回归纪律</td><td>固化 21 个回归任务，改核心逻辑前后跑基线对照，经验沉淀进跨会话记忆</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ============ ARCH ============ -->
+<section id="arch">
+  <div class="wrap">
+    <div class="center">
+      <span class="eyebrow">架构与技术栈</span>
+      <h2>一条链路，看得清楚</h2>
+      <p class="sec-lead">前端实时呈现 Agent 思考与产出，后端用 LangGraph 编排，全程 SSE 流式回传。</p>
+    </div>
+    <div class="arch rv">
+      <img src="assets/architecture.svg" alt="Talk2Code 架构流程图" />
+    </div>
+    <p class="arch-hint">← 左右滑动查看完整架构图 →</p>
+    <div class="stack">
+      <span class="chip"><b>Vue 3</b> + TypeScript + Vite</span>
+      <span class="chip"><b>Python 3.11</b> + Flask</span>
+      <span class="chip"><b>LangGraph</b> 1.x</span>
+      <span class="chip"><b>PostgreSQL</b> + pgvector</span>
+      <span class="chip"><b>Celery</b> + Redis</span>
+      <span class="chip"><b>SSE</b> 实时流</span>
+      <span class="chip"><b>BGE-M3</b> 混合检索</span>
+      <span class="chip"><b>JWT</b> 认证</span>
+    </div>
+  </div>
+</section>
+
+<!-- ============ QUICKSTART ============ -->
+<section id="start" class="soft">
+  <div class="wrap">
+    <div class="center">
+      <span class="eyebrow">快速开始</span>
+      <h2>三步跑起来</h2>
+      <p class="sec-lead">本地或服务器均可，配置好一个 LLM API Key 就能用。</p>
+    </div>
+    <div class="qs">
+      <ol class="steps">
+        <li><b>安装依赖</b>创建虚拟环境并安装后端依赖包。</li>
+        <li><b>配置模型</b>复制配置模板，填入你的 LLM API Key（兼容 OpenAI / Anthropic 协议）。</li>
+        <li><b>一键启动</b>执行启动脚本，打开浏览器访问即可使用。</li>
+      </ol>
+      <div class="term rv">
+        <div class="term-bar">
+          <i style="background:#FF5F57"></i><i style="background:#FEBC2E"></i><i style="background:#28C840"></i>
+          <span class="t">bash</span>
+        </div>
+<pre><span class="c"># 1. 安装依赖</span>
+<span class="k">python</span> -m venv venv &amp;&amp; <span class="k">source</span> venv/bin/activate
+<span class="k">pip</span> install -r backend/requirements.txt
+
+<span class="c"># 2. 配置模型（填入 LLM_API_KEY）</span>
+<span class="k">cp</span> backend/.env.example backend/.env
+
+<span class="c"># 3. 一键启动 → http://localhost:5001</span>
+<span class="k">./</span>start.sh
+
+<span class="g">✔</span> <span class="p">服务已就绪，输入一句话需求试试</span></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ FOOTER ============ -->
+<footer>
+  <div class="wrap foot">
+    <a class="brand" href="#top"><img src="assets/logo.png" alt="Talk2Code" />Talk2Code</a>
+    <div class="foot-links">
+      <a href="https://github.com/WowCoder/talk2code" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/WowCoder/talk2code/blob/main/docs/ARCHITECTURE.md" target="_blank" rel="noopener">架构与设计</a>
+      <a href="https://github.com/WowCoder/talk2code/blob/main/README.md" target="_blank" rel="noopener">文档</a>
+      <a href="https://github.com/WowCoder/talk2code/blob/main/LICENSE" target="_blank" rel="noopener">MIT License</a>
+    </div>
+    <div class="fine">
+      Talk2Code · 用一句话，生成一个能跑的应用 · 本项目基于 MIT License 开源
+    </div>
+  </div>
+</footer>
+
+<script>
+  // 导航滚动态
+  var nav = document.getElementById('nav');
+  addEventListener('scroll', function () {
+    nav.classList.toggle('scrolled', window.scrollY > 8);
+  }, { passive: true });
+
+  // 滚动渐入
+  var io = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+    });
+  }, { threshold: 0.12 });
+  document.querySelectorAll('.rv').forEach(function (el) { io.observe(el); });
+
+  // 视频进入视口才播放，离开暂停（省带宽）
+  var v = document.querySelector('video');
+  if (v) {
+    var vio = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) { v.play().catch(function () {}); }
+        else { v.pause(); }
+      });
+    }, { threshold: 0.25 });
+    vio.observe(v);
+  }
+</script>
+</body>
+</html>
