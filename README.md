@@ -15,6 +15,7 @@
 </p>
 
 <p align="center">
+  <a href="https://wowcoder.github.io/talk2code/"><img src="https://img.shields.io/badge/项目主页-github.io-2EA043?logo=github" alt="项目主页"></a>
   <a href="https://github.com/WowCoder/talk2code/actions/workflows/ci.yml"><img src="https://github.com/WowCoder/talk2code/actions/workflows/ci.yml/badge.svg" alt="Build"></a>
   <img src="https://img.shields.io/badge/Python-3.11%2B-blue" alt="Python">
   <img src="https://img.shields.io/badge/LangGraph-1.x-005571" alt="LangGraph">
@@ -26,7 +27,8 @@
 </p>
 
 <p align="center">
-  🎬 <a href="https://github.com/WowCoder/talk2code/blob/main/docs/talk2code_pitch.mp4">观看高清视频（MP4）</a>
+  🌐 <a href="https://wowcoder.github.io/talk2code/"><b>项目主页（含完整演示视频）</b></a>
+  &nbsp;·&nbsp; 🎬 <a href="https://github.com/WowCoder/talk2code/blob/main/docs/talk2code_pitch.mp4">观看高清视频（MP4）</a>
   &nbsp;·&nbsp; 📐 <a href="#架构一览">架构一览</a>
   &nbsp;·&nbsp; ⚡ <a href="#快速开始">3 步跑起来</a>
 </p>

@@ -15,6 +15,7 @@
 </p>
 
 <p align="center">
+  <a href="https://wowcoder.github.io/talk2code/"><img src="https://img.shields.io/badge/Project%20Site-github.io-2EA043?logo=github" alt="Project Site"></a>
   <a href="https://github.com/WowCoder/talk2code/actions/workflows/ci.yml"><img src="https://github.com/WowCoder/talk2code/actions/workflows/ci.yml/badge.svg" alt="Build"></a>
   <img src="https://img.shields.io/badge/Python-3.11%2B-blue" alt="Python">
   <img src="https://img.shields.io/badge/LangGraph-1.x-005571" alt="LangGraph">
@@ -26,7 +27,8 @@
 </p>
 
 <p align="center">
-  🎬 <a href="https://github.com/WowCoder/talk2code/blob/main/docs/talk2code_pitch.mp4">Watch the full video (MP4)</a>
+  🌐 <a href="https://wowcoder.github.io/talk2code/"><b>Project site (with full demo video)</b></a>
+  &nbsp;·&nbsp; 🎬 <a href="https://github.com/WowCoder/talk2code/blob/main/docs/talk2code_pitch.mp4">Watch the full video (MP4)</a>
   &nbsp;·&nbsp; 📐 <a href="#architecture">Architecture</a>
   &nbsp;·&nbsp; ⚡ <a href="#quick-start">Quick Start</a>
 </p>
