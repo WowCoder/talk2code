@@ -18,6 +18,7 @@ from typing import Callable, Any, Dict, Optional, Union
 from enum import Enum
 
 from harness.observability.logger import get_logger
+from harness.observability.log_context import bind_requirement, clear
 
 logger = get_logger(__name__)
 
@@ -202,6 +203,10 @@ class TaskQueue:
         **kwargs
     ):
         """运行任务（内部使用）"""
+        # 绑定需求上下文。ThreadPoolExecutor **不会**继承提交者的 contextvar，
+        # 必须在线程入口显式绑定，否则本线程内所有日志的 req_id 都是 "-"。
+        bind_requirement(requirement_id)
+
         # 更新状态为运行中
         with self._tasks_lock:
             if task_id in self._tasks:
@@ -246,6 +251,10 @@ class TaskQueue:
             with self._requirement_tasks_lock:
                 if requirement_id in self._requirement_tasks:
                     del self._requirement_tasks[requirement_id]
+
+            # 线程池线程会被复用：不清理会把本需求的 req_id
+            # 带到该线程执行的下一个任务上，产生张冠李戴的日志
+            clear()
 
     @staticmethod
     def _match_celery_task(task_func: Callable) -> Optional[Any]:

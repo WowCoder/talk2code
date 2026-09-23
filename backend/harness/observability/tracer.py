@@ -14,6 +14,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
+from harness.observability.log_context import bind_trace_id
+
 logger = logging.getLogger(__name__)
 
 
@@ -51,6 +53,8 @@ class Trace:
     end_time: Optional[float] = None
     spans: list = field(default_factory=list)
     total_tokens: int = 0
+    input_tokens: int = 0
+    cached_tokens: int = 0
     total_cost: float = 0.0
 
     def to_dict(self) -> dict:
@@ -62,6 +66,12 @@ class Trace:
             "span_count": len(self.spans),
             "spans": [s.to_dict() for s in self.spans],
             "total_tokens": self.total_tokens,
+            "input_tokens": self.input_tokens,
+            "cached_tokens": self.cached_tokens,
+            "cache_hit_rate": (
+                round(self.cached_tokens / self.input_tokens, 4)
+                if self.input_tokens else 0.0
+            ),
             "total_cost": round(self.total_cost, 4),
         }
 
@@ -87,6 +97,9 @@ class Tracer:
             start_time=time.time(),
         )
         self._traces[trace.trace_id] = trace
+        # trace_id 生成后立刻绑定日志上下文 —— 这是「日志 ↔ agent_traces 表」
+        # 唯一能互查的钥匙。此前 trace_id 从不落日志，两边永远对不上。
+        bind_trace_id(trace.trace_id)
         return trace
 
     def start_span(self, trace_id: str, name: str, parent_id: str = None, metadata: dict = None) -> Span:
@@ -119,6 +132,8 @@ class Tracer:
         if self._cost_tracker:
             report = self._cost_tracker.get_report(trace_id)
             trace.total_cost = report.total_cost
+            trace.input_tokens = report.input_tokens
+            trace.cached_tokens = report.cached_tokens
             # trace 已落库/入最近列表，cost 明细无需再按 trace 保留，
             # 联动清理避免 _usage 无界增长
             self._cost_tracker.clear(trace_id)
@@ -129,6 +144,8 @@ class Tracer:
 
         # 从活动字典移入最近列表（_traces 不再无界增长；_recent 是唯一内存回放源）
         self._traces.pop(trace_id, None)
+        # trace 已结束：解绑，避免该线程后续日志挂着已结束的 trace_id
+        bind_trace_id(None)
         self._recent.append(trace)
         if len(self._recent) > 100:
             self._recent = self._recent[-100:]

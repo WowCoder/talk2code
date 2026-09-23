@@ -10,10 +10,40 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
+from harness.observability.log_context import install_record_factory
+
+
+def _make_routing_filter(include=(), exclude=()):
+    """按 logger 名前缀把记录路由到**唯一**一个文件通道
+
+    此前三个文件 handler 全部挂在 root 上且无分流，导致 app/agent/llm 三个
+    文件的内容完全相同（实测 md5 一致）——分类形同虚设，磁盘占用却是 3 倍。
+    """
+    prefixes_include = tuple(include)
+    prefixes_exclude = tuple(exclude)
+
+    class _RoutingFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            name = record.name
+            for p in prefixes_exclude:
+                if name == p or name.startswith(p + "."):
+                    return False
+            if prefixes_include:
+                for p in prefixes_include:
+                    if name == p or name.startswith(p + "."):
+                        return True
+                return False
+            return True
+
+    return _RoutingFilter()
+
 
 def setup_logging(log_dir: str = "logs", level: str = "INFO"):
-    """初始化日志系统，配置 4 类日志文件"""
+    """初始化日志系统，配置 3 类日志文件（互斥分流，不再是三份副本）"""
     os.makedirs(log_dir, exist_ok=True)
+
+    # 给每条日志补 req_id / trace_id（幂等）
+    install_record_factory()
 
     log_level = getattr(logging, level.upper(), logging.INFO)
 
@@ -23,29 +53,35 @@ def setup_logging(log_dir: str = "logs", level: str = "INFO"):
     root.handlers.clear()
 
     formatter = logging.Formatter(
-        '%(asctime)s | %(levelname)-8s | %(name)s | %(funcName)s:%(lineno)d | %(message)s',
+        '%(asctime)s | %(levelname)-8s | req=%(req_id)s trace=%(trace_id)s | '
+        '%(name)s | %(funcName)s:%(lineno)d | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-    # 控制台
+    # 控制台：不分流，看全部（分流只影响落盘）
     console = logging.StreamHandler()
     console.setLevel(log_level)
     console.setFormatter(formatter)
     root.addHandler(console)
 
-    # 文件日志（按天轮转）
-    log_files = {
-        "app": os.path.join(log_dir, "app.log"),
-        "agent": os.path.join(log_dir, "agent.log"),
-        "llm": os.path.join(log_dir, "llm.log"),
-    }
+    # 文件日志（按天轮转，三者互斥）
+    #   harness.* → agent.log（Agent 执行链路）
+    #   llm.*     → llm.log（LLM 调用；llm.traffic 另有独立通道，不在此列）
+    #   其余      → app.log（Web 层、服务层、基础设施）
+    log_files = [
+        ("agent", ("harness",), ()),
+        ("llm", ("llm",), ()),
+        ("app", (), ("harness", "llm")),
+    ]
 
-    for name, path in log_files.items():
+    for name, include, exclude in log_files:
         handler = TimedRotatingFileHandler(
-            path, when="midnight", interval=1, backupCount=30, encoding="utf-8"
+            os.path.join(log_dir, f"{name}.log"), when="midnight", interval=1,
+            backupCount=30, encoding="utf-8"
         )
         handler.setLevel(log_level)
         handler.setFormatter(formatter)
+        handler.addFilter(_make_routing_filter(include, exclude))
         root.addHandler(handler)
 
     return root
