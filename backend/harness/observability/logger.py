@@ -38,8 +38,36 @@ def _make_routing_filter(include=(), exclude=()):
     return _RoutingFilter()
 
 
-def setup_logging(log_dir: str = "logs", level: str = "INFO"):
-    """初始化日志系统，配置 3 类日志文件（互斥分流，不再是三份副本）"""
+def _resolve_log_settings(log_dir, level):
+    """解析日志配置：显式参数优先，否则读 config.settings，再失败回退内置默认。
+
+    修复两个历史问题：
+    1. backupCount 此前硬编码 30，config 里的 *_RETENTION_DAYS 从未被读取（死配置）；
+    2. log_dir 相对路径随 CWD 漂移，与 llm/client.py 的绝对路径分裂成两个目录 ——
+       统一锚定 BACKEND_DIR（backend/logs），llm/client.py 同步改为同一锚点。
+    """
+    agent_days, app_days, fallback_dir, fallback_level = 30, 90, "logs", "INFO"
+    try:
+        from config import settings
+        resolved_dir = log_dir or str(settings.BACKEND_DIR / settings.LOG_DIR)
+        resolved_level = level or settings.LOG_LEVEL
+        agent_days = getattr(settings, "AGENT_LOG_RETENTION_DAYS", agent_days)
+        app_days = getattr(settings, "APP_LOG_RETENTION_DAYS", app_days)
+        return resolved_dir, resolved_level, agent_days, app_days
+    except Exception:
+        # config 不可用（极端单测环境）：按 __file__ 反推 backend 目录
+        backend = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        return (log_dir or os.path.join(backend, fallback_dir),
+                level or fallback_level, agent_days, app_days)
+
+
+def setup_logging(log_dir: str = None, level: str = None):
+    """初始化日志系统，配置 3 类日志文件（互斥分流，不再是三份副本）
+
+    注：config 里还有一个 LOG_FILE_MAX_SIZE_MB（按大小轮转），与按天轮转
+    二选一，当前选按天 —— 大小上限未实现，改配置不生效，勿误以为有保护。
+    """
+    log_dir, level, agent_days, app_days = _resolve_log_settings(log_dir, level)
     os.makedirs(log_dir, exist_ok=True)
 
     # 给每条日志补 req_id / trace_id（幂等）
@@ -64,20 +92,20 @@ def setup_logging(log_dir: str = "logs", level: str = "INFO"):
     console.setFormatter(formatter)
     root.addHandler(console)
 
-    # 文件日志（按天轮转，三者互斥）
+    # 文件日志（按天轮转，三者互斥；保留天数真正读自 config 的 RETENTION_DAYS）
     #   harness.* → agent.log（Agent 执行链路）
     #   llm.*     → llm.log（LLM 调用；llm.traffic 另有独立通道，不在此列）
     #   其余      → app.log（Web 层、服务层、基础设施）
     log_files = [
-        ("agent", ("harness",), ()),
-        ("llm", ("llm",), ()),
-        ("app", (), ("harness", "llm")),
+        ("agent", ("harness",), (), agent_days),
+        ("llm", ("llm",), (), agent_days),
+        ("app", (), ("harness", "llm"), app_days),
     ]
 
-    for name, include, exclude in log_files:
+    for name, include, exclude, keep_days in log_files:
         handler = TimedRotatingFileHandler(
             os.path.join(log_dir, f"{name}.log"), when="midnight", interval=1,
-            backupCount=30, encoding="utf-8"
+            backupCount=keep_days, encoding="utf-8"
         )
         handler.setLevel(log_level)
         handler.setFormatter(formatter)

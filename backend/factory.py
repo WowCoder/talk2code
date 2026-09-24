@@ -27,7 +27,9 @@ from utils.rate_limiter import get_user_identity, rate_limit_handler, RATE_LIMIT
 # ==================== 日志配置 ====================
 
 # 初始化根 logger 的文件处理器（app.log / agent.log / llm.log）
-setup_logging(log_dir="logs", level=os.environ.get("LOG_LEVEL", "INFO"))
+# 目录、级别、保留天数统一由 setup_logging 从 config.settings 读取，
+# 不再在此处用环境变量重复解析（此前两处读取可能不一致）
+setup_logging()
 setup_logger('sqlalchemy.engine', level=30)  # WARNING 级别
 logger = get_logger(__name__)
 logger.info("日志系统已初始化")

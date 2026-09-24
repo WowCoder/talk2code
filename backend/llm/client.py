@@ -28,7 +28,9 @@ _llm_logger = _logging.getLogger("llm.traffic")
 _llm_logger.setLevel(_logging.DEBUG)
 if not _llm_logger.handlers:
     import os as _os
-    _log_dir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "..", "logs")
+    # 锚定 backend/logs —— 与 setup_logging 的 BACKEND_DIR / LOG_DIR 同一目录。
+    # 此前是 backend/../logs（项目根），曾与应用日志分裂在两个目录（P1-1）。
+    _log_dir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "logs")
     _os.makedirs(_log_dir, exist_ok=True)
     # 按天轮转、保留 7 天，避免明文流量日志无限增长
     _fh = _logging_handlers.TimedRotatingFileHandler(

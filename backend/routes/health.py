@@ -164,30 +164,34 @@ def readiness_check():
 
 @app.route('/api/metrics', methods=['GET'])
 def metrics():
-    """Prometheus 监控指标端点"""
+    """Prometheus 监控指标端点
+
+    指标命名约定：指标名不带 talk2code_ 前缀，输出时统一拼接，
+    避免 key 与前缀重复叠加导致采集端按名称抓不到。
+    """
     import time
     metrics_data = {
-        # 语义修正：这里是 requirements 表行数（历史需求总数），不是请求数
-        'talk2code_requirements_total': 0,
-        'talk2code_active_sessions': 0,
-        'timestamp': time.time(),
-        'uptime_seconds': time.time() - app.config.get('START_TIME', time.time()),
+        # requirements 表行数（历史需求总数），不是请求数
+        'requirements_total': 0,
+        # 处理中的需求数 —— 真实"活跃度"，取代原硬编码 0 的 active_sessions
+        'requirements_processing': 0,
+        'uptime_seconds': round(time.time() - app.config.get('START_TIME', time.time()), 1),
     }
 
     try:
         with get_db() as db:
             from sqlalchemy import text
-            result = db.execute(text("SELECT COUNT(*) FROM requirements")).fetchone()
-            metrics_data['talk2code_requirements_total'] = result[0] if result else 0
+            total = db.execute(text("SELECT COUNT(*) FROM requirements")).fetchone()
+            processing = db.execute(
+                text("SELECT COUNT(*) FROM requirements WHERE status = 'processing'")
+            ).fetchone()
+            metrics_data['requirements_total'] = total[0] if total else 0
+            metrics_data['requirements_processing'] = processing[0] if processing else 0
     except Exception:
+        # 查询失败输出 0 而不是 500：监控端点自身挂掉比数据缺失更糟
         pass
 
-    # Prometheus text 格式
-    lines = []
-    for key, value in metrics_data.items():
-        if isinstance(value, (int, float)):
-            safe_key = key.replace('.', '_')
-            lines.append(f"talk2code_{safe_key} {value}")
+    lines = [f"talk2code_{key} {value}" for key, value in metrics_data.items()]
     return '\n'.join(lines) + '\n', 200, {'Content-Type': 'text/plain; charset=utf-8'}
 
 
