@@ -2,10 +2,13 @@
 """
 进度约束 Hook —— 硬阻断不合理行为
 
-- block_unnecessary_read: 写入后 2 轮内阻断 read_file 同一文件
 - block_premature_completion: contract 未全部完成时阻断 task_complete
+- track_write_success: write_file 成功后更新 CompletionContract（成功后静默）
 
 原则：基于可验证的客观事实做阻断判断，不依赖 LLM 的主观判断。
+
+（原 block_unnecessary_read 已移除：v2 把 read_file 定位为 just-in-time 内容通道，
+"写入后 N 轮内禁止回读" 会拦截内容恢复型读取，与设计冲突。）
 """
 
 from harness.constraints.hooks import HookContext
@@ -13,11 +16,6 @@ from harness.constraints.completion_contract import CompletionContract
 from harness.observability.logger import get_logger
 
 logger = get_logger(__name__)
-
-# 写入后禁止回读的轮次数（可配置）
-# 从 2 降低到 1：允许 Agent 在下一轮回读验证写入内容，
-# 避免"盲写"导致连续 edit_file 失败后只能重写整个文件。
-READ_BLOCK_WINDOW = 1
 
 
 def _get_contract(ctx: HookContext):
@@ -31,78 +29,6 @@ def _get_contract(ctx: HookContext):
     if workspace:
         return CompletionContract(workspace)
 
-    return None
-
-
-def _in_fix_phase(state: dict) -> bool:
-    """是否处于「修复/调试」阶段
-
-    首轮编码时禁止回读是对的（防止 Agent 空转刷 read）；但验证已经失败、
-    正在按缺陷卡片改代码时，禁止回读会逼 Agent 盲改——它明明已经诊断出
-    「循环没启动」，却读不到 js/game.js 定位不到那几行（需求 140 事故）。
-    """
-    meta = state.get("metadata") or {}
-    if meta.get("repair_count", 0) or meta.get("defect_repair_count", 0):
-        return True
-    # 验证跑过且失败 → 后续都算修复阶段
-    if state.get("verify_passed") is False:
-        return True
-    return False
-
-
-def block_unnecessary_read(ctx: HookContext) -> str | None:
-    """阻断刚写入文件的 read_file 调用
-
-    基于 _recent_writes 追踪（写入文件名 → 写入时的轮次），
-    在 READ_BLOCK_WINDOW 轮内阻断对同一文件的 read_file。
-    修复阶段（验证失败后 / repair 轮次中）一律放行。
-
-    Returns:
-        None = 允许通过
-        str = 阻断原因（返回给 Agent）
-    """
-    if ctx.tool_name != "read_file":
-        return None
-
-    state = ctx.state or {}
-
-    if _in_fix_phase(state):
-        return None
-
-    recent_writes = state.get("_recent_writes", {})
-    if not recent_writes:
-        return None
-
-    filename = (ctx.tool_args or {}).get("filename", "")
-    if not filename:
-        return None
-
-    if filename not in recent_writes:
-        return None  # 不是刚写入的文件
-
-    write_round = recent_writes[filename]
-    current_round = state.get("tool_call_count", 0)
-
-    # 如果 write_round > current_round，说明 tool_call_count 已跨节点重置
-    # （例如修复循环回到 coder 节点），此时应清理过期记录并放行读取
-    if write_round > current_round:
-        del recent_writes[filename]
-        return None
-
-    rounds_since_write = current_round - write_round
-
-    if rounds_since_write <= READ_BLOCK_WINDOW:
-        msg = (
-            f"[硬约束] 文件 {filename} 在第 {write_round} 轮刚刚写入完成，"
-            f"当前第 {current_round} 轮（仅间隔 {rounds_since_write} 轮），"
-            f"禁止 read_file 回读验证。文件已完整写入，无需验证。"
-            f"请继续使用文件摘要或直接编辑下一个文件。"
-        )
-        logger.info(f"[ProgressHook] 阻断 read_file: {filename} (写入轮次={write_round}, 当前={current_round})")
-        return msg
-
-    # 超出窗口期，允许读取，清理追踪记录
-    del recent_writes[filename]
     return None
 
 
@@ -186,11 +112,9 @@ def block_premature_completion(ctx: HookContext) -> str | None:
 
 
 def track_write_success(ctx: HookContext) -> str | None:
-    """追踪 write_file 成功后更新相关状态
+    """write_file 成功后更新 CompletionContract
 
-    此 Hook 在 POST_TOOL_USE 触发，执行：
-    1. 将写入的文件记录到 _recent_writes（用于 block_unnecessary_read）
-    2. 更新 CompletionContract（mark_created）
+    此 Hook 在 POST_TOOL_USE 触发：write_file 成功后调用 contract.mark_created。
 
     原则：成功静默，始终返回 None（不阻断）。
 
@@ -204,16 +128,11 @@ def track_write_success(ctx: HookContext) -> str | None:
     if not ctx.tool_result:
         return None
 
-    state = ctx.state or {}
     filename = (ctx.tool_args or {}).get("filename", "")
     if not filename:
         return None
 
-    # 1. 追踪最近写入（用于防回读）
-    current_round = state.get("tool_call_count", 0)
-    state.setdefault("_recent_writes", {})[filename] = current_round
-
-    # 2. 更新 CompletionContract
+    # 更新 CompletionContract
     contract = _get_contract(ctx)
     if contract and contract.exists():
         updated = contract.mark_created(filename)

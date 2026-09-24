@@ -886,6 +886,19 @@ class RequirementService:
             requirement.status = 'finished'
             db.commit()
 
+            # 交付边界折叠（短期记忆 v2 §3.H）：写 .task/DELIVERY.md（handoff）并清空工具轨迹。
+            # 不可重建项（需求/计划/决策/反馈）已落地到 requirement 状态 + TASK_STATE.md，
+            # 加上此处 handoff，故可丢弃上一轮 read/edit/verify 结果（100% 可重建）。
+            try:
+                from harness.state.context_pipeline import finalize_delivery
+                finalize_delivery(final_state, workspace)
+                requirement.dialogue_history = final_state.get("dialogue_history", [])
+                from sqlalchemy.orm.attributes import flag_modified
+                flag_modified(requirement, 'dialogue_history')
+                db.commit()
+            except Exception as e:
+                logger.warning(f"[Delivery] handoff 折叠失败（不阻断）: {e}")
+
             # 完成追踪
             trace_id = final_state.get('metadata', {}).get('trace_id', '')
             if trace_id and tracer:

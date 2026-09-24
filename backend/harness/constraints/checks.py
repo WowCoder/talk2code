@@ -275,12 +275,14 @@ def register_all_hooks(manager):
 
     # ---- 进度约束 Hook（硬阻断） ----
     from harness.constraints.progress_hooks import (
-        block_unnecessary_read,
         block_premature_completion,
         track_write_success,
     )
     # PreToolUse: 在工具执行前阻断不合理行为
-    manager.register(HookPoint.PRE_TOOL_USE, block_unnecessary_read)
+    # 注：block_unnecessary_read 已移除。v2 把 read_file 明确为「just-in-time 内容通道」
+    # （见 docs/design/context-pipeline-v2.md §3.A）——写完后的回读往往是恢复正文的正当行为
+    # （write 正文在 tool_call.arguments，不进 LLM 上下文），"写入后 1 轮内禁止回读"
+    # 只会把它拦下、白烧一轮再放行。文件地图改由「文件索引的一行结构摘要」提供。
     manager.register(HookPoint.PRE_TOOL_USE, block_premature_completion)
     # PreToolUse: 写文件瞬间按环境契约拦截 module/CDN/ES 语法（零 LLM 成本）
     manager.register(HookPoint.PRE_TOOL_USE, _validate_environment_on_write)

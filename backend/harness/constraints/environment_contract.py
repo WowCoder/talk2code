@@ -330,6 +330,9 @@ _ATTR_METHOD_RE = re.compile(
 
 _CALL_RE = re.compile(r'\b(?:window\s*\.\s*)?([A-Z][\w$]*)\s*\.\s*([a-z_$][\w$]*)\s*\(')
 _CLASSLIST_RE = re.compile(r'classList\s*\.\s*(?:add|remove|toggle)\s*\(\s*[\'"]([^\'"]+)[\'"]')
+# 子命名空间探测：`X.Y` 形式（X 是已知全局，Y 大写开头），如 `Utils.LocalStore.getItem`。
+# Y 不是顶层全局，而是 X 的属性对象，不能误报为 missing_global（req 151 复盘）。
+_SUBNS_RE = re.compile(r'\b([A-Za-z_$][\w$]*)\s*\.\s*([A-Z][\w$]*)\s*(?:\(|\.)')
 
 
 def _match_brace(src: str, open_idx: int) -> int:
@@ -426,13 +429,22 @@ def _extract_js_apis(src: str) -> tuple[dict[str, set[str]], set[str], set[str]]
             apis.setdefault(name, set()).update(methods)
         pos = close_idx + 1
 
-    # 别名导出：window.X = Y（Y 是此前解析过的对象字面量）
+    # 别名导出：window.X = Y / global.X = Y（Y 是此前解析过的对象字面量）
     for m in _ALIAS_RE.finditer(src):
         gname, source = m.group(1), m.group(2)
         declared.add(gname)
+        # req 148 事故：`var Store = {}; Store.getHighScore = function(){...};
+        # global.Storage = Store;` 这种「先建空对象再逐个赋值，最后用 IIFE 参数名导出」
+        # 的写法，方法集落在 apis["Store"] 里而不在 literals["Store"]（那是空对象字面量）。
+        # 原实现只查 literals，于是把完全正常的导出误报成 missing_api，
+        # 两条误报占满缺陷配额，真正的「方向键无响应」反而没人修。
         if source in literals:
             apis.setdefault(gname, set()).update(literals[source])
-        elif source in opaque:
+        # source == gname（自别名 `global.Utils = Utils`）由上面的 literals 分支覆盖，
+        # 这里跳过以免自我引用把已有方法集洗成空集
+        if source != gname and source in apis:
+            apis.setdefault(gname, set()).update(apis[source])
+        if source in opaque:
             opaque.add(gname)
 
     return apis, opaque, declared
@@ -460,17 +472,37 @@ def check_cross_file_contract(files: dict[str, str]) -> tuple[list[dict], list[d
     all_apis: dict[str, set[str]] = {}
     all_opaque: set[str] = set()
     api_source: dict[str, str] = {}
+    # req 152 事故：IIFE 返回值/闭包导出的全局（var Store = (function(){...})();
+    # global.Store = Store;）不在 apis 也不在 opaque，但确实已声明。
+    # 不收集 declared 会导致 Store.getItem 被误报 missing_global。
+    known_globals: set[str] = set()
     for fname, src in js_files.items():
         # 内联 <script> 场景由调用方拆好传入；这里只处理纯 js 文件
-        apis, opaque, _declared = _extract_js_apis(src)
+        apis, opaque, declared = _extract_js_apis(src)
         for gname, methods in apis.items():
             all_apis.setdefault(gname, set()).update(methods)
             api_source.setdefault(gname, fname)
         all_opaque.update(opaque)
+        known_globals.update(declared)
 
     defects: list[dict] = []
     warnings: list[dict] = []
     seen: set[tuple[str, str]] = set()
+
+    # 收集子命名空间：`X.Y` 中 X 是已知全局时，Y 是 X 的属性对象（嵌套命名空间），
+    # 后续遇到 `Y.method(` 不得当成 missing_global（req 151：Utils.LocalStore.getItem
+    # 被误报 LocalStore 未定义，占着架构类缺陷 → coder 预算被假缺陷耗尽）。
+    # 注意：`window.X` / `global.X` 里的 X 是**顶层全局**（window 的属性即全局），
+    # 不是子命名空间——必须排除这些浏览器全局前缀，否则 Utils/App 都被误吞。
+    sub_namespaces: set[str] = set()
+    _GLOBAL_PREFIXES = {"window", "global", "self", "globalThis"}
+    for _fname, _src in js_files.items():
+        for _m in _SUBNS_RE.finditer(_src):
+            _parent, _child = _m.group(1), _m.group(2)
+            if _parent in _GLOBAL_PREFIXES:
+                continue
+            if _parent in all_apis or _parent in all_opaque:
+                sub_namespaces.add(_child)
 
     for fname, src in js_files.items():
         # 去掉字符串与注释内容再找引用点（行级近似即可）
@@ -485,6 +517,8 @@ def check_cross_file_contract(files: dict[str, str]) -> tuple[list[dict], list[d
             gname, meth = m.group(1), m.group(2)
             if gname in _BROWSER_GLOBALS:
                 continue
+            if gname in sub_namespaces:
+                continue  # 嵌套命名空间（X.Y 的 Y），不是顶层全局
             line_no = cleaned.count("\n", 0, m.start()) + 1
 
             if gname in all_opaque:
@@ -511,6 +545,14 @@ def check_cross_file_contract(files: dict[str, str]) -> tuple[list[dict], list[d
                         "_source": "api_closure",
                     })
             else:
+                # req 152：已声明但方法不可静态枚举的全局（IIFE 返回值/
+                # 闭包导出/别名导出源对象非字面量），不算 missing_global。
+                # 例：var Store = (function(){...return{getItem,...};})();
+                #     global.Store = Store; → Store 进 declared 但不在 apis。
+                # 运行时 Store.getItem 完全正常（AC-4 持久化验收通过），
+                # 纯静态分析无法枚举其方法，报 missing_global 是误报。
+                if gname in known_globals:
+                    continue
                 key = (f"__global__{gname}", "")
                 if key in seen:
                     continue

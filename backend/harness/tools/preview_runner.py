@@ -28,6 +28,7 @@ Playwright headless 预览运行器
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -37,9 +38,35 @@ logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT_MS = 10_000
 # 页面加载后额外等待时间（ms），给异步脚本/初始化逻辑跑完的机会
 SETTLE_MS = 1_500
+# 会话整体预算的固定余量（秒）——叠加在 per-step 超时之上，测试可调小
+_SESSION_BUDGET_SLACK_S = 20.0
+
+
+from harness.tools.sandboxed_browser import (  # noqa: E402
+    BrowserSessionTimeout,
+    run_browser_session_isolated,
+)
 
 
 def run_preview_in_browser(
+    html_path: Path,
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    elem_checks: list[dict] | None = None,
+) -> dict:
+    """在全新线程里执行浏览器预览会话（req 154：复用线程二次启动挂死的根治）。
+
+    超时/异常语义见 ``_run_preview_in_browser_session``；本包装只负责
+    wall-clock 兜底——超时抛 BrowserSessionTimeout，由调用方（preview_tools
+    的 except）降级为「预览验证跳过」。
+    """
+    budget = _watchdog_ms(timeout_ms, len(elem_checks or []) + 4) / 1000.0 + _SESSION_BUDGET_SLACK_S
+    return run_browser_session_isolated(
+        _run_preview_in_browser_session, budget, html_path,
+        timeout_ms=timeout_ms, elem_checks=elem_checks,
+    )
+
+
+def _run_preview_in_browser_session(
     html_path: Path,
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
     elem_checks: list[dict] | None = None,
@@ -58,7 +85,7 @@ def run_preview_in_browser(
         RuntimeError: 当 playwright 未安装或浏览器二进制缺失时（调用方应降级）
     """
     try:
-        from playwright.sync_api import sync_playwright, Error as PWError
+        from harness.tools.sandboxed_browser import sandboxed_browser
     except ImportError as e:
         raise RuntimeError(f"playwright 未安装：{e}") from e
 
@@ -75,14 +102,8 @@ def run_preview_in_browser(
     }
 
     try:
-        with sync_playwright() as p:
-            try:
-                browser = p.chromium.launch(headless=True)
-            except PWError as e:
-                # 典型：浏览器二进制未安装
-                raise RuntimeError(
-                    f"chromium 未安装，请运行 `playwright install chromium`：{e}"
-                ) from e
+        # watchdog 必须覆盖 goto/settle/元素检查等全部合法等待（req 154）
+        with sandboxed_browser(timeout_ms=_watchdog_ms(timeout_ms, len(elem_checks or []) + 4)) as browser:
 
             try:
                 context = browser.new_context()
@@ -313,7 +334,69 @@ def _resolve_selector(doc, selector: str):
     return None
 
 
+# driver 被 watchdog 杀掉 / 浏览器崩溃后，会话里任何**新**命令都会在死管道上
+# 永久挂起（实测：query_selector 挂死，playwright 对已死 transport 不快速失败）。
+# 唯一安全的做法是识别这类错误并立即中止会话（req 154）。
+_FATAL_TRANSPORT_RE = re.compile(
+    r"connection closed|target closed|browser has been closed"
+    r"|target page, context or browser has been closed|pipe closed|driver died",
+    re.IGNORECASE,
+)
+
+
+def _is_fatal_transport_error(e: BaseException) -> bool:
+    return bool(_FATAL_TRANSPORT_RE.search(str(e)))
+
+
+def _watchdog_ms(timeout_ms: int, n_ops: int) -> int:
+    """会话级 watchdog 预算：必须是**全部合法操作时长之和**的上界。
+
+    req 154 教训：watchdog 只略大于单步超时时，会在「操作合法地等待自身超时」
+    时误杀浏览器（driver 一死，会话内所有后续命令全部挂起，只能整段废弃）。
+    旧实现里 close 在忙线程上阻塞、watchdog 形同虚设掩盖了这个问题；
+    改为 kill 之后必须显式给足上界。
+    """
+    return int(timeout_ms * (n_ops + 3) + 5_000)
+
+
 def run_ac_checks(
+    html_path: Path,
+    ac_scripts: list[dict],
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    preview_url: str = None,
+) -> list[dict]:
+    """在全新线程里执行 AC 验收会话（req 154：复用线程二次启动挂死的根治）。
+
+    整体预算 = 会话 watchdog（全部合法操作时长上界，见 _watchdog_ms）+ 固定余量。
+    超时不抛异常，而是把全部 AC 标记为 harness_errors（脚本驱动失败）——与
+    session 内部的异常降级通道形状一致，verify 侧可照常触发缓存失效/重译逻辑。
+    """
+    _total_steps = sum(len(s.get("steps") or []) for s in ac_scripts) or len(ac_scripts)
+    _watchdog = _watchdog_ms(timeout_ms, _total_steps)
+    budget = _watchdog / 1000.0 + _SESSION_BUDGET_SLACK_S
+    try:
+        return run_browser_session_isolated(
+            _run_ac_checks_session, budget, html_path,
+            ac_scripts=ac_scripts, timeout_ms=timeout_ms, preview_url=preview_url,
+        )
+    except BrowserSessionTimeout as e:
+        logger.warning(
+            "[AC] 浏览器会话整体超时（%.0fs 预算），%d 条 AC 全部标记为驱动失败: %s",
+            budget, len(ac_scripts), e,
+        )
+        return [
+            {
+                "ac_id": s.get("ac_id", "?"),
+                "passed": False,
+                "failures": [],
+                "harness_errors": [f"浏览器会话超时: {e}"],
+                "steps_executed": 0,
+            }
+            for s in ac_scripts
+        ]
+
+
+def _run_ac_checks_session(
     html_path: Path,
     ac_scripts: list[dict],
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
@@ -350,12 +433,13 @@ def run_ac_checks(
     - assert_count:     匹配元素数量 ≥ 预期
     - assert_value:     input 元素的 value 符合预期
     - assert_canvas_change: canvas 像素在 wait_ms 内发生变化
+    - assert_dom_change:    观察范围内 DOM 在本次 AC 期间发生变化（DOM 实现的画面断言）
 
     Returns:
         [{"ac_id": "AC-1", "passed": True, "failures": [], "steps_executed": 5}, ...]
     """
     try:
-        from playwright.sync_api import sync_playwright, Error as PWError
+        from harness.tools.sandboxed_browser import sandboxed_browser
     except ImportError:
         return [{"ac_id": s["ac_id"], "passed": False, "failures": [], "harness_errors": ["playwright 未安装"], "steps_executed": 0} for s in ac_scripts]
 
@@ -364,11 +448,9 @@ def run_ac_checks(
     results = []
 
     try:
-        with sync_playwright() as p:
-            try:
-                browser = p.chromium.launch(headless=True)
-            except PWError:
-                return [{"ac_id": s["ac_id"], "passed": False, "failures": [], "harness_errors": ["chromium 未安装"], "steps_executed": 0} for s in ac_scripts]
+        # watchdog 必须覆盖所有 AC 全部步骤的合法等待（req 154：误杀后新命令全挂起）
+        _ac_total_steps = sum(len(s.get("steps") or []) for s in ac_scripts) or len(ac_scripts)
+        with sandboxed_browser(timeout_ms=_watchdog_ms(timeout_ms, _ac_total_steps)) as browser:
 
             try:
                 context = browser.new_context()
@@ -380,7 +462,19 @@ def run_ac_checks(
                     if use_sandbox:
                         page.goto(wrapper_uri, wait_until="domcontentloaded", timeout=timeout_ms)
                         page.wait_for_timeout(1500)  # 等待 iframe 资源拉取
-                        return _resolve_preview_frame(page)
+                        frame = _resolve_preview_frame(page)
+                        # req 151 复盘（致命）：沙箱 iframe 默认无焦点，frame.press 派发的
+                        # 键盘事件不会到达内层 document 的 keydown 监听 → 游戏类 AC 全部
+                        # 假红（「DOM 无变化 0 次」）。file:// 直读正常、沙箱 0 次，差异就在焦点。
+                        # 必须显式抢焦点，否则方向键/Enter 类 AC 在沙箱链路下永远失败。
+                        try:
+                            frame.evaluate(
+                                "() => { try { window.focus(); } catch (e) {} "
+                                "try { document.body && document.body.focus(); } catch (e) {} }"
+                            )
+                        except Exception:
+                            pass
+                        return frame
                     page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
                     page.wait_for_timeout(1000)  # 等待初始化
                     return page
@@ -403,12 +497,14 @@ def run_ac_checks(
                             degraded_reason, preview_url,
                         )
 
+                browser_dead = False  # req 154：driver 被 watchdog 杀掉后，新命令会永久挂起
                 for script in ac_scripts:
                     ac_id = script.get("ac_id", "?")
                     label = script.get("label", ac_id)
                     steps = script.get("steps", [])
                     failures = []          # 产品断言失败（真实缺陷信号）
                     harness_failures = []  # 脚本驱动失败（假阴性嫌疑，不计入产品缺陷）
+                    not_applicable = []    # 前提不成立的断言（如页面无 canvas 却断言 canvas 变化）
                     steps_executed = 0
                     doc = None
 
@@ -433,6 +529,42 @@ def run_ac_checks(
                                     return h;
                                 }
                             """)
+
+                        def _dom_mutation_count():
+                            return doc.evaluate("() => window.__acMut || 0")
+
+                        # DOM 观察器必须在触发动作之前安装：老旧脚本的形状是
+                        # press → wait → assert_*，DOM 变化发生在 wait 期间，
+                        # 若等到 assert 步骤再装观察器就已经错过了。
+                        def _install_dom_observer(sel):
+                            try:
+                                eff = _resolve_selector(doc, sel) if sel else None
+                                target = eff or sel or "body"
+                                doc.evaluate("""
+                                    (sel) => {
+                                        window.__acMut = 0;
+                                        if (window.__acOb) { try { window.__acOb.disconnect(); } catch (e) {} }
+                                        const el = document.querySelector(sel) || document.body;
+                                        window.__acOb = new MutationObserver(
+                                            ms => { window.__acMut += ms.length; }
+                                        );
+                                        window.__acOb.observe(
+                                            el, {childList: true, subtree: true,
+                                                 attributes: true, characterData: true}
+                                        );
+                                    }
+                                """, target)
+                                return True
+                            except Exception as obs_err:
+                                harness_failures.append(f"DOM 观察器安装失败: {obs_err}")
+                                return False
+
+                        # 预扫描：取本条 AC 第一条 assert_dom_change 的观察范围并立即挂上
+                        dom_obs_ready = False
+                        for _s in steps:
+                            if _s.get("action") == "assert_dom_change":
+                                dom_obs_ready = _install_dom_observer(_s.get("selector", ""))
+                                break
 
                         for step in steps:
                             action = step.get("action", "")
@@ -497,9 +629,37 @@ def run_ac_checks(
                                     s0 = _canvas_sig()
                                     page.wait_for_timeout(step.get("wait_ms", 2000))
                                     s1 = _canvas_sig()
-                                    if s0 == s1:
+                                    if s0 is None and s1 is None:
+                                        # 页面没有 canvas（DOM/网格渲染实现）→ 断言前提不成立。
+                                        # 记为「不适用」，走 unverified 通道：
+                                        #   - 不计入 failures（它不是产品缺陷，实现可能完全正确）
+                                        #   - 也不计 harness_errors（不是脚本驱动失败）
+                                        # 保留 passed=False —— 「未验证」绝不等于「通过」。
+                                        # req 147 复盘：混进 harness_errors 会让 DOM 游戏被永久判死，
+                                        # 且缺陷清单里出现的全是「脚本错误」，修复环节拿不到有效信号。
+                                        msg = (
+                                            f"canvas 断言不适用（页面无 canvas 元素）: "
+                                            f"{step.get('label', '')}"
+                                        )
+                                        not_applicable.append(msg)
+                                    elif s0 == s1:
                                         failures.append(
                                             f"canvas 无变化: {step.get('label', '画面应随操作变化')}"
+                                        )
+                                elif action == "assert_dom_change":
+                                    # DOM 实现的「画面变化」断言：统计本条 AC 开始到现在
+                                    # 观察范围内的 DOM 变更次数。req 147 复盘：DOM 游戏的
+                                    # 画面类 AC 原先被翻译成 assert_canvas_change，
+                                    # 结果永远是「不适用」，拿不到任何可判定信号。
+                                    if not dom_obs_ready:
+                                        dom_obs_ready = _install_dom_observer(selector)
+                                    page.wait_for_timeout(step.get("wait_ms", 1500))
+                                    min_changes = step.get("min_changes", 1)
+                                    n = _dom_mutation_count()
+                                    if n < min_changes:
+                                        failures.append(
+                                            f"DOM 无变化: {step.get('label', '界面应随操作更新')}"
+                                            f"（观察到变更 {n} 次，期望 ≥{min_changes}）"
                                         )
                                 elif action == "screenshot":
                                     # 截图用于 LLM 诊断（不参与通过/失败判断）
@@ -508,20 +668,61 @@ def run_ac_checks(
                                 # 操作类步骤抛异常 = 脚本无法驱动页面（选择器失配/超时），
                                 # 与产品断言失败区分，避免假阴性压垮验收
                                 harness_failures.append(f"步骤 [{action} {selector}]: {step_err}")
+                                # req 154：driver 已死时后续命令会永久挂起，立即中止
+                                if _is_fatal_transport_error(step_err):
+                                    browser_dead = True
+                                    break
 
                     except Exception as ac_err:
                         harness_failures.append(f"AC 执行异常: {ac_err}")
+                        if _is_fatal_transport_error(ac_err):
+                            browser_dead = True
 
+                    # 「断言前提不成立」（N/A）不再混进 harness_errors：
+                    # 它不是「脚本驱动失败」，而是「这条断言对当前实现根本不适用」。
+                    # 单独走 unverified 通道，交给评估器裁量——既保留「未验证 ≠ 通过」，
+                    # 又不再把「验不了」伪装成「验没过」去污染产品缺陷判定。
                     results.append({
                         "ac_id": ac_id,
                         "label": label,
-                        "passed": len(failures) == 0,
+                        # 脚本驱动失败（harness_errors）同样阻断 passed：选择器超时 / 元素点不动
+                        # 意味着这条 AC 从未被真正验证过，此时判 passed=True 是假绿
+                        #（req 145 的 AC-1/AC-4 就是带着 harness_errors 拿到 passed）。
+                        # 与 nodes.py 快速通道 ac_all_passed 的语义保持一致。
+                        "passed": len(failures) == 0 and not harness_failures and not not_applicable,
                         "failures": failures,
                         "harness_errors": harness_failures,
+                        "not_applicable": not_applicable,
+                        # True = 本条 AC 从未被真正验证（断言前提不成立），既非通过也非失败
+                        "unverified": bool(not_applicable) and not failures and not harness_failures,
+                        # True = 脚本没跑成 且 断言失败（P2.5）。此时 failures 是在「被半驱动坏的
+                        # 页面」上产生的：点击超时没点成，后面的断言自然找不到元素。
+                        # 这类失败是幽灵，直接喂给 repair 会让 coder 去修不存在的问题。
+                        # 实测（tmp/analyze_ac_verification.py）：139 条 AC 中 45.3% 属于此类。
+                        # 这里只做标记不丢信号，由 nodes.py 在提示词里降权。
+                        "compromised": bool(failures) and bool(harness_failures),
                         "steps_executed": steps_executed,
                         # 沙箱链路降级时标注，便于区分「产品坏」与「验证环境坏」
                         "preview_degraded": degraded_reason,
                     })
+
+                    if browser_dead:
+                        # 剩余 AC 无法再执行：标记驱动失败并跳出（下一轮 _load 会挂死）
+                        remaining = ac_scripts[len(results):]
+                        for rest in remaining:
+                            results.append({
+                                "ac_id": rest.get("ac_id", "?"),
+                                "label": rest.get("label", rest.get("ac_id", "?")),
+                                "passed": False,
+                                "failures": [],
+                                "harness_errors": ["浏览器会话已中断（driver 被 watchdog 终止）"],
+                                "steps_executed": 0,
+                            })
+                        logger.warning(
+                            "[AC] 浏览器会话在执行中死亡（watchdog 终止/崩溃），剩余 %d 条 AC 标记为驱动失败",
+                            len(remaining),
+                        )
+                        break
 
             finally:
                 browser.close()
@@ -548,6 +749,20 @@ def _loc(loc) -> str:
 
 def capture_screenshot(html_path: Path, out_path: Path,
                        timeout_ms: int = 12_000, preview_url: str = None) -> str | None:
+    """在全新线程里执行截图会话（req 154）。超时返回 None（与既有失败语义一致）。"""
+    budget = _watchdog_ms(timeout_ms, 2) / 1000.0 + _SESSION_BUDGET_SLACK_S
+    try:
+        return run_browser_session_isolated(
+            _capture_screenshot_session, budget, html_path, out_path,
+            timeout_ms=timeout_ms, preview_url=preview_url,
+        )
+    except BrowserSessionTimeout as e:
+        logger.warning("[Screenshot] 截图会话超时（跳过）: %s", e)
+        return None
+
+
+def _capture_screenshot_session(html_path: Path, out_path: Path,
+                       timeout_ms: int = 12_000, preview_url: str = None) -> str | None:
     """对 index.html 截图（与用户一致的沙箱预览链路），保存为 PNG。
 
     用途：fast_pass 通道不再硬编码 ui_quality——截图落盘到
@@ -557,7 +772,7 @@ def capture_screenshot(html_path: Path, out_path: Path,
         截图文件路径字符串；浏览器不可用等失败时返回 None（不抛异常）。
     """
     try:
-        from playwright.sync_api import sync_playwright, Error as PWError
+        from harness.tools.sandboxed_browser import sandboxed_browser
     except ImportError:
         return None
 
@@ -565,8 +780,9 @@ def capture_screenshot(html_path: Path, out_path: Path,
     sandbox, wrapper_uri, wrapper_tmp = _prepare_sandbox(preview_url)
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+        from playwright.sync_api import Error as PWError
+        # watchdog 覆盖 goto/settle/截图的合法等待（req 154）
+        with sandboxed_browser(timeout_ms=_watchdog_ms(timeout_ms, 2)) as browser:
             try:
                 context = browser.new_context(viewport={"width": 1280, "height": 800})
                 page = context.new_page()
@@ -729,6 +945,24 @@ _TERMINAL_MARKERS = (
 
 
 def run_universal_smoke(html_path: Path, timeout_ms: int = 15_000, preview_url: str = None) -> dict:
+    """在全新线程里执行通用冒烟会话（req 154）。
+
+    超时返回 available=False 的空结果——与 verify 节点冒烟异常时的降级
+    形状一致（「跳过」而非「通过」）。
+    """
+    budget = _watchdog_ms(timeout_ms, 4) / 1000.0 + _SESSION_BUDGET_SLACK_S
+    try:
+        return run_browser_session_isolated(
+            _run_universal_smoke_session, budget, html_path,
+            timeout_ms=timeout_ms, preview_url=preview_url,
+        )
+    except BrowserSessionTimeout as e:
+        logger.warning("[Smoke] 通用冒烟会话超时（按不可用处理）: %s", e)
+        return {"available": False, "defects": [], "checks": {},
+                "logs": [f"浏览器会话超时: {e}"]}
+
+
+def _run_universal_smoke_session(html_path: Path, timeout_ms: int = 15_000, preview_url: str = None) -> dict:
     """
     通用冒烟测试：与品类无关的确定性不变量，任何网页交付物一律适用。
 
@@ -783,7 +1017,7 @@ def run_universal_smoke(html_path: Path, timeout_ms: int = 15_000, preview_url: 
 
     # ---- 不变量 2/3/4: 需要浏览器 ----
     try:
-        from playwright.sync_api import sync_playwright, Error as PWError
+        from harness.tools.sandboxed_browser import sandboxed_browser
     except ImportError:
         result["logs"].append("[smoke] playwright 未安装，跳过交互检查")
         return result
@@ -794,12 +1028,8 @@ def run_universal_smoke(html_path: Path, timeout_ms: int = 15_000, preview_url: 
         result["logs"].append(f"[smoke] 沙箱预览模式: {preview_url.split('/api/pt/')[-1][:40]}")
 
     try:
-        with sync_playwright() as p:
-            try:
-                browser = p.chromium.launch(headless=True)
-            except PWError as e:
-                result["logs"].append(f"[smoke] chromium 不可用: {e}")
-                return result
+        # watchdog 覆盖 goto/settle/CTA 探测/交互检查的合法等待（req 154）
+        with sandboxed_browser(timeout_ms=_watchdog_ms(timeout_ms, 4)) as browser:
 
             try:
                 context = browser.new_context()

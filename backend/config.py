@@ -165,6 +165,10 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = Field(default=0.7, ge=0, le=2, description='LLM 温度参数')
     LLM_MAX_TOKENS: int = Field(default=12000, ge=100, le=65500, description='LLM 最大生成 token 数（输出上限，非上下文窗口）')
     LLM_TIMEOUT: int = Field(default=60, ge=10, le=300, description='LLM 调用超时时间（秒）')
+    # 缺陷修复的 LLM 调用要输出整文件 JSON（16k~32k tokens），响应天然更慢，故单独给上限。
+    # 此前该值硬编码 150s：LLM 端点慢时单次请求挂 2.5 分钟，前端长时间无 SSE 更新，
+    # 观感等同"卡死"（req 146 实测两次 150s 读超时）。
+    DEFECT_REPAIR_TIMEOUT: int = Field(default=90, ge=10, le=300, description='缺陷修复 LLM 调用超时时间（秒）')
     LLM_MAX_RETRIES: int = Field(default=2, ge=0, le=5, description='LLM 调用最大重试次数')
     LLM_CRAFT_ENABLED: bool = Field(default=True, description='是否启用 Craft 设计质量规则注入')
 
@@ -255,6 +259,20 @@ class Settings(BaseSettings):
     AGENT_LOG_RETENTION_DAYS: int = Field(default=30, description='agent/llm 日志保留天数')
     APP_LOG_RETENTION_DAYS: int = Field(default=90, description='app/access 日志保留天数')
     LOG_FILE_MAX_SIZE_MB: int = Field(default=50, description='单日志文件最大大小 (MB)')
+
+    # ==================== Agent 执行明细日志（开发排查用） ====================
+
+    # 打开后每个 LLM 轮次 / 工具调用落一条 JSONL（含完整请求参数与返回值），
+    # 供开发排查「Agent 到底收发了什么」。默认关闭：属**开发视角**，不进前端、
+    # 不给用户看，避免生产环境无界增长。
+    AGENT_EXEC_LOG: bool = Field(
+        default=False,
+        description='是否记录 Agent 执行明细（LLM 请求/返回 + 工具调用）到 JSONL'
+    )
+    AGENT_EXEC_LOG_DIR: str = Field(
+        default='logs/agent_exec',
+        description='Agent 执行明细日志目录（相对 BACKEND_DIR）'
+    )
 
     # ==================== 安全配置 ====================
 

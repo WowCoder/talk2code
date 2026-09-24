@@ -60,7 +60,7 @@ _ESTIMATE_CJK = re.compile(r'[\u4e00-\u9fff]')
 def _estimate_tokens(text: str) -> int:
     """粗略估算 token 数。
 
-    口径与 harness/instructions/compactor.py 的 _estimate_text_tokens 保持一致
+    口径与 harness/state/context_pipeline.py 的 estimate_tokens 保持一致
     （中文约 1.5 字/token，英文与符号约 4 字/token），避免两处估算漂移。
     """
     if not text:
@@ -137,6 +137,129 @@ class Memory:
             access_count=row.access_count or 0, created_at=ts,
             merged_from=row.merged_from or [], superseded=row.superseded or False,
         )
+
+
+def _should_supersede(new: "Memory", old: "Memory") -> bool:
+    """新记忆是否可以取代同需求的旧记忆（req 147 复盘引入的条件规则）。
+
+    无条件取代 = 让每一轮的坏教训覆盖上一轮的好经验，系统永远不会积累。
+    """
+    old_has = _has_injectable_content(old)
+    new_has = _has_injectable_content(new)
+    # 旧的是空壳 → 一律取代
+    if not old_has:
+        return True
+    # 新的是空壳（反思失败）→ 绝不让它挤掉有内容的旧记忆
+    if not new_has:
+        return False
+    # 都有内容 → 只有更好（评分更高）才取代；成功经验不被更差的失败覆盖
+    return (new.rating or 0) > (old.rating or 0)
+
+
+def _reflection_has_content(data: dict) -> bool:
+    """反思结果是否含可注入内容（lesson / reusable_pattern 至少一项非空且非占位符）。
+
+    req 147 复盘：反思 LLM 调用失败时 `reflection_data` 为空 dict，
+    旧代码照样拿它建 Memory 并入库，产出一条 rating 有值、教训为空的记忆。
+    """
+    if not isinstance(data, dict) or not data:
+        return False
+    lesson = (data.get("lesson") or "").strip()
+    pattern = (data.get("reusable_pattern") or "").strip()
+    return (bool(lesson) and lesson != "无") or (bool(pattern) and pattern != "无")
+
+
+# 规则化归因：反思 LLM 不可用/无产出时的确定性兜底（见 _build_rule_based_reflection）
+_RULE_ERR_PATTERNS = [
+    ("TypeError", r"TypeError"),
+    ("ReferenceError", r"ReferenceError"),
+    ("SyntaxError", r"SyntaxError"),
+    ("未捕获运行时异常", r"pageerror|Uncaught"),
+    ("AC 断言不适用", r"不适用|not_applicable"),
+    ("冒烟缺陷", r"smoke|defect"),
+]
+
+
+def _build_rule_based_reflection(requirement: str, code_summary: str, rating: float,
+                                 failure_context: str, is_failure: bool) -> dict:
+    """反思 LLM 拿不到可用教训时的规则化兜底。
+
+    req 147 复盘：反思 LLM 调用失败（超时/连接错误）时 `after_task` 直接 return，
+    于是"跑了好几轮的 1024 需求"一条能注入的记忆都没沉淀下来——下一次重跑等于从零开始。
+    「不入库」虽然避免了空记忆占位，但也让系统彻底不学习。
+
+    折中：用确定性规则从**实测证据**里抽结构化字段，写一条机器可验证的 lesson，
+    并打 `rule_based_lesson` 标签。它不如 LLM 归因漂亮，但绝不会臆造根因。
+    """
+    import re as _re
+
+    ctx = (failure_context or "").strip()
+    err_types = [name for name, pat in _RULE_ERR_PATTERNS
+                 if _re.search(pat, ctx, _re.I)]
+    files = []
+    for f in _re.findall(r"[\w./-]+\.(?:js|html|css)", ctx):
+        if f not in files:
+            files.append(f)
+    stop = {"the", "and", "not", "for", "with", "this", "that", "error", "pageerror",
+            "uncaught", "typeerror", "browser", "console", "function", "undefined"}
+    idents = []
+    for raw in _re.findall(r"[A-Za-z_$][A-Za-z0-9_$.]{3,}", ctx):
+        for part in raw.split("."):
+            if len(part) >= 4 and part.lower() not in stop and part not in idents:
+                idents.append(part)
+
+    if is_failure and ctx:
+        bits = []
+        if err_types:
+            bits.append("错误类型：" + "、".join(err_types[:3]))
+        if files:
+            bits.append("涉及文件：" + "、".join(files[:4]))
+        if idents:
+            bits.append("关键标识符：" + "、".join(idents[:6]))
+        lesson = (
+            "[规则抽取·未经 LLM 归因] " + ("；".join(bits) if bits else "无结构化证据")
+            + f"。原始证据：{ctx[:200]}"
+            + "。下次做同类需求，先自查上述文件与标识符再动手。"
+        )
+        pattern = ""
+    else:
+        render = "canvas" if _re.search(r"<canvas|createElement\(['\"]canvas", code_summary, _re.I) else "DOM"
+        lesson = (
+            f"[规则抽取] 本次以 {render} 方式实现「{(requirement or '')[:40]}」，评分 {rating}。"
+            f"产出文件：{code_summary[:150]}"
+        )
+        pattern = f"实现方式：{render}"
+
+    return {
+        "reflection": "[规则抽取兜底] 反思 LLM 未产出可用内容，以下为确定性抽取结果。",
+        "lesson": lesson,
+        "reusable_pattern": pattern,
+        "tags": ["rule_based_lesson"] + (["failure"] if is_failure else []),
+        "importance": 0.6 if is_failure else max(rating / 10.0, 0.5),
+    }
+
+
+def _lesson_references_evidence(lesson: str, evidence: str) -> bool:
+    """教训是否真的提到了实测证据里的关键信息（标识符/关键词）。
+
+    用于拦截 LLM 臆造归因：req 147 把 `this._updateScoreDisplay is not a function`
+    归因为"deferred initialization / DOM ready 时序"，与证据零重叠。
+    """
+    import re as _re
+    if not lesson or not evidence:
+        return False
+    stop = {"the", "and", "not", "for", "with", "this", "that", "error",
+            "pageerror", "uncaught", "typeerror", "browser", "console", "function"}
+    tokens = set()
+    for raw in _re.findall(r"[A-Za-z_$][A-Za-z0-9_$.]{3,}", evidence):
+        # this._updateScoreDisplay 这类调用链要拆开，否则教训里写 "_updateScoreDisplay"
+        # 也匹配不上证据里的 "this._updateScoreDisplay"
+        for part in raw.split("."):
+            if len(part) >= 4 and part.lower() not in stop:
+                tokens.add(part)
+    if not tokens:
+        return True  # 证据本身无可比对 token，不强校验
+    return any(t in lesson for t in tokens)
 
 
 def _has_injectable_content(m: "Memory") -> bool:
@@ -355,19 +478,56 @@ class MemoryManager:
         is_failure = (qa_passed is False) or (qa_passed is None and rating < 6.0)
 
         # LLM 反思（失败任务注入失败上下文，引导提取负面教训）
+        # req 147 复盘：三条 1024 记忆（8.2/5.5/4.8 分）的 lesson 全为空——反思调用
+        # 失败后照样入库，空记忆既占着"唯一活跃位"又在检索时被过滤，等于系统从不积累。
+        # 修法：反思最多重试一次；仍然拿不到可用教训就**不入库**，把位子留给有内容的记忆。
+        failure_context = self._build_failure_context(qa_result) if is_failure else ""
         reflection_data = {}
         if self._llm:
-            try:
-                reflection_data = self._reflect(
-                    requirement, code_summary, rating,
-                    failure_context=self._build_failure_context(qa_result) if is_failure else "",
+            for attempt in (1, 2):
+                try:
+                    reflection_data = self._reflect(
+                        requirement, code_summary, rating,
+                        failure_context=failure_context,
+                    )
+                except Exception as e:
+                    reflection_data = {}
+                    logger.warning(f"[MemoryManager] LLM 反思失败（第 {attempt} 次）: {e}")
+                if _reflection_has_content(reflection_data):
+                    break
+                if attempt == 1:
+                    logger.info("[MemoryManager] 反思未产出可用教训，重试一次")
+
+        if not _reflection_has_content(reflection_data):
+            # 降级为规则化 lesson：宁可要一条机器可验证的朴素记录，
+            # 也不要「空记忆占位」或「彻底不学习」这两种极端。
+            if self._llm:
+                logger.warning(
+                    f"[MemoryManager] 反思两次均未产出可用教训（rating={rating}），"
+                    f"降级为规则化 lesson（从实测证据确定性抽取）"
                 )
-            except Exception as e:
-                logger.warning(f"[MemoryManager] LLM 反思失败，使用默认值: {e}")
+            reflection_data = _build_rule_based_reflection(
+                requirement, code_summary, rating, failure_context, is_failure
+            )
+            if not _reflection_has_content(reflection_data):
+                return
 
         tags = list(reflection_data.get("tags", []))
         if is_failure and "failure" not in tags:
             tags.append("failure")
+
+        lesson = reflection_data.get("lesson", "")
+        # 根因校验：失败教训必须能对上实测证据。LLM 自由归因会臆造诊断
+        # （req 147 实测把"原型方法未挂载"误诊成"DOM ready 时序问题"），
+        # 注入后反而把下一轮带偏。这里做确定性校验，对不上就把原始证据一并附上。
+        if is_failure and failure_context and not _lesson_references_evidence(lesson, failure_context):
+            logger.info("[MemoryManager] 教训与实测证据无重叠，附原始证据并标记未验证归因")
+            lesson = (
+                f"{lesson}\n"
+                f"实测证据（归因以证据为准，上面的解释仅供参考）: {failure_context[:300]}"
+            ).strip()
+            if "unverified_lesson" not in tags:
+                tags.append("unverified_lesson")
 
         memory = Memory(
             user_id=user_id,
@@ -376,7 +536,7 @@ class MemoryManager:
             code_summary=code_summary,
             rating=rating,
             reflection=reflection_data.get("reflection", ""),
-            lesson=reflection_data.get("lesson", ""),
+            lesson=lesson,
             reusable_pattern=reflection_data.get("reusable_pattern", ""),
             tags=tags,
             importance=max(reflection_data.get("importance", 0), 0.7) if is_failure
@@ -516,11 +676,30 @@ class MemoryManager:
         try:
             # 去重: 如果同一用户已有高度相似的需求，标记旧记忆为 superseded。
             # 必须按 user_id 过滤——否则用户 A 的新需求会把用户 B 的相似记忆淘汰掉。
+            #
+            # req 147 修正：取代必须**有条件**。旧逻辑无条件 supersede，于是
+            # 8.2 分的成功记忆被 5.5 → 4.8 → 5.2 的失败记忆链依次覆盖，
+            # 系统每轮只剩自己那一轮的坏教训，跑再多轮也不会变好。
+            # 规则（见 _should_supersede）：
+            #   - 旧记忆没有可注入内容 → 可取代（清理垃圾）
+            #   - 新记忆没有可注入内容 → **不可**取代（别让空的挤掉有内容的）
+            #   - 都有内容 → 只有新记忆评分更高才可取代
             memories = self._get_active_memories(user_id=memory.user_id)
             for existing in memories:
                 if self._jaccard_similarity(memory.requirement, existing.requirement) > 0.6:
-                    self._mark_superseded(existing.id)
-                    logger.debug(f"[MemoryManager] 去重: 标记记忆 {existing.id} 为 superseded")
+                    if _should_supersede(memory, existing):
+                        self._mark_superseded(existing.id)
+                        logger.info(
+                            f"[MemoryManager] 去重: 记忆 {existing.id} "
+                            f"(rating={existing.rating}, 有内容={_has_injectable_content(existing)}) "
+                            f"被新记忆取代 (rating={memory.rating})"
+                        )
+                    else:
+                        logger.info(
+                            f"[MemoryManager] 去重跳过: 保留旧记忆 {existing.id} "
+                            f"(rating={existing.rating})，新记忆 rating={memory.rating} "
+                            f"未更优或无内容"
+                        )
                     break
 
             # 写入新记忆

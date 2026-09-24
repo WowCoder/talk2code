@@ -7,6 +7,7 @@ import type {
   SSEDialogueData,
   SSECodeData,
   SSEProgressData,
+  SSEHeartbeatData,
   SSEQuestionFormData,
   SSEThinkingData,
   SSEHookCheckData,
@@ -33,6 +34,9 @@ export function useSSE(reqId: Ref<number | null>) {
   const eventSource = ref<EventSource | null>(null)
   const isConnected = ref(false)
   const connectionError = ref('')
+  // 服务端心跳：静默期（LLM 挂起）的唯一活性信号，供 UI 显示「仍在处理 · 已等待 Ns」
+  const serverElapsedS = ref(0)
+  const lastHeartbeatAt = ref(0)
 
   // 指数退避重连状态（EventSource 会自动重连，这里关闭后由自己按退避策略调度）
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
@@ -62,6 +66,17 @@ export function useSSE(reqId: Ref<number | null>) {
 
     es.addEventListener('connected', () => {
       isConnected.value = true
+    })
+
+    // 心跳：把「服务端还在干活」变成前端可见的状态（此前静默期前端一无所知）
+    es.addEventListener('heartbeat', (e: MessageEvent) => {
+      try {
+        const data: SSEHeartbeatData = JSON.parse(e.data)
+        serverElapsedS.value = data.elapsed_s || 0
+      } catch {
+        serverElapsedS.value = 0
+      }
+      lastHeartbeatAt.value = Date.now()
     })
 
     es.addEventListener('dialogue', (e: MessageEvent) => {
@@ -354,6 +369,8 @@ export function useSSE(reqId: Ref<number | null>) {
   return {
     isConnected,
     connectionError,
+    serverElapsedS,
+    lastHeartbeatAt,
     connect,
     disconnect,
   }

@@ -82,7 +82,7 @@ const reqId = computed(() => {
   const id = route.params.id
   return id ? Number(id) : null
 })
-const { connect, disconnect, isConnected, connectionError } = useSSE(reqId)
+const { connect, disconnect, isConnected, connectionError, serverElapsedS } = useSSE(reqId)
 
 const pageTitle = computed(() => {
   const req = store.currentRequirement
@@ -92,6 +92,14 @@ const pageTitle = computed(() => {
 const statusText = computed(() => {
   if (store.isGenerating) {
     const agent = store.progress.currentAgent || 'Agent'
+    // 心跳累计超过 15s 说明正处于静默期（LLM 请求可能挂起 60~150s）。把等待时长显式
+    // 说出来，否则用户面对的只是一个不动的界面，只能猜「是不是卡住了」。
+    if (serverElapsedS.value >= 15) {
+      const m = Math.floor(serverElapsedS.value / 60)
+      const sec = serverElapsedS.value % 60
+      const waited = m > 0 ? `${m} 分 ${sec} 秒` : `${sec} 秒`
+      return `${agent} 工作中 · 已等待 ${waited}`
+    }
     return `${agent} 工作中…`
   }
   if (store.currentRequirement?.status === 'finished') return '已完成'

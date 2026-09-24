@@ -53,6 +53,19 @@ export interface SSEProgressData {
   status: string
 }
 
+/**
+ * 服务端周期性心跳（每 15s 一次，仅在无业务事件时发送）。
+ *
+ * LLM 请求可能挂起 60~150 秒且期间没有任何业务事件，此前服务端只发 SSE 注释行，
+ * 前端收不到任何东西，观感等同「卡死」。改为真实事件后，前端可据此显示
+ * 「仍在处理 · 已等待 Ns」，把静默期变成可见的等待。
+ */
+export interface SSEHeartbeatData {
+  requirement_id: number
+  elapsed_s: number
+  timestamp?: string
+}
+
 export interface SSEQuestionFormData {
   questions: Array<{
     id: string

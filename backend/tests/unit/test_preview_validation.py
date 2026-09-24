@@ -164,3 +164,30 @@ def _to_result(report):
     r.error = "errors found" if report.get("errors") else ""
     r.content = "ok"
     return r
+
+
+# ---------------- rAF / canvas 误报防护（req 145 复盘） ----------------
+
+def test_format_success_suppresses_raf_warning_without_canvas():
+    """页面无 canvas（DOM 渲染实现）时不得报 rAF 警告。
+
+    req 145 的 1024 用 <div class="grid"> 实现、根本没有 canvas，
+    却被连报 3 次「requestAnimationFrame 未被调用」，把 coder 往错误方向带。
+    """
+    from harness.tools.preview_tools import RunPreviewHandler
+    text = RunPreviewHandler._format_success({
+        "logs": [], "network": [],
+        "initialization": {"canvas_activity": None, "animation_started": False},
+    })
+    assert "requestAnimationFrame" not in text
+
+
+def test_format_success_reports_raf_warning_when_canvas_exists():
+    """有 canvas 但 rAF 未调用 = 渲染循环可能没起来，仍须报警（真缺陷）。"""
+    from harness.tools.preview_tools import RunPreviewHandler
+    text = RunPreviewHandler._format_success({
+        "logs": [], "network": [],
+        "initialization": {"canvas_activity": False, "animation_started": False},
+    })
+    assert "无像素变化" in text
+    assert "requestAnimationFrame" in text
