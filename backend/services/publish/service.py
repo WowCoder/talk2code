@@ -11,12 +11,15 @@ Ship C 复验通过 on_published 回调解耦（默认 None），由路由层注
 """
 from typing import Callable, Dict, List, Optional
 
+from harness.observability.logger import get_logger
 from models.models import PublishedBundle, PublishedSite
 from utils.db import transactional_db
 
-from .bundle import build_bundle, BundleError
+from .bundle import build_bundle, BundleError, is_internal_path
 from .slug import new_slug
 from .store import LocalFSStore
+
+logger = get_logger(__name__)
 
 
 class PublishError(Exception):
@@ -55,6 +58,7 @@ class PublishService:
     # ---- 归一化：Requirement.code_files(JSON) → {relpath: bytes} ----
     def normalize_code_files(self, code_files: List[Dict]) -> Dict[str, bytes]:
         files: Dict[str, bytes] = {}
+        skipped: List[str] = []
         for item in code_files or []:
             if not isinstance(item, dict):
                 continue
@@ -64,7 +68,16 @@ class PublishService:
             rel = _extract_relpath(name)
             if not rel:
                 continue
+            if is_internal_path(rel):
+                skipped.append(rel)
+                continue
             files[rel] = _to_bytes(item.get("content"))
+        if skipped:
+            logger.info(
+                "发布产物剔除 %d 个平台内部文件（不对外发布）: %s",
+                len(skipped),
+                ", ".join(sorted(skipped)[:5]),
+            )
         return files
 
     # ---- 发布入口 ----

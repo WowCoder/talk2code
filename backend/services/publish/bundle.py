@@ -19,6 +19,18 @@ def _sha256(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
+def is_internal_path(rel: str) -> bool:
+    """路径中含点开头的段（.task/、.git/ 等）→ 平台内部文件，不属于发布产物。
+
+    两个调用点共用同一条策略，缺一不可：
+    - 打包侧（PublishService.normalize_code_files）：新发布的产物不含内部文件
+    - 服务侧（routes/published_site.py）：历史产物里已存在的也被挡住
+    背景：requirement.code_files 混有 .task/TASK_STATE.md、.task/contract.json、
+    .task/evaluator/result.json 等工作区文件；unlisted 是 noindex 而不是保密。
+    """
+    return any(seg.startswith(".") for seg in rel.split("/") if seg)
+
+
 def compute_content_hash(files: BundleFiles) -> str:
     """稳定 content_hash：按 relpath 排序后拼接 "rel\0sha"，再整体 sha256。
 

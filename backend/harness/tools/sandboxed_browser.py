@@ -50,17 +50,22 @@ def build_chromium_args(allow_hosts: Tuple[str, ...] = ()) -> list[str]:
         # 非空：在「全拒」基础上开白名单。EXCLUDE 必须写在 MAP 之后，作为例外。
         excludes = ", ".join(f"EXCLUDE {h}" for h in allow_hosts)
         resolver = f"MAP * ~NOTFOUND, {excludes}"
+        # 代理 bypass 必须同步放行：host-resolver-rules 只解决「名字能否解析」，
+        # 不写进 bypass 的话被放行的主机仍会被送进黑洞代理
+        # （ERR_PROXY_CONNECTION_FAILED）——即 allow_hosts 形同虚设。
+        loopback = "127.0.0.1;localhost;<local>;" + ";".join(allow_hosts)
     else:
         # 空：默认放行 loopback，保证 127.0.0.1 预览链路不受影响。
         # 注意：预览 URL 用的是**数字 IP** 127.0.0.1，而 MAP * 的 * 会匹配数字 IP，
         # 所以必须显式 EXCLUDE 127.0.0.1 —— 只写 EXCLUDE localhost 救不了数字 IP，
         # 否则预览请求会被解析成 NOTFOUND → 验收链路静默降级（假绿）。
         resolver = "MAP * ~NOTFOUND, EXCLUDE 127.0.0.1, EXCLUDE localhost"
+        loopback = "127.0.0.1;localhost;<local>"
 
     return [
         f"--host-resolver-rules={resolver}",
         "--proxy-server=http://127.0.0.1:9",
-        "--proxy-bypass-list=127.0.0.1;localhost;<local>",
+        f"--proxy-bypass-list={loopback}",
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-background-networking",

@@ -22,7 +22,9 @@ from services.task_queue import task_queue
 from services.requirement_service import process_requirement_async
 from harness.observability.logger import setup_logger, get_logger, setup_logging
 from harness.agent_names import TL_NAME
-from utils.rate_limiter import get_user_identity, rate_limit_handler, RATE_LIMITS
+from utils.rate_limiter import (
+    get_user_identity, rate_limit_handler, RATE_LIMITS, is_published_site_request,
+)
 
 # ==================== 日志配置 ====================
 
@@ -59,6 +61,11 @@ if '*' in settings.cors_origins_list:
         raise RuntimeError(_cors_msg)
 
 # JWT 配置
+# ⚠️ 隔离红线：已发布站点跑在 <slug>.<PUBLISH_APEX>，与主站同属一个可注册域。
+# 主站登录态之所以不会被「任意一份 AI 生成的代码」读走，唯一依赖就是这里的
+# cookie 是 host-only —— 即**没有**设置 JWT_COOKIE_DOMAIN。
+# 一旦给它设上 '.wowcoder.cn' 这类 Domain，所有已发布的子域就都能读到登录态，
+# 而生成代码是不可信输入。改动此项前先看 tests/unit/test_publish_host_isolation.py。
 app.config['JWT_SECRET_KEY'] = JWT_SECRET_KEY
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = JWT_ACCESS_TOKEN_EXPIRES
 app.config['JWT_TOKEN_LOCATION'] = ['headers', 'cookies']
@@ -94,7 +101,10 @@ else:
         app=app,
         default_limits=[RATE_LIMITS['default']],
         storage_uri="memory://",
-        headers_enabled=True
+        headers_enabled=True,
+        # 已发布站点（<slug>.<PUBLISH_APEX>）豁免默认限流：一个页面加载会打出
+        # 十几个静态资源请求，套 60/min 会 429；详见 utils/rate_limiter.py
+        default_limits_exempt_when=is_published_site_request,
     )
 
 # 限流触发处理

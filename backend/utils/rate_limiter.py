@@ -49,6 +49,31 @@ def rate_limit_handler(e=None):
     }), 429
 
 
+def is_published_site_request() -> bool:
+    """当前请求是否指向已发布站点（Host = <slug>.<PUBLISH_APEX>）。
+
+    为什么必须豁免：发布站是纯静态产物，一次页面加载会打出十几个资源请求。
+    套用默认的 60/min 配额，刷新几次就 429，用户会当成「站点坏了」。这些请求
+    也不触碰任何鉴权资源，豁免不放大风险。
+
+    只豁免默认限流档位；各路由自己的 @limiter.limit 不受影响。
+    这里刻意只做 Host 形态判断、不查库：限流发生在 before_request 阶段，
+    必须保持零 IO。归属校验仍由 routes/published_site.py 负责。
+    """
+    apex = (settings.PUBLISH_APEX or '').strip().lower()
+    if not apex:
+        return False
+    try:
+        host = request.host.split(':')[0].strip().lower()
+    except Exception:  # 无请求上下文（如离线调用）时不豁免
+        return False
+    if not host.endswith('.' + apex):
+        return False
+    # 必须是 slug 形态，否则 www.<apex> 这类主站子域会被误豁免
+    from services.publish.slug import is_valid_slug
+    return is_valid_slug(host[:-len(apex) - 1].upper())
+
+
 # 预定义的限流配置
 # 实际限流由 factory.py 的 Limiter(key_func=get_user_identity) 按 RATE_LIMITS 执行；
 # 路由代码通过 rate_limit_auth / rate_limit_chat 等装饰器引用对应档位。

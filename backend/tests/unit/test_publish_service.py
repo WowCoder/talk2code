@@ -22,6 +22,13 @@ SAMPLE = [
     {"filename": "app.js", "content": "console.log(1)"},
 ]
 
+# requirement.code_files 里混入的平台内部文件（工作区 .task/ 目录）
+INTERNAL = [
+    {"filename": ".task/TASK_STATE.md", "content": "# 内部状态"},
+    {"filename": ".task/contract.json", "content": "{}"},
+    {"filename": ".task/evaluator/result.json", "content": "{}"},
+]
+
 
 def _make_env():
     d = tempfile.mkdtemp(dir=Path(__file__).parent)
@@ -122,3 +129,33 @@ def test_publish_no_files_raises(env):
     svc = PublishService(store=store, db_session_factory=factory)
     with pytest.raises(PublishError):
         svc.publish(user_id=5, code_files=[], requirement_id=50)
+
+
+def test_normalize_excludes_internal_paths(env):
+    """点开头的路径段（.task/ 等）是平台内部文件，归一化阶段就剔除。"""
+    store, factory = env
+    svc = PublishService(store=store, db_session_factory=factory)
+    files = svc.normalize_code_files(SAMPLE + INTERNAL)
+    assert set(files) == {"index.html", "app.js"}
+
+
+def test_publish_does_not_expose_internal_files(env):
+    """`unlisted` 只是 noindex 而不是保密：.task/ 内容绝不能进公网产物。"""
+    store, factory = env
+    svc = PublishService(store=store, db_session_factory=factory)
+    site = svc.publish(user_id=6, code_files=SAMPLE + INTERNAL, requirement_id=60)
+    assert store.get(site.current_hash, "index.html")
+    for rel in (".task/TASK_STATE.md", ".task/contract.json", ".task/evaluator/result.json"):
+        with pytest.raises(KeyError):
+            store.get(site.current_hash, rel)
+
+
+def test_hash_ignores_internal_files(env):
+    """内部文件不进产物 ⇒ 也不影响 content_hash（纯内部改动不产生新版本）。"""
+    store, factory = env
+    svc = PublishService(store=store, db_session_factory=factory)
+    s1 = svc.publish(user_id=7, code_files=SAMPLE, requirement_id=70)
+    changed_internal = INTERNAL + [{"filename": ".task/TASK_STATE.md", "content": "# 变了"}]
+    s2 = svc.publish(user_id=7, code_files=SAMPLE + changed_internal, requirement_id=70)
+    assert s2.current_hash == s1.current_hash
+    assert s2.version == 1

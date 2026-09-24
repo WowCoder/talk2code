@@ -47,6 +47,22 @@ def test_allow_hosts_adds_exclude_whitelist():
     assert resolver.index("MAP * ~NOTFOUND") < resolver.index("EXCLUDE 198.18.0.1")
 
 
+def test_allow_hosts_also_bypasses_proxy():
+    """放行必须同时体现在代理 bypass 上。
+
+    历史缺陷：allow_hosts 只写进 host-resolver-rules，没进 proxy-bypass-list。
+    结果是名字能解析、请求仍被送进黑洞代理（127.0.0.1:9）→
+    ERR_PROXY_CONNECTION_FAILED，「放行」形同虚设。
+    """
+    args = build_chromium_args(allow_hosts=("site.example.com",))
+    bypass = next(a for a in args if a.startswith("--proxy-bypass-list="))
+    assert "site.example.com" in bypass
+    # 反向：默认 loopback 白名单不能被 allow_hosts 分支挤掉
+    assert "127.0.0.1" in bypass
+    assert "localhost" in bypass
+    assert "<-loopback>" not in bypass
+
+
 # ---------------------------------------------------------------------------
 # A4 的同文件回归断言（空 allow_hosts 必须放行 localhost）
 # ---------------------------------------------------------------------------
@@ -182,3 +198,26 @@ def test_unsandboxed_control_reaches_external():
             print(f"[control] external fetch result = {result!r}")
         finally:
             browser.close()
+
+
+# ---------------------------------------------------------------------------
+# A11：preview_url 的主机名必须动态进入出口白名单
+#   发布复验的 preview_url 是 <slug>.<apex> 形态（不是数字 IP），不在默认
+#   豁免内；不放行就会加载失败并静默回退直读本地文件，复验丢掉「线上 URL
+#   真的能打开」这一唯一有意义的信号。
+# ---------------------------------------------------------------------------
+def test_preview_allow_hosts_derives_from_url():
+    from harness.tools.preview_runner import _preview_allow_hosts
+
+    assert _preview_allow_hosts("http://N4Z3.localhost:5001") == ("n4z3.localhost",)
+    assert _preview_allow_hosts("https://abc.wowcoder.cn") == ("abc.wowcoder.cn",)
+
+
+def test_preview_allow_hosts_skips_default_loopback():
+    """数字 IP / localhost 已在默认豁免里，不重复追加（避免参数噪音）。"""
+    from harness.tools.preview_runner import _preview_allow_hosts
+
+    assert _preview_allow_hosts("http://127.0.0.1:5001") == ()
+    assert _preview_allow_hosts("http://localhost:5001") == ()
+    assert _preview_allow_hosts(None) == ()
+    assert _preview_allow_hosts("") == ()

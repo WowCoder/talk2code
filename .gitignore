@@ -56,6 +56,8 @@ backend/tests/unit/tmp*/
 
 # 用户工作区（运行时生成的代码产物）
 backend/workspaces/
+# 一键发布 ObjectStore 产物（运行时写入，slug 目录可重建）
+backend/published/
 # 调试/复现脚本与截图（根目录或项目根下的临时产物）
 /tmp/
 /probe_*.py

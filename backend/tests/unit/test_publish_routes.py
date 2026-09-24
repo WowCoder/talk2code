@@ -134,14 +134,20 @@ def test_by_requirement_requires_auth(app_client):
     assert r.status_code == 401
 
 
-def test_by_requirement_unknown_404(pub_env):
-    """未发布的需求查询 → 404，前端据此渲染「未发布」态（不是错误态）。
+def test_by_requirement_unknown_returns_published_false(pub_env):
+    """未发布的需求查询 → 200 + published=false，前端据此渲染「未发布」态。
+
+    注意：故意设计为 200 而非 404，避免 Chrome DevTools Network 面板
+    在详情页打开时显示红色 404 噪音。响应形态与「req 不属于我」一致，
+    不泄露资源存在性（HTTP code 维度的「404 一致」降级到 body 维度的
+    「published=false 一致」）。
 
     用一个明显不存在的 requirement_id 隔离 DB 状态共享的影响。
     """
     app_client, req_id, d = pub_env
     r = app_client.get("/api/publish/by-requirement/999999")
-    assert r.status_code == 404
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json() == {"published": False}
 
 
 def test_by_requirement_returns_site_after_publish(pub_env):
@@ -158,6 +164,7 @@ def test_by_requirement_returns_site_after_publish(pub_env):
     r2 = app_client.get(f"/api/publish/by-requirement/{req_id}")
     assert r2.status_code == 200, r2.get_json()
     info = r2.get_json()
+    assert info["published"] is True
     assert info["slug"] == slug
     assert info["version"] == 1
     assert info["requirement_id"] == req_id
@@ -170,8 +177,11 @@ def test_by_requirement_returns_site_after_publish(pub_env):
     assert "view_count" in info
 
 
-def test_by_requirement_other_user_404(pub_env):
-    """他人 requirement_id 一律 404，避免响应差异泄露资源存在性。"""
+def test_by_requirement_other_user_returns_published_false(pub_env):
+    """他人 requirement_id → 200 + published=false（不泄露存在性）。
+
+    跨用户场景下，response 形态与「未发布」「req 不存在」三种情况完全一致。
+    """
     app_client, req_id, d = pub_env
     # 先发布拿到自己的站点（test_func）
     app_client.post("/api/publish", json={"requirement_id": req_id})
@@ -185,6 +195,7 @@ def test_by_requirement_other_user_404(pub_env):
     app_client.post("/api/login", json={"username": "other_func", "password": "test123456"})
 
     # 拿一个 other_func 自己的需求 id（不是 test_func 的）
-    # 简化方案：用一个明显不存在的 id 也应 404
+    # 简化方案：用一个明显不存在的 id 也应 published=false
     r = app_client.get(f"/api/publish/by-requirement/{req_id}")
-    assert r.status_code == 404
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json() == {"published": False}

@@ -10,6 +10,13 @@
 - degraded   : 任一失败 / 复验过程异常（安全默认：绝不谎报成功）
 - unverified : 未配置 apex（Host 路由未启用），无法对线上 URL 复验
 
+两个易错前提，动这块代码前先读：
+1. 复验的线上 URL 一律取 ``services.publish.urls.published_url()``，不要自行拼接
+   ——协议与端口随环境变（本地是 ``http://<slug>.localhost:5001``）。
+2. **未配 apex 时本模块几乎不执行**（``decide_verify_status`` 提前返回
+   ``unverified``）。这意味着这里的缺陷在本地开发态会长期潜伏，只有配上
+   ``PUBLISH_APEX`` 才集中暴露；改完务必用一次真实发布验证，光跑单测不够。
+
 Chromium 实际跑在 Leon 本机 / CI；单测通过 monkeypatch _run_verification 验证
 写库决策路径（ok / degraded / unverified），不依赖浏览器。
 """
@@ -18,13 +25,18 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from config import settings
 from factory import logger
 from models.models import PublishedSite
 from utils.db import transactional_db
 
 from services.publish.slug import is_valid_slug
 from services.publish.store import LocalFSStore, StoreError
+from services.publish.urls import published_url
+
+# same-origin 探针预算：单步超时 15s，watchdog 给足「启动 + 导航 + evaluate」
+# 的上界，外层隔离线程再留余量（同 preview_runner 的 watchdog 取值思路）。
+SAME_ORIGIN_TIMEOUT_MS = 15_000
+SAME_ORIGIN_BUDGET_S = SAME_ORIGIN_TIMEOUT_MS / 1000.0 + 10.0
 
 
 def _write_status(slug: str, status: str) -> None:
@@ -38,12 +50,6 @@ def _write_status(slug: str, status: str) -> None:
         db.flush()
 
 
-def _site_requirement_id(slug: str) -> Optional[int]:
-    with transactional_db() as db:
-        site = db.query(PublishedSite).filter_by(slug=slug).first()
-        return site.requirement_id if site else None
-
-
 def decide_verify_status(slug: str, content_hash: str) -> Optional[str]:
     """计算复验结论（纯逻辑，可单测，不依赖站点行是否存在）。
 
@@ -52,13 +58,14 @@ def decide_verify_status(slug: str, content_hash: str) -> Optional[str]:
     """
     if not is_valid_slug(slug):
         return None
-    apex = settings.PUBLISH_APEX
-    if not apex:
-        return "unverified"  # Host 路由未启用，无法复验线上 URL
-    url = f"https://{slug}.{apex}"
-    requirement_id = _site_requirement_id(slug)
+    # 与前端展示、Host 路由共用同一份 URL（协议/端口来自配置）；为 None
+    # 即 apex 未配置、Host 路由整体关闭，线上 URL 不存在 → 无从复验。
+    url = published_url(slug)
+    if not url:
+        return "unverified"
+    user_id, requirement_id = _site_owner(slug)
     try:
-        ok = _run_verification(url, slug, requirement_id)
+        ok = _run_verification(url, slug, user_id, requirement_id, content_hash)
     except Exception as e:
         logger.warning(f"发布复验执行异常（判 degraded）: slug={slug} err={e}")
         ok = False
@@ -77,11 +84,27 @@ def trigger_publish_verify(slug: str, content_hash: str) -> None:
     _write_status(slug, status)
 
 
-def _load_published_index(slug: str) -> Optional[Path]:
-    """把已发布 index.html 落到临时文件，供 runner 作为 html_path 兜底。"""
+def _current_hash_for_slug(slug: str) -> Optional[str]:
+    """站点当前指向的 bundle hash（复验要落盘的那份 index.html）。"""
+    with transactional_db() as db:
+        site = db.query(PublishedSite).filter_by(slug=slug).first()
+        return site.current_hash if site else None
+
+
+def _load_published_index(slug: str, content_hash: Optional[str] = None) -> Optional[Path]:
+    """把已发布 index.html 落到临时文件，供 runner 作为 html_path 兜底。
+
+    content_hash 由发布流程直接传入（发布事务已提交，即为最新值），拿不到时
+    回退查库——历史上这里调用了一个根本不存在的 ``_current_hash()``，
+    NameError 被 ``_run_verification`` 的 except 吞成 warning，表现为每次复验
+    都判 degraded；本地未配 apex 时该分支根本不执行，所以一直没暴露。
+    """
+    content_hash = content_hash or _current_hash_for_slug(slug)
+    if not content_hash:
+        return None
     try:
         store = LocalFSStore()
-        data = store.get(_current_hash(slug), "index.html")
+        data = store.get(content_hash, "index.html")
     except (KeyError, StoreError):
         return None
     if data is None:
@@ -92,28 +115,48 @@ def _load_published_index(slug: str) -> Optional[Path]:
     return Path(fd.name)
 
 
-def _load_ac_scripts(requirement_id: Optional[int]) -> list:
+def _site_owner(slug: str) -> tuple[Optional[int], Optional[int]]:
+    """站点属主 (user_id, requirement_id)——工作区路径按这两者分层。"""
+    with transactional_db() as db:
+        site = db.query(PublishedSite).filter_by(slug=slug).first()
+        if site is None:
+            return None, None
+        return site.user_id, site.requirement_id
+
+
+def _load_ac_scripts(user_id: Optional[int], requirement_id: Optional[int]) -> list:
     """尽力加载该需求的 AC 脚本缓存（.task/ac_scripts.json）。
+
+    缓存形状与验收同源：``{"ac_hash": ..., "scripts": [ ... ]}``——**是对象不是
+    裸数组**，故取 ``scripts`` 键并校验类型。
 
     解析失败 / 不存在 → 返回空列表（跳过 AC，仅跑 smoke + same-origin）。
     """
-    if not requirement_id:
+    if not requirement_id or not user_id:
         return []
     try:
-        # 复用需求服务的 workspace 解析（与验收同源）
-        from services.workspace_service import get_requirement_workspace
-        ws = get_requirement_workspace(requirement_id)
+        # 与验收同源：工作区路径 = {base}/{user_id}/{requirement_id}
+        from harness.state.workspace import WorkspaceFS
+        ws = WorkspaceFS(user_id, requirement_id)
         raw = ws.read(".task/ac_scripts.json") if ws.exists(".task/ac_scripts.json") else None
         if not raw:
             return []
         import json
-        return json.loads(raw)
+        cached = json.loads(raw)
+        scripts = cached.get("scripts") if isinstance(cached, dict) else None
+        return scripts if isinstance(scripts, list) else []
     except Exception as e:
         logger.warning(f"发布复验加载 AC 脚本失败（跳过 AC）: req={requirement_id} err={e}")
         return []
 
 
-def _run_verification(url: str, slug: str, requirement_id: Optional[int]) -> bool:
+def _run_verification(
+    url: str,
+    slug: str,
+    user_id: Optional[int],
+    requirement_id: Optional[int],
+    content_hash: Optional[str] = None,
+) -> bool:
     """真实复验（需 Chromium）。返回 True=全通过。任何异常 → False（degraded）。
 
     拆分三路信号，与 C3「same-origin 专属用例」对应：
@@ -126,12 +169,12 @@ def _run_verification(url: str, slug: str, requirement_id: Optional[int]) -> boo
             run_universal_smoke,
             run_ac_checks,
         )
-        html_path = _load_published_index(slug)
+        html_path = _load_published_index(slug, content_hash)
 
         smoke = run_universal_smoke(html_path, preview_url=url)
         smoke_ok = bool(smoke.get("available"))
 
-        ac_scripts = _load_ac_scripts(requirement_id)
+        ac_scripts = _load_ac_scripts(user_id, requirement_id)
         ac_ok = True
         if ac_scripts:
             results = run_ac_checks(html_path, ac_scripts, preview_url=url)
@@ -147,28 +190,49 @@ def _run_verification(url: str, slug: str, requirement_id: Optional[int]) -> boo
         return False
 
 
+def _same_origin_probe(url: str) -> bool:
+    """探测会话本体（**必须整个在隔离线程里执行**，见 _check_same_origin）。"""
+    import urllib.parse
+
+    from harness.tools.sandboxed_browser import sandboxed_browser
+
+    host = urllib.parse.urlsplit(url).hostname or ''
+    with sandboxed_browser(
+        allow_hosts=(host,) if host else (),
+        timeout_ms=SAME_ORIGIN_TIMEOUT_MS,
+    ) as browser:
+        page = browser.new_page()
+        page.goto(url, wait_until="load", timeout=SAME_ORIGIN_TIMEOUT_MS)
+        # 必须包成函数体：page.evaluate 收到裸语句串时按表达式 eval，
+        # 顶层 return 会直接抛 "SyntaxError: Illegal return statement"
+        # ——那样这条探针永远返回失败，复验恒判 degraded。
+        return bool(page.evaluate(
+            "() => { try { localStorage.setItem('__t2c_probe', '1'); "
+            "localStorage.removeItem('__t2c_probe'); return true; } "
+            "catch(e) { return false; } }"
+        ))
+
+
 def _check_same_origin(url: str) -> bool:
     """C3 专属：在放开 same-origin 的浏览器上下文里验证 localStorage 可写。
 
     预览环境因 iframe 无 allow-same-origin，localStorage 必抛 SecurityError；
     发布环境放开后必须可用，否则用户当成 bug。
+
+    两个必须遵守的约束：
+    - **隔离线程**：本函数由发布请求线程调用，而 Flask/WSGI 线程会被复用；
+      Playwright sync API 在复用线程里第二次 ``sync_playwright().start()``
+      会永久挂死（无 driver、无日志）。故整段探针走
+      ``run_browser_session_isolated``。
+    - **出口封锁下仍需可达**：探针打的是发布站点自身，故把自己的主机名
+      加进 ``allow_hosts``；否则被 ``MAP * ~NOTFOUND`` + 黑洞代理拦掉，
+      会得到一个假的 degraded。
     """
     try:
-        from playwright.sync_api import sync_playwright
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            try:
-                page = browser.new_page()
-                page.goto(url, wait_until="load", timeout=15000)
-                result = page.evaluate(
-                    "try { localStorage.setItem('__t2c_probe', '1'); "
-                    "localStorage.removeItem('__t2c_probe'); return true; } "
-                    "catch(e) { return false; }"
-                )
-                return bool(result)
-            finally:
-                browser.close()
+        from harness.tools.sandboxed_browser import run_browser_session_isolated
+        return run_browser_session_isolated(
+            _same_origin_probe, SAME_ORIGIN_BUDGET_S, url
+        )
     except Exception as e:
         logger.warning(f"same-origin 复验失败（判 degraded）: url={url} err={e}")
         return False

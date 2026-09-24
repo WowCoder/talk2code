@@ -142,6 +142,10 @@ import { useToast } from '@/composables/useToast'
 import { useApi } from '@/composables/useApi'
 
 interface PublishResult {
+  // 仅 by-requirement 端点携带（永远 200）；POST /api/publish 不会带此字段。
+  // 为 false 时表示「该需求从未发布 / 不属于当前用户 / 不存在」三种情形之一
+  // —— 后端不区分以避免响应差异泄露资源存在性。
+  published?: boolean
   slug: string
   version: number
   // 以下三项是平台内部信号，**刻意不在界面上暴露**（保留字段仅为对齐后端响应
@@ -188,7 +192,8 @@ const isPublishedButUnavailable = computed(
 const warnings = computed(() => result.value?.warnings ?? [])
 
 // 进入 TAB 时拉一次发布状态：解决「刷新后只剩一个发布按钮」的持久化问题。
-// 404 是正常态（该需求从未发布），不是错误。
+// 后端 by-requirement 永远返回 200 —— `published: false` 表示「未发布 / 不属于我 / 不存在」，
+// 这种情况下不当作错误（避免 Chrome Network 红字噪音）。
 async function loadPublishState() {
   if (!reqId.value) {
     loading.value = false
@@ -200,16 +205,17 @@ async function loadPublishState() {
     const data = await api<PublishResult>(
       `/api/publish/by-requirement/${reqId.value}`
     )
-    result.value = data
-  } catch (e) {
-    const msg = (e as Error).message || ''
-    // 404 = 未发布（正常态）；其它才视为拉取错误
-    if (/404|尚未发布/.test(msg)) {
+    // `published: false` 是 by-requirement 的「未发布」正常态，
+    // 其他字段缺失（slug=undefined）说明这不是已发布记录 —— 当未发布处理
+    if (data.published === false) {
       result.value = null
     } else {
-      loadError.value = msg
-      result.value = null
+      result.value = data
     }
+  } catch (e) {
+    // 真错误（网络/服务挂了/JWT 失效）才显示给用户
+    loadError.value = (e as Error).message || '加载失败'
+    result.value = null
   } finally {
     loading.value = false
   }

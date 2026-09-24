@@ -319,7 +319,19 @@ class Settings(BaseSettings):
 
     PUBLISH_APEX: str = Field(
         default='',
-        description='发布站点 apex 域名（如 talk2code.pub）。空=关闭 Host 路由'
+        description='发布站点 apex 域名（如 wowcoder.cn）。空=关闭 Host 路由'
+    )
+    # 发布链接的协议与端口必须可配：生产是 https + 标准端口，而本地开发
+    # 跑在 http://<slug>.localhost:<后端端口>（*.localhost 由系统解析到
+    # 127.0.0.1，零外部 DNS 依赖）。此前链接被硬编码成 https 且不带端口，
+    # 本地永远拼不出可用地址，才会出现前端自拼 nip.io 的假兜底。
+    PUBLISH_URL_SCHEME: str = Field(
+        default='https',
+        description='发布链接协议：生产 https；本地开发 http'
+    )
+    PUBLISH_URL_PORT: str = Field(
+        default='',
+        description='发布链接端口：本地开发填后端端口（如 5001），生产留空'
     )
     PUBLISH_STORE_DIR: str = Field(
         default='',

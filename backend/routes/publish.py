@@ -32,6 +32,34 @@ def _publish_warnings(host: str | None) -> list:
     ]
 
 
+def _site_payload(site) -> dict:
+    """发布状态的对外表示（三个端点共用同一份字段表）。
+
+    共用而非各写各的：前端只按一个形状解析；此前 POST /api/publish 少返回
+    view_count / created_at / updated_at，于是刚发布完那一刻界面渲染出空时间
+    与「0 次访问」（必须刷新页面、走 by-requirement 才对）—— 同一份数据在
+    三个端点上漂移出的不一致，正是这种「看起来能用但数字不对」的来源。
+    """
+    host = _published_host(site.slug)
+    return {
+        'slug': site.slug,
+        'version': site.version,
+        'visibility': site.visibility,
+        'runtime_tier': site.runtime_tier,
+        'verify_status': site.verify_status,
+        'current_hash': site.current_hash,
+        'view_count': site.view_count,
+        'title': site.title,
+        'requirement_id': site.requirement_id,
+        'published_host': host,
+        'url': _published_url(site.slug),
+        'warnings': _publish_warnings(host),
+        'created_at': site.created_at.isoformat() if site.created_at else None,
+        'updated_at': site.updated_at.isoformat() if site.updated_at else None,
+        'verified_at': site.verified_at.isoformat() if site.verified_at else None,
+    }
+
+
 @app.route('/api/publish', methods=['POST'])
 @jwt_required()
 def publish_requirement():
@@ -69,17 +97,7 @@ def publish_requirement():
         except PublishError as e:
             return jsonify({'error': str(e)}), 400
 
-    host = _published_host(site.slug)
-    return jsonify({
-        'slug': site.slug,
-        'version': site.version,
-        'visibility': site.visibility,
-        'verify_status': site.verify_status,
-        'current_hash': site.current_hash,
-        'published_host': host,
-        'url': _published_url(site.slug),
-        'warnings': _publish_warnings(host),
-    }), 200
+    return jsonify(_site_payload(site)), 200
 
 
 @app.route('/api/publish/<slug>/unpublish', methods=['POST'])
@@ -104,40 +122,27 @@ def publish_by_requirement(requirement_id: int):
 
     用于详情页「发布」TAB 首屏加载：刷新页面后无需依赖前端内存，
     直接从 PublishedSite 表读取该需求最近一次发布记录。
-    不存在时返回 404（前端据此渲染「未发布」态，而非错误态）。
 
-    鉴权：要求 user_id 匹配；他人 requirement_id 一律 404
-    （避免响应差异泄露资源存在性，与 publish_info 同策略）。
+    ⚠️ 故意设计为「永远 200」而非 404：避免 Chrome DevTools Network 面板
+    对未发布需求显示一行红色 404 噪音（详情页打开即查，会一直跳出来）。
+    安全性靠 body 内的 `published: bool` 判定 —— 未发布、req 不存在、
+    req 不属于当前用户，三种情况 body 形态完全一致（`{published: false}`），
+    response 形状无差异，外部观察者无法据此区分这三种场景（与 publish_info
+    「404 一致」的同源策略，从 HTTP code 维度降级到 body 维度）。
     """
     current_user_id = int(get_jwt_identity())
     with get_db() as db:
-        # 同一需求可能有多次发布记录，但 slug 在 PublishService.publish 内部
-        # 复用 requirement 派生 slug，所以同一用户 × 同一需求最多一条；
-        # 即便理论上有重复，取最新（updated_at 最大）作为权威来源。
+        # 同一用户 × 同一需求理论上最多一条 PublishedSite 行；按 updated_at
+        # 降序取最新作为权威来源（兜底历史脏数据）。
         site = db.query(PublishedSite).filter_by(
             requirement_id=requirement_id,
             user_id=current_user_id,
         ).order_by(PublishedSite.updated_at.desc()).first()
         if not site:
-            return jsonify({'error': '该需求尚未发布'}), 404
-        host = _published_host(site.slug)
-        return jsonify({
-            'slug': site.slug,
-            'version': site.version,
-            'visibility': site.visibility,
-            'runtime_tier': site.runtime_tier,
-            'verify_status': site.verify_status,
-            'current_hash': site.current_hash,
-            'view_count': site.view_count,
-            'title': site.title,
-            'requirement_id': site.requirement_id,
-            'published_host': host,
-            'url': _published_url(site.slug),
-            'warnings': _publish_warnings(host),
-            'created_at': site.created_at.isoformat() if site.created_at else None,
-            'updated_at': site.updated_at.isoformat() if site.updated_at else None,
-            'verified_at': site.verified_at.isoformat() if site.verified_at else None,
-        }), 200
+            return jsonify({'published': False}), 200
+        payload = _site_payload(site)
+        payload['published'] = True
+        return jsonify(payload), 200
 
 
 @app.route('/api/publish/<slug>/info', methods=['GET'])
@@ -151,23 +156,7 @@ def publish_info(slug: str):
         site = db.query(PublishedSite).filter_by(slug=slug).first()
         if not site or site.user_id != current_user_id:
             return jsonify({'error': '站点不存在'}), 404
-        return jsonify({
-            'slug': site.slug,
-            'version': site.version,
-            'visibility': site.visibility,
-            'runtime_tier': site.runtime_tier,
-            'verify_status': site.verify_status,
-            'current_hash': site.current_hash,
-            'view_count': site.view_count,
-            'title': site.title,
-            'requirement_id': site.requirement_id,
-            'published_host': _published_host(site.slug),
-            'url': _published_url(site.slug),
-            'warnings': _publish_warnings(_published_host(site.slug)),
-            'created_at': site.created_at.isoformat() if site.created_at else None,
-            'updated_at': site.updated_at.isoformat() if site.updated_at else None,
-            'verified_at': site.verified_at.isoformat() if site.verified_at else None,
-        }), 200
+        return jsonify(_site_payload(site)), 200
 
 
 def _trigger_publish_verify(slug: str, content_hash: str):

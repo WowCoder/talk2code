@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import re
+import urllib.parse
 from pathlib import Path
 from typing import Optional
 
@@ -359,6 +360,25 @@ def _watchdog_ms(timeout_ms: int, n_ops: int) -> int:
     return int(timeout_ms * (n_ops + 3) + 5_000)
 
 
+def _preview_allow_hosts(preview_url: str | None) -> tuple[str, ...]:
+    """把 preview_url 的主机名加进沙箱出口白名单。
+
+    默认白名单只豁免 ``127.0.0.1`` / ``localhost``——因为常规预览链路用数字 IP。
+    但发布复验传进来的 preview_url 是 ``<slug>.<apex>`` 形态（例如
+    ``http://xxxx.localhost:5001``、``https://xxxx.wowcoder.cn``），不在默认豁免内，
+    会被 ``MAP * ~NOTFOUND`` + 黑洞代理拦掉 → 沙箱链路加载失败 → 静默回退直读
+    本地文件。于是复验就丢掉了唯一有意义的信号：「线上 URL 真的能打开」。
+
+    故凡带着 preview_url 进入沙箱的会话，都按 URL 动态放行其主机名。
+    """
+    if not preview_url:
+        return ()
+    host = urllib.parse.urlsplit(preview_url).hostname
+    if not host or host in ("127.0.0.1", "localhost"):
+        return ()
+    return (host,)
+
+
 def run_ac_checks(
     html_path: Path,
     ac_scripts: list[dict],
@@ -450,7 +470,10 @@ def _run_ac_checks_session(
     try:
         # watchdog 必须覆盖所有 AC 全部步骤的合法等待（req 154：误杀后新命令全挂起）
         _ac_total_steps = sum(len(s.get("steps") or []) for s in ac_scripts) or len(ac_scripts)
-        with sandboxed_browser(timeout_ms=_watchdog_ms(timeout_ms, _ac_total_steps)) as browser:
+        with sandboxed_browser(
+            timeout_ms=_watchdog_ms(timeout_ms, _ac_total_steps),
+            allow_hosts=_preview_allow_hosts(preview_url),
+        ) as browser:
 
             try:
                 context = browser.new_context()
@@ -782,7 +805,10 @@ def _capture_screenshot_session(html_path: Path, out_path: Path,
     try:
         from playwright.sync_api import Error as PWError
         # watchdog 覆盖 goto/settle/截图的合法等待（req 154）
-        with sandboxed_browser(timeout_ms=_watchdog_ms(timeout_ms, 2)) as browser:
+        with sandboxed_browser(
+            timeout_ms=_watchdog_ms(timeout_ms, 2),
+            allow_hosts=_preview_allow_hosts(preview_url),
+        ) as browser:
             try:
                 context = browser.new_context(viewport={"width": 1280, "height": 800})
                 page = context.new_page()
@@ -1029,7 +1055,10 @@ def _run_universal_smoke_session(html_path: Path, timeout_ms: int = 15_000, prev
 
     try:
         # watchdog 覆盖 goto/settle/CTA 探测/交互检查的合法等待（req 154）
-        with sandboxed_browser(timeout_ms=_watchdog_ms(timeout_ms, 4)) as browser:
+        with sandboxed_browser(
+            timeout_ms=_watchdog_ms(timeout_ms, 4),
+            allow_hosts=_preview_allow_hosts(preview_url),
+        ) as browser:
 
             try:
                 context = browser.new_context()
