@@ -274,6 +274,16 @@ class Settings(BaseSettings):
         description='Agent 执行明细日志目录（相对 BACKEND_DIR）'
     )
 
+    # ==================== 任务中断自愈 ====================
+
+    # 任务队列是纯内存的，进程重启后上一进程在跑的需求会永久停在 processing。
+    # 开启后启动时把这类僵尸需求改判为 interrupted，用户可经
+    # POST /api/requirements/<id>/resume 从检查点续跑。
+    MARK_STALE_ON_BOOT: bool = Field(
+        default=True,
+        description='启动时把僵死在 processing 的需求改判为 interrupted（可续跑）'
+    )
+
     # ==================== 安全配置 ====================
 
     PASSWORD_MIN_LENGTH: int = Field(default=6, description='密码最小长度')
@@ -304,6 +314,21 @@ class Settings(BaseSettings):
     APP_HOST: str = Field(default='0.0.0.0', description='应用监听地址')
     APP_PORT: int = Field(default=5001, ge=1, le=65535, description='应用端口')
     APP_DEBUG: bool = Field(default=False, description='调试模式')
+
+    # ==================== 发布配置（一键发布） ====================
+
+    PUBLISH_APEX: str = Field(
+        default='',
+        description='发布站点 apex 域名（如 talk2code.pub）。空=关闭 Host 路由'
+    )
+    PUBLISH_STORE_DIR: str = Field(
+        default='',
+        description='发布产物存储目录。空则用 BACKEND_DIR/published'
+    )
+
+    @property
+    def PUBLISH_STORE_PATH(self) -> Path:
+        return Path(self.PUBLISH_STORE_DIR) if self.PUBLISH_STORE_DIR else (self.BACKEND_DIR / "published")
 
     # CORS 配置
     CORS_ORIGINS: str = Field(

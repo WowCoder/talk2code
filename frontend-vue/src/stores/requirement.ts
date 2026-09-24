@@ -294,6 +294,14 @@ function messageKey(msg: DialogueMessage): string {
     progress.value = { currentAgent: '', percent: 0 }
   }
 
+  // 续跑被中断的需求（服务重启 / 取消后重来）：后端经检查点恢复上下文
+  async function resumeRequirement(): Promise<void> {
+    if (!currentRequirement.value) return
+    await api(`/api/requirements/${currentRequirement.value.id}/resume`, { method: 'POST' })
+    isGenerating.value = true
+    progress.value = { currentAgent: '', percent: 0 }
+  }
+
   function reset() {
     loadSeq++ // 使进行中的旧 loadRequirement 失效，避免竞态写入
     currentRequirement.value = null
@@ -340,6 +348,7 @@ function messageKey(msg: DialogueMessage): string {
     planStatus,
     confirmPlan,
     cancelTask,
+    resumeRequirement,
     reset,
   }
 })

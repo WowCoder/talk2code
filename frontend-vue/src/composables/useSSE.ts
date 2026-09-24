@@ -266,6 +266,8 @@ export function useSSE(reqId: Ref<number | null>) {
         if (ac) {
           ac.passed = data.passed
           ac.reason = data.reason || ''
+          // P4: 四态信号优先用后端 state；缺省时回退到 passed 布尔推导
+          if (data.state) ac.state = data.state
         }
       }
     })

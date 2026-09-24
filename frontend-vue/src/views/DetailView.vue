@@ -8,6 +8,14 @@
       :is-active="store.isGenerating"
     />
 
+    <!-- 中断提示：服务重启会中断在跑的需求，进度已保留在检查点，可一键续跑 -->
+    <div v-if="store.currentRequirement?.status === 'interrupted'" class="resume-banner">
+      <span class="resume-text">上次执行被服务重启中断，进度已保留，可从断点继续。</span>
+      <button class="resume-btn" :disabled="resuming" @click="onResume">
+        {{ resuming ? '正在继续…' : '继续' }}
+      </button>
+    </div>
+
     <!-- Split layout -->
     <div class="split">
       <!-- Left: Dialogue -->
@@ -44,6 +52,11 @@
           <CodePanel />
         </div>
 
+        <!-- Publish view -->
+        <div v-show="activeTab === 'publish'" class="view active">
+          <PublishPanel />
+        </div>
+
         <TokenBar
           :tokens="tokenInfo.totalTokens"
           :cost="tokenInfo.totalCost"
@@ -68,6 +81,7 @@ import SpecPanel from '@/components/detail/SpecPanel.vue'
 import TaskPanel from '@/components/detail/TaskPanel.vue'
 import PreviewFrame from '@/components/detail/PreviewFrame.vue'
 import CodePanel from '@/components/detail/CodePanel.vue'
+import PublishPanel from '@/components/detail/PublishPanel.vue'
 import TokenBar from '@/components/detail/TokenBar.vue'
 import type { SSETraceSummaryData } from '@/types/sse'
 
@@ -257,6 +271,24 @@ async function onStopGeneration() {
   }
 }
 
+// Resume handler: 从检查点继续被中断的需求
+const resuming = ref(false)
+async function onResume() {
+  if (resuming.value || !store.currentRequirement?.id) return
+  resuming.value = true
+  try {
+    await store.resumeRequirement()
+    // 后端已置为 processing；同步本地状态让提示条立即收起（SSE 随后会推送真实进度）
+    store.currentRequirement.status = 'processing'
+    show('已从断点继续', 'success')
+  } catch (err: any) {
+    resuming.value = false
+    show('继续失败: ' + (err.message || '未知错误'), 'error')
+    return
+  }
+  resuming.value = false
+}
+
 // Download handler: 将 index.html 及相关资源打包为独立 HTML
 function onDownload() {
   const files = { ...store.codeFiles }
@@ -328,6 +360,44 @@ function escapeInlineScript(content: string): string {
   display: flex;
   flex-direction: column;
   background: var(--bg);
+}
+
+/* 中断提示条：横贯在导航与分栏之间，不挤占左右面板 */
+.resume-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  background: var(--accent-soft);
+  border-bottom: 1px solid var(--border);
+  color: var(--fg);
+  font-size: 13px;
+}
+
+.resume-text {
+  min-width: 0;
+}
+
+.resume-btn {
+  flex-shrink: 0;
+  padding: 6px 16px;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--color-on-accent);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.resume-btn:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+
+.resume-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 .split {

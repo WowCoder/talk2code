@@ -36,15 +36,25 @@
           <div
             v-for="(item, i) in specData.acceptance_criteria"
             :key="i"
-            :class="['ac-item', acStatus(item)]"
+            :class="['ac-item', acState(item)]"
           >
-            <span :class="['ac-status', acStatus(item)]">
-              {{ acStatus(item) === 'pass' ? '✅' : acStatus(item) === 'fail' ? '❌' : '⏳' }}
+            <span :class="['ac-status', acState(item)]">
+              {{ acIcon(item) }}
             </span>
             <span class="ac-label">{{ item.id }}: {{ item.label }}</span>
             <div v-if="item.how_to_verify" class="ac-verify">验证: {{ item.how_to_verify }}</div>
-            <div v-if="acStatus(item) === 'fail' && item.reason" class="ac-reason">
+            <!-- 四态信号各自的判定说明（P4 可视化） -->
+            <div v-if="acState(item) === 'fail' && item.reason" class="ac-reason">
               {{ item.reason }}
+            </div>
+            <div v-else-if="acState(item) === 'compromised'" class="ac-reason ac-warn">
+              失败信号不可信：脚本未完整驱动页面（如点击步骤超时），后续断言可能是在未操作状态下得出的。请先核实该缺陷是否真实存在，勿直接照此修改。
+            </div>
+            <div v-else-if="acState(item) === 'unverified'" class="ac-reason ac-muted">
+              断言前提不成立（未触发验证），既非通过也非失败，需结合代码与截图自行判断。
+            </div>
+            <div v-else-if="acState(item) === 'not_applicable'" class="ac-reason ac-muted">
+              该断言对当前实现不适用，未纳入验收。
             </div>
           </div>
         </div>
@@ -123,6 +133,8 @@ export interface AcceptanceCriterion {
   how_to_verify?: string
   passed?: boolean | null
   reason?: string
+  /** 四态信号: passed / compromised / unverified / not_applicable / fail / pending */
+  state?: string
 }
 
 export interface SpecData {
@@ -151,10 +163,25 @@ const techStackItems = computed(() => {
   return items
 })
 
-function acStatus(item: AcceptanceCriterion): 'pass' | 'fail' | 'pending' {
-  if (item.passed === true) return 'pass'
+// 四态信号（P4）：后端直接给 state 时优先采用；旧后端只给 passed 布尔时回退推导。
+type ACState = 'passed' | 'fail' | 'compromised' | 'unverified' | 'not_applicable' | 'pending'
+
+function acState(item: AcceptanceCriterion): ACState {
+  if (item.state) return item.state as ACState
+  if (item.passed === true) return 'passed'
   if (item.passed === false) return 'fail'
   return 'pending'
+}
+
+function acIcon(item: AcceptanceCriterion): string {
+  switch (acState(item)) {
+    case 'passed': return '✅'
+    case 'fail': return '❌'
+    case 'compromised': return '⚠️'
+    case 'unverified': return '❔'
+    case 'not_applicable': return '➖'
+    default: return '⏳'
+  }
 }
 
 function scoreClass(val: number): string {
@@ -298,6 +325,21 @@ function severityLabel(severity: string): string {
   background: oklch(97% 0.01 20 / 0.4);
 }
 
+.ac-item.compromised {
+  border-left-color: oklch(70% 0.14 70);
+  background: oklch(97% 0.01 70 / 0.4);
+}
+
+.ac-item.unverified {
+  border-left-color: oklch(60% 0.02 250);
+  background: oklch(97% 0.01 250 / 0.3);
+}
+
+.ac-item.not_applicable {
+  border-left-color: var(--border);
+  opacity: 0.7;
+}
+
 .ac-item.pending {
   border-left-color: var(--accent);
   background: oklch(97% 0.01 50 / 0.3);
@@ -331,6 +373,15 @@ function severityLabel(severity: string): string {
   font-size: 12px;
   color: var(--muted);
   line-height: 1.4;
+}
+
+.ac-reason.ac-warn {
+  color: oklch(52% 0.14 70);
+  font-weight: 600;
+}
+
+.ac-reason.ac-muted {
+  font-style: italic;
 }
 
 /* 文件结构 */

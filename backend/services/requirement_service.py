@@ -908,8 +908,11 @@ class RequirementService:
                     sse.trace_summary(requirement_id, trace_data.to_dict())
 
             # 任务成功完成，清除检查点（避免下次误恢复已完成任务）
+            # 注：此处必须自建 CheckpointManager —— 之前直接引用未定义的
+            # `checkpoint`，NameError 被 except 吞成一条 warning，导致检查点
+            # 从未被清除：残留的旧检查点会让后续的 /resume 恢复出过期状态。
             try:
-                checkpoint.clear(requirement_id)
+                CheckpointManager(db_session=db).clear(requirement_id)
             except Exception as e:
                 logger.warning(f"清除检查点失败（不阻断）：{e}")
 

@@ -109,10 +109,14 @@ class SSEReporter:
         """推送单个任务状态更新"""
         self._send(requirement_id, "task_update", {"file": file_path, "status": status})
 
-    def checklist_update(self, requirement_id: int, ac_id: str, passed: bool, reason: str = ""):
-        """推送验收条件检查结果更新"""
+    def checklist_update(self, requirement_id: int, ac_id: str, passed: bool, reason: str = "", state: str = None):
+        """推送验收条件检查结果更新。
+
+        state 为四态信号（passed/compromised/unverified/not_applicable/fail/pending），
+        供前端 P4 可视化；旧前端只读 passed 也兼容（state 缺省为 None）。
+        """
         self._send(requirement_id, "checklist_update", {
-            "ac_id": ac_id, "passed": passed, "reason": reason
+            "ac_id": ac_id, "passed": passed, "reason": reason, "state": state
         })
 
     def evaluator_result(self, requirement_id: int, result: dict):

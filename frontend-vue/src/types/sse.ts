@@ -146,6 +146,8 @@ export interface SSESpecData {
     how_to_verify?: string
     passed?: boolean | null
     reason?: string
+    /** 四态信号: passed / compromised / unverified / not_applicable / fail / pending */
+    state?: string
   }>
   file_structure?: string[]
   tech_stack?: {
@@ -177,6 +179,8 @@ export interface SSEChecklistUpdateData {
   ac_id: string
   passed: boolean
   reason?: string
+  /** 四态信号: passed / compromised / unverified / not_applicable / fail / pending */
+  state?: string
 }
 
 // ===== Evaluator 结果 =====

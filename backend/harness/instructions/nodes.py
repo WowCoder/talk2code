@@ -19,6 +19,7 @@ from llm.client import _try_fix_json as try_fix_json
 from harness.instructions.prompts import load_prompt, load_prompt_template
 from harness.observability.logger import get_logger
 from harness.harness_context import get_tool_loop, get_workspace
+from harness.instructions.ac_verdict_policy import _ac_state, _should_invalidate_ac_cache
 
 logger = get_logger(__name__)
 
@@ -1304,13 +1305,12 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                     _prod_fail = sum(1 for r in ac_check_results if r.get("failures"))
                     _harness_fail = sum(1 for r in ac_check_results if r.get("harness_errors"))
                     _unverified = sum(1 for r in ac_check_results if r.get("unverified"))
-                    # 脚本锁死治理：多数 AC「验不了/驱动不动」说明翻译出来的脚本
+                    # 脚本锁死治理（P2.5）：多数 AC「验不了/驱动不动」说明翻译出来的脚本
                     # 对当前实现不适用（选择器猜错、断言类型选错）。首轮锁定本来是为了
                     # 防漂移，但锁死一个错脚本等于永久假绿/假红——这里作废缓存，
                     # 下一轮按当前代码重新翻译（req 147 的 canvas 断言锁死就是这么来的）。
-                    if ac_check_results and (_unverified + _harness_fail) >= max(
-                        2, len(ac_check_results) // 2 + 1
-                    ):
+                    # 判据抽到 ac_verdict_policy._should_invalidate_ac_cache 单测守卫。
+                    if _should_invalidate_ac_cache(ac_check_results):
                         try:
                             ac_cache_path.unlink()
                             logger.warning(
@@ -1337,6 +1337,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                                 result["ac_id"],
                                 result["passed"],
                                 "; ".join(hints) if not result["passed"] else "",
+                                state=_ac_state(result),
                             )
         except Exception as e:
             logger.warning(f"[Verify] AC 逐条验收异常（降级为 LLM 评估）: {e}")

@@ -731,6 +731,53 @@ def cancel_requirement(req_id):
 
         logger.info(f"需求 {req_id} 已被用户取消")
         return jsonify({'message': '操作已取消', 'requirement_id': req_id}), 200
+
+
+@app.route('/api/requirements/<int:req_id>/resume', methods=['POST'])
+@jwt_required()
+def resume_requirement(req_id):
+    """从断点续跑被中断的需求。
+
+    服务重启后，上一进程在跑的需求会停在 processing —— 任务队列是纯内存的，
+    重启即清空、没有任何重放，而 `process_requirement` 的状态守卫又会把
+    processing 直接跳过，导致这类需求既不会被自动拉起也无法被重新提交。
+    启动期由 `services.stale_sweeper` 把它们改判为 interrupted；用户主动取消
+    的需求则落为 failed。这两种状态都表示"没有任务在跑"，可安全重新入队：
+    工作流入口会经 `CheckpointManager.resume()` 恢复上次状态继续执行。
+
+    processing 不在允许之列 —— 它表示有任务在跑，重复入队只会被守卫静默吞掉。
+    """
+    from models import Requirement
+
+    user_id = int(get_jwt_identity())
+    with transactional_db() as db:
+        req_record = db.query(Requirement).filter(
+            Requirement.id == req_id, Requirement.user_id == user_id
+        ).first()
+        if not req_record:
+            return jsonify({'error': '需求不存在'}), 404
+
+        if req_record.status not in ('interrupted', 'failed'):
+            return jsonify({'error': f'需求状态为 {req_record.status}，不可续跑'}), 400
+
+        from services.requirement_service import RequirementService
+        # 清掉上一次可能遗留的取消信号，否则新任务会被旧信号立即判为已取消
+        RequirementService.clear_cancel(req_id)
+        # 交回工作流；process_requirement 会把它置为 processing
+        req_record.status = 'pending'
+
+    # 事务已提交后再入队，避免 worker 查不到该行
+    task_id = task_queue.submit(req_id, process_requirement_async, req_id)
+    if task_id is None:
+        return jsonify({'error': '该需求已有任务在处理中'}), 409
+
+    logger.info(f"需求 {req_id} 经 /resume 从断点重新入队：{task_id}")
+    return jsonify({
+        'message': '已从断点继续',
+        'requirement_id': req_id,
+        'task_id': task_id,
+    }), 200
+
 @app.route('/api/requirements/<int:req_id>/code', methods=['POST'])
 @jwt_required()
 def save_code(req_id):

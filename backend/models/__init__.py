@@ -5,7 +5,7 @@
 
 from .models import (
     User, Requirement, AgentMemory, AgentMemoryV2, AgentTrace, CheckpointRecord, AgentMemoryVector,
-    MemoryHit,
+    MemoryHit, PublishedBundle, PublishedSite,
     init_db, SessionLocal, engine, Base,
 )
 

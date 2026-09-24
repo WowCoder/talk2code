@@ -25,6 +25,12 @@
       >
         📄 代码
       </button>
+      <button
+        :class="['panel-tab', { active: activeTab === 'publish' }]"
+        @click="$emit('update:activeTab', 'publish')"
+      >
+        🚀 发布
+      </button>
     </div>
     <button class="btn-download" @click="$emit('download')">
       <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">

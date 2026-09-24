@@ -51,6 +51,8 @@ logs/
 
 # 临时文档或者文件
 tmp/
+# pytest mkdtemp 遗留（backend/tests/unit 下随机后缀 tmp* 目录）
+backend/tests/unit/tmp*/
 
 # 用户工作区（运行时生成的代码产物）
 backend/workspaces/

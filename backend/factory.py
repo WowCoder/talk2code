@@ -114,6 +114,13 @@ else:
 # 初始化数据库
 init_db()
 
+# 启动期僵尸清理：上一进程在跑的需求会永久停在 processing（队列是纯内存的），
+# 这里改判为 interrupted，使其可经 /api/requirements/<id>/resume 续跑。
+# 必须放在服务器开始接收请求之前，且失败不阻断启动。
+from services.stale_sweeper import sweep_stale_processing  # noqa: E402
+
+sweep_stale_processing()
+
 # ==================== 生产环境安全检查 ====================
 
 def check_production_security():

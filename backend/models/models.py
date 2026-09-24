@@ -5,7 +5,7 @@
 """
 
 from datetime import datetime
-from sqlalchemy import create_engine, event, Column, Integer, String, Text, DateTime, Boolean, ForeignKey, JSON, Float, text, Index
+from sqlalchemy import create_engine, event, Column, Integer, String, Text, DateTime, Boolean, ForeignKey, JSON, Float, SmallInteger, text, Index
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.sql import func
@@ -31,7 +31,8 @@ if not settings.IS_POSTGRES:
         cursor.close()
 
 # 创建会话工厂
-SessionLocal = sessionmaker(bind=engine)
+# expire_on_commit=False：提交后实例保留属性值（避免 detached 后访问触发 refresh 报错）
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 # 基类
 Base = declarative_base()
@@ -215,6 +216,46 @@ class AgentMemoryVector(Base):
     # SQLite 回退时用普通 TEXT 列存 JSON
     embedding_text = Column(Text, nullable=True)  # SQLite 回退存储
     created_at = Column(DateTime, default=func.now())
+
+
+class PublishedBundle(Base):
+    """不可变产物（内容寻址）。
+
+    详见 docs/design/publish-and-sandbox.md §4。
+    """
+    __tablename__ = "published_bundles"
+
+    content_hash = Column(String(64), primary_key=True)
+    store_key = Column(String(255), nullable=False)
+    size_bytes = Column(Integer, default=0)
+    file_count = Column(Integer, default=0)
+    entry = Column(String(64), default="index.html")
+    created_at = Column(DateTime, default=func.now())
+
+
+class PublishedSite(Base):
+    """发布槽位（可变指针）。
+
+    - slug 与内容解耦：同一个 slug 可指向不同 version 的 bundle
+    - requirement_id 不加外键：需求删除后站点仍可保留
+    - verified_at / verify_status 由 Ship C 发布后复验写入
+    """
+    __tablename__ = "published_sites"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    slug = Column(String(32), unique=True, nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    requirement_id = Column(Integer, nullable=True, index=True)
+    title = Column(String(500), default="")
+    runtime_tier = Column(SmallInteger, default=0)            # 0=static（v1 唯一值）
+    visibility = Column(String(16), default="unlisted")       # public / unlisted
+    current_hash = Column(String(64), ForeignKey("published_bundles.content_hash"), nullable=True)
+    version = Column(Integer, default=1)
+    view_count = Column(Integer, default=0)
+    verified_at = Column(DateTime, nullable=True)
+    verify_status = Column(String(16), default="pending")     # pending / ok / degraded
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
 
 # 初始化数据库（创建所有表）
