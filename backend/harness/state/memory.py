@@ -60,7 +60,7 @@ _ESTIMATE_CJK = re.compile(r'[\u4e00-\u9fff]')
 def _estimate_tokens(text: str) -> int:
     """粗略估算 token 数。
 
-    口径与 harness/instructions/compactor.py 的 _estimate_text_tokens 保持一致
+    口径与 harness/state/context_pipeline.py 的 estimate_tokens 保持一致
     （中文约 1.5 字/token，英文与符号约 4 字/token），避免两处估算漂移。
     """
     if not text:

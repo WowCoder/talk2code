@@ -2,7 +2,7 @@
 """
 ContextPipeline —— 短期记忆 v2 的上下文管线（L0–L5）
 
-取代旧的 ContextCompactor（P0–P3 分层压缩）。设计原则见
+取代旧的分层压缩器（已移除）。设计原则见
 docs/design/context-pipeline-v2.md：
 
 - 按可重建性分类：文件内容（read_file 结果）可随时重读 → 允许遮蔽/卸载；
@@ -40,7 +40,7 @@ _EXCLUDE_PREFIXES = (
 def estimate_tokens(text: str) -> int:
     """粗略估算 token 数（中英文字符分段加权，避免中文低估约 50%）。
 
-    与旧 ContextCompactor._estimate_text_tokens 同口径，保证预算判断一致。
+    与预算判断口径一致（中英文字符分段加权），避免两处估算漂移。
     """
     if not text:
         return 0
@@ -107,9 +107,9 @@ def _extract_symbol_summary(body: str) -> str:
 
 
 def _local_summary(text: str) -> str:
-    """L5 本地抽取式摘要（不调 LLM，零成本；真实 LLM 摘要在 T6 接入）。
+    """L5 本地抽取式摘要（不调 LLM，零成本）。
 
-    与旧 ContextCompactor._generate_summary_stub 同思路：提取文件操作 / 错误 / 修复线索。
+    提取文件操作 / 错误 / 修复线索。
     """
     key = []
     for line in text.splitlines():
