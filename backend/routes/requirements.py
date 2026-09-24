@@ -296,7 +296,6 @@ def chat_with_requirement(req_id):
     from harness.state.versioning import GitVersioning
     from harness.tools.registry import create_tool_registry
     from harness.constraints.hooks import create_default_hook_manager
-    from harness.instructions.compactor import ContextCompactor
     from harness.observability.sse_reporter import SSEReporter
     from harness.observability.tracer import Tracer
     from harness.observability.cost import CostTracker
@@ -853,9 +852,11 @@ def sse_stream(req_id):
             return jsonify({'error': '需求不存在'}), 404
 
     import queue
+    import time
 
     client_queue = queue.Queue()
     client_id = str(req_id)
+    sse_started_at = time.time()
 
     # 添加到 SSE 管理器
     sse_manager.add_client(client_id, client_queue)
@@ -869,12 +870,20 @@ def sse_stream(req_id):
             # 持续监听队列中的消息
             while True:
                 try:
-                    message = client_queue.get(timeout=30)
+                    message = client_queue.get(timeout=15)
                     if message is None:
                         break
                     yield message
                 except queue.Empty:
-                    yield ': heartbeat\n\n'
+                    # 真实心跳**事件**（而非 SSE 注释行 ': heartbeat'）：LLM 请求可能挂起
+                    # 60~150 秒且期间无任何业务事件，注释行只维持连接、前端收不到，
+                    # 用户只能猜「是不是卡住了」（req 146 实测静默 4 分钟）。
+                    # 用命名事件发送：前端的 onmessage 只收无名事件，不会干扰既有逻辑。
+                    yield SSEMessage.format_event('heartbeat', {
+                        'requirement_id': req_id,
+                        'elapsed_s': int(time.time() - sse_started_at),
+                        'timestamp': get_current_timestamp(),
+                    })
         except GeneratorExit:
             logger.debug(f"SSE 客户端断开：client_id={client_id}")
         finally:
