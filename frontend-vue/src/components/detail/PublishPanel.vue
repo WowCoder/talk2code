@@ -15,10 +15,6 @@
         <div class="pc-skel skel-short"></div>
         <div class="pc-skel-url"></div>
         <button class="btn-publish" disabled>查询中…</button>
-        <div class="pc-foot-hint">
-          <strong>为什么要有这个加载态</strong>
-          <p>进入 TAB 时会向后端查询当前需求是否有已发布记录：404 → 未发布；200 → 切换为「已发布」状态。整个查询耗时 &lt; 100ms，骨架屏只在弱网下短暂可见。</p>
-        </div>
       </div>
     </div>
 
@@ -109,24 +105,18 @@
         <div class="pc-meta-card">
           <span class="pc-dot ready"></span>
           <span class="pc-meta-ready">代码已就绪，可发布</span>
-          <span class="pc-meta-sub">index.html · 3 个资源</span>
+          <span v-if="assetSummary" class="pc-meta-sub">{{ assetSummary }}</span>
         </div>
         <button class="btn-publish" :disabled="publishing || !reqId" @click="onPublish">
           {{ publishing ? '发布中…' : '发布此需求' }}
         </button>
         <p class="pc-tip">发布后会得到一个可分享的链接，访问者无需登录即可打开。</p>
-        <div class="pc-foot-hint">
-          <strong>发布后你会得到</strong>
-          <p>· 一个 &lt;slug&gt;.&lt;apex&gt; 形式的可分享链接</p>
-          <p>· 每次重新发布：URL 不变、版本号 +1</p>
-          <p>· 取消发布会移除访问入口（产物保留）</p>
-        </div>
       </div>
     </div>
 
     <!-- 全局动作错误（发布/取消失败） -->
     <p v-if="error" class="publish-error">{{ error }}</p>
-    <!-- 首屏拉取错误（非 404 的真错误；404 走「未发布」分支） -->
+    <!-- 首屏拉取错误（by-requirement 恒定 200，故这里只可能是网络/服务/JWT 类真错误） -->
     <p v-if="loadError" class="publish-error">{{ loadError }}</p>
     <!-- 后端返回的 warnings（域名未配置等）：与设计稿 D 态警示框互补，不重复渲染 -->
     <ul v-if="warnings.length" class="publish-warnings">
@@ -190,6 +180,18 @@ const isPublishedButUnavailable = computed(
 )
 
 const warnings = computed(() => result.value?.warnings ?? [])
+
+// 「index.html · 共 N 个文件」：按需求实际的代码文件数算。
+// 此前这一行是硬编码的「index.html · 3 个资源」——文件数不是 3 时就是在给用户
+// 报错误信息，且「资源」与「文件」含义含混。无文件时不渲染这一行。
+const assetSummary = computed(() => {
+  const files = store.currentRequirement?.code_files ?? []
+  if (!files.length) return ''
+  const entry = files.some((f) => f.filename === 'index.html')
+    ? 'index.html'
+    : files[0].filename
+  return `${entry} · 共 ${files.length} 个文件`
+})
 
 // 进入 TAB 时拉一次发布状态：解决「刷新后只剩一个发布按钮」的持久化问题。
 // 后端 by-requirement 永远返回 200 —— `published: false` 表示「未发布 / 不属于我 / 不存在」，
@@ -568,30 +570,6 @@ async function copyUrl() {
   border-radius: 8px;
   background: #f5f5f5;
   border: 1px solid #eaeaea;
-}
-
-/* ===== 底部说明框（解释性 footer，复用 .pc-meta-card 的视觉风格）===== */
-.pc-foot-hint {
-  padding: 10px 12px;
-  border-radius: 6px;
-  background: #fafafa;
-  border: 1px solid var(--border);
-  font-size: 12px;
-}
-.pc-foot-hint strong {
-  display: block;
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  margin-bottom: 6px;
-}
-.pc-foot-hint p {
-  margin: 4px 0 0;
-  font-size: 12px;
-  color: var(--fg);
-  line-height: 1.6;
 }
 
 /* ===== 全局错误 ===== */

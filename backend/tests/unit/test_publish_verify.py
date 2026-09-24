@@ -8,13 +8,17 @@
 - unverified : 未配置 apex（Host 路由未启用），无法对线上 URL 复验
 - 非法 slug  → 返回 None（不写库）
 
-另含两条回归（都是「静默判 degraded / 静默打不开」型缺陷）：
+另含四条回归（都是「静默判 degraded / 静默打不开 / 静默阻塞」型缺陷）：
 - 复验 URL 必须与展示链接同源（协议/端口来自配置），不得硬编码 https
 - 复验必须能取到站点当前的 bundle hash（历史缺陷：调用了不存在的
   ``_current_hash()``，NameError 被 except 吞掉 → 每次复验恒判 degraded）
+- AC 脚本缓存必须按「验收同源」的路径与形状读取（否则 AC 被静默跳过）
+- 复验必须异步：schedule 立即返回；同 slug 去重；异常路径也要释放闸门
 """
 import shutil
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -201,3 +205,139 @@ def test_load_ac_scripts_tolerates_bad_cache(tmp_path, monkeypatch):
 def test_load_ac_scripts_empty_without_ids():
     assert verify_mod._load_ac_scripts(None, None) == []
     assert verify_mod._load_ac_scripts(1, None) == []
+
+
+# ---------------------------------------------------------------------------
+# 回归 4：复验不得阻塞发布请求（异步调度 + 同 slug 去重 + 闸门必释放）
+#   历史缺陷：复验在 POST /api/publish 的请求线程里同步跑（Chromium smoke +
+#   AC + same-origin，单次 15s 起、带 AC 更久）→ 接口长时间不返回，前端先
+#   超时报错，而站点其实已经发布。「界面报错但站点已发布」是最难排查的一类
+#   状态，因为两端各自都「对」。
+# ---------------------------------------------------------------------------
+def _wait_gate_free(slug, timeout=5.0):
+    """等 _scheduled_verify 的 finally 把闸门释放掉（避免测试间互相污染）。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with verify_mod._verify_lock:
+            if slug not in verify_mod._verify_inflight:
+                return True
+        time.sleep(0.01)
+    return False
+
+
+def test_schedule_verify_invalid_slug_returns_false():
+    """非法 slug 不进线程、不写库。"""
+    assert verify_mod.schedule_publish_verify("not-a-valid-slug", "abc") is False
+
+
+def test_publish_verify_async_is_the_default():
+    """默认必须异步。这个开关一旦被翻成 False，发布接口又会等 Chromium。"""
+    assert settings.PUBLISH_VERIFY_ASYNC is True
+
+
+def test_schedule_verify_returns_immediately(monkeypatch):
+    """核心断言：复验再慢，schedule 也必须立刻返回。"""
+    slug = new_slug()
+    monkeypatch.setattr(settings, "PUBLISH_APEX", "publish.test")
+    release = threading.Event()
+
+    def _slow_verification(*a, **k):
+        release.wait(5)
+        return True
+
+    monkeypatch.setattr(verify_mod, "_run_verification", _slow_verification)
+    monkeypatch.setattr(verify_mod, "_write_status", lambda s, st: None)
+
+    t0 = time.monotonic()
+    assert verify_mod.schedule_publish_verify(slug, "abc") is True
+    elapsed = time.monotonic() - t0
+    assert elapsed < 1.0, f"schedule 阻塞了 {elapsed:.2f}s，复验跑回了请求线程"
+
+    release.set()
+    assert _wait_gate_free(slug)
+
+
+def test_schedule_verify_writes_status_in_background(monkeypatch):
+    """后台跑完要把结论写回（ok / degraded 由 decide 决定）。"""
+    slug = new_slug()
+    monkeypatch.setattr(settings, "PUBLISH_APEX", "publish.test")
+    monkeypatch.setattr(verify_mod, "_run_verification", lambda *a, **k: True)
+    written = {}
+    done = threading.Event()
+
+    def _capture(s, status):
+        written["slug"], written["status"] = s, status
+        done.set()
+
+    monkeypatch.setattr(verify_mod, "_write_status", _capture)
+
+    assert verify_mod.schedule_publish_verify(slug, "abc") is True
+    assert done.wait(5), "后台复验未写回状态"
+    assert written == {"slug": slug, "status": "ok"}
+    assert _wait_gate_free(slug)
+
+
+def test_schedule_verify_dedupes_same_slug_inflight(monkeypatch):
+    """同一 slug 连点「重新发布」不得叠起多个 Chromium 会话。"""
+    slug = new_slug()
+    monkeypatch.setattr(settings, "PUBLISH_APEX", "publish.test")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _slow_verification(*a, **k):
+        entered.set()
+        release.wait(5)
+        return True
+
+    monkeypatch.setattr(verify_mod, "_run_verification", _slow_verification)
+    monkeypatch.setattr(verify_mod, "_write_status", lambda s, st: None)
+
+    try:
+        assert verify_mod.schedule_publish_verify(slug, "abc") is True
+        assert entered.wait(5), "第一个复验没进 _run_verification"
+        # 在跑期间重复调度 → 拒绝，不产生第二个会话
+        assert verify_mod.schedule_publish_verify(slug, "abc") is False
+    finally:
+        release.set()
+        assert _wait_gate_free(slug)
+    # 闸门释放后可正常再调度
+    assert verify_mod.schedule_publish_verify(slug, "abc") is True
+    release.set()
+    assert _wait_gate_free(slug)
+
+
+def test_scheduled_verify_inner_failure_is_degraded(monkeypatch):
+    """_run_verification 抛异常 → 由 decide 兜成 degraded（安全默认）。"""
+    slug = new_slug()
+    monkeypatch.setattr(settings, "PUBLISH_APEX", "publish.test")
+
+    def _boom(*a, **k):
+        raise RuntimeError("chromium died")
+
+    monkeypatch.setattr(verify_mod, "_run_verification", _boom)
+    written = []
+    monkeypatch.setattr(verify_mod, "_write_status", lambda s, st: written.append(st))
+
+    assert verify_mod.schedule_publish_verify(slug, "abc") is True
+    assert _wait_gate_free(slug)
+    assert written == ["degraded"]
+
+
+def test_scheduled_verify_outer_exception_leaves_pending_and_releases_gate(monkeypatch):
+    """决策/写库本身炸了 → 状态留 pending（未知 ≠ 通过），且闸门必须释放。
+
+    这里刻意**不**再写一次 degraded：写库很可能正是失败原因，二次写入等于
+    把「库不可用」升级成第二个未捕获异常，还会把闸门永久卡住。
+    """
+    slug = new_slug()
+
+    def _boom(*a, **k):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(verify_mod, "decide_verify_status", _boom)
+    written = []
+    monkeypatch.setattr(verify_mod, "_write_status", lambda s, st: written.append(st))
+
+    assert verify_mod.schedule_publish_verify(slug, "abc") is True
+    assert _wait_gate_free(slug), "异常路径没释放闸门（后续发布将永久无法复验）"
+    assert written == []

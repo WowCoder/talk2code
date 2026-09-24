@@ -34,6 +34,10 @@ def pub_env(app_client, auth_token, monkeypatch):
     d = tempfile.mkdtemp(dir=Path(__file__).parent)
     monkeypatch.setattr(settings, "PUBLISH_APEX", "publish.test")
     monkeypatch.setattr(settings, "PUBLISH_STORE_DIR", str(Path(d) / "published"))
+    # 复验默认异步（后台线程 + 独立 DB session）；测试库是 :memory:
+    # （SingletonThreadPool 按线程分连接），异步写回既不可见也不可断言。
+    # 故这里走同步路径，与线上共用同一份 decide/write 逻辑。
+    monkeypatch.setattr(settings, "PUBLISH_VERIFY_ASYNC", False)
     # 避开 Chromium：复验恒为真
     monkeypatch.setattr(verify_mod, "_run_verification", lambda *a, **k: True)
 

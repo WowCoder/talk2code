@@ -337,6 +337,14 @@ class Settings(BaseSettings):
         default='',
         description='发布产物存储目录。空则用 BACKEND_DIR/published'
     )
+    # 复验要不要在后台线程跑。默认 True：复验要起 Chromium 跑 smoke + AC +
+    # same-origin 探针，单次 15s 起、带 AC 更久；同步跑在 POST /api/publish 的
+    # 请求线程里会让接口长时间不返回（前端可能先超时报错，而站点其实已经发布）。
+    # 置 False 只在测试里用（同步返回便于断言 verify_status）。
+    PUBLISH_VERIFY_ASYNC: bool = Field(
+        default=True,
+        description='发布后复验是否异步执行（False=在发布请求线程内同步跑，仅测试用）'
+    )
 
     @property
     def PUBLISH_STORE_PATH(self) -> Path:

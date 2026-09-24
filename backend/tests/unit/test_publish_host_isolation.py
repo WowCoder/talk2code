@@ -67,6 +67,9 @@ def host_env(app_client, auth_token, monkeypatch):
     monkeypatch.setattr(settings, "PUBLISH_URL_SCHEME", "https")
     monkeypatch.setattr(settings, "PUBLISH_URL_PORT", "")
     monkeypatch.setattr(settings, "PUBLISH_STORE_DIR", str(Path(d) / "published"))
+    # 复验在线上是后台线程（发布接口不等它）；单测要断言响应体里的
+    # verify_status，故走同步路径 —— 与线上共用同一份 decide/write 逻辑。
+    monkeypatch.setattr(settings, "PUBLISH_VERIFY_ASYNC", False)
     # 真浏览器复验需要能访问 <slug>.<apex>，单测里不存在，故直接放行
     monkeypatch.setattr(verify_mod, "_run_verification", lambda *a, **k: True)
 
@@ -190,6 +193,8 @@ def test_publish_warns_when_apex_missing(app_client, auth_token, monkeypatch):
     d = tempfile.mkdtemp(dir=Path(__file__).parent)
     monkeypatch.setattr(settings, "PUBLISH_APEX", "")
     monkeypatch.setattr(settings, "PUBLISH_STORE_DIR", str(Path(d) / "published"))
+    # 同上：断言响应体 → 走同步复验路径
+    monkeypatch.setattr(settings, "PUBLISH_VERIFY_ASYNC", False)
 
     req_id = _fresh_requirement()
     try:

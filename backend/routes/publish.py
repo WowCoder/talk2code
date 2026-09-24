@@ -7,6 +7,7 @@ Ship C 复验通过 PublishService.publish(on_published=...) 解耦触发。
 """
 from flask import jsonify, request
 from flask_jwt_extended import jwt_required, get_jwt_identity
+from config import settings
 from factory import app, logger
 from utils.db import get_db, transactional_db
 
@@ -162,12 +163,23 @@ def publish_info(slug: str):
 def _trigger_publish_verify(slug: str, content_hash: str):
     """Ship C 复验触发（设计 §5.3）。
 
-    解耦：发布主流程不依赖 Chromium 是否可用。具体复验实现见
-    services/publish/verify.py；若未实现或环境不可用，记录日志后由
-    复验服务自身把站点标 degraded / unverified，不在此处阻断发布。
+    解耦：发布主流程不依赖 Chromium 是否可用，也不等复验跑完。具体复验实现见
+    services/publish/verify.py；若环境不可用，复验服务自身把站点标 degraded /
+    留 pending，不在此处阻断发布。
+
+    默认异步（``PUBLISH_VERIFY_ASYNC``）：复验要起 Chromium，单次 15s 起、
+    带 AC 更久；同步跑在发布请求线程里会让 POST /api/publish 长时间不返回，
+    前端超时报错而站点其实已发布。测试里置 False 走同步路径，便于断言。
     """
     try:
-        from services.publish.verify import trigger_publish_verify
-        trigger_publish_verify(slug, content_hash)
+        from services.publish.verify import (
+            schedule_publish_verify,
+            trigger_publish_verify,
+        )
+
+        if settings.PUBLISH_VERIFY_ASYNC:
+            schedule_publish_verify(slug, content_hash)
+        else:
+            trigger_publish_verify(slug, content_hash)
     except Exception as e:  # 复验失败不阻断发布
         logger.warning(f"发布后复验触发失败（已放行发布）: slug={slug} err={e}")

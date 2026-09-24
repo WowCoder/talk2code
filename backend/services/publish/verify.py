@@ -9,6 +9,7 @@
 - ok         : smoke + AC + same-origin 全部通过
 - degraded   : 任一失败 / 复验过程异常（安全默认：绝不谎报成功）
 - unverified : 未配置 apex（Host 路由未启用），无法对线上 URL 复验
+- pending    : 刚发布，异步复验尚未写回（发布接口不再等复验）
 
 两个易错前提，动这块代码前先读：
 1. 复验的线上 URL 一律取 ``services.publish.urls.published_url()``，不要自行拼接
@@ -22,6 +23,7 @@ Chromium 实际跑在 Leon 本机 / CI；单测通过 monkeypatch _run_verificat
 """
 import datetime
 import tempfile
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -37,6 +39,12 @@ from services.publish.urls import published_url
 # 的上界，外层隔离线程再留余量（同 preview_runner 的 watchdog 取值思路）。
 SAME_ORIGIN_TIMEOUT_MS = 15_000
 SAME_ORIGIN_BUDGET_S = SAME_ORIGIN_TIMEOUT_MS / 1000.0 + 10.0
+
+# 同一 slug 同时只允许一个复验在跑。
+# 复验要起一个 Chromium 会话（内存 + 秒级耗时），而「重新发布」可以连点：
+# 不设闸门时并发会话会互相抢资源，且后写库的结果未必对应最新那次发布。
+_verify_inflight: set = set()
+_verify_lock = threading.Lock()
 
 
 def _write_status(slug: str, status: str) -> None:
@@ -73,7 +81,11 @@ def decide_verify_status(slug: str, content_hash: str) -> Optional[str]:
 
 
 def trigger_publish_verify(slug: str, content_hash: str) -> None:
-    """Ship C 入口：由 PublishService.publish(on_published=...) 调用。
+    """Ship C 同步入口：跑完复验并把结论写库后才返回。
+
+    只在 ``PUBLISH_VERIFY_ASYNC=False``（测试）时被路由层调用；线上走
+    :func:`schedule_publish_verify`，否则 Chromium 复验（15s 起）会卡住
+    POST /api/publish 的请求线程。
 
     content_hash 当前未直接用于复验（站点以 slug 寻址），保留参数以对齐调用约定。
     """
@@ -82,6 +94,55 @@ def trigger_publish_verify(slug: str, content_hash: str) -> None:
         logger.warning(f"发布复验收到非法 slug，跳过: {slug}")
         return
     _write_status(slug, status)
+
+
+def schedule_publish_verify(slug: str, content_hash: str) -> bool:
+    """异步入口：起一个守护线程跑复验，立即返回。
+
+    为什么必须异步：复验要起 Chromium 跑 smoke + AC + same-origin 探针，
+    单次 15s 起、带 AC 更久。同步跑在 POST /api/publish 的请求线程里会让
+    发布会上限直接等于复验耗时——前端先超时报错、用户以为发布失败，而站点
+    其实已经落盘可访问（「界面报错但站点已发布」，最难排查的一类状态）。
+    异步化后发布接口立即返回，``verify_status`` 先落在 ``pending``，复验结束
+    再写回 ``ok`` / ``degraded``（该字段不渲染给用户，供排障用）。
+
+    Returns:
+        True  = 已安排复验；False = 非法 slug 或该 slug 已有复验在跑。
+    """
+    if not is_valid_slug(slug):
+        logger.warning(f"发布复验收到非法 slug，跳过: {slug}")
+        return False
+    with _verify_lock:
+        if slug in _verify_inflight:
+            return False
+        _verify_inflight.add(slug)
+
+    t = threading.Thread(
+        target=_scheduled_verify,
+        args=(slug, content_hash),
+        name=f"publish-verify-{slug[:8]}",
+        daemon=True,
+    )
+    t.start()
+    return True
+
+
+def _scheduled_verify(slug: str, content_hash: str) -> None:
+    """守护线程主体：任何异常都不得逃逸，且必须把闸门释放掉。
+
+    异常路径刻意**不**写 degraded，只记日志：写库本身可能就是失败原因，
+    再写一次等于把「库不可用」变成第二个未捕获异常。验证状态留在
+    ``pending`` 是诚实的（未知 ≠ 通过），不会谎报成功。
+    """
+    try:
+        status = decide_verify_status(slug, content_hash)
+        if status is not None:
+            _write_status(slug, status)
+    except Exception as e:
+        logger.warning(f"发布复验后台执行异常（状态留 pending）: slug={slug} err={e}")
+    finally:
+        with _verify_lock:
+            _verify_inflight.discard(slug)
 
 
 def _current_hash_for_slug(slug: str) -> Optional[str]:
