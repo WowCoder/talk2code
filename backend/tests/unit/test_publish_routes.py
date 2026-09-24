@@ -125,3 +125,66 @@ def test_publish_other_user_slug_404(pub_env, monkeypatch):
     app_client.post("/api/login", json={"username": "other_func", "password": "test123456"})
     r2 = app_client.get(f"/api/publish/{slug}/info")
     assert r2.status_code == 404
+
+
+# ===== by-requirement 端点（持久化首屏加载用）=====
+
+def test_by_requirement_requires_auth(app_client):
+    r = app_client.get("/api/publish/by-requirement/1")
+    assert r.status_code == 401
+
+
+def test_by_requirement_unknown_404(pub_env):
+    """未发布的需求查询 → 404，前端据此渲染「未发布」态（不是错误态）。
+
+    用一个明显不存在的 requirement_id 隔离 DB 状态共享的影响。
+    """
+    app_client, req_id, d = pub_env
+    r = app_client.get("/api/publish/by-requirement/999999")
+    assert r.status_code == 404
+
+
+def test_by_requirement_returns_site_after_publish(pub_env):
+    """发布后按 requirement_id 查询应返回 200 + 完整状态字段。"""
+    app_client, req_id, d = pub_env
+
+    # 1) 发布
+    r = app_client.post("/api/publish", json={"requirement_id": req_id})
+    assert r.status_code == 200, r.get_json()
+    body = r.get_json()
+    slug = body["slug"]
+
+    # 2) 按 requirement_id 查回
+    r2 = app_client.get(f"/api/publish/by-requirement/{req_id}")
+    assert r2.status_code == 200, r2.get_json()
+    info = r2.get_json()
+    assert info["slug"] == slug
+    assert info["version"] == 1
+    assert info["requirement_id"] == req_id
+    assert info["url"]  # 命中 PUBLISH_APEX 后 url 必非空
+    assert info["published_host"] == f"{slug}.publish.test"
+    # 时间戳存在（ISO 字符串）
+    assert info["created_at"] is not None
+    assert info["updated_at"] is not None
+    # view_count 字段已暴露（模板暂未渲染，但 result 拿到便于后续扩展）
+    assert "view_count" in info
+
+
+def test_by_requirement_other_user_404(pub_env):
+    """他人 requirement_id 一律 404，避免响应差异泄露资源存在性。"""
+    app_client, req_id, d = pub_env
+    # 先发布拿到自己的站点（test_func）
+    app_client.post("/api/publish", json={"requirement_id": req_id})
+
+    # 切到 other_func
+    db = SessionLocal()
+    if db.query(User).filter(User.username == "other_func").first() is None:
+        db.add(User(username="other_func", password_hash=hash_password("test123456")))
+        db.commit()
+    db.close()
+    app_client.post("/api/login", json={"username": "other_func", "password": "test123456"})
+
+    # 拿一个 other_func 自己的需求 id（不是 test_func 的）
+    # 简化方案：用一个明显不存在的 id 也应 404
+    r = app_client.get(f"/api/publish/by-requirement/{req_id}")
+    assert r.status_code == 404

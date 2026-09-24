@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """已发布站点 Host 路由（plan B8）：按 Host 头把 <slug>.<APEX> 解析到静态产物。
 
-用 before_request 短路：仅当请求 Host 命中 apex 时才接管，否则 return None
-让正常 /api 路由继续，避免与既有路由冲突。
+用 before_request 短路：仅当请求 Host 是**合法 slug 形态**的子域时才接管，
+否则 return None 让正常 /api 路由与主站 SPA 继续，避免与既有路由冲突
+（尤其不能让主站的 www.<APEX> 被当成发布站点）。
 安全红线（设计 §6）：
 - 独立 apex（不承载主站 cookie）
 - 每站点独占 origin（<slug>.apex 硬要求）
@@ -17,6 +18,7 @@ from config import settings
 
 from models.models import PublishedSite
 from utils.db import get_db
+from services.publish.bundle import is_internal_path
 from services.publish.slug import is_valid_slug
 from services.publish.store import LocalFSStore, StoreError
 
@@ -39,12 +41,21 @@ def _published_site_host_route():
         return None
 
     slug = host[:-len(suffix)].upper()
-    if not slug or not is_valid_slug(slug):
-        abort(404)
+    if not is_valid_slug(slug):
+        # 不是 slug 形态的子域（www / blog / api …）一律交回正常路由。
+        # ⚠️ 这里**不能** abort(404)：主站自己也常挂在 www.<apex> 上，
+        # 而 www.<apex> 同样以 .<apex> 结尾，硬 404 会在配置 PUBLISH_APEX
+        # 之后把主站打成 404。slug 是 20 位 Crockford Base32，不会与
+        # www 这类常规子域碰撞，因此按形态区分是安全的。
+        return None
 
     filepath = request.path.lstrip('/') or 'index.html'
     if filepath.startswith('/') or '..' in filepath or filepath.startswith('~'):
         abort(403)
+    # 平台内部文件（.task/ 等）不对公网提供。打包侧已过滤，这里再挡一次：
+    # 修复前发布的产物目录里已经躺着 .task/TASK_STATE.md 等文件。
+    if is_internal_path(filepath):
+        abort(404)
 
     with get_db() as db:
         site = db.query(PublishedSite).filter_by(slug=slug).first()
@@ -52,6 +63,14 @@ def _published_site_host_route():
             abort(404)
         content_hash = site.current_hash
         visibility = site.visibility
+
+        # 访问计数：只在页面级请求（/ 或 index.html） +1，避免子资源
+        # （css / js / img / favicon 等）请求污染数据 —— 否则加载一个页面
+        # 会触发 5~6 次 +1，view_count 完全失去参考价值。
+        # 顺带：同 session 内 commit，避免单独开 db 上下文的多余连接开销。
+        if filepath in ('index.html', '', '/'):
+            site.view_count = (site.view_count or 0) + 1
+            db.commit()
 
     try:
         data = _store().get(content_hash, filepath)

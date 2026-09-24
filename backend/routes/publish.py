@@ -9,18 +9,27 @@ from flask import jsonify, request
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from factory import app, logger
 from utils.db import get_db, transactional_db
-from config import settings
 
 from models.models import Requirement, PublishedSite
 from services.publish.service import PublishService, PublishError
 from services.publish.slug import is_valid_slug
+from services.publish.urls import published_host as _published_host
+from services.publish.urls import published_url as _published_url
 
 
-def _published_host(slug: str):
-    apex = settings.PUBLISH_APEX
-    if not apex:
-        return None
-    return f"{slug}.{apex}"
+def _publish_warnings(host: str | None) -> list:
+    """发布成功后仍存在的环境问题。
+
+    PUBLISH_APEX 为空时 Host 路由整体关闭：产物已落盘、站点行已建立，
+    但**没有任何可访问的公网地址**。此前这里静默返回 url=null，前端再自行
+    拼一个 nip.io 兜底，点开必然落到主站 SPA（要登录 + 首页）——用户会
+    当成「一键发布坏了」。所以必须显式告警，由前端当成阻断级提示。
+    """
+    if host:
+        return []
+    return [
+        '未配置 PUBLISH_APEX：产物已保存，但当前环境没有可访问的发布域名，链接不可用'
+    ]
 
 
 @app.route('/api/publish', methods=['POST'])
@@ -68,7 +77,8 @@ def publish_requirement():
         'verify_status': site.verify_status,
         'current_hash': site.current_hash,
         'published_host': host,
-        'url': (f"https://{host}" if host else None),
+        'url': _published_url(site.slug),
+        'warnings': _publish_warnings(host),
     }), 200
 
 
@@ -85,6 +95,49 @@ def unpublish_site(slug: str):
             return jsonify({'error': '站点不存在'}), 404
         db.delete(site)
     return jsonify({'ok': True, 'slug': slug}), 200
+
+
+@app.route('/api/publish/by-requirement/<int:requirement_id>', methods=['GET'])
+@jwt_required()
+def publish_by_requirement(requirement_id: int):
+    """按需求查询当前发布状态。
+
+    用于详情页「发布」TAB 首屏加载：刷新页面后无需依赖前端内存，
+    直接从 PublishedSite 表读取该需求最近一次发布记录。
+    不存在时返回 404（前端据此渲染「未发布」态，而非错误态）。
+
+    鉴权：要求 user_id 匹配；他人 requirement_id 一律 404
+    （避免响应差异泄露资源存在性，与 publish_info 同策略）。
+    """
+    current_user_id = int(get_jwt_identity())
+    with get_db() as db:
+        # 同一需求可能有多次发布记录，但 slug 在 PublishService.publish 内部
+        # 复用 requirement 派生 slug，所以同一用户 × 同一需求最多一条；
+        # 即便理论上有重复，取最新（updated_at 最大）作为权威来源。
+        site = db.query(PublishedSite).filter_by(
+            requirement_id=requirement_id,
+            user_id=current_user_id,
+        ).order_by(PublishedSite.updated_at.desc()).first()
+        if not site:
+            return jsonify({'error': '该需求尚未发布'}), 404
+        host = _published_host(site.slug)
+        return jsonify({
+            'slug': site.slug,
+            'version': site.version,
+            'visibility': site.visibility,
+            'runtime_tier': site.runtime_tier,
+            'verify_status': site.verify_status,
+            'current_hash': site.current_hash,
+            'view_count': site.view_count,
+            'title': site.title,
+            'requirement_id': site.requirement_id,
+            'published_host': host,
+            'url': _published_url(site.slug),
+            'warnings': _publish_warnings(host),
+            'created_at': site.created_at.isoformat() if site.created_at else None,
+            'updated_at': site.updated_at.isoformat() if site.updated_at else None,
+            'verified_at': site.verified_at.isoformat() if site.verified_at else None,
+        }), 200
 
 
 @app.route('/api/publish/<slug>/info', methods=['GET'])
@@ -109,6 +162,8 @@ def publish_info(slug: str):
             'title': site.title,
             'requirement_id': site.requirement_id,
             'published_host': _published_host(site.slug),
+            'url': _published_url(site.slug),
+            'warnings': _publish_warnings(_published_host(site.slug)),
             'created_at': site.created_at.isoformat() if site.created_at else None,
             'updated_at': site.updated_at.isoformat() if site.updated_at else None,
             'verified_at': site.verified_at.isoformat() if site.verified_at else None,
