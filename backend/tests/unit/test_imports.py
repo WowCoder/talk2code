@@ -147,7 +147,7 @@ class TestProjectImportsClean:
         # 验证模板加载（coder_base.md 统一模板）
         result = load_prompt_template("coding/coder_base.md",
             requirement="test", plan_section="", api_contracts="",
-            file_hint="", batch_hint="",
-            existing_text="", craft_rules="", environment_contract="",
+            file_hint="", first_round_section="",
+            existing_text="", task_state="", craft_rules="", environment_contract="",
             mode_section="", max_repair_rounds=2)
         assert "test" in result

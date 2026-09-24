@@ -47,7 +47,6 @@ def create_harness(requirement_id: int, user_id: int, db_session=None):
     from harness.state.memory import MemoryManager
     from harness.tools.registry import create_tool_registry
     from harness.constraints.hooks import create_default_hook_manager
-    from harness.instructions.compactor import ContextCompactor
     from harness.observability.tracer import Tracer
     from harness.observability.cost import CostTracker
     from llm.client import get_client
@@ -58,7 +57,6 @@ def create_harness(requirement_id: int, user_id: int, db_session=None):
     hooks = create_default_hook_manager()
     checkpoint = CheckpointManager(db_session=db_session)
     memory_manager = MemoryManager(llm_client=get_client())
-    compactor = ContextCompactor()
     cost_tracker = CostTracker()
     tracer = Tracer(db_session=db_session, cost_tracker=cost_tracker)
 
@@ -69,7 +67,6 @@ def create_harness(requirement_id: int, user_id: int, db_session=None):
         "hooks": hooks,
         "checkpoint": checkpoint,
         "memory_manager": memory_manager,
-        "compactor": compactor,
         "tracer": tracer,
         "cost_tracker": cost_tracker,
     }

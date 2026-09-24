@@ -60,8 +60,9 @@ def load_prompt(rel_path: str) -> str:
 
 TEMPLATES: dict[str, list[str]] = {
     "coding/coder_base.md": [
-        "requirement", "plan_section", "api_contracts", "file_hint", "batch_hint",
-        "existing_text", "craft_rules", "environment_contract",
+        "requirement", "plan_section", "api_contracts", "file_hint",
+        "existing_text", "task_state", "first_round_section",
+        "craft_rules", "environment_contract",
         "mode_section", "max_repair_rounds",
     ],
     "coding/tl_analysis.md": ["environment_contract"],
@@ -77,7 +78,7 @@ TEMPLATES: dict[str, list[str]] = {
     ],
     "memory/consolidate_prompt.md": ["memories"],
     "memory/verify_prompt.md": ["query", "candidates"],
-    "verify/ac_translator.md": ["selector_text", "ac_text"],
+    "verify/ac_translator.md": ["selector_text", "ac_text", "render_info"],
 }
 
 

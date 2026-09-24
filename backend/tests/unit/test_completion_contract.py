@@ -9,10 +9,8 @@ from unittest.mock import Mock, MagicMock, patch
 
 from harness.constraints.completion_contract import CompletionContract
 from harness.constraints.progress_hooks import (
-    block_unnecessary_read,
     block_premature_completion,
     track_write_success,
-    READ_BLOCK_WINDOW,
 )
 from harness.constraints.hooks import HookContext
 
@@ -270,76 +268,6 @@ class TestCompletionContract:
 
 # ==================== Progress Hooks ====================
 
-class TestBlockUnnecessaryRead:
-    """block_unnecessary_read Hook 测试"""
-
-    def test_blocks_read_within_window(self):
-        """写入后 1 轮内阻断 read_file"""
-        ctx = HookContext(
-            requirement_id=1,
-            tool_name="read_file",
-            tool_args={"filename": "js/app.js"},
-            state={
-                "tool_call_count": 3,
-                "_recent_writes": {"js/app.js": 2},  # 上一轮写入
-            }
-        )
-        result = block_unnecessary_read(ctx)
-        assert result is not None
-        assert "js/app.js" in result
-        assert "禁止 read_file" in result
-
-    def test_allows_read_after_window(self):
-        """写入后超过 2 轮允许 read_file"""
-        ctx = HookContext(
-            requirement_id=1,
-            tool_name="read_file",
-            tool_args={"filename": "js/app.js"},
-            state={
-                "tool_call_count": 6,
-                "_recent_writes": {"js/app.js": 2},  # 间隔 4 轮
-            }
-        )
-        result = block_unnecessary_read(ctx)
-        assert result is None  # 允许通过
-
-    def test_allows_read_unrelated_file(self):
-        """读取非刚写入的文件允许通过"""
-        ctx = HookContext(
-            requirement_id=1,
-            tool_name="read_file",
-            tool_args={"filename": "js/game.js"},
-            state={
-                "tool_call_count": 5,
-                "_recent_writes": {"js/app.js": 4},  # 不同的文件
-            }
-        )
-        result = block_unnecessary_read(ctx)
-        assert result is None
-
-    def test_no_recent_writes_allows_pass(self):
-        """没有最近写入记录时允许通过"""
-        ctx = HookContext(
-            requirement_id=1,
-            tool_name="read_file",
-            tool_args={"filename": "js/app.js"},
-            state={}
-        )
-        result = block_unnecessary_read(ctx)
-        assert result is None
-
-    def test_non_read_tool_ignored(self):
-        """非 read_file 工具直接忽略"""
-        ctx = HookContext(
-            requirement_id=1,
-            tool_name="write_file",
-            tool_args={"filename": "js/app.js"},
-            state={"_recent_writes": {"js/app.js": 1}}
-        )
-        result = block_unnecessary_read(ctx)
-        assert result is None
-
-
 class TestBlockPrematureCompletion:
     """block_premature_completion Hook 测试"""
 
@@ -416,10 +344,10 @@ class TestBlockPrematureCompletion:
 
 
 class TestTrackWriteSuccess:
-    """track_write_success Hook 测试"""
+    """track_write_success Hook 测试（write 成功后静默更新 contract）"""
 
-    def test_tracks_write_to_recent_writes(self):
-        """write_file 成功后追踪到 _recent_writes"""
+    def test_silent_on_success_without_contract(self):
+        """无 contract 时静默通过，不阻断、不写 _recent_writes"""
         ctx = HookContext(
             requirement_id=1,
             tool_name="write_file",
@@ -429,8 +357,7 @@ class TestTrackWriteSuccess:
         )
         result = track_write_success(ctx)
         assert result is None  # 静默通过
-
-        assert ctx.state["_recent_writes"]["js/app.js"] == 3
+        assert "_recent_writes" not in ctx.state
 
     def test_non_write_tool_ignored(self):
         """非 write_file 工具跳过"""

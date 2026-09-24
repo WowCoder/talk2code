@@ -27,6 +27,8 @@ class ToolCallLoop:
 
     MAX_ITERATIONS = 15
     NO_PROGRESS_LIMIT = 5  # 连续无进展轮次限制
+    # 自修复保底：预算将尽且手上有确定性运行时错误时，一次性追加的轮数
+    SELF_REPAIR_EXTRA_ITERATIONS = 3
 
     def __init__(self, workspace, git=None, tools: ToolRegistry = None,
                  hooks=None, tracer=None, cost_tracker=None, sse_reporter=None,
@@ -97,6 +99,22 @@ class ToolCallLoop:
         # 用 while 循环（而非 for range）：允许 edit_file 失败后动态 +2 轮回退
         iteration = 0
         while iteration < effective_max_iterations:
+            # 自修复保底（req 147）：预算将尽但 Agent 手上还压着一个确定性的运行时错误
+            # （如 run_preview 报的 pageerror）→ 一次性追加若干轮让它把错误修掉。
+            # 只追加一次，避免把"迭代上限"退化成"无上限"。
+            if (
+                effective_max_iterations - iteration <= 1
+                and state.get("_deterministic_error_pending")
+                and not state.get("_self_repair_extended")
+            ):
+                state["_self_repair_extended"] = True
+                state["_deterministic_error_pending"] = False
+                effective_max_iterations += self.SELF_REPAIR_EXTRA_ITERATIONS
+                logger.info(
+                    f"[ToolLoop] 检测到未修复的确定性运行时错误，自修复保底："
+                    f"迭代预算 {effective_max_iterations - self.SELF_REPAIR_EXTRA_ITERATIONS} → "
+                    f"{effective_max_iterations}"
+                )
             state["tool_call_count"] = iteration + 1
 
             # 检查取消信号
@@ -165,6 +183,23 @@ class ToolCallLoop:
                     self.cost_tracker.record(trace_id, input_tokens, output_tokens, client.model)
                     span.metadata["tokens"] = input_tokens + output_tokens
                 self.tracer.end_span(span)
+
+            # 开发排查：记录本轮完整 LLM 请求参数与原始返回（AGENT_EXEC_LOG=1 时生效）
+            try:
+                from harness.observability import exec_log
+                exec_log.log_llm_turn(
+                    req_id, iteration + 1, getattr(client, "model", None),
+                    messages,
+                    self.tools.get_schemas() if self.tools else [],
+                    response,
+                    thinking="enabled",
+                    latency_ms=(
+                        round((span.end_time - span.start_time) * 1000, 1)
+                        if span and span.end_time else None
+                    ),
+                )
+            except Exception as _e:
+                logger.debug(f"[ExecLog] llm_turn 记录失败（不阻断）: {_e}")
 
             # 诊断日志（生产环境可关闭）
             from harness.observability.logger import get_logger
@@ -279,6 +314,13 @@ class ToolCallLoop:
             for tc in response.tool_calls:
                 result = self._execute_tool(state, tc)
                 logger.info(f"[ToolLoop] 执行 {tc.name}: success={result.success} content={result.content[:100] if result.success else ''} error={result.error[:100] if not result.success else ''}")
+
+                # 开发排查：记录工具调用入参/结果（AGENT_EXEC_LOG=1 时生效）
+                try:
+                    from harness.observability import exec_log
+                    exec_log.log_tool_call(req_id, iteration + 1, tc.name, tc.arguments, result)
+                except Exception as _e:
+                    logger.debug(f"[ExecLog] tool_call 记录失败（不阻断）: {_e}")
 
                 # 生成前端展示用简短标签
                 display_readable = self._tool_display_label(tc.name, tc.arguments, result)
@@ -597,6 +639,25 @@ class ToolCallLoop:
             # 回退：兼容旧的硬编码 handler_map（逐步废弃）
             result = self._execute_tool_fallback(state, tool_call)
 
+        # L2 staleness 跟踪：记录本轮文件变更 / notes 更新事件（harness 唯一介入点）。
+        try:
+            from harness.state.context_pipeline import note_task_activity
+            note_task_activity(state, tool_call.name, result.success)
+        except Exception:
+            pass
+
+        # 确定性运行时错误标记（req 147 复盘）：run_preview 抓到 pageerror 后，
+        # 迭代预算 min(文件数+3,10) 恰好在这一轮耗尽，Agent 已经读文件准备修却被强行收尾。
+        # 这里只做标记，由主循环决定是否追加预算（见 _self_repair_extension）。
+        try:
+            _err_text = "" if result.success else (result.error or "")
+            _content_text = result.content or ""
+            _blob = f"{_err_text}\n{_content_text}"
+            if any(k in _blob for k in ("pageerror", "Uncaught", "运行时错误", "控制台错误")):
+                state["_deterministic_error_pending"] = True
+        except Exception:
+            pass
+
         # 后处理 Hook
         if self.hooks:
             from harness.constraints.hooks import HookContext, HookPoint
@@ -654,8 +715,6 @@ class ToolCallLoop:
         if tool_call.name == "write_file" and result.success:
             state["_edit_fail_count"] = 0
             self._update_contract_on_write(state, tool_call.arguments)
-            # 增量更新文件摘要缓存（避免下次 _build_file_summaries 全量重建）
-            self._update_file_summary_cache(tool_call.arguments)
             # 推送任务状态更新到前端（全复杂度通用）
             if self.sse:
                 try:
@@ -756,61 +815,123 @@ class ToolCallLoop:
         ]
 
     def _build_messages(self, state: AgentState) -> list:
-        """构建 LLM 消息列表"""
-        messages = []
+        """构建 LLM 消息列表（v2：委托 ContextPipeline 做 L0/L3/L4/L5）。
 
-        # 系统提示词
+        系统提示由 _build_system_prompt 产出（记忆注入在该方法外层包装，见
+        requirement_service 的 _memory_aware_prompt，本方法不触碰其契约）。
+        """
+        # L2：run 开始播种 TASK_STATE.md（若缺失，从需求/spec 写入种子）；幂等、单次。
+        self._ensure_task_state_seed(state)
+
         system_prompt = self._build_system_prompt(state)
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
+        history = state.get("dialogue_history", [])
+        hook_failures = state.get("_recent_hook_failures", [])
+        requirement_content = state.get("requirement_content", "")
 
-        # 对话历史：先过滤掉 thinking 消息（不发给 LLM，但会占用槽位），
-        # 再截断最近 30 条有效消息（保留足够上下文避免重复 read_file）
-        all_history = state.get("dialogue_history", [])
-        relevant = [m for m in all_history if m.get("role") != "thinking"]
-        for msg in relevant[-30:]:
-            role = msg.get("role", "agent")
-            content = str(msg.get("content", ""))
-            if role == "tool_call":
-                tool_name = msg.get("name", "")
-                tool_result = msg.get("content", "")
-                # 只保留工具结果，不伪造 assistant 消息（伪造的 "已执行工具 xx"
-                # 会让 LLM 误以为已完成操作，导致跳过实际工具调用）
-                messages.append({
-                    "role": "user",
-                    "content": f"[工具 {tool_name} 返回结果]\n{tool_result}"
-                })
-            elif role in ("user", "agent", "assistant"):
-                messages.append({"role": "user" if role == "user" else "assistant", "content": content})
+        # L2 staleness 检测：基于上一轮事件评估，达到阈值则注入提醒（harness 唯一介入点）。
+        staleness_reminder = ""
+        try:
+            from harness.state.context_pipeline import evaluate_staleness
+            staleness_reminder = evaluate_staleness(state)
+        except Exception:
+            staleness_reminder = ""
 
-        # ---- 注入最近的 Hook 失败（让 LLM 看到验证错误并修复） ----
-        recent_failures = state.get("_recent_hook_failures", [])
-        if recent_failures:
-            failure_text = (
-                "## 最近验证失败（请立即修复这些问题）\n"
-                + "\n".join(f"- {f}" for f in recent_failures[-5:])
-            )
-            messages.append({"role": "user", "content": failure_text})
-            # 消费后保留一份在持久化字段中，但清空 _recent 避免重复注入
-            state["_recent_hook_failures"] = []
-
-        # ---- 分层上下文压缩（替换简单截断） ----
         # 预算从 56000 收紧到 24000：贪吃蛇实测 prompt_tokens 高达 20.9 万，
         # 主要来自每轮重发完整 plan + 文件摘要 + 最近 30 条工具结果。
-        from harness.instructions.compactor import ContextCompactor
-        compactor = ContextCompactor(budget=24000)
-        messages = compactor.maybe_compact(messages)
+        from harness.state.context_pipeline import ContextPipeline, _local_summary
+        pipeline = ContextPipeline(
+            budget=24000,
+            llm_summary=_local_summary,
+            ref_store=self._make_ref_store(),
+        )
+        history_msgs, stats = pipeline.build(
+            head_content=system_prompt or "",
+            history=history,
+            hook_failures=hook_failures,
+            requirement_content=requirement_content,
+        )
 
-        # ---- 冷启动兜底：保证至少一个 user 角色消息 ----
-        # agnes 等 OpenAI 兼容端点要求 messages 中必须含 user 角色内容，
-        # 否则返回 400 "No user query found in messages"。对话历史为空时
-        # （eval 冷启动、首轮无用户消息），需求虽已嵌进 system prompt 但仍缺
-        # user turn，这里兜底补一条。生产环境对话历史恒含 user 消息，本分支为 no-op。
-        if not any(m.get("role") == "user" for m in messages):
-            req = state.get("requirement_content", "") or "请根据以上系统提示开始任务。"
-            messages.append({"role": "user", "content": req})
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.extend(history_msgs)
 
+        # 消费 hook 失败（pipeline 已注入，清空避免重复）
+        if hook_failures:
+            state["_recent_hook_failures"] = []
+
+        # staleness 提醒追加为 user 消息（与 hook 失败同位置，下一轮 LLM 可见）
+        if staleness_reminder:
+            messages.append({"role": "user", "content": staleness_reminder})
+
+        logger.info(
+            f"[ContextPipeline] head={stats['head_tokens']} "
+            f"history={stats['history_tokens']} masked_read={stats['masked_read']} "
+            f"masked_nonfile={stats['masked_nonfile']} offloaded={stats['offloaded']} "
+            f"dropped={stats['dropped']} compacted={stats['compacted']}"
+            f"{' stale=1' if staleness_reminder else ''}"
+        )
         return messages
+
+    def _read_task_state(self) -> str:
+        """读取 .task/TASK_STATE.md 全文（不存在返回空串）。"""
+        try:
+            ws = getattr(self, "workspace", None)
+            if ws is None or not hasattr(ws, "list"):
+                return ""
+            path = ".task/TASK_STATE.md"
+            if path not in ws.list():
+                return ""
+            return ws.read(path)
+        except Exception:
+            return ""
+
+    def _ensure_task_state_seed(self, state: dict):
+        """run 开始播种 TASK_STATE.md（若缺失）：从需求 + spec 写入「目标/决策/文件状态」种子。
+
+        幂等：仅当 .task/TASK_STATE.md 不存在时写入一次。agent 之后通过 update_task_notes
+        维护它。设计文档 §3.A：spec 作种子，TASK_STATE.md 承载进度（spec 只读不写）。
+        """
+        try:
+            ws = getattr(self, "workspace", None)
+            if ws is None or not hasattr(ws, "list"):
+                return
+            path = ".task/TASK_STATE.md"
+            if path in ws.list():
+                return
+            requirement = state.get("requirement_content", "") or ""
+            plan = state.get("plan")
+            seed = [
+                "# .task/TASK_STATE.md（自动播种自需求/spec；Agent 用 update_task_notes 维护）",
+                "## 目标",
+                (requirement[:500] if requirement else "(未提供)"),
+                "## 决策与理由",
+            ]
+            if isinstance(plan, dict):
+                tasks = plan.get("tasks", [])
+                if isinstance(tasks, list):
+                    for t in tasks[:6]:
+                        if isinstance(t, dict) and t.get("description"):
+                            seed.append(f"- {str(t.get('file', ''))}: {str(t.get('description', ''))[:80]}")
+            seed += ["## 文件状态", "## 未决问题", "## 下一步"]
+            ws.write(path, "\n".join(seed) + "\n")
+        except Exception as e:
+            logger.debug(f"[TASK_STATE] 播种失败（不阻断）: {e}")
+
+    def _make_ref_store(self):
+        """非文件大结果落盘回调（写入 workspace 的 .task/refs/）。"""
+        workspace = getattr(self, "workspace", None)
+        if workspace is None or not hasattr(workspace, "write"):
+            return None
+
+        def _store(name: str, content: str):
+            try:
+                workspace.write(f".task/refs/{name}", content)
+                return f".task/refs/{name}"
+            except Exception:
+                return None
+
+        return _store
 
     def _get_craft_context(self, requirement: str = '') -> str:
         """渐进式加载 Skills，注入到编码 Prompt 中。
@@ -830,7 +951,12 @@ class ToolCallLoop:
             return ''
 
     def _build_system_prompt(self, state: AgentState) -> str:
-        """构建 Coder 系统提示词（含文件内容概要，避免 Agent 重复 read_file）
+        """构建 Coder 系统提示词（稳定前缀 + 可变尾段）
+
+        结构（§3.A）：模板骨架 / 需求 / 计划摘要 / 接口契约 = **稳定前缀**（run 内不变，
+        命中 KV-cache）；工作区文件索引 + TASK_STATE.md = **可变尾段**，放在提示词**最末**，
+        避免它们每轮变化时打断前缀缓存。文件索引给「一行结构摘要」（不含正文），
+        正文按需 just-in-time read_file。
 
         根据复杂度切换提示词策略：
         - simple:  自由文件结构，极简流程，5 轮快速通过
@@ -842,32 +968,42 @@ class ToolCallLoop:
 
         existing_files = self.workspace.list()
         existing_text = self._build_file_summaries(existing_files)
+        # L2 任务状态：把 .task/TASK_STATE.md 注入 head（可变尾段首段，每轮变）。
+        # 它不在稳定前缀内，不破坏前缀缓存；agent 通过 update_task_notes 维护它。
+        task_state = self._read_task_state()
 
         plan_section = ""
-        batch_hint = ""
+        first_round_section = ""
         if plan:
-            if state.get("tool_call_count", 1) > 1:
-                # 第 2 轮起：完整 plan 已在首轮下发，后续只保留文件清单与任务要点，
-                # 避免每轮把大段 plan JSON 重发给 LLM（实测 prompt_tokens 因此膨胀）
-                plan_text = self._compact_plan_text(plan)
-                plan_section = f"""## 实现计划（摘要）
-{plan_text}"""
-            else:
-                plan_text = json.dumps(plan, ensure_ascii=False, indent=2) if isinstance(plan, dict) else str(plan)
-                plan_section = f"""## 实现计划（请严格遵循）
-{plan_text}"""
-                # 动态生成批量创建分组提示（基于依赖关系自动分组）
+            # 稳定前缀**始终**只放计划摘要（run 内字节不变 → 命中 KV-cache）。
+            plan_section = f"""## 实现计划（摘要）
+{self._compact_plan_text(plan)}"""
+            if state.get("tool_call_count", 1) <= 1:
+                # 首轮的完整 plan + 批量分组提示放进**可变尾段**（模板最末的
+                # {first_round_section}）。这样首轮仍能看到完整规格，而稳定前缀的
+                # 字节序列在整个 run 内保持一致。
+                # 此前首轮发完整 JSON、第 2 轮改摘要 → head 从 plan 段起整段 cache miss
+                # （实测 head 5576 → 4384，且每次重入 coder 首轮都重演一次）。
+                plan_full = json.dumps(plan, ensure_ascii=False, indent=2) if isinstance(plan, dict) else str(plan)
                 batch_hint = self._generate_batch_hint(plan)
+                first_round_section = f"""## 完整实现计划（首轮下发，请严格遵循）
+{plan_full}
+
+{batch_hint}"""
 
         if complexity == "simple":
-            return self._build_simple_prompt(requirement, plan_section, existing_text, existing_files)
+            return self._build_simple_prompt(requirement, plan_section, existing_text, existing_files,
+                                             task_state=task_state,
+                                             first_round_section=first_round_section)
         else:
             # 跨文件 API 契约：从 plan.tasks[].exports 渲染，每轮都注入
             # （体积小且是硬约束，不参与第 2 轮起的 plan 摘要压缩）
             from harness.constraints.plan_validator import build_api_contracts_section
             api_contracts = build_api_contracts_section(plan if isinstance(plan, dict) else None)
-            return self._build_standard_prompt(requirement, plan_section, existing_text, existing_files, batch_hint,
-                                               api_contracts=api_contracts)
+            return self._build_standard_prompt(requirement, plan_section, existing_text, existing_files,
+                                               first_round_section=first_round_section,
+                                               api_contracts=api_contracts, task_state=task_state,
+                                               plan=plan if isinstance(plan, dict) else None)
 
     def _compact_plan_text(self, plan: dict) -> str:
         """紧凑版计划：仅保留文件清单与任务要点，用于第 2 轮起的上下文瘦身"""
@@ -1024,7 +1160,8 @@ class ToolCallLoop:
         return batches
 
     def _build_simple_prompt(self, requirement: str, plan_section: str,
-                              existing_text: str, existing_files: list) -> str:
+                              existing_text: str, existing_files: list,
+                              task_state: str = "", first_round_section: str = "") -> str:
         """simple 复杂度：自由文件结构，极简流程，5 轮快速通道"""
         from harness.instructions.prompts import load_prompt, load_prompt_template
         from harness.constraints.environment_contract import render_environment_contract
@@ -1034,8 +1171,9 @@ class ToolCallLoop:
             plan_section=plan_section,
             api_contracts="",
             file_hint="",
-            batch_hint="",
+            first_round_section=first_round_section,
             existing_text=existing_text,
+            task_state=task_state,
             craft_rules=craft_rules,
             environment_contract=render_environment_contract(),
             mode_section=load_prompt("coding/coder_mode_simple.md"),
@@ -1044,20 +1182,17 @@ class ToolCallLoop:
 
     def _build_standard_prompt(self, requirement: str, plan_section: str,
                                 existing_text: str, existing_files: list,
-                                batch_hint: str = "", api_contracts: str = "") -> str:
+                                first_round_section: str = "", api_contracts: str = "",
+                                task_state: str = "", plan: dict = None) -> str:
         """standard 复杂度：架构先导 + 批量创建 + 完整的浏览器验证"""
         from harness.instructions.prompts import load_prompt, load_prompt_template
         from harness.constraints.environment_contract import render_environment_contract
-        # 从 plan 中提取推荐的文件结构。
-        # 注意：第 2 轮起 plan_section 为紧凑摘要（非 JSON），json.loads 会失败，
-        # 此时 file_hint 留空即可（摘要已包含"目标文件"清单）。
+        # 推荐文件结构直接取自 plan 对象。
+        # 注：plan_section 现在**恒定**为紧凑摘要（非 JSON），不能再靠 json.loads 解析它，
+        # 否则 file_hint 会永久为空 —— 这是「稳定前缀只用摘要」改造的连带修正项。
         file_hint = ""
-        try:
-            plan_obj = json.loads(plan_section.split("\n", 1)[1]) if plan_section and "\n" in plan_section else {}
-        except (json.JSONDecodeError, ValueError):
-            plan_obj = {}
-        if isinstance(plan_obj, dict):
-            file_structure = plan_obj.get("file_structure", [])
+        if isinstance(plan, dict):
+            file_structure = plan.get("file_structure", [])
             if file_structure:
                 file_hint = "## 推荐文件结构\n" + "\n".join(f"- {f}" for f in file_structure)
         craft_rules = self._get_craft_context(requirement)
@@ -1066,8 +1201,9 @@ class ToolCallLoop:
             plan_section=plan_section,
             api_contracts=api_contracts,
             file_hint=file_hint,
-            batch_hint=batch_hint,
+            first_round_section=first_round_section,
             existing_text=existing_text,
+            task_state=task_state,
             craft_rules=craft_rules,
             environment_contract=render_environment_contract(),
             mode_section=load_prompt("coding/coder_mode_standard.md"),
@@ -1075,35 +1211,84 @@ class ToolCallLoop:
         )
 
     def _build_file_summaries(self, existing_files: list) -> str:
-        """为已有文件生成内容概要，让 Agent 无需 read_file 就知道文件结构
+        """工作区文件索引：每文件一行「文件名 + 一行结构摘要」（不含正文）。
 
-        优先使用增量缓存（_summary_cache），缓存未命中时才读取文件构建摘要。
+        对齐设计文档 §3.A L142：`文件名 + 一行结构摘要（不含内容）`，正文靠
+        just-in-time 的 read_file。摘要**纯规则提取**（不调 LLM）——导出符号 / 函数名 /
+        元素 id·class / CSS 选择器 / EXPORT 警告——给 Agent 一张「文件地图」。
+        早期版本只回文件名（丢了「结构摘要」），实测诱发「写完立刻回读」：
+        LLM 上下文里既没有正文（write 正文在 tool_call.arguments，被 _stage_history
+        丢弃），也没有任何结构线索，只能 read_file 找回。索引体积小、可重建，放**可变尾段**。
         """
         if not existing_files:
             return "(空目录)"
-
-        cache = getattr(self, '_summary_cache', {})
         lines = []
-        for fname in existing_files:
-            # 优先使用缓存（write_file 后增量更新）
-            if fname in cache:
-                lines.append(cache[fname])
-                continue
-
+        for fname in sorted(existing_files):
             try:
                 content = self.workspace.read(fname)
             except Exception:
                 lines.append(f"- {fname}: (无法读取)")
                 continue
+            summary = self._build_one_line_file_summary(fname, content)
+            lines.append(f"- {fname}: {summary}" if summary else f"- {fname}")
+        return "\n".join(lines)
 
-            summary = self._build_single_file_summary(fname, content)
-            if summary:
-                cache[fname] = summary  # 加入缓存
-                lines.append(summary)
-            else:
-                lines.append(f"- {fname}: (空文件)")
+    def _build_one_line_file_summary(self, fname: str, content: str) -> str:
+        """规则提取的**单行**结构摘要（不含正文），供文件索引使用。
 
-        return '\n'.join(lines)
+        仅保留可重建的「接口线索」，整体截断到 ~200 字符，避免索引膨胀。
+        """
+        if not content or not isinstance(content, str):
+            return ""
+        import re
+        stripped = [l.strip() for l in content.split("\n") if l.strip()]
+        n_lines = len(stripped)
+        parts = []
+        if fname.endswith(".html"):
+            for l in stripped:
+                m = re.search(r"<title>(.*?)</title>", l)
+                if m:
+                    parts.append(m.group(1).strip()[:40])
+                    break
+            ids = set()
+            for l in stripped:
+                ids.update(re.findall(r'id="([^"]+)"', l))
+                ids.update(re.findall(r"id='([^']+)'", l))
+            if ids:
+                parts.append("元素 id: " + ", ".join(sorted(ids)[:10]))
+        elif fname.endswith(".css"):
+            selectors = []
+            for l in stripped:
+                if l.endswith("{") and not l.startswith("@") and not l.startswith("/*"):
+                    sel = l[:-1].strip()
+                    if sel and len(sel) < 50:
+                        selectors.append(sel)
+            if selectors:
+                parts.append("选择器: " + ", ".join(selectors[:10]))
+        elif fname.endswith(".js"):
+            funcs = []
+            for l in stripped:
+                m = re.match(r"(?:async\s+)?function\s+(\w+)", l)
+                if not m:
+                    m = re.match(r"(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(", l)
+                if m and m.group(1) not in funcs:
+                    funcs.append(m.group(1))
+            if funcs:
+                parts.append("函数: " + ", ".join(funcs[:10]))
+            dom_refs = set()
+            for l in stripped:
+                dom_refs.update(
+                    re.findall(r"""(?:getElementById|querySelector(?:All)?)\(\s*["']([^"']+)["']""", l)
+                )
+            if dom_refs:
+                parts.append("DOM: " + ", ".join(sorted(dom_refs)[:8]))
+            if re.search(r"^\s*export\s", content, re.M):
+                parts.append("含 export（与普通 <script> 冲突）")
+        detail = "；".join(parts)
+        head = f"({n_lines}行)"
+        if detail:
+            return f"{head} {detail}"[:200]
+        return head
 
     def _check_missing_files(self, state: AgentState) -> list[str]:
         """检查目标文件是否全部生成。返回缺失文件名列表。
@@ -1226,21 +1411,6 @@ class ToolCallLoop:
         has_html = any(f.endswith("index.html") or f.endswith(".html") for f in existing)
         return [] if has_html else ["index.html"]
 
-    def _update_file_summary_cache(self, arguments: dict):
-        """write_file 成功后增量更新单个文件的摘要缓存"""
-        filename = arguments.get("filename", "")
-        content = arguments.get("content", "")
-        if not filename:
-            return
-
-        if not hasattr(self, '_summary_cache'):
-            self._summary_cache = {}
-
-        # 生成单文件摘要
-        summary = self._build_single_file_summary(filename, content)
-        if summary:
-            self._summary_cache[filename] = summary
-
     def _auto_lint_after_write(self, state: AgentState, arguments: dict):
         """write_file/edit_file 成功后自动运行语法检查，增量注入质量信号
 
@@ -1301,84 +1471,6 @@ class ToolCallLoop:
                 )
         except Exception as e:
             logger.debug(f"[AutoLint] {filename} lint 异常: {e}")
-
-    def _build_single_file_summary(self, fname: str, content: str) -> str:
-        """生成单个文件的摘要（提取自 _build_file_summaries）"""
-        if not content or not isinstance(content, str):
-            return f"- {fname}: (无法读取)"
-
-        import re
-        all_lines = [l for l in content.split('\n')]
-        content_lines = [l.strip() for l in all_lines if l.strip()]
-        head_lines = content_lines[:30]
-        tail_lines = content_lines[-10:] if len(content_lines) > 30 else []
-
-        structural = []
-        if fname.endswith('.html'):
-            for l in content_lines:
-                if '<title>' in l:
-                    structural.append(l.strip()[:120])
-                    break
-            ids = set()
-            for l in content_lines:
-                if 'id="' in l:
-                    ids.update(re.findall(r'id="([^"]+)"', l))
-                if "id='" in l:
-                    ids.update(re.findall(r"id='([^']+)'", l))
-            if ids:
-                structural.append(f"元素 id: {', '.join(sorted(ids)[:15])}")
-            classes = set()
-            for l in content_lines:
-                if 'class="' in l:
-                    classes.update(re.findall(r'class="([^"]+)"', l))
-                if "class='" in l:
-                    classes.update(re.findall(r"class='([^']+)'", l))
-            if classes:
-                structural.append(f"CSS class: {', '.join(sorted(classes)[:20])}")
-        elif fname.endswith('.css'):
-            selectors = []
-            for l in content_lines:
-                l = l.strip()
-                if l.endswith('{') and not l.startswith('@') and not l.startswith('/*'):
-                    sel = l[:-1].strip()
-                    if sel and len(sel) < 60:
-                        selectors.append(sel)
-            if selectors:
-                structural.append(f"选择器: {', '.join(selectors[:20])}")
-        elif fname.endswith('.js'):
-            funcs = []
-            for l in content_lines:
-                m = re.match(r'(?:async\s+)?function\s+(\w+)', l)
-                if m:
-                    funcs.append(m.group(1))
-                m = re.match(r'(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\(', l)
-                if m:
-                    funcs.append(m.group(1))
-            if funcs:
-                structural.append(f"函数: {', '.join(funcs[:15])}")
-            dom_refs = set()
-            for l in content_lines:
-                for m in re.findall(r"(?:querySelector|getElementById|querySelectorAll)\(['\"]([^'\"]+)['\"]\)", l):
-                    dom_refs.add(m)
-            if dom_refs:
-                structural.append(f"DOM 引用: {', '.join(sorted(dom_refs)[:15])}")
-            # 检测 export 语句（ES Module 语法）——关键：与 <script> 标签加载方式冲突
-            exports = []
-            for l in content_lines:
-                m = re.match(r'export\s+(?:default\s+)?(?:class|function|const|let|var|\{|\*)', l)
-                if m:
-                    exports.append(l.strip()[:80])
-            if exports:
-                structural.append(f"⚠️ EXPORT 语句: {', '.join(exports[:5])} —— 如 index.html 使用普通 <script> 加载，将导致 SyntaxError！")
-
-        head_preview = ' | '.join(head_lines)[:400]
-        parts = [f"- {fname} ({len(content_lines)} 行): {head_preview}"]
-        if tail_lines:
-            tail_preview = ' | '.join(tail_lines)[:200]
-            parts.append(f"  ... 尾部: {tail_preview}")
-        if structural:
-            parts.append("  " + " | ".join(structural))
-        return '\n'.join(parts)
 
     def _update_contract_on_write(self, state: AgentState, arguments: dict):
         """write_file 成功后自动更新 CompletionContract（冗余保障）
