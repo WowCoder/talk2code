@@ -552,8 +552,14 @@ class LLMClient:
             'temperature': self.temperature,
             'max_tokens': max_tokens if max_tokens is not None else self.max_tokens
         }
-        # 思考模式开关（OpenAI 格式，DeepSeek 扩展字段）：仅 enabled 时发送，
-        # 避免不认识该字段的 OpenAI 兼容端点报 400 或静默忽略产生歧义
+        # 思考模式开关（OpenAI 格式，DeepSeek 扩展字段）：
+        # - enabled：携带 thinking + reasoning_effort；
+        # - disabled：**省略字段**。各端点对关闭的语义不一致（实测矩阵）：
+        #   · agnes-3.0-flash：省略 = 思考 OFF；携带 thinking 字段（哪怕
+        #     {"type":"disabled"}）反而触发思考；
+        #   · glm-5.3-flash（lkeap）：省略 = 服务端默认自动思考（关不掉），
+        #     且 disabled 值直接 HTTP 400。
+        #   因此省略是唯一安全选项；glm 下如需真正关思考只能换模型/端点。
         if _thinking == 'enabled':
             data['thinking'] = {'type': _thinking}
             data['reasoning_effort'] = self.reasoning_effort
@@ -1154,7 +1160,8 @@ class LLMClient:
             'tools': tools,
             'tool_choice': tool_choice,
         }
-        # 思考模式开关（OpenAI 格式，DeepSeek 扩展字段）：仅 enabled 时发送
+        # 思考模式开关（OpenAI 格式，DeepSeek 扩展字段）：语义同 _request_openai，
+        # disabled 通过省略字段实现（各端点语义矩阵见 _request_openai 注释）
         if _thinking == 'enabled':
             data['thinking'] = {'type': _thinking}
             data['reasoning_effort'] = self.reasoning_effort

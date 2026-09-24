@@ -63,14 +63,15 @@ L5 Compaction   仅当 L4 装不下：最旧段（已遮蔽，只剩对话）交
 ### A. 系统提示组装
 
 ```
-[稳定前缀：第 2 轮起字节不变，命中 KV-cache]
-head = 模板骨架
+[稳定前缀：整个 run 内字节不变，命中 KV-cache]
+msg[0] system = 模板骨架
      + ## 需求            需求原文                       ← 固定
      + ## 实现计划（摘要） _compact_plan_text(plan)        ← 固定（合同，只读）
      + ## 接口契约         build_api_contracts_section     ← 固定
-[稳定前缀结束；以下为每轮可变尾段]
+[末尾独立 user 消息（每轮刷新，不落 dialogue_history）]
      + ## 工作区文件索引   每文件一行「文件名 + 一行结构摘要」（不含正文）  ← 每轮重建
      + ## 任务状态         TASK_STATE.md 全文                          ← Agent 上轮写的
+     + ## 完整实现计划     first_round_section（仅首轮非空）             ← 首轮下发
 ```
 
 三条硬约束：
@@ -78,8 +79,10 @@ head = 模板骨架
 1. **索引不能退化成「只有文件名」**。结构摘要（HTML title / 元素 id、CSS 选择器、JS 函数名与 DOM 引用）由
    `_build_one_line_file_summary()` 规则提取（纯正则，不调 LLM），它是 Agent 的「文件地图」，决定它要不要去 `read_file`。
    摘要丢失 → 上下文里既无正文也无结构线索，会诱发「刚写完就回读」。
-2. **可变尾段必须挂在提示词末尾**（`coder_base.md` 模板末尾的注入槽），不能夹在模板中段——
-   否则会把稳定前缀劈成两半，KV-cache 命中率下降。
+2. **可变尾段必须拆到末尾独立 user 消息**（`_build_messages` 按 coder_base.md 的
+   「## 工作区文件索引」标记切分），不能留在 system 消息内部——provider 对 msg[0]
+   整条判定缓存：实测即使变化只在 msg[0] 末尾（公共前缀 82-100%），下一轮也
+   `cached_tokens=0`；msg[0] 字节完全相同才命中。拆出后 msg[0] 整个 run 字节稳定。
 3. **双文件分工**：实现计划（spec）在 head 里只读注入**摘要**，属稳定前缀，是「合同」，永不改写；
    run 开始时把计划写进 `TASK_STATE.md` 作为种子，之后进度只更新 TASK_STATE.md。
 
@@ -141,9 +144,12 @@ head = 模板骨架
 ### D. 可观测（每轮一条结构化日志）
 
 ```
-[ContextPipeline] head=5.4k history=3.4k/98msg masked_read=12
+[ContextPipeline] head=5.4k head_sha=44cb5578 history=3.4k/98msg masked_read=12
                   dropped=0 compacted=0 cache_hit=true
 ```
+
+`head_sha` = 稳定前缀（拆分后 msg[0]）的 8 位字节指纹：同一 run 内恒定即达标；
+跨轮变化说明有内容混进了稳定区，会直接打断 KV-cache。
 
 ### E. 交付边界与跨轮次（run 边界的折叠）
 

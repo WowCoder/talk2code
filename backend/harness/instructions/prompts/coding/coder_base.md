@@ -47,8 +47,6 @@
 
 ---
 
-{first_round_section}
-
 ## 工作区文件索引（每轮重建；文件名 + 一行结构摘要，不含正文）
 {existing_text}
 
@@ -68,3 +66,5 @@
 后续轮次会重复踩同一个坑、甚至把已经修好的地方改回去。
 
 {task_state}
+
+{first_round_section}

@@ -724,6 +724,13 @@ def coder_node(state: AgentState) -> Dict[str, Any]:
         }
     state.setdefault("metadata", {})["coder_name"] = DEV_NAME
     state["metadata"]["thinking_name"] = DEV_NAME
+    # 关闭 coder 思考模式（ToolCallLoop 读取 metadata["tool_thinking"]）：
+    # 实测写码大轮 reasoning tokens 占 completion 60-75%（req 156：10610 token
+    # 中 6877 为思考），是编码阶段耗时的最大单因素。Phase 2 定向补全复用同一
+    # metadata，一并关闭。TeamLeader/verify 不设置此键，维持默认 enabled。
+    # ⚠️ config.py 有 effort=low 的 A/B 负信号记录（贪吃蛇 1 个运行时错误），
+    # 全关比 effort=low 更激进——上线后需跑 eval 集对照通过率；回退 = 删除本行。
+    state["metadata"]["tool_thinking"] = "disabled"
 
     # CompletionContract：standard 复杂度使用，simple 跳过
     if complexity == "standard":
@@ -742,6 +749,30 @@ def coder_node(state: AgentState) -> Dict[str, Any]:
                 contract.initialize(impl_order, acceptance_criteria=acs)
             state["_completion_contract"] = contract
             state.setdefault("metadata", {})["_completion_contract"] = contract
+
+            # ---- SSE 编码进度（1/2）：推送目标文件清单给前端 TaskPanel ----
+            # 前端已支持 task_list/task_update 事件（TaskPanel.vue），此前后端从未
+            # 推送过。文件状态按 contract 现状初始化，修复循环重入时不回退已亮进度。
+            try:
+                sse = getattr(tool_loop, "sse", None)
+                req_id = (state.get("metadata", {}).get("requirement_id")
+                          or state.get("requirement_id"))
+                if sse is not None and req_id and impl_order:
+                    plan_tasks = (plan.get("tasks") if isinstance(plan, dict) else None) or []
+                    desc_by_file = {
+                        t.get("file"): str(t.get("description", ""))[:60]
+                        for t in plan_tasks if isinstance(t, dict)
+                    }
+                    sse.task_list(req_id, [
+                        {
+                            "file": f,
+                            "description": desc_by_file.get(f, ""),
+                            "status": "completed" if contract.is_created(f) else "pending",
+                        }
+                        for f in impl_order
+                    ])
+            except Exception as e:
+                logger.debug(f"[Coder] task_list SSE 推送失败（不阻断）: {e}")
 
     # 注入 Hook 失败历史（去重：同一摘要只注入一次，避免 verify→coder
     # 修复循环多轮重入时重复累积相同内容、无谓膨胀上下文）

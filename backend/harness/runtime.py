@@ -7,6 +7,7 @@ ToolCallLoop —— Agent ReAct 工具调用循环
 import time
 import json
 import re
+import hashlib
 
 from harness.state.agent_state import AgentState
 from harness.agent_names import DEV_NAME
@@ -135,17 +136,20 @@ class ToolCallLoop:
 
             # 调用 LLM with tools
             messages = self._build_messages(state)
+            # 思考模式可按节点覆盖：coder 经 metadata["tool_thinking"]="disabled" 关闭
+            # （实测写码大轮 reasoning tokens 占 completion 60-75%，req 156：
+            #   10610 token 中 6877 为思考，是编码耗时的最大单因素）；
+            # 其余节点不设置该键，维持默认 enabled。
+            thinking_mode = meta.get("tool_thinking", "enabled")
             try:
                 response = client.chat_with_tools(
                     messages=messages,
                     tools=self.tools.get_schemas() if self.tools else [],
                     max_tokens=self._max_tokens,
-                    # 显式开启思考模式：deepseek-v4 系列不传该参数时会以服务端默认
-                    # 强度自动思考（实测单轮 6.7 万字符、把全部代码在思考链里写一遍），
-                    # 触发多次 token 耗尽扩容重试，单轮编码耗时 5-10 分钟。
-                    # 显式 enabled + 配置的 reasoning_effort(low) 后思考长度可控，
-                    # 与 TL/记忆节点的既有调用行为对齐。
-                    thinking='enabled',
+                    # 思考模式说明：thinking='enabled' 携带思考字段 + reasoning_effort
+                    # 控制长度；'disabled' 由 client 省略字段实现（agnes 省略即关；
+                    # glm 不支持关闭，省略是唯一安全选项，语义矩阵见 client 注释）
+                    thinking=thinking_mode,
                 )
             except Exception as e:
                 # 熔断器打开或其他 LLM 不可用异常 → 立即终止
@@ -192,7 +196,7 @@ class ToolCallLoop:
                     messages,
                     self.tools.get_schemas() if self.tools else [],
                     response,
-                    thinking="enabled",
+                    thinking=thinking_mode,
                     latency_ms=(
                         round((span.end_time - span.start_time) * 1000, 1)
                         if span and span.end_time else None
@@ -836,6 +840,19 @@ class ToolCallLoop:
         except Exception:
             staleness_reminder = ""
 
+        # ---- 可变尾段拆分（前缀缓存治理，详见 docs/design/context-pipeline-v2.md）----
+        # 实测（req 156）：provider 的前缀缓存对 msg[0] 是整条判定——即使变化只在
+        # 末尾的「工作区文件索引 + TASK_STATE」段（公共前缀 82-100%），下一轮也
+        # cached_tokens=0；msg[0] 字节完全相同才命中。因此把这两个每轮重建的段落
+        # 从 system 消息整体搬到**末尾独立 user 消息**，保证 msg[0] 在整个 run 内
+        # 字节稳定。分界标记 = coder_base.md 的「## 工作区文件索引」标题（模板内唯一）。
+        TAIL_MARKER = "## 工作区文件索引"
+        stable_prompt, var_tail = system_prompt, ""
+        if TAIL_MARKER in system_prompt:
+            marker_idx = system_prompt.index(TAIL_MARKER)
+            stable_prompt = system_prompt[:marker_idx].rstrip() + "\n"
+            var_tail = system_prompt[marker_idx:]
+
         # 预算从 56000 收紧到 24000：贪吃蛇实测 prompt_tokens 高达 20.9 万，
         # 主要来自每轮重发完整 plan + 文件摘要 + 最近 30 条工具结果。
         from harness.state.context_pipeline import ContextPipeline, _local_summary
@@ -852,8 +869,8 @@ class ToolCallLoop:
         )
 
         messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
+        if stable_prompt:
+            messages.append({"role": "system", "content": stable_prompt})
         messages.extend(history_msgs)
 
         # 消费 hook 失败（pipeline 已注入，清空避免重复）
@@ -864,8 +881,20 @@ class ToolCallLoop:
         if staleness_reminder:
             messages.append({"role": "user", "content": staleness_reminder})
 
+        # 可变尾段固定挂在消息列表**最末**（离生成点最近）：每轮刷新的文件索引与
+        # 任务状态，重建不落 dialogue_history，不会污染下一轮前缀。
+        if var_tail:
+            messages.append({
+                "role": "user",
+                "name": "System",
+                "content": "[系统注入·每轮刷新，以下为最新工作区状态]\n\n" + var_tail,
+            })
+
+        # head_sha：稳定前缀的字节指纹，供跨轮比对缓存友好性（同 run 内不变 = 达标）
+        head_sha = hashlib.sha256(stable_prompt.encode("utf-8")).hexdigest()[:8]
+
         logger.info(
-            f"[ContextPipeline] head={stats['head_tokens']} "
+            f"[ContextPipeline] head={stats['head_tokens']} head_sha={head_sha} "
             f"history={stats['history_tokens']} masked_read={stats['masked_read']} "
             f"masked_nonfile={stats['masked_nonfile']} offloaded={stats['offloaded']} "
             f"dropped={stats['dropped']} compacted={stats['compacted']}"
@@ -954,9 +983,11 @@ class ToolCallLoop:
         """构建 Coder 系统提示词（稳定前缀 + 可变尾段）
 
         结构（§3.A）：模板骨架 / 需求 / 计划摘要 / 接口契约 = **稳定前缀**（run 内不变，
-        命中 KV-cache）；工作区文件索引 + TASK_STATE.md = **可变尾段**，放在提示词**最末**，
-        避免它们每轮变化时打断前缀缓存。文件索引给「一行结构摘要」（不含正文），
-        正文按需 just-in-time read_file。
+        命中 KV-cache）；工作区文件索引 + TASK_STATE.md = **可变尾段**。渲染时尾段仍
+        拼在提示词文本最末，但 _build_messages 会按「## 工作区文件索引」标记把它拆出，
+        作为**末尾独立 user 消息**下发——provider 对 msg[0] 整条判定缓存，尾段留在
+        msg[0] 内（哪怕只在末尾变化）也会让缓存整条失效（req 156 实测）。
+        文件索引给「一行结构摘要」（不含正文），正文按需 just-in-time read_file。
 
         根据复杂度切换提示词策略：
         - simple:  自由文件结构，极简流程，5 轮快速通过
