@@ -6,7 +6,9 @@
 第三条 compromised 是 P2.5 的新行为。
 
 为什么放在 unit 而不放 integration：测的是 run_ac_checks 单个函数的判定契约，
-不碰 app / DB。为了跑得快，timeout_ms 一律压到 3 秒。
+不碰 app / DB。为了跑得快，timeout_ms 压到 8 秒——注意不能压到与 sandboxed_browser
+watchdog 同量级（req 154 复盘：watchdog=3000 与页面操作自身超时=3000 同刻竞争时，
+在途操作会被强制中断，测的就不是判定契约了）。
 """
 import pytest
 
@@ -49,7 +51,7 @@ def _run(html_path, steps, ac_id="AC-1"):
     return run_ac_checks(
         html_path,
         [{"ac_id": ac_id, "label": "测试用 AC", "steps": steps}],
-        timeout_ms=3000,
+        timeout_ms=8000,
         preview_url=None,  # 直读 file://，不依赖预览服务
     )
 

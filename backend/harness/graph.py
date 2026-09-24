@@ -84,6 +84,14 @@ def route_after_verify(state: AgentState) -> str:
     max_rounds = _get_max_repair_rounds(state)
 
     # 路径 0: 架构类缺陷 → 回 coder 重构（根因卡片已由 verify 注入对话）
+    # 路径 1 的判定变量提前：架构类预算耗尽时要 fallthrough 到这里
+    smoke_defects = state.get("smoke_defects") or []
+    defect_repair_count = state.get("metadata", {}).get("defect_repair_count", 0)
+    max_defect_rounds = _get_max_defect_repair_rounds()
+    # LLM 端点持续故障时不得再进定向修复：LLM 故障已不计轮数（nodes.py），
+    # 若这里仍按 count 放行会形成 verify ⇄ defect_repair 的无限循环。
+    llm_failures = state.get("metadata", {}).get("defect_repair_llm_failures", 0) or 0
+
     architectural_defects = state.get("architectural_defects") or []
     if architectural_defects:
         complexity = state.get("metadata", {}).get("complexity", "?")
@@ -95,17 +103,20 @@ def route_after_verify(state: AgentState) -> str:
                 f"complexity={complexity})"
             )
             return "coder"
+        # req 148 修正：这里原先直接 return "done"，等于「coder 预算耗尽就放弃全部修复」，
+        # 即便手上还握着若干条确定性局部缺陷也没人处理。改为**降级 fallthrough**：
+        # 架构类修不动，至少让 defect_repair 去清掉局部缺陷。
         logger.warning(
             f"[Graph] 架构类缺陷未修复且 coder 预算耗尽 "
-            f"(repair_count={repair_count}/{max_rounds})，交由交付门禁处理"
+            f"(repair_count={repair_count}/{max_rounds})，降级尝试定向修复局部缺陷"
         )
-        return "done"
 
     # 路径 1: 局部确定性缺陷 → 小上下文定向修复（不进 ToolCallLoop）
-    smoke_defects = state.get("smoke_defects") or []
-    defect_repair_count = state.get("metadata", {}).get("defect_repair_count", 0)
-    max_defect_rounds = _get_max_defect_repair_rounds()
-    if smoke_defects and defect_repair_count < max_defect_rounds:
+    if llm_failures >= 2:
+        logger.warning(
+            f"[Graph] 定向修复 LLM 连续 {llm_failures} 次不可用，跳过该路径"
+        )
+    elif smoke_defects and defect_repair_count < max_defect_rounds:
         logger.info(
             f"[Graph] 检测到 {len(smoke_defects)} 个局部确定性缺陷 "
             f"(类型: {[d.get('type') for d in smoke_defects]})，"

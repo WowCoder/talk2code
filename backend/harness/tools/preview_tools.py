@@ -146,14 +146,28 @@ class RunPreviewHandler(ToolHandler):
             parts.append(f"关键元素验证通过: {elem_ok} 个。")
         init = report.get("initialization", {})
         if init:
-            if init.get("canvas_activity") is False:
+            canvas_activity = init.get("canvas_activity")
+            if canvas_activity is False:
                 parts.append("⚠️ Canvas 存在但无像素变化（游戏循环可能未启动）。")
-            elif init.get("canvas_activity") is True:
+            elif canvas_activity is True:
                 parts.append("✅ Canvas 有像素变化（动画/游戏正在运行）。")
-            if init.get("animation_started") is False:
-                parts.append("⚠️ requestAnimationFrame 未被调用（init/入口函数可能未执行）。")
-            elif init.get("animation_started") is True:
-                parts.append("✅ requestAnimationFrame 已调用（渲染循环已启动）。")
+            # rAF 只对 canvas 渲染有意义。页面没有 canvas 时 animation_started 恒为默认值
+            # False，照报会误导 —— req 145 的 1024 是 DOM 网格实现，本就不需要渲染循环，
+            # 却被连报 3 次「requestAnimationFrame 未被调用」，把 coder 往错误方向带。
+            if canvas_activity is not None:
+                if init.get("animation_started") is False:
+                    parts.append("⚠️ Canvas 存在但 requestAnimationFrame 未被调用（渲染循环可能未启动）。")
+                elif init.get("animation_started") is True:
+                    parts.append("✅ requestAnimationFrame 已调用（渲染循环已启动）。")
+        # req 148 修正：上面全部是「页面能加载、没有报错」层面的静态检查，
+        # 从未验证过任何交互。Agent 连拿 4 次这份全绿报告就宣布「游戏已完成」，
+        # 而实际上点开始后棋盘是空的、方向键完全无响应。
+        # 必须把「未做交互验证」写进报告，否则绿色会被当成可交付的证明。
+        parts.append(
+            "ℹ️ 本检查只覆盖「加载无报错 + 关键元素存在」，**未做交互验证**"
+            "（不会模拟点击/按键）。凡是有交互的功能，你必须自己按验收条件"
+            "逐条走一遍确认真的生效，不能凭本报告的「无错误」判定完成。"
+        )
         return " ".join(parts)
 
 
