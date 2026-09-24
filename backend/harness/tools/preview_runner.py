@@ -58,7 +58,7 @@ def run_preview_in_browser(
         RuntimeError: 当 playwright 未安装或浏览器二进制缺失时（调用方应降级）
     """
     try:
-        from playwright.sync_api import sync_playwright, Error as PWError
+        from harness.tools.sandboxed_browser import sandboxed_browser
     except ImportError as e:
         raise RuntimeError(f"playwright 未安装：{e}") from e
 
@@ -75,14 +75,7 @@ def run_preview_in_browser(
     }
 
     try:
-        with sync_playwright() as p:
-            try:
-                browser = p.chromium.launch(headless=True)
-            except PWError as e:
-                # 典型：浏览器二进制未安装
-                raise RuntimeError(
-                    f"chromium 未安装，请运行 `playwright install chromium`：{e}"
-                ) from e
+        with sandboxed_browser(timeout_ms=timeout_ms) as browser:
 
             try:
                 context = browser.new_context()
@@ -350,12 +343,13 @@ def run_ac_checks(
     - assert_count:     匹配元素数量 ≥ 预期
     - assert_value:     input 元素的 value 符合预期
     - assert_canvas_change: canvas 像素在 wait_ms 内发生变化
+    - assert_dom_change:    观察范围内 DOM 在本次 AC 期间发生变化（DOM 实现的画面断言）
 
     Returns:
         [{"ac_id": "AC-1", "passed": True, "failures": [], "steps_executed": 5}, ...]
     """
     try:
-        from playwright.sync_api import sync_playwright, Error as PWError
+        from harness.tools.sandboxed_browser import sandboxed_browser
     except ImportError:
         return [{"ac_id": s["ac_id"], "passed": False, "failures": [], "harness_errors": ["playwright 未安装"], "steps_executed": 0} for s in ac_scripts]
 
@@ -364,11 +358,7 @@ def run_ac_checks(
     results = []
 
     try:
-        with sync_playwright() as p:
-            try:
-                browser = p.chromium.launch(headless=True)
-            except PWError:
-                return [{"ac_id": s["ac_id"], "passed": False, "failures": [], "harness_errors": ["chromium 未安装"], "steps_executed": 0} for s in ac_scripts]
+        with sandboxed_browser(timeout_ms=timeout_ms) as browser:
 
             try:
                 context = browser.new_context()
@@ -574,7 +564,7 @@ def capture_screenshot(html_path: Path, out_path: Path,
         截图文件路径字符串；浏览器不可用等失败时返回 None（不抛异常）。
     """
     try:
-        from playwright.sync_api import sync_playwright, Error as PWError
+        from harness.tools.sandboxed_browser import sandboxed_browser
     except ImportError:
         return None
 
@@ -582,8 +572,8 @@ def capture_screenshot(html_path: Path, out_path: Path,
     sandbox, wrapper_uri, wrapper_tmp = _prepare_sandbox(preview_url)
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+        from playwright.sync_api import Error as PWError
+        with sandboxed_browser(timeout_ms=timeout_ms) as browser:
             try:
                 context = browser.new_context(viewport={"width": 1280, "height": 800})
                 page = context.new_page()
@@ -800,7 +790,7 @@ def run_universal_smoke(html_path: Path, timeout_ms: int = 15_000, preview_url: 
 
     # ---- 不变量 2/3/4: 需要浏览器 ----
     try:
-        from playwright.sync_api import sync_playwright, Error as PWError
+        from harness.tools.sandboxed_browser import sandboxed_browser
     except ImportError:
         result["logs"].append("[smoke] playwright 未安装，跳过交互检查")
         return result
@@ -811,12 +801,7 @@ def run_universal_smoke(html_path: Path, timeout_ms: int = 15_000, preview_url: 
         result["logs"].append(f"[smoke] 沙箱预览模式: {preview_url.split('/api/pt/')[-1][:40]}")
 
     try:
-        with sync_playwright() as p:
-            try:
-                browser = p.chromium.launch(headless=True)
-            except PWError as e:
-                result["logs"].append(f"[smoke] chromium 不可用: {e}")
-                return result
+        with sandboxed_browser(timeout_ms=timeout_ms) as browser:
 
             try:
                 context = browser.new_context()
