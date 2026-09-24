@@ -512,12 +512,29 @@ def run_ac_checks(
                     except Exception as ac_err:
                         harness_failures.append(f"AC 执行异常: {ac_err}")
 
+                    # 「断言前提不成立」（N/A）不再混进 harness_errors：
+                    # 它不是「脚本驱动失败」，而是「这条断言对当前实现根本不适用」。
+                    # 单独走 unverified 通道，交给评估器裁量——既保留「未验证 ≠ 通过」，
+                    # 又不再把「验不了」伪装成「验没过」去污染产品缺陷判定。
                     results.append({
                         "ac_id": ac_id,
                         "label": label,
-                        "passed": len(failures) == 0,
+                        # 脚本驱动失败（harness_errors）同样阻断 passed：选择器超时 / 元素点不动
+                        # 意味着这条 AC 从未被真正验证过，此时判 passed=True 是假绿
+                        #（req 145 的 AC-1/AC-4 就是带着 harness_errors 拿到 passed）。
+                        # 与 nodes.py 快速通道 ac_all_passed 的语义保持一致。
+                        "passed": len(failures) == 0 and not harness_failures and not not_applicable,
                         "failures": failures,
                         "harness_errors": harness_failures,
+                        "not_applicable": not_applicable,
+                        # True = 本条 AC 从未被真正验证（断言前提不成立），既非通过也非失败
+                        "unverified": bool(not_applicable) and not failures and not harness_failures,
+                        # True = 脚本没跑成 且 断言失败（P2.5）。此时 failures 是在「被半驱动坏的
+                        # 页面」上产生的：点击超时没点成，后面的断言自然找不到元素。
+                        # 这类失败是幽灵，直接喂给 repair 会让 coder 去修不存在的问题。
+                        # 实测（tmp/analyze_ac_verification.py）：139 条 AC 中 45.3% 属于此类。
+                        # 这里只做标记不丢信号，由 nodes.py 在提示词里降权。
+                        "compromised": bool(failures) and bool(harness_failures),
                         "steps_executed": steps_executed,
                         # 沙箱链路降级时标注，便于区分「产品坏」与「验证环境坏」
                         "preview_degraded": degraded_reason,

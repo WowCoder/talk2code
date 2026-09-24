@@ -1378,6 +1378,17 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             herr = "; ".join(r.get("harness_errors", []))
             if herr:
                 ac_results_text += f" — [脚本错误·可能假阴性] {herr}"
+            na = "; ".join(r.get("not_applicable", []))
+            if na:
+                ac_results_text += f" — [未验证·断言前提不成立] {na}"
+            if r.get("compromised"):
+                # P2.5：脚本没跑成 + 断言失败 ⇒ 这条失败可能是幽灵。
+                # 实测 139 条 AC 中 45.3% 属于此类；不标注的话 repair 轮会去修不存在的问题。
+                ac_results_text += (
+                    " — ⚠️【失败不可信】脚本未完整驱动页面（如点击步骤超时），"
+                    "后续断言可能是在未操作的状态下得出的。"
+                    "请先核实该缺陷是否真实存在，不要直接照此修改。"
+                )
             ac_results_text += "\n"
 
     # 层1 冒烟结果注入评估 prompt（确定性证据，供 LLM 参考）
