@@ -164,6 +164,17 @@ class Settings(BaseSettings):
     # LLM 调用配置
     LLM_TEMPERATURE: float = Field(default=0.7, ge=0, le=2, description='LLM 温度参数')
     LLM_MAX_TOKENS: int = Field(default=12000, ge=100, le=65500, description='LLM 最大生成 token 数（输出上限，非上下文窗口）')
+    # 「content 为空但有 reasoning_content」时的重试额度上限。
+    # 背景：对强制思考型模型（lkeap 的 glm 全系，服务端明确「该模型始终思考，不支持关闭」），
+    # max_tokens 是 **reasoning + content 的共享额度且 reasoning 先扣**。
+    # 实测同一 prompt：cap=8000 → 188s 全部耗在思考上，正文 **0 字**（finish=length）。
+    # 而流水线里大量按需写死的小额度调用（500/1000/2000/3000），一旦失败就把
+    # 重试额度抬到全局 LLM_MAX_TOKENS（32000）——单轮随即可达 ~680s，必然撞穿
+    # LLM_TIMEOUT，整节点表现为「假挂死」。故这里给一个**绝对天花板**。
+    LLM_REASONING_FALLBACK_TOKENS: int = Field(
+        default=8000, ge=500, le=65500,
+        description='推理模型 token 耗尽时的重试额度上限'
+    )
     LLM_TIMEOUT: int = Field(default=60, ge=10, le=300, description='LLM 调用超时时间（秒）')
     # 缺陷修复的 LLM 调用要输出整文件 JSON（16k~32k tokens），响应天然更慢，故单独给上限。
     # 此前该值硬编码 150s：LLM 端点慢时单次请求挂 2.5 分钟，前端长时间无 SSE 更新，

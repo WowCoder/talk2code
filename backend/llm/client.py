@@ -418,6 +418,7 @@ class LLMClient:
         self.provider = provider or LLM_PROVIDER
         self.temperature = temperature if temperature is not None else settings.LLM_TEMPERATURE
         self.max_tokens = max_tokens if max_tokens is not None else settings.LLM_MAX_TOKENS
+        self.reasoning_fallback_tokens = settings.LLM_REASONING_FALLBACK_TOKENS
         self.timeout = timeout if timeout is not None else settings.LLM_TIMEOUT
         self.max_retries = max_retries if max_retries is not None else settings.LLM_MAX_RETRIES
 
@@ -612,16 +613,37 @@ class LLMClient:
                     msg = result.get('choices', [{}])[0].get('message', {})
                     content = msg.get('content', '')
                     reasoning = msg.get('reasoning_content', '')
-                    # 如果 content 为空但有 reasoning_content，说明 max_tokens 不足，
-                    # 所有 token 被 reasoning 消耗。此时以默认 max_tokens 重试一次。
+                    # content 为空但有 reasoning_content：max_tokens 被 thinking 吃光了。
+                    # 重试一次，但额度必须「够用且不过量」——
+                    #   ① 必须显著大于原额度，否则同样被 thinking 再次吃光，重试无意义；
+                    #   ② 必须有绝对天花板（LLM_REASONING_FALLBACK_TOKENS）。不能用全局
+                    #      LLM_MAX_TOKENS：流水线里大量按需写死的小额度调用（500/1000/2000/3000）
+                    #      一旦失败就会被抬到 32000，而该额度下 glm-5.3-flash 单轮要 ~680s
+                    #      （cap=8000 实测 188s 全耗在思考上、正文 0 字），必然撞穿
+                    #      LLM_TIMEOUT，整节点表现为「假挂死」。
                     if not content and reasoning:
-                        req_tokens = data.get('max_tokens', 0)
-                        fallback_tokens = self.max_tokens  # 默认 8000
+                        req_tokens = data.get('max_tokens', 0) or 0
+                        fallback_tokens = min(
+                            max(req_tokens * 2, req_tokens + 4000),
+                            self.reasoning_fallback_tokens,
+                            self.max_tokens,
+                        )
+                        if fallback_tokens <= req_tokens:
+                            # 天花板已经压不住：再抬只会把一次超长调用变成必然超时。
+                            # 不如把空内容如实交回上层（上层有自己的错误处理/降级）。
+                            logger.error(
+                                f"[LLM] reasoning 耗尽且重试额度无法提升 "
+                                f"(reasoning={len(reasoning)} chars, content为空, "
+                                f"req_max_tokens={req_tokens}, 可给上限={fallback_tokens})，"
+                                f"放弃重试"
+                            )
+                            yield content
+                            return
                         logger.warning(
                             f"[LLM] 检测到 reasoning 模型 token 耗尽 "
                             f"(reasoning={len(reasoning)} chars, content为空, "
                             f"req_max_tokens={req_tokens})，"
-                            f"以默认 max_tokens={fallback_tokens} 重试"
+                            f"以 max_tokens={fallback_tokens} 重试"
                         )
                         retry_data = dict(data)
                         retry_data['max_tokens'] = fallback_tokens
@@ -633,7 +655,12 @@ class LLMClient:
                         retry_result = retry_response.json()
                         retry_msg = retry_result.get('choices', [{}])[0].get('message', {})
                         content = retry_msg.get('content', '')
-                        # 重试后仍然为空则放弃，让上层错误处理
+                        if not content:
+                            logger.error(
+                                f"[LLM] 以 max_tokens={fallback_tokens} 重试后 content 仍为空 "
+                                f"(reasoning={len(retry_msg.get('reasoning_content', ''))} chars)，"
+                                f"交由上层错误处理"
+                            )
                     yield content
                 return
 
