@@ -35,6 +35,46 @@ from llm.client import get_client
 
 logger = get_logger(__name__)
 
+# 超出纯前端能力边界时的澄清问题（确定性构造，零 LLM）。
+#
+# 设计取舍：不直接拒绝。用户说"要后端"，真实意图通常是"数据要存下来""要多人看到"，
+# 一句"做不到"把需求堵死；而"本地存储版 + 讲清局限"既守住边界又给得出东西。
+# 选项刻意写成可交付的形态，用户选完即可开工，不需要再追问一轮。
+OUT_OF_SCOPE_QUESTIONS = [
+    {
+        "id": "data_scope",
+        "type": "radio",
+        "label": (
+            "这个需求有一部分要靠服务器（数据库 / 用户账号 / 跨设备同步），"
+            "而这里产出的是纯前端站点——做出来是一个双击就能打开、功能完整、"
+            "数据保存在你这台设备上的应用。你想要哪种形态？"
+        ),
+        "options": [
+            "改成浏览器本地存储 -- 功能完整可用，数据保存在你这台设备上（推荐）",
+            "内置示例数据做演示 -- 预置一批数据，重点展示界面和交互效果",
+            "只做界面与交互 -- 数据部分留空接口，后续你自己接后端",
+        ],
+    },
+    {
+        "id": "visual_style",
+        "type": "radio",
+        "label": "你偏好哪种视觉风格？",
+        "options": [
+            "极简白 -- 白色背景，灰黑文字，大量留白，功能优先",
+            "暖柔风格 -- 暖色调、圆角卡片、柔和阴影 (默认)",
+            "暗黑科技 -- 深色背景、霓虹强调色、终端风格",
+            "活泼多彩 -- 明亮渐变、大色块、趣味性设计",
+            "无偏好，自动选择",
+        ],
+    },
+]
+
+OUT_OF_SCOPE_NOTICE = (
+    "这个需求里有需要服务器支撑的部分（比如数据库、账号体系、跨设备同步）。"
+    "这里生成的是纯前端站点——没有服务器和数据库，数据保存在浏览器本地。"
+    "选一个下面可行的做法，我立刻开工。"
+)
+
 # 全局记忆管理器（持久化到 agent_memories_v2 表，跨进程重启保留）
 _memory_manager: Optional[MemoryManager] = None
 
@@ -168,6 +208,8 @@ class RequirementService:
                         return self._handle_search_answer(db, requirement, requirement_id, intent_result)
                     elif intent_result.intent == IntentType.AMBIGUOUS:
                         return self._handle_ambiguous_direct(db, requirement, requirement_id)
+                    elif intent_result.intent == IntentType.OUT_OF_SCOPE:
+                        return self._handle_out_of_scope(db, requirement, requirement_id)
                     elif intent_result.intent == IntentType.SKILL:
                         # SKILL 进入完整工作流：SkillLoader 会将该技能的 SKILL.md
                         # 注入编码 Prompt，Coder 可经 run_skill 工具编排/组合子技能。
@@ -474,16 +516,24 @@ class RequirementService:
                 break  # 暂停 stream, 等待用户确认后继续
 
             # 多节点进度映射
+            # 文案从「角色名」改为「动作描述」：角色名不携带任何进展信息，
+            # 前端只能显示成"开发工程师工作中…"这类无信息文案。
             node_name = self._detect_node_name(current_step)
             if node_name:
                 progress = self._progress_map.get(node_name, 0)
                 display_name = {
-                    'team_leader': TL_NAME,
-                    'coder': DEV_NAME,
-                    'verify': QA_NAME,
-                    'repair': DEV_NAME,
+                    'team_leader': '正在分析需求，拆解实现计划',
+                    'coder': '正在编写代码',
+                    'verify': '正在浏览器里验证效果',
+                    'repair': '正在修复发现的问题',
                 }.get(node_name, node_name)
-                self._send_progress(requirement_id, display_name, progress)
+                stage = {
+                    'team_leader': 'planning',
+                    'coder': 'coding',
+                    'verify': 'verifying',
+                    'repair': 'repairing',
+                }.get(node_name, '')
+                self._send_progress(requirement_id, display_name, progress, stage)
 
             # 错误不会立即中断（让图走到 END），除非是严重错误
             if final_state.get('error') and 'ToolCallLoop 未注入' in str(final_state.get('error', '')):
@@ -981,12 +1031,19 @@ class RequirementService:
         message = SSEMessage.question_form_message(form_data)
         sse_manager.broadcast(str(requirement_id), message)
 
-    def _send_progress(self, requirement_id: int, agent_name: str, progress: int):
-        message = SSEMessage.progress_message(agent_name, progress, 'processing')
+    def _send_progress(self, requirement_id: int, agent_name: str, progress: int,
+                       stage: str = ''):
+        message = SSEMessage.progress_message(agent_name, progress, 'processing', stage)
         sse_manager.broadcast(str(requirement_id), message)
 
-    def _send_dialogue(self, requirement_id: int, name: str, content: str, role: str = 'agent'):
-        message = SSEMessage.dialogue_message(role, name, content, get_current_timestamp())
+    def _send_dialogue(self, requirement_id: int, name: str, content: str,
+                       role: str = 'agent', timestamp: str | None = None):
+        # timestamp 必须用消息在 dialogue_history 里的原始时间，不能用推送时刻。
+        # 前端按「role+name+content+timestamp」做幂等去重：SSE 重连时后端会整段回放
+        # 缓冲消息，若回放时间与首推时间不同，同一条消息会被当成两条（req 164：
+        # 一轮生成刷新两次页面，TL 分析显示 4 遍）。
+        message = SSEMessage.dialogue_message(
+            role, name, content, timestamp or get_current_timestamp())
         sse_manager.broadcast(str(requirement_id), message)
 
     def _send_code(self, requirement_id: int, filename: str, content: str):
@@ -1104,6 +1161,34 @@ class RequirementService:
         message = SSEMessage.question_form_message({'questions': questions})
         sse_manager.broadcast(str(requirement_id), message)
         logger.info(f"需求 {requirement_id} 触发澄清（AMBIGUOUS 意图），生成 {len(questions)} 个问题")
+        return True
+
+    def _handle_out_of_scope(self, db, requirement, requirement_id: int) -> bool:
+        """OUT_OF_SCOPE 意图：讲清纯前端边界，并给出可交付的替代方案。
+
+        此前缺少这一类：需求会直接进 TASK 流程，Coder 闷头用 localStorage 伪造一个
+        "登录/数据库"，验收不通过也不告诉用户真实原因——用户只觉得"这平台做不好"。
+        这里把边界摆到台面上，让用户自己选一条走得通的路。
+        """
+        from sqlalchemy.orm.attributes import flag_modified
+
+        dialogue_list = list(requirement.dialogue_history or [])
+        dialogue_list.append({
+            'role': 'system', 'name': TL_NAME,
+            'content': OUT_OF_SCOPE_NOTICE,
+            'status': 'needs_clarification',
+            'question_form': {'questions': OUT_OF_SCOPE_QUESTIONS},
+        })
+        requirement.dialogue_history = dialogue_list
+        flag_modified(requirement, 'dialogue_history')
+        requirement.status = 'pending'
+        db.commit()
+
+        sse_manager.broadcast(
+            str(requirement_id),
+            SSEMessage.question_form_message({'questions': OUT_OF_SCOPE_QUESTIONS}),
+        )
+        logger.info(f"需求 {requirement_id} 判定超出纯前端能力边界，已推送边界澄清")
         return True
 
     def _build_code_context_text(self, code_files: list) -> str:

@@ -16,6 +16,7 @@ from harness.state.agent_state import AgentState
 from harness.agent_names import TL_NAME, DEV_NAME, QA_NAME
 from llm.client import get_client
 from llm.client import _try_fix_json as try_fix_json
+from utils.sse import get_current_timestamp as _ts
 from harness.instructions.prompts import load_prompt, load_prompt_template
 from harness.observability.logger import get_logger
 from harness.harness_context import get_tool_loop, get_workspace
@@ -370,6 +371,7 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
                 ),
                 'status': 'needs_clarification',
                 'question_form': question_form,
+                'timestamp': _ts(),
             }],
             'metadata': {
                 **state.get('metadata', {}),
@@ -523,6 +525,7 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
                     **_extract_plan_metadata(plan),
                 },
                 'preserve': True,
+                'timestamp': _ts(),
             }],
             'metadata': {
                 **state.get('metadata', {}),
@@ -546,7 +549,8 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
             'dialogue_history': [{
                 'role': 'agent', 'name': TL_NAME,
                 'content': f"分析失败: {requirement[:50]}...",
-                'status': 'failed'
+                'status': 'failed',
+                'timestamp': _ts(),
             }],
             'metadata': {**state.get('metadata', {}), 'team_leader_success': False}
         }
@@ -580,7 +584,8 @@ def tool_coder_node(state: AgentState) -> Dict[str, Any]:
             'dialogue_history': state.get('dialogue_history', []) + [{
                 'role': 'agent', 'name': DEV_NAME,
                 'content': f'生成过程出错: {e}',
-                'status': 'failed'
+                'status': 'failed',
+                'timestamp': _ts(),
             }],
         }
 
@@ -1218,10 +1223,21 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                 "smoke_defects": [], "architectural_defects": [],
                 "metadata": meta}  # 显式返回：不依赖浅拷贝副作用
 
+    # ---- 验证阶段动作级进度（此前完全静默：前端看不到"在验证什么"）----
+    def _verify_progress(percent: int, text: str) -> None:
+        try:
+            _tl = get_tool_loop(state)
+            _sse = _tl.sse if _tl else None
+            if _sse is not None and state.get("requirement_id"):
+                _sse.progress(state["requirement_id"], percent, text, stage="verifying")
+        except Exception as _e:
+            logger.debug(f"[Verify] 进度推送失败（不阻断）: {_e}")
+
     # 运行 run_preview 获取浏览器执行结果
     browser_result = {"available": False, "errors": [], "warnings": []}
     if any(f.endswith("index.html") for f in code_files):
         try:
+            _verify_progress(80, "正在浏览器里打开页面，检查报错")
             tl = get_tool_loop(state)
             if tl and tl._preview_handler:
                 preview = tl._preview_handler.run_preview("index.html")
@@ -1332,6 +1348,9 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                         _ac_steps_text[_sid] = " → ".join(_frags)[:400]
                 index_path = workspace.path / "index.html"
                 if index_path.exists():
+                    _verify_progress(
+                        85, f"正在逐条验证 {len(ac_scripts)} 条验收标准"
+                    )
                     ac_check_results = run_ac_checks(index_path, ac_scripts, preview_url=preview_url)
                     _prod_fail = sum(1 for r in ac_check_results if r.get("failures"))
                     _harness_fail = sum(1 for r in ac_check_results if r.get("harness_errors"))
@@ -1380,6 +1399,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             from harness.tools.preview_runner import run_universal_smoke
             index_path = workspace.path / "index.html"
             if index_path.exists():
+                _verify_progress(90, "正在做通用交互冒烟测试")
                 smoke_result = run_universal_smoke(index_path, preview_url=preview_url)
                 logger.info(
                     f"[Verify] 通用冒烟: available={smoke_result.get('available')}, "

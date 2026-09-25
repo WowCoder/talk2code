@@ -990,11 +990,17 @@ class LLMClient:
         self, messages: list, tools: list, tool_choice: str, effective_max_tokens: int,
         thinking: Optional[str] = None,
         timeout: Optional[int] = None,
-        endpoint: Optional[_Endpoint] = None
+        endpoint: Optional[_Endpoint] = None,
+        max_retries: Optional[int] = None,
     ) -> tuple:
         """chat_with_tools 核心请求+重试循环
 
         重试策略：指数退避；HTTP 4xx（除 429）为非瞬时错误，立即终止不重试。
+
+        Args:
+            max_retries: 覆盖实例级重试次数。调用方做长尾熔断时传 0——
+                超时预算是给"这一次尝试"的，若内部再重试 N 次，
+                实际墙钟时间会变成 N+1 倍预算，熔断就失去了意义。
 
         Returns:
             (content, reasoning_content, tool_calls, usage, failed)
@@ -1007,7 +1013,8 @@ class LLMClient:
         usage = None
         failed = False
 
-        for attempt in range(self.max_retries + 1):
+        effective_retries = self.max_retries if max_retries is None else max_retries
+        for attempt in range(effective_retries + 1):
             try:
                 if ep.provider == 'anthropic_compatible':
                     content, reasoning_content, tool_calls, usage = self._request_anthropic_with_tools(
@@ -1027,21 +1034,27 @@ class LLMClient:
                     content = f"[错误] 工具调用失败：{e}"
                     break
                 failed = True
-                if self._retry_backoff(attempt, e, context="chat_with_tools"):
+                if self._retry_backoff(attempt, e, effective_retries, context="chat_with_tools"):
                     continue
                 content = f"[错误] 工具调用失败：{e}"
             except Exception as e:
                 failed = True
-                if self._retry_backoff(attempt, e, context="chat_with_tools"):
+                if self._retry_backoff(attempt, e, effective_retries, context="chat_with_tools"):
                     continue
                 content = f"[错误] 工具调用失败：{e}"
 
         return content, reasoning_content, tool_calls, usage, failed
 
-    def _retry_backoff(self, attempt: int, e: Exception, context: str = "LLM") -> bool:
-        """重试退避：还有剩余次数则指数退避等待并返回 True（继续重试），否则返回 False"""
+    def _retry_backoff(self, attempt: int, e: Exception,
+                       max_retries: Optional[int] = None, context: str = "LLM") -> bool:
+        """重试退避：还有剩余次数则指数退避等待并返回 True（继续重试），否则返回 False
+
+        Args:
+            max_retries: 覆盖实例级重试上限（长尾熔断时用 0 关闭重试）
+        """
         logger.error(f"{context} 失败：{e}")
-        if attempt < self.max_retries:
+        limit = self.max_retries if max_retries is None else max_retries
+        if attempt < limit:
             import random
             delay = min(1.0 * (2 ** attempt), 10.0) * (0.5 + random.random() * 0.5)
             logger.warning(f"{context} {delay:.2f}秒后重试 ({attempt + 1}/{self.max_retries})")
@@ -1056,6 +1069,8 @@ class LLMClient:
         tool_choice: str = "auto",
         max_tokens: Optional[int] = None,
         thinking: Optional[str] = None,
+        timeout: Optional[int] = None,
+        max_retries: Optional[int] = None,
     ) -> LLMResponse:
         """
         支持 function calling 的聊天接口，含主备模型自动切换
@@ -1066,6 +1081,9 @@ class LLMClient:
             tool_choice: "auto" / "none" / "required"
             max_tokens: 最大 token 数
             thinking: 思考模式覆盖（'enabled'/'disabled'，默认 None 使用实例配置）
+            timeout: 单次请求超时（秒），None 表示使用实例默认值。
+                     调用方可用它给单轮 LLM 设预算，实现长尾熔断。
+            max_retries: 覆盖实例级重试次数，None 表示使用实例默认值。
 
         Returns:
             LLMResponse 含 tool_calls 字段
@@ -1092,7 +1110,8 @@ class LLMClient:
             content, reasoning_content, tool_calls, usage, failed = \
                 self._chat_with_tools_request_loop(
                     messages, tools, tool_choice, effective_max_tokens, thinking,
-                    endpoint=self._primary_endpoint()
+                    timeout=timeout, endpoint=self._primary_endpoint(),
+                    max_retries=max_retries,
                 )
             if failed and (not content or content.startswith('[错误]')):
                 self._circuit_breaker.record_failure()
@@ -1113,10 +1132,10 @@ class LLMClient:
             else:
                 # 端点经参数传递，不改写实例状态（多线程共享单例下安全）
                 content, reasoning_content, tool_calls, usage, failed = \
-                    self._chat_with_tools_request_loop(
-                        messages, tools, tool_choice, effective_max_tokens, thinking,
-                        endpoint=backup_ep
-                    )
+                self._chat_with_tools_request_loop(
+                    messages, tools, tool_choice, effective_max_tokens, thinking,
+                    timeout=timeout, endpoint=backup_ep, max_retries=max_retries,
+                )
                 if failed and (not content or content.startswith('[错误]')):
                     self._backup_circuit_breaker.record_failure()
                 elif content and not content.startswith('[错误]'):

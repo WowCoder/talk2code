@@ -22,14 +22,30 @@
       />
       <ExecutionPanel :trace-data="traceSummary" />
 
-      <!-- Loading bar -->
-      <div v-if="isLoading" class="loading-bar">
-        <div class="lb-dots">
-          <span class="lb-dot"></span>
-          <span class="lb-dot"></span>
-          <span class="lb-dot"></span>
+      <!-- 执行进度：显示后台"当前在做什么" + 阶段 + 静默期等待时长。
+           此前这里是一句硬编码的"AI 正在处理…"，不绑定任何后端状态，
+           用户在长达数分钟的编码/验证期里得不到任何信息。 -->
+      <div v-if="isLoading" class="progress-card">
+        <div class="pc-head">
+          <div class="lb-dots">
+            <span class="lb-dot"></span>
+            <span class="lb-dot"></span>
+            <span class="lb-dot"></span>
+          </div>
+          <span class="pc-action">{{ activityText }}</span>
         </div>
-        <span class="lb-text">AI 正在处理…</span>
+        <div class="pc-stages">
+          <span
+            v-for="(s, i) in STAGES"
+            :key="s.key"
+            class="pc-stage"
+            :class="{
+              'is-done': currentStageIndex > i,
+              'is-current': currentStageIndex === i,
+            }"
+          >{{ s.label }}</span>
+        </div>
+        <div v-if="waitedText" class="pc-waited">{{ waitedText }}</div>
       </div>
     </div>
     <DialogueInput
@@ -41,7 +57,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, nextTick } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { useRequirementStore } from '@/stores/requirement'
 import DialogueMessage from './DialogueMessage.vue'
 import DialogueInput from './DialogueInput.vue'
@@ -119,6 +135,48 @@ const messages = computed(() => {
   return grouped
 })
 const isLoading = computed(() => store.isGenerating)
+
+// ---- 进度可观测化 ----
+// 执行阶段（顺序即时间线）：需求分析 → 编码 → 验证 → 修复
+const STAGES = [
+  { key: 'planning', label: '需求分析' },
+  { key: 'coding', label: '编码' },
+  { key: 'verifying', label: '验证' },
+  { key: 'repairing', label: '修复' },
+]
+
+const currentStageIndex = computed(() =>
+  STAGES.findIndex((s) => s.key === store.progress.stage)
+)
+
+// 后端推送的是动作描述（"正在创建 js/app.js"）；无动作时退化到中性文案，
+// 不再显示没有信息量的"AI 正在处理…"。
+const activityText = computed(() => store.progress.currentAgent || '正在处理')
+
+// 静默期计时：LLM 挂起时后端可能数十秒无任何事件，这里用本地秒级心跳
+// 把"这一步已经跑了多久"显式说出来，避免用户只能面对一个不动的界面。
+const now = ref(Date.now())
+let tickTimer: ReturnType<typeof setInterval> | null = null
+onMounted(() => {
+  tickTimer = setInterval(() => {
+    now.value = Date.now()
+  }, 1000)
+})
+onUnmounted(() => {
+  if (tickTimer) clearInterval(tickTimer)
+})
+
+const waitedText = computed(() => {
+  const updatedAt = store.progress.updatedAt
+  if (!updatedAt) return ''
+  const secs = Math.max(0, Math.floor((now.value - updatedAt) / 1000))
+  // 15s 以内是正常节奏，不必提示；超过后用户的真实疑问是"是不是卡住了"
+  if (secs < 15) return ''
+  if (secs < 60) return `已等待 ${secs} 秒`
+  const m = Math.floor(secs / 60)
+  const s = secs % 60
+  return `已等待 ${m} 分 ${s} 秒`
+})
 
 // Access SSE-triggered state from the store
 const questionForm = computed(() => store.questionForm)
@@ -238,20 +296,64 @@ watch(
   border-radius: 3px;
 }
 
-.loading-bar {
+.progress-card {
   display: flex;
-  align-items: center;
+  flex-direction: column;
   gap: 10px;
   padding: 12px 16px;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 12px;
-  align-self: center;
+  align-self: stretch;
   margin-top: auto;
 }
 
-.lb-text {
+.pc-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.pc-action {
   font-size: 13px;
+  color: var(--fg);
+  line-height: 1.5;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pc-stages {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.pc-stage {
+  font-size: 11px;
+  color: var(--muted);
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+}
+
+.pc-stage.is-done {
+  color: var(--muted);
+  border-color: var(--border);
+  text-decoration: line-through;
+  opacity: 0.6;
+}
+
+.pc-stage.is-current {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.pc-waited {
+  font-size: 12px;
   color: var(--muted);
 }
 

@@ -1,0 +1,7 @@
+{
+  "name": "dashboard",
+  "description": "数据看板 / 图表类需求：零 CDN 手绘图表、空数据态、容器尺寸、筛选联动",
+  "type": "knowledge",
+  "trigger": "看板|仪表盘|图表|数据可视化|统计报表|趋势图|饼图|柱状图|折线图|占比|dashboard|chart|可视化",
+  "priority": 45
+}

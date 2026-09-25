@@ -1,0 +1,7 @@
+{
+  "name": "crud",
+  "description": "列表 + 表单 + 增删改查类需求：存储层分离、渲染与数据解耦、表单契约、空态",
+  "type": "knowledge",
+  "trigger": "待办|清单|记事|笔记|博客|日记|记账|通讯录|收藏夹|购物车|任务管理|备忘录|增删改查|管理我的|todo|notebook|blog",
+  "priority": 45
+}

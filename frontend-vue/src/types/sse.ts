@@ -48,9 +48,15 @@ export interface SSECodeData {
 }
 
 export interface SSEProgressData {
+  /**
+   * "当前在做什么"的动作描述（如"正在创建 js/app.js"）。
+   * 后端已改为推动作而非角色名——角色名不携带进展信息。
+   */
   current_agent: string
   progress: number
   status: string
+  /** 阶段标识，用于渲染阶段指示器；缺省表示沿用上一阶段 */
+  stage?: 'planning' | 'coding' | 'verifying' | 'repairing'
 }
 
 /**

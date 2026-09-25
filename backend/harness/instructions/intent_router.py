@@ -2,11 +2,16 @@
 """
 IntentRouter —— 前置意图分类器
 
-在 TeamLeader 之前对用户输入做轻量分类，将请求分流到四条路径：
+在 TeamLeader 之前对用户输入做轻量分类，将请求分流到五条路径：
 - QUICK:    常识问答/代码解释/问候 → LLM 直接回答
 - SEARCH:   需要实时信息 → Web 搜索后回答
 - TASK:     软件开发任务 → 进入 TeamLeader → FrontendEngineer 流程
 - AMBIGUOUS: 需求模糊 → 生成澄清问题
+- OUT_OF_SCOPE: 核心价值依赖服务端、纯前端无法等价实现 → 澄清并给出替代方案
+
+OUT_OF_SCOPE 的存在意义：本平台只产出纯静态前端站点。缺少这一类时，
+「做个带用户注册和数据库的博客」会被判成 TASK，最终默默交付一个
+localStorage 假登录，验收不通过却不告诉用户真实原因。
 
 设计原则：
 1. 分类调用极轻量（max_tokens=20, timeout=10s），失败时默认走 TASK
@@ -31,6 +36,7 @@ class IntentType(Enum):
     TASK = "task"
     AMBIGUOUS = "ambiguous"
     SKILL = "skill"
+    OUT_OF_SCOPE = "out_of_scope"
 
 
 @dataclass
@@ -122,11 +128,14 @@ class IntentRouter:
                 return IntentResult(intent=IntentType.TASK, confidence=0.5)
 
             raw = response.content.strip().upper()
+            # 归一化分隔符：模型常把 OUT_OF_SCOPE 写成 OUT-OF-SCOPE / OUT OF SCOPE，
+            # 不统一就无法命中枚举值，边界声明会被静默跳过。
+            raw_norm = raw.replace("-", "_").replace(" ", "_")
 
             # 解析分类结果：先精确单标签，再按词边界取最早出现的标签
             # （避免 "这是 TASK，不需要 search" 被先命中 SEARCH）
             for intent_type in IntentType:
-                if raw == intent_type.value.upper():
+                if raw_norm == intent_type.value.upper():
                     logger.info(f"[IntentRouter] 分类结果: {intent_type.value} (raw={raw})")
                     return IntentResult(intent=intent_type, confidence=0.95)
 
@@ -134,7 +143,7 @@ class IntentRouter:
             matches = []
             for intent_type in IntentType:
                 label = intent_type.value.upper()
-                m = _re.search(rf"\b{label}\b", raw)
+                m = _re.search(rf"\b{label}\b", raw_norm)
                 if m:
                     matches.append((m.start(), intent_type))
             if matches:

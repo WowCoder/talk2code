@@ -15,10 +15,26 @@ class SSEReporter:
     def __init__(self, sse_manager):
         self.sse = sse_manager
 
-    def progress(self, requirement_id: int, percent: int, message: str = ""):
-        self._send(requirement_id, "progress", {
+    def progress(self, requirement_id: int, percent: int, message: str = "", stage: str = ""):
+        """推送执行进度。
+
+        Args:
+            requirement_id: 需求 ID
+            percent: 百分比（0-100）
+            message: 人类可读的「当前在做什么」文案，直接显示在前端进度条上
+            stage: 阶段标识（planning / coding / verifying / repairing），
+                   供前端渲染阶段指示器；留空表示沿用上一阶段。
+
+        文案准则：`message` 必须描述**动作**（"正在写 js/app.js"），
+        而不是角色名（"开发工程师"）——后者不携带任何进展信息，
+        是「AI 正在处理…」这类无信息展示的根因。
+        """
+        payload = {
             "current_agent": message, "progress": percent, "status": "processing"
-        })
+        }
+        if stage:
+            payload["stage"] = stage
+        self._send(requirement_id, "progress", payload)
 
     def dialogue(self, requirement_id: int, role: str, name: str, content: str, status: str = ""):
         self._send(requirement_id, "dialogue", {

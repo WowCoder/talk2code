@@ -169,6 +169,12 @@ class Settings(BaseSettings):
     # 此前该值硬编码 150s：LLM 端点慢时单次请求挂 2.5 分钟，前端长时间无 SSE 更新，
     # 观感等同"卡死"（req 146 实测两次 150s 读超时）。
     DEFECT_REPAIR_TIMEOUT: int = Field(default=90, ge=10, le=300, description='缺陷修复 LLM 调用超时时间（秒）')
+    # 长尾熔断：单轮 LLM 超过此预算就中断并按更小的 max_tokens 重试一次。
+    # 实测（req 146-159，155 轮）延迟 >60s 的轮次只占 20%，却吃掉 71% 的 LLM 总时间，
+    # 且这些慢轮输出很短（中位 583 token）——是空转/抖动，不是"写太长"。
+    # 与其干等 300s，不如 45s 断掉重来一次；第二次不熔断，避免误杀真需要长输出的轮次。
+    # 设为 0 关闭熔断。
+    LLM_SLOW_TURN_TIMEOUT: int = Field(default=45, ge=0, le=300, description='单轮 LLM 熔断预算（秒），0=关闭')
     LLM_MAX_RETRIES: int = Field(default=2, ge=0, le=5, description='LLM 调用最大重试次数')
     LLM_CRAFT_ENABLED: bool = Field(default=True, description='是否启用 Craft 设计质量规则注入')
 

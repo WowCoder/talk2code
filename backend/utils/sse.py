@@ -75,23 +75,28 @@ class SSEMessage:
         })
 
     @staticmethod
-    def progress_message(current_agent: str, progress: int, status: str = 'processing') -> str:
+    def progress_message(current_agent: str, progress: int, status: str = 'processing',
+                         stage: str = '') -> str:
         """
         进度消息
 
         Args:
-            current_agent: 当前智能体
+            current_agent: 当前智能体 / 当前动作描述
             progress: 进度百分比
             status: 状态
+            stage: 阶段标识（planning / coding / verifying / repairing），可选
 
         Returns:
             SSE 消息字符串
         """
-        return SSEMessage.format_event('progress', {
+        payload = {
             'current_agent': current_agent,
             'progress': progress,
             'status': status
-        })
+        }
+        if stage:
+            payload['stage'] = stage
+        return SSEMessage.format_event('progress', payload)
 
     @staticmethod
     def question_form_message(form_data: dict) -> str:

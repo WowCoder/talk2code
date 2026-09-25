@@ -132,34 +132,36 @@ def track_write_success(ctx: HookContext) -> str | None:
     if not filename:
         return None
 
-    # 更新 CompletionContract
+    # 更新 CompletionContract（contract 缺失时降级为「无总量」进度，不再静默）
     contract = _get_contract(ctx)
+    completed = 0
+    total = 0
     if contract and contract.exists():
-        updated = contract.mark_created(filename)
-        if updated:
+        if contract.mark_created(filename):
             progress = contract.get_progress()
-            logger.info(
-                f"[ProgressHook] contract 进度: "
-                f"{progress['completed']}/{progress['total']}"
-            )
-            # ---- SSE 编码进度（2/2）：文件创建成功 → 实时推送前端 ----
-            # ① task_update 点亮 TaskPanel 对应文件；② progress 更新状态栏文案
-            # 与百分比（20~95 区间：20=确认 Plan 开始编码，100=完成）。
-            # 编码阶段此前后端零推送，用户面对的是全程静止的进度条。
-            try:
-                tool_loop = (ctx.state or {}).get("metadata", {}).get("_tool_loop")
-                sse = getattr(tool_loop, "sse", None)
-                total = progress.get("total") or 0
-                if sse is not None and ctx.requirement_id and total:
-                    sse.task_update(ctx.requirement_id, filename, "completed")
-                    percent = 20 + int(75 * progress["completed"] / total)
-                    sse.progress(
-                        ctx.requirement_id, percent,
-                        f"开发工程师 · 已完成 {filename}"
-                        f"（{progress['completed']}/{total}）",
-                    )
-            except Exception as e:
-                logger.debug(f"[ProgressHook] SSE 进度推送失败（不阻断）: {e}")
+            completed = progress.get("completed") or 0
+            total = progress.get("total") or 0
+            logger.info(f"[ProgressHook] contract 进度: {completed}/{total}")
+
+    # ---- SSE 编码进度：文件创建成功 → 实时推送前端 ----
+    # ① task_update 点亮 TaskPanel 对应文件；② progress 更新进度条文案与百分比。
+    # 此前整段包在 `if contract and contract.exists()` 内：contract 缺失时
+    # 编码阶段零推送，用户面对全程静止的进度条——这正是「AI 正在处理…」的成因。
+    # contract 只是让文案能带 (n/total)，不该成为推送的前提。
+    try:
+        tool_loop = (ctx.state or {}).get("metadata", {}).get("_tool_loop")
+        sse = getattr(tool_loop, "sse", None)
+        if sse is not None and ctx.requirement_id:
+            sse.task_update(ctx.requirement_id, filename, "completed")
+            if total:
+                percent = 20 + int(75 * completed / total)
+                text = f"已完成 {filename}（{completed}/{total}）"
+            else:
+                percent = 20
+                text = f"已完成 {filename}"
+            sse.progress(ctx.requirement_id, percent, text, stage="coding")
+    except Exception as e:
+        logger.debug(f"[ProgressHook] SSE 进度推送失败（不阻断）: {e}")
 
     # 静默通过
     return None

@@ -1,5 +1,5 @@
 import { ref, type Ref, onUnmounted } from 'vue'
-import { useRequirementStore } from '@/stores/requirement'
+import { useRequirementStore, emptyProgress } from '@/stores/requirement'
 import { usePreviewStore } from '@/stores/preview'
 import { useAuthStore } from '@/stores/auth'
 import router from '@/router'
@@ -73,6 +73,7 @@ export function useSSE(reqId: Ref<number | null>) {
       try {
         const data: SSEHeartbeatData = JSON.parse(e.data)
         serverElapsedS.value = data.elapsed_s || 0
+        store.serverElapsedS = data.elapsed_s || 0
       } catch {
         serverElapsedS.value = 0
       }
@@ -96,10 +97,18 @@ export function useSSE(reqId: Ref<number | null>) {
 
     es.addEventListener('progress', (e: MessageEvent) => {
       const data: SSEProgressData = JSON.parse(e.data)
+      // SSE 重连会整段回放缓冲的历史 progress。需求停在等确认（planning）或
+      // 已终止时，这些旧事件不能把界面拉回"生成中"——req 164 就是这么出现
+      // 「一边让你确认计划、一边亮着编码阶段灯」的。
+      const st = store.currentRequirement?.status
+      if (st !== 'pending' && st !== 'processing') return
       store.isGenerating = true
       store.progress = {
         currentAgent: data.current_agent,
         percent: data.progress,
+        // 阶段缺省时沿用上一阶段：后端部分埋点不带 stage，避免指示器闪回未知
+        stage: data.stage || store.progress.stage,
+        updatedAt: Date.now(),
       }
     })
 
@@ -192,7 +201,7 @@ export function useSSE(reqId: Ref<number | null>) {
     es.addEventListener('complete', (e: MessageEvent) => {
       const data: SSECompleteData = JSON.parse(e.data)
       store.isGenerating = false
-      store.progress = { currentAgent: '', percent: 100 }
+      store.progress = { ...emptyProgress(), percent: 100 }
       if (data.code_files) {
         data.code_files.forEach((f) => {
           store.codeFiles[f.filename] = f.content
@@ -237,11 +246,29 @@ export function useSSE(reqId: Ref<number | null>) {
       if (store.planStatus !== 'confirmed') {
         store.planStatus = 'needs_confirmation'
       }
+      // spec 事件到达 = TL 已完成，后端随即把需求置为 planning 等用户确认。
+      // 但前端的 status 是 API 快照，不会随 SSE 更新；不同步就会出现
+      // 「确认卡片已经在眼前、顶部却还写着准备中」的错位（req 165 实测）。
+      const _req = store.currentRequirement
+      if (_req && (_req.status === 'pending' || _req.status === 'processing')) {
+        _req.status = 'planning'
+      }
+      // 确认卡片出现 = 流程停在选择点，绝不在"生成中"。
+      // SSE 会整段回放缓冲消息，其中包含上一轮的 progress 事件——若不在这里清掉，
+      // 界面会一边让你确认计划、一边亮着上一轮残留的「编码」阶段灯（req 164）。
+      if (store.planStatus === 'needs_confirmation') {
+        store.isGenerating = false
+        store.progress = emptyProgress()
+        store.serverElapsedS = 0
+      }
     })
 
     es.addEventListener('task_list', (e: MessageEvent) => {
       const data: SSETaskListData = JSON.parse(e.data)
-      store._taskList = data.tasks || []
+      // 重连时后端会回放缓冲里的 task_list（推送时状态还是 pending）。
+      // 直接采信会把已结束需求的进度倒退回"全部待处理"，与"全部已完成"一样是假象，
+      // 所以先过一遍产物对账（进行中的需求不受影响，对账会原样返回）。
+      store._taskList = store.reconcileTaskList(data.tasks || [])
     })
 
     es.addEventListener('task_update', (e: MessageEvent) => {
@@ -274,7 +301,7 @@ export function useSSE(reqId: Ref<number | null>) {
 
     es.addEventListener('cancelled', (_e: MessageEvent) => {
       store.isGenerating = false
-      store.progress = { currentAgent: '', percent: 0 }
+      store.progress = emptyProgress()
       store.addDialogueMessage({
         role: 'system',
         name: 'System',

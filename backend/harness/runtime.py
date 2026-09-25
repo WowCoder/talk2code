@@ -142,14 +142,10 @@ class ToolCallLoop:
             # 其余节点不设置该键，维持默认 enabled。
             thinking_mode = meta.get("tool_thinking", "enabled")
             try:
-                response = client.chat_with_tools(
-                    messages=messages,
-                    tools=self.tools.get_schemas() if self.tools else [],
-                    max_tokens=self._max_tokens,
-                    # 思考模式说明：thinking='enabled' 携带思考字段 + reasoning_effort
-                    # 控制长度；'disabled' 由 client 省略字段实现（agnes 省略即关；
-                    # glm 不支持关闭，省略是唯一安全选项，语义矩阵见 client 注释）
-                    thinking=thinking_mode,
+                response = self._chat_with_breaker(
+                    client, messages,
+                    self.tools.get_schemas() if self.tools else [],
+                    thinking_mode, iteration,
                 )
             except Exception as e:
                 # 熔断器打开或其他 LLM 不可用异常 → 立即终止
@@ -316,6 +312,9 @@ class ToolCallLoop:
             batch_tools: list[ToolCallEvent] = []
             written_files: list[str] = []  # 本轮成功写入/编辑的文件（用于聚合 Git commit）
             for tc in response.tool_calls:
+                # 动作级进度：在**执行前**推送，让用户看到"正在写 X"而不是转圈
+                self._push_activity(state, tc.name, tc.arguments,
+                                    iteration, effective_max_iterations)
                 result = self._execute_tool(state, tc)
                 logger.info(f"[ToolLoop] 执行 {tc.name}: success={result.success} content={result.content[:100] if result.success else ''} error={result.error[:100] if not result.success else ''}")
 
@@ -602,6 +601,104 @@ class ToolCallLoop:
         elif tool_name == "fetch_cdn_library":
             return f"📦 CDN: {arguments.get('library', '')}"
         return f"🔧 {tool_name}"
+
+    # 超时错误特征：只有这类错误值得熔断重试，HTTP 4xx 之类重试必然复现
+    _TIMEOUT_MARKERS = ("timed out", "timeout", "read timeout", "连接超时")
+
+    def _is_timeout_error(self, text: str) -> bool:
+        low = (text or "").lower()
+        return any(m in low for m in self._TIMEOUT_MARKERS)
+
+    def _chat_with_breaker(self, client, messages: list, tools: list,
+                           thinking_mode: str, iteration: int):
+        """单轮 LLM 调用，带长尾熔断。
+
+        实测依据（req 146-159 共 155 轮）：延迟 >60s 的轮次只占 20%，
+        却吃掉 71% 的 LLM 总时间；而这些慢轮输出很短（中位 583 token），
+        说明是空转 / 端点抖动，不是在生成长内容。与其干等 300s，
+        不如在预算内断掉重来一次——多数情况下第二次就正常了。
+
+        策略：
+        1. 首试带预算且**关闭内部重试**（否则实际墙钟 = 预算 × (N+1)，熔断失效）；
+        2. 仅当失败原因是超时才降级重试一次，用减半的 max_tokens；
+        3. 重试同样带预算（熔断预算的 3 倍，下限 120s）且关闭内部重试，
+           给真需要长输出的轮次留出余量，同时不把等待时间再放大一轮。
+
+        配置 LLM_SLOW_TURN_TIMEOUT=0 可整体关闭。
+        """
+        budget = int(getattr(self._settings, "LLM_SLOW_TURN_TIMEOUT", 0) or 0)
+        if budget <= 0:
+            return client.chat_with_tools(
+                messages=messages, tools=tools,
+                max_tokens=self._max_tokens, thinking=thinking_mode,
+            )
+
+        first = client.chat_with_tools(
+            messages=messages, tools=tools,
+            max_tokens=self._max_tokens, thinking=thinking_mode,
+            timeout=budget, max_retries=0,
+        )
+        if not first.is_error or not self._is_timeout_error(first.error or ""):
+            return first
+
+        # 降级重试必须同样显式约束 timeout 与 max_retries。
+        # 这两个参数此前都没传：timeout 落到实例默认（LLM_TIMEOUT，本机 .env 为 300），
+        # max_retries 落到 LLM_MAX_RETRIES（2）→ 单次"降级重试"最坏挂 3 × 300 = 900s。
+        # req 162 正是这么等满 15 分钟的：45s 熔断本想快速止损，结果换来三次各 300s
+        # 的慢失败，最后仍然判 failed，一个文件都没写出来。
+        # 重试预算取熔断预算的 3 倍（下限 120s，不超过配置的单次上限），
+        # 并再次关闭内部重试——否则墙钟时间会被乘回去，熔断等于没做。
+        retry_timeout = min(
+            max(budget * 3, 120),
+            int(getattr(self._settings, "LLM_TIMEOUT", 300) or 300),
+        )
+        logger.warning(
+            f"[ToolLoop] 单轮超过 {budget}s 触发熔断，以 {retry_timeout}s 预算降级重试 "
+            f"(iter {iteration + 1})"
+        )
+        return client.chat_with_tools(
+            messages=messages, tools=tools,
+            max_tokens=max(self._max_tokens // 2, 4000), thinking=thinking_mode,
+            timeout=retry_timeout, max_retries=0,
+        )
+
+    # 有「用户可感知语义」的工具：执行前推一条动作级进度，让前端说得出在做什么。
+    # read_file / list_files 不推——它们高频且对用户无进展信息，只会刷屏。
+    _ACTIVITY_TOOLS = frozenset({
+        "write_file", "edit_file", "run_preview",
+        "lint_js", "lint_css", "validate_html", "execute_code",
+    })
+
+    def _push_activity(self, state, tool_name: str, arguments: dict,
+                       iteration: int, max_iterations: int) -> None:
+        """推送动作级进度（编码期此前零推送，是「AI 正在处理…」的根因之一）。
+
+        只描述**动作**（"正在创建 js/app.js"）而非角色名，前端直接展示。
+        百分比按迭代预算线性映射：20=确认 Plan 开始编码，95=编码收尾。
+        失败静默——进度推送永远不允许阻断主流程。
+        """
+        if not self.sse or tool_name not in self._ACTIVITY_TOOLS:
+            return
+        req_id = state.get("requirement_id")
+        if not req_id:
+            return
+        try:
+            args = arguments if isinstance(arguments, dict) else {}
+            filename = args.get("filename", "")
+            if tool_name == "write_file":
+                text = f"正在创建 {filename or '文件'}"
+            elif tool_name == "edit_file":
+                text = f"正在修改 {filename or '文件'}"
+            elif tool_name == "run_preview":
+                text = "正在浏览器里试跑，检查报错"
+            elif tool_name == "execute_code":
+                text = "正在运行代码验证"
+            else:
+                text = f"正在检查 {filename or '文件'} 语法"
+            percent = 20 + int(75 * (iteration + 1) / max(max_iterations, 1))
+            self.sse.progress(req_id, percent, text, stage="coding")
+        except Exception as e:
+            logger.debug(f"[ToolLoop] 动作进度推送失败（不阻断）: {e}")
 
     def _execute_tool(self, state: AgentState, tool_call) -> "ToolResult":
         from harness.tools.registry import ToolResult

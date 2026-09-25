@@ -84,6 +84,8 @@ export interface Requirement {
   create_time: string
   update_time: string
   preview_token?: string
+  /** 失败原因（status='failed' 时后端填充）。技术性原文，展示前需转成用户能读的话 */
+  error_message?: string | null
 }
 
 // ===== API Request Types =====

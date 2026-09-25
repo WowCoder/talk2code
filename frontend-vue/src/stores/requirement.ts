@@ -8,6 +8,20 @@ import type {
 import type { SSEQuestionFormData, SSEEvaluatorResultData, SSESpecData, SSETraceSummaryData, SSETask } from '@/types/sse'
 import { useApi } from '@/composables/useApi'
 
+/** 执行进度：currentAgent 承载"当前在做什么"的动作描述（后端已推动作而非角色名） */
+export interface ProgressState {
+  currentAgent: string
+  percent: number
+  /** 阶段：planning / coding / verifying / repairing，'' 表示未知 */
+  stage: string
+  /** 最后一条进度到达的本地时间戳（ms），用于计算"当前动作已持续多久" */
+  updatedAt: number
+}
+
+export function emptyProgress(): ProgressState {
+  return { currentAgent: '', percent: 0, stage: '', updatedAt: 0 }
+}
+
 export const useRequirementStore = defineStore('requirement', () => {
   // ===== State =====
   const currentRequirement = ref<Requirement | null>(null)
@@ -15,7 +29,9 @@ export const useRequirementStore = defineStore('requirement', () => {
   const codeFiles = reactive<Record<string, string>>({})
   const activeFile = ref<string>('index.html')
   const isGenerating = ref(false)
-  const progress = ref({ currentAgent: '', percent: 0 })
+  const progress = ref<ProgressState>(emptyProgress())
+  // 服务端心跳累计秒数：LLM 静默期的唯一活性信号，供 UI 显示"已等待 Ns"
+  const serverElapsedS = ref(0)
   const questionForm = ref<SSEQuestionFormData | null>(null)
   // chat 模式下的澄清上下文（暂存原始消息，表单提交后拼接重新发送）
   const pendingChatClarification = ref<{ originalMessage: string } | null>(null)
@@ -40,6 +56,61 @@ export const useRequirementStore = defineStore('requirement', () => {
   // ===== API (from shared composable) =====
   const { api } = useApi()
 
+/**
+ * 从「计划」+「实际产物」推导任务状态。
+ *
+ * 这里曾经把 plan.implementation_order 的每个文件一律标成 'completed'——只要计划里
+ * 写了这个文件就宣称完成，从不核对磁盘上到底有没有产物。需求 162 在 Coder 阶段 LLM
+ * 读超时失败、code_files 为空，任务面板照样显示「6/6 完成」，用户据此以为代码好了，
+ * 于是追问「代码 TAB 怎么是空的、发布按钮为什么能点」。任务面板存在的意义是让用户
+ * 知道真实进度，所以状态必须由产物对账得出，不能由计划单方面宣称。
+ */
+function deriveTaskList(plan: any, requirement: Requirement): SSETask[] {
+  const planTasks: any[] = Array.isArray(plan?.tasks) ? plan.tasks : []
+  // implementation_order 是权威顺序，缺失时退回 tasks 里声明的文件
+  const order: string[] = plan?.implementation_order?.length
+    ? plan.implementation_order
+    : planTasks.map((t) => t?.file).filter(Boolean)
+  const descByFile = new Map<string, string>()
+  for (const t of planTasks) {
+    if (t?.file && t?.description) descByFile.set(t.file, t.description)
+  }
+
+  const produced = new Set((requirement.code_files || []).map((f) => f.filename))
+  // 需求已经终止（成功 / 失败 / 待用户处理）后不会再有新的写入。此时仍未产出的文件
+  // 不是「还没轮到」，而是「没写出来」——标 failed 而不是 pending，否则失败的需求会
+  // 留下一列永远停在"待处理"的任务，看起来像还有希望（162 就是这个观感）。
+  // interrupted 仍可续跑，算未完成。
+  const settled = !['pending', 'planning', 'processing', 'interrupted'].includes(requirement.status)
+
+  return order.map((file) => ({
+    file,
+    description: descByFile.get(file) || file,
+    status: produced.has(file) ? 'completed' : settled ? 'failed' : 'pending',
+  }))
+}
+
+/**
+ * 对实时推送来的任务列表做一次对账。
+ *
+ * 后端推送 task_list 时状态一律是 pending（TL 刚出计划，还没写代码，本该如此）。
+ * 但 sse_manager 会把广播过的消息放进缓冲区，客户端重连时整段回放——
+ * 于是刷新一个已经结束的需求，会收到一份"全部待处理"的历史快照，把真实进度
+ * 倒退回去。失败的需求显示 6/6 待处理，和显示 6/6 完成一样是假象。
+ * 所以只在进行中的需求上信任推送值；已终止的按产物重新定状态。
+ */
+function reconcileTaskList(tasks: SSETask[]): SSETask[] {
+  const req = currentRequirement.value
+  if (!req) return tasks
+  const settled = !['pending', 'planning', 'processing', 'interrupted'].includes(req.status)
+  if (!settled) return tasks
+  const produced = new Set((req.code_files || []).map((f) => f.filename))
+  return tasks.map((t) => ({
+    ...t,
+    status: produced.has(t.file) ? 'completed' : 'failed',
+  }))
+}
+
 function messageKey(msg: DialogueMessage): string {
   // SSE dialogue 事件携带时间戳，重放时同一事件的时间戳一致，可作幂等键；
   // 无时间戳的本地消息（如用户连发"继续"）不去重
@@ -57,6 +128,13 @@ function messageKey(msg: DialogueMessage): string {
     // 表现为「一直收到同一条消息」
     return `${msg.role}::${msg.name || ''}::${msg.content ?? ''}`
   }
+  // 无时间戳的 agent 消息（旧版本落库的 TL 分析等）用内容做兜底键：
+  // 同一消息在「历史恢复 + SSE 回放」两条路径下都无时间戳，不去重就会重复显示
+  // （req 164：TL 分析出现 4 遍）。只对 agent 侧生效——用户连发相同消息
+  // （如连续「继续」）是合法行为，绝不能被这里吞掉。
+  if (msg.role !== 'user' && msg.content) {
+    return `content::${msg.role}::${msg.name || ''}::${msg.content}`
+  }
   return ''
 }
 
@@ -67,6 +145,8 @@ function messageKey(msg: DialogueMessage): string {
     seenMessageKeys.clear()
     Object.keys(codeFiles).forEach((k) => delete codeFiles[k])
     activeFile.value = 'index.html'
+    progress.value = emptyProgress()
+    serverElapsedS.value = 0
     questionForm.value = null
     evaluatorResult.value = null
     _specData.value = null
@@ -118,11 +198,7 @@ function messageKey(msg: DialogueMessage): string {
             file_structure: plan.file_structure || [],
             tech_stack: plan.tech_stack || {},
           }
-          _taskList.value = (plan.implementation_order || []).map((f: string) => ({
-            file: f,
-            description: f,
-            status: 'completed' as const,
-          }))
+          _taskList.value = deriveTaskList(plan, data.requirement)
           break
         }
       }
@@ -285,21 +361,34 @@ function messageKey(msg: DialogueMessage): string {
     if (!feedback) {
       planStatus.value = 'confirmed'
     }
+    // 后端此时已把需求置为 processing 并开始编码，但前端 status 是 API 快照、
+    // 不会随 SSE 更新。不同步的话：进度事件会被"已停在选择点"的判据挡掉，
+    // 表现为点了确认之后界面毫无反应（req 166 实测点了确认 80 秒没动静）。
+    if (currentRequirement.value) {
+      currentRequirement.value.status = 'processing'
+    }
+    isGenerating.value = true
   }
 
   async function cancelTask(): Promise<void> {
     if (!currentRequirement.value) return
     await api(`/api/requirements/${currentRequirement.value.id}/cancel`, { method: 'POST' })
     isGenerating.value = false
-    progress.value = { currentAgent: '', percent: 0 }
+    progress.value = emptyProgress()
+    serverElapsedS.value = 0
   }
 
   // 续跑被中断的需求（服务重启 / 取消后重来）：后端经检查点恢复上下文
   async function resumeRequirement(): Promise<void> {
     if (!currentRequirement.value) return
     await api(`/api/requirements/${currentRequirement.value.id}/resume`, { method: 'POST' })
+    // 同 confirmPlan：同步 status 快照，否则后续进度事件会被判据挡掉
+    if (currentRequirement.value) {
+      currentRequirement.value.status = 'processing'
+    }
     isGenerating.value = true
-    progress.value = { currentAgent: '', percent: 0 }
+    progress.value = emptyProgress()
+    serverElapsedS.value = 0
   }
 
   function reset() {
@@ -310,7 +399,8 @@ function messageKey(msg: DialogueMessage): string {
     Object.keys(codeFiles).forEach((k) => delete codeFiles[k])
     activeFile.value = 'index.html'
     isGenerating.value = false
-    progress.value = { currentAgent: '', percent: 0 }
+    progress.value = emptyProgress()
+    serverElapsedS.value = 0
     questionForm.value = null
     pendingChatClarification.value = null
     evaluatorResult.value = null
@@ -328,6 +418,7 @@ function messageKey(msg: DialogueMessage): string {
     activeFile,
     isGenerating,
     progress,
+    serverElapsedS,
     questionForm,
     pendingChatClarification,
     loadRequirement,
@@ -350,5 +441,6 @@ function messageKey(msg: DialogueMessage): string {
     cancelTask,
     resumeRequirement,
     reset,
+    reconcileTaskList,
   }
 })

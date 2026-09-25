@@ -1,0 +1,7 @@
+{
+  "name": "admin",
+  "description": "管理后台类需求：侧边栏 + 表格 + 弹窗三层结构、纯前端分页排序、弹窗状态重置",
+  "type": "knowledge",
+  "trigger": "后台管理|管理系统|管理后台|运营平台|控制台|admin|后台系统|数据管理",
+  "priority": 45
+}

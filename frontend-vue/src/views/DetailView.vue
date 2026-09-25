@@ -16,6 +16,16 @@
       </button>
     </div>
 
+    <!-- 生成失败：失败后代码 TAB 与预览 TAB 都是全空的，而失败信号只有导航栏一枚
+         小徽章，用户既不知道发生了什么，也不知道还能再来一次。这里给出可读原因
+         与重试入口——后端 /resume 的放行闸门包含 failed，可安全重新入队。 -->
+    <div v-else-if="store.currentRequirement?.status === 'failed'" class="resume-banner failed">
+      <span class="resume-text">{{ failureText }}</span>
+      <button class="resume-btn" :disabled="resuming" @click="onResume">
+        {{ resuming ? '正在重新生成…' : '重新生成' }}
+      </button>
+    </div>
+
     <!-- Split layout -->
     <div class="split">
       <!-- Left: Dialogue -->
@@ -54,7 +64,7 @@
 
         <!-- Publish view -->
         <div v-show="activeTab === 'publish'" class="view active">
-          <PublishPanel />
+          <PublishPanel @resume="onResume" />
         </div>
 
         <TokenBar
@@ -70,7 +80,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { useRequirementStore } from '@/stores/requirement'
+import { useRequirementStore, emptyProgress } from '@/stores/requirement'
 import { useToast } from '@/composables/useToast'
 import { useSSE } from '@/composables/useSSE'
 import AppNav from '@/components/layout/AppNav.vue'
@@ -105,22 +115,40 @@ const pageTitle = computed(() => {
 
 const statusText = computed(() => {
   if (store.isGenerating) {
-    const agent = store.progress.currentAgent || 'Agent'
+    // 后端已改为推动作描述（"正在创建 js/app.js"），不再是角色名，直接展示。
+    const action = store.progress.currentAgent || '正在处理'
     // 心跳累计超过 15s 说明正处于静默期（LLM 请求可能挂起 60~150s）。把等待时长显式
     // 说出来，否则用户面对的只是一个不动的界面，只能猜「是不是卡住了」。
     if (serverElapsedS.value >= 15) {
       const m = Math.floor(serverElapsedS.value / 60)
       const sec = serverElapsedS.value % 60
       const waited = m > 0 ? `${m} 分 ${sec} 秒` : `${sec} 秒`
-      return `${agent} 工作中 · 已等待 ${waited}`
+      return `${action} · 已等待 ${waited}`
     }
-    return `${agent} 工作中…`
+    return action
   }
   if (store.currentRequirement?.status === 'finished') return '已完成'
   if (store.currentRequirement?.status === 'finished_with_issues') return '已完成 (有问题)'
   if (store.currentRequirement?.status === 'needs_user_input') return '待用户处理（存在关键缺陷）'
   if (store.currentRequirement?.status === 'failed') return '失败'
+  if (store.currentRequirement?.status === 'planning') return '等待确认开发计划'
   return '准备中'
+})
+
+// 失败提示文案：后端 error_message 是技术原文（例如
+// "HTTPSConnectionPool(host='api.lkeap...'): Read timed out. (read timeout=300)"），
+// 直接铺给用户等于没说。这里识别几类已知故障给出人话，其余降级为通用表述。
+const failureText = computed(() => {
+  const req = store.currentRequirement
+  if (!req) return ''
+  const raw = req.error_message || ''
+  const produced = (req.code_files?.length ?? 0) > 0
+  const outcome = produced
+    ? '这次生成没有跑完，已产出的代码仍然可用'
+    : '这次生成没能产出任何代码'
+  if (/timed ?out/i.test(raw)) return `${outcome}：模型服务响应超时。`
+  if (/取消|cancel/i.test(raw)) return `${outcome}：任务已取消。`
+  return `${outcome}。可以重新生成一次，或在对话里补充要求后再试。`
 })
 
 const tokenInfo = computed(() => {
@@ -149,15 +177,16 @@ onMounted(async () => {
 
     if (req.status === 'finished' || req.status === 'finished_with_issues' || req.status === 'needs_user_input') {
       store.isGenerating = false
-      store.progress = { currentAgent: '', percent: 100 }
+      store.progress = { ...emptyProgress(), percent: 100 }
       // trace / evaluator 已在 loadRequirement 内恢复
-    } else if (req.status === 'processing' || req.status === 'planning') {
-      // 进行中状态：连接 SSE 并锁定输入
+    } else if (req.status === 'processing') {
+      // 真正有任务在跑：连接 SSE 并锁定输入
       store.isGenerating = true
       connect()
     } else {
-      // pending 状态：连接 SSE 但不立即显示"工作中"
-      // isGenerating 由 progress 事件或 SSE 连接状态触发
+      // pending / planning：planning 表示「TL 已出计划，等你点确认」，此刻队列里
+      // 没有任务在跑——按"生成中"渲染就会一边让你确认计划、一边转着工作指示灯
+      //（req 164 的观感就是"一直卡在编码"）。isGenerating 由 progress 事件触发。
       connect()
     }
   } catch (err: any) {
@@ -178,7 +207,10 @@ watch(() => store.planStatus, (status) => {
 // 避免把 pending / finished 等普通浏览态误锁死
 watch(isConnected, (connected) => {
   const st = store.currentRequirement?.status
-  const inProgress = st === 'processing' || st === 'planning'
+  // planning 表示「TL 已出计划，等你点确认」，此刻队列里没有任务在跑。
+  // 把它算成进行中会让界面一直转着「工作中」，而实际上正停在一个需要你操作
+  // 的选择点上（req 164：确认卡片就在眼前，顶部却还在说"正在处理"）。
+  const inProgress = st === 'processing'
   if (connected && inProgress) {
     store.isGenerating = true
   }
@@ -263,7 +295,7 @@ async function onStopGeneration() {
     // SSE cancelled 事件会自动清理 isGenerating 状态
     // 作为 fallback，也在这里清理
     store.isGenerating = false
-    store.progress = { currentAgent: '', percent: 0 }
+    store.progress = emptyProgress()
   } catch (err: any) {
     // 即使请求失败，也恢复输入状态
     store.isGenerating = false
@@ -276,11 +308,15 @@ const resuming = ref(false)
 async function onResume() {
   if (resuming.value || !store.currentRequirement?.id) return
   resuming.value = true
+  const wasFailed = store.currentRequirement.status === 'failed'
   try {
     await store.resumeRequirement()
     // 后端已置为 processing；同步本地状态让提示条立即收起（SSE 随后会推送真实进度）
     store.currentRequirement.status = 'processing'
-    show('已从断点继续', 'success')
+    // 必须重新挂上 SSE：失败/中断的需求在页面挂载时连过一次，但那时后端没有任务在跑，
+    // 推送一直空转。不重连的话点了「重新生成」界面毫无反应，用户只能自己刷新页面猜。
+    connect()
+    show(wasFailed ? '已重新入队，正在重新生成' : '已从断点继续', 'success')
   } catch (err: any) {
     resuming.value = false
     show('继续失败: ' + (err.message || '未知错误'), 'error')
@@ -377,6 +413,16 @@ function escapeInlineScript(content: string): string {
 
 .resume-text {
   min-width: 0;
+}
+
+/* 失败态：与中断态（accent-soft）区分开——中断是"可以接着来"，失败是"这次没成" */
+.resume-banner.failed {
+  background: #fffbeb;
+  border-bottom-color: #fde68a;
+  color: #92400e;
+}
+.resume-banner.failed .resume-btn {
+  background: #d97706;
 }
 
 .resume-btn {
