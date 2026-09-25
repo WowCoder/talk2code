@@ -1248,7 +1248,14 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             browser_result["errors"].append(f"run_preview 异常: {e}")
 
     # ========== Playwright AC 逐条验收 ==========
+    # ⚠️ 这两个变量都必须在**函数作用域**初始化，不能只在下面的
+    # `if acceptance_criteria and 有 index.html` 分支里初始化：
+    # 该分支被跳过时（plan 没有 acceptance_criteria，或工作区还没有 index.html），
+    # 末尾 _build_ac_failure_defects(ac_check_results, _ac_steps_text) 仍会执行，
+    # 于是抛 UnboundLocalError 把整个 verify 节点打挂（req 177 实测：
+    # plan 无 AC → 分支跳过 → "cannot access local variable '_ac_steps_text'" → 需求直接 failed）。
     ac_check_results = []
+    _ac_steps_text = {}  # ac_id -> 复现步骤文本（供缺陷回传定位根因）
     plan = state.get("plan", {})
     acceptance_criteria = plan.get("acceptance_criteria", []) if isinstance(plan, dict) else []
     # req 148 事故：state["plan"] 里取不到 AC 时，整轮 AC 逐条验收被**静默跳过**
@@ -1304,7 +1311,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                 ).encode()
             ).hexdigest()
             ac_scripts = None
-            _ac_steps_text = {}   # ac_id -> 复现步骤文本（供缺陷回传定位根因）
+            # _ac_steps_text 已在函数入口初始化（见上方注释），此处不再重复赋值
             if ac_cache_path.exists():
                 try:
                     cached = json.loads(ac_cache_path.read_text())

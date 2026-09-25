@@ -109,6 +109,11 @@ def _run_preview_in_browser_session(
             try:
                 context = browser.new_context()
                 page = context.new_page()
+                # 声明为复验/预览请求：已发布站点的 Host 路由据此**跳过 badge 装饰**，
+                # 让验收跑在用户作品的原稿上。badge 是平台装饰，不属于验收范围，
+                # 且它浮在右下角可能遮挡 AC 脚本要点击的元素，造成假红。
+                # 详见 services/publish/decorate.py
+                page.set_extra_http_headers({"X-T2C-Verify": "1"})
 
                 # ---- 注入 RAF 追踪脚本（在页面脚本执行前注入） ----
                 # 用于检测 initGame / 游戏循环等是否真正启动了 requestAnimationFrame
@@ -478,6 +483,11 @@ def _run_ac_checks_session(
             try:
                 context = browser.new_context()
                 page = context.new_page()
+                # 声明为复验/预览请求：已发布站点的 Host 路由据此**跳过 badge 装饰**，
+                # 让验收跑在用户作品的原稿上。badge 是平台装饰，不属于验收范围，
+                # 且它浮在右下角可能遮挡 AC 脚本要点击的元素，造成假红。
+                # 详见 services/publish/decorate.py
+                page.set_extra_http_headers({"X-T2C-Verify": "1"})
                 page.set_default_timeout(timeout_ms)
 
                 def _load(use_sandbox: bool):
@@ -812,6 +822,11 @@ def _capture_screenshot_session(html_path: Path, out_path: Path,
             try:
                 context = browser.new_context(viewport={"width": 1280, "height": 800})
                 page = context.new_page()
+                # 声明为复验/预览请求：已发布站点的 Host 路由据此**跳过 badge 装饰**，
+                # 让验收跑在用户作品的原稿上。badge 是平台装饰，不属于验收范围，
+                # 且它浮在右下角可能遮挡 AC 脚本要点击的元素，造成假红。
+                # 详见 services/publish/decorate.py
+                page.set_extra_http_headers({"X-T2C-Verify": "1"})
                 page.set_default_timeout(timeout_ms)
                 target = page
                 if sandbox:
@@ -1063,6 +1078,11 @@ def _run_universal_smoke_session(html_path: Path, timeout_ms: int = 15_000, prev
             try:
                 context = browser.new_context()
                 page = context.new_page()
+                # 声明为复验/预览请求：已发布站点的 Host 路由据此**跳过 badge 装饰**，
+                # 让验收跑在用户作品的原稿上。badge 是平台装饰，不属于验收范围，
+                # 且它浮在右下角可能遮挡 AC 脚本要点击的元素，造成假红。
+                # 详见 services/publish/decorate.py
+                page.set_extra_http_headers({"X-T2C-Verify": "1"})
                 page.set_default_timeout(timeout_ms)
 
                 load_errors: list[str] = []

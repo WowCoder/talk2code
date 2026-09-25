@@ -5,7 +5,7 @@
 """
 
 from datetime import datetime
-from sqlalchemy import create_engine, event, Column, Integer, String, Text, DateTime, Boolean, ForeignKey, JSON, Float, SmallInteger, text, Index
+from sqlalchemy import create_engine, event, Column, Integer, String, Text, DateTime, Date, Boolean, ForeignKey, JSON, Float, SmallInteger, text, Index, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.sql import func
@@ -257,6 +257,123 @@ class PublishedSite(Base):
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
+    # ---- 创意市集（marketplace）----
+    # ⚠️ market_visible 默认 False 是**不可回退约束**：上架必须 opt-in。
+    # 现状所有站点都是 unlisted，用户的预期是"我只是在分享一个链接"；
+    # 默认搬进公共列表是对既有预期的背叛，且产物中可能含私人内容。
+    market_visible = Column(Boolean, default=False, nullable=False)
+    market_listed_at = Column(DateTime, nullable=True)        # 上架时间 = 热度的时间基准
+    badge_enabled = Column(Boolean, default=True, nullable=False)
+    author_note = Column(String(120), default="")
+    # 市集分类（Ship 3）。空串 = 未分类，列表里归入「全部」。
+    category = Column(String(16), default="")
+
+
+class SiteVisitDedup(Base):
+    """市集去重访客账本。
+
+    只存指纹哈希，不存 IP / UA 明文。指纹 = sha256(salt|ip|ua|day)[:32]，
+    按天分桶，使账本天然过期、可定期清理。唯一约束就是去重实现本身，
+    不依赖"先查再插"的时序（并发下先查再插必然漏判）。
+    """
+    __tablename__ = "site_visit_dedup"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    site_id = Column(Integer, ForeignKey("published_sites.id"), nullable=False, index=True)
+    fingerprint = Column(String(32), nullable=False, index=True)
+    day = Column(Date, nullable=False, index=True)
+    created_at = Column(DateTime, default=func.now())
+    __table_args__ = (UniqueConstraint("site_id", "fingerprint", "day", name="uq_site_visit_dedup"),)
+
+
+class SiteLike(Base):
+    """市集点赞。唯一约束兜底重复点赞，前端禁用按钮只是体验优化。"""
+    __tablename__ = "site_likes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    site_id = Column(Integer, ForeignKey("published_sites.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime, default=func.now())
+    __table_args__ = (UniqueConstraint("site_id", "user_id", name="uq_site_like"),)
+
+
+class SiteComment(Base):
+    """市集留言（Ship 2）。
+
+    **不支持匿名留言**：匿名区没有可追责主体，是垃圾内容的温床。删除一律软删
+    （`is_deleted`）而非物理删 —— 保留时间戳与归属，便于事后追溯与申诉。
+    """
+    __tablename__ = "site_comments"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    site_id = Column(Integer, ForeignKey("published_sites.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    body = Column(String(200), nullable=False)
+    is_deleted = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, default=func.now())
+    __table_args__ = (Index("idx_comment_site_created", "site_id", "created_at"),)
+
+
+class UserFollow(Base):
+    """市集关注关系（Ship 2）。
+
+    只记「谁关注了谁」这一条有向边；粉丝数/关注数一律实时聚合，不做冗余计数列
+    —— 冗余列会在软删、并发下漂移，而这里的量级完全撑得住 COUNT。
+    """
+    __tablename__ = "user_follows"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    follower_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    followee_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime, default=func.now())
+    __table_args__ = (UniqueConstraint("follower_id", "followee_id", name="uq_user_follow"),)
+
+
+def _sql_false() -> str:
+    return "FALSE" if settings.IS_POSTGRES else "0"
+
+
+def _sql_true() -> str:
+    return "TRUE" if settings.IS_POSTGRES else "1"
+
+
+def _add_column(table: str, column: str, *, pg: str, sqlite: str) -> None:
+    """给既有表补列。DDL **必须按方言分别给出**，不能只写一份 SQLite 语法。
+
+    为什么：SQLite 认 `BOOLEAN DEFAULT 0` / `DATETIME`，PostgreSQL 会拒绝
+    （布尔列收到整型默认值 → DatatypeMismatch；`DATETIME` 类型不存在）。
+    而这类失败长期被 `except Exception: pass` 当成"列已存在"抹平 —— 列其实
+    根本没建出来，直到运行时以 UndefinedColumn 炸在某个离迁移很远的查询上。
+
+    另一条：失败必须显式 rollback。连接回池后若仍处在 aborted 事务里，
+    后续每条语句都会跟着失败，错误会被误读成"别的列也建不了"。
+    """
+    ddl = pg if settings.IS_POSTGRES else sqlite
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
+            conn.commit()
+    except Exception:
+        try:
+            with engine.connect() as conn:
+                conn.rollback()
+        except Exception:
+            pass  # 列已存在是唯一可忽略的失败
+
+
+def _backfill_null(table: str, column: str, literal: str) -> None:
+    """把既有行的 NULL 新列回填成默认值（ALTER 的 DEFAULT 不改写既有行）。"""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(f"UPDATE {table} SET {column} = {literal} WHERE {column} IS NULL"))
+            conn.commit()
+    except Exception:
+        try:
+            with engine.connect() as conn:
+                conn.rollback()
+        except Exception:
+            pass
+
 
 # 初始化数据库（创建所有表）
 def init_db():
@@ -289,35 +406,26 @@ def init_db():
             except Exception:
                 pass  # 索引已存在
 
-    # 迁移：为已有 requirements 表添加软删除列（SQLite 兼容）
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE requirements ADD COLUMN is_deleted BOOLEAN DEFAULT 0"))
-            conn.commit()
-    except Exception:
-        pass  # 列已存在
+    # 迁移：为已有表补列。create_all 只建新表，不给既有表加列。
+    # ⚠️ 一律走 _add_column()，不要裸写 try/except + 方言不分的 DDL（见其注释）。
+    _add_column("requirements", "is_deleted", pg="BOOLEAN DEFAULT FALSE", sqlite="BOOLEAN DEFAULT 0")
+    _add_column("requirements", "deleted_at", pg="TIMESTAMP", sqlite="DATETIME")
+    _add_column("requirements", "error_message", pg="TEXT", sqlite="TEXT")
 
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE requirements ADD COLUMN deleted_at DATETIME"))
-            conn.commit()
-    except Exception:
-        pass  # 列已存在
+    # 修复已有数据：将 NULL 的 is_deleted 统一设为假（非删除状态）
+    _backfill_null("requirements", "is_deleted", _sql_false())
 
-    # 修复已有数据：将 NULL 的 is_deleted 统一设为 0（非删除状态）
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("UPDATE requirements SET is_deleted = 0 WHERE is_deleted IS NULL"))
-            conn.commit()
-    except Exception:
-        pass
+    # 迁移：创意市集。
+    _add_column("published_sites", "market_visible", pg="BOOLEAN DEFAULT FALSE", sqlite="BOOLEAN DEFAULT 0")
+    _add_column("published_sites", "market_listed_at", pg="TIMESTAMP", sqlite="DATETIME")
+    _add_column("published_sites", "badge_enabled", pg="BOOLEAN DEFAULT TRUE", sqlite="BOOLEAN DEFAULT 1")
+    _add_column("published_sites", "author_note", pg="VARCHAR(120) DEFAULT ''", sqlite="VARCHAR(120) DEFAULT ''")
+    _add_column("published_sites", "category", pg="VARCHAR(16) DEFAULT ''", sqlite="VARCHAR(16) DEFAULT ''")
 
-    # 迁移：为已有 requirements 表添加 error_message 列
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE requirements ADD COLUMN error_message TEXT"))
-            conn.commit()
-    except Exception:
-        pass  # 列已存在
+    # 回填：既有行的新列是 NULL，会漏过 market_visible.is_(True) 过滤，
+    # 也会让 badge_enabled 判成假 → 必须显式落默认值。
+    _backfill_null("published_sites", "category", "''")
+    _backfill_null("published_sites", "market_visible", _sql_false())
+    _backfill_null("published_sites", "badge_enabled", _sql_true())
 
 

@@ -90,6 +90,10 @@ RATE_LIMITS = {
     # 代码保存：防止频繁修改
     'code_save': '30 per minute',
 
+    # 创意市集：列表/详情是**公开**端点（免登录可逛），必须单独限流。
+    # 注意它跑在主站 origin，不享受 is_published_site_request 的默认限流豁免。
+    'market': '60 per minute',
+
     # SSE 连接：不限制（长连接，不计入请求频率）
     'sse_exempt': None,
 

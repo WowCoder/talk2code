@@ -351,6 +351,32 @@ class Settings(BaseSettings):
         default=True,
         description='发布后复验是否异步执行（False=在发布请求线程内同步跑，仅测试用）'
     )
+    PUBLISH_BADGE_ENABLED: bool = Field(
+        default=True,
+        description='已发布站点是否注入来源 badge（全局开关；作者侧另有 badge_enabled）'
+    )
+
+    # ==================== 创意市集配置 ====================
+
+    MARKET_PAGE_SIZE: int = Field(default=20, description='市集列表默认分页大小')
+    MARKET_MAX_PAGE_SIZE: int = Field(default=50, description='市集列表分页大小上限')
+    MARKET_VISIT_SALT: str = Field(
+        default='',
+        description='访客指纹加盐。空则回退 JWT_SECRET_KEY 前 16 位'
+    )
+    MARKET_SITE_URL: str = Field(
+        default='',
+        description='主站市集地址（badge 跳转目标）。空则按 PUBLISH_APEX + /market 推导'
+    )
+    # 留言审核：不内置"假装能用"的词库，词表由部署方提供。
+    # 为空表示不启用关键词拦截（此时仍受长度、限流、重复内容三道约束）。
+    MARKET_COMMENT_BLOCKWORDS: str = Field(
+        default='',
+        description='留言屏蔽词，逗号分隔。为空则不启用关键词拦截'
+    )
+    MARKET_COMMENT_MAX_PER_MINUTE: int = Field(
+        default=10, description='留言频率上限（条/分钟）'
+    )
 
     @property
     def PUBLISH_STORE_PATH(self) -> Path:

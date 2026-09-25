@@ -7,6 +7,8 @@
         <RequirementInput ref="inputRef" />
         <ExampleChips @select="onSelectExample" />
       </div>
+      <!-- 输入框下方给几条真实作品：一句"你要做什么"之前，先让人看见别人做成了什么 -->
+      <MarketTeaser />
     </main>
   </div>
 </template>
@@ -17,6 +19,7 @@ import AppNav from '@/components/layout/AppNav.vue'
 import HeroSection from '@/components/home/HeroSection.vue'
 import RequirementInput from '@/components/home/RequirementInput.vue'
 import ExampleChips from '@/components/home/ExampleChips.vue'
+import MarketTeaser from '@/components/home/MarketTeaser.vue'
 
 const inputRef = ref<InstanceType<typeof RequirementInput>>()
 

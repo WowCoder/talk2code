@@ -11,27 +11,41 @@
         <span class="nav-title">{{ title }}</span>
       </template>
       <template v-else>
-        <router-link to="/" class="nav-brand">
+        <router-link :to="isGuest ? '/market' : '/'" class="nav-brand">
           <img src="@/assets/logo.png" alt="Talk2Code" class="nav-logo" /><span class="brand-text">Talk<span>2</span>Code</span>
         </router-link>
         <div class="nav-links">
-          <router-link to="/history" class="nav-link" active-class="active">
-            历史记录
+          <router-link to="/market" class="nav-link" active-class="active">
+            创意市集
           </router-link>
-          <router-link to="/settings" class="nav-link" active-class="active">
-            设置
-          </router-link>
+          <!-- 游客态：需要登录的 tab 置灰而不是隐藏 —— 隐藏会让人以为产品只有
+               一个页面，置灰则顺带说明了「登录后有更多」。 -->
+          <template v-if="isGuest">
+            <span class="nav-link disabled" title="登录后可查看">历史记录</span>
+            <span class="nav-link disabled" title="登录后可查看">设置</span>
+          </template>
+          <template v-else>
+            <router-link to="/history" class="nav-link" active-class="active">
+              历史记录
+            </router-link>
+            <router-link to="/settings" class="nav-link" active-class="active">
+              设置
+            </router-link>
+          </template>
         </div>
       </template>
     </div>
     <div class="nav-right">
+      <router-link v-if="isGuest && !compact" class="nav-guest-link" to="/login">
+        登录 / 注册
+      </router-link>
       <template v-if="compact && statusText">
         <span class="nav-status">
           <span v-if="isActive" class="status-dot"></span>
           {{ statusText }}
         </span>
       </template>
-      <div class="nav-user" @click="toggleDropdown" ref="userRef">
+      <div v-if="!isGuest" class="nav-user" @click="toggleDropdown" ref="userRef">
         <span class="nav-avatar">{{ authStore.username[0]?.toUpperCase() }}</span>
         <span class="nav-username">{{ authStore.username }}</span>
         <svg class="nav-caret" :class="{ open: showDropdown }" viewBox="0 0 24 24" width="12" height="12"
@@ -56,7 +70,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount } from 'vue'
+import { computed, ref, onMounted, onBeforeUnmount } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import { useRouter } from 'vue-router'
 
@@ -77,6 +91,9 @@ const router = useRouter()
 
 const showDropdown = ref(false)
 const userRef = ref<HTMLElement | null>(null)
+
+// 游客态：只留市集一个可用 tab，右上角给登录入口，不渲染用户头像与下拉。
+const isGuest = computed(() => !authStore.isAuthenticated)
 
 function toggleDropdown() {
   showDropdown.value = !showDropdown.value
@@ -172,6 +189,28 @@ async function handleLogout() {
 
 .nav-link.active {
   color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.nav-link.disabled {
+  color: var(--muted);
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.nav-guest-link {
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--accent);
+  text-decoration: none;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.nav-guest-link:hover {
+  border-color: var(--accent);
   background: var(--accent-soft);
 }
 

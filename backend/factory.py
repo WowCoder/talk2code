@@ -7,6 +7,7 @@ Talk2Code - Flask 主应用
 import os
 import sys
 from flask import Flask, request, jsonify, Response, send_from_directory, g
+from werkzeug.exceptions import NotFound
 from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity,
     verify_jwt_in_request,
@@ -117,9 +118,10 @@ if limiter:
     rate_limit_auth = limiter.limit(RATE_LIMITS['auth'])
     rate_limit_requirement = limiter.limit(RATE_LIMITS['requirement_create'])
     rate_limit_chat = limiter.limit(RATE_LIMITS['chat'])
+    rate_limit_market = limiter.limit(RATE_LIMITS['market'])
 else:
     # No-op decorator for tests
-    rate_limit_auth = rate_limit_requirement = rate_limit_chat = lambda f: f
+    rate_limit_auth = rate_limit_requirement = rate_limit_chat = rate_limit_market = lambda f: f
 
 # 初始化数据库
 init_db()
@@ -227,14 +229,50 @@ atexit.register(cleanup)
 # Vue SPA 静态文件目录
 SPA_DIST = os.path.join(os.path.dirname(__file__), '..', 'frontend-vue', 'dist')
 
+# 前端构建产物（Vite 输出目录）。文件名内容寻址（自带 hash），故：
+# - 命中时允许客户端长期缓存（文件名变即内容变，不存在"更新了却拿到旧的"）；
+# - 未命中时必须 404，**绝不回退 index.html**（理由见 serve_spa）。
+SPA_ASSET_PREFIX = 'assets/'
+SPA_ASSET_CACHE_CONTROL = 'public, max-age=31536000, immutable'
+
 
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve_spa(path):
-    """SPA fallback — 非 API 路径返回 index.html，由 Vue Router 处理"""
+    """前端页面路由。
+
+    这里必须分清两类路径 —— 把两者同等对待会制造极难排查的假象：
+
+    **一、前端路由**（``/detail/162``、``/history``）
+    服务端没有对应文件是正常的，必须回退 ``index.html`` 交给 Vue Router，
+    否则用户刷新页面直接 404。
+
+    **二、构建产物**（``/assets/<name>-<hash>.js``）
+    文件名内容寻址，**不存在就是真的不存在**。最常见的原因是页面还停留在
+    旧版本：浏览器里的旧入口引用了上一次构建产出的 chunk，而新构建已把它删掉。
+    此时若回退 ``index.html``，浏览器会拿到 ``200`` + ``text/html`` 去当 ES
+    module 执行，报出
+
+        Expected a JavaScript-or-Wasm module script but the server responded
+        with a MIME type of "text/html"
+
+    —— 把「这个 chunk 已经不存在了，重新加载页面即可」这个清晰事实，伪装成
+    一个看起来像 MIME 配置错误的乱麻。所以产物路径必须返回 404：动态 import
+    失败会得到 ``Failed to fetch dynamically imported module``，指向真正的原因。
+    """
     if path.startswith('api/'):
         return jsonify({'error': 'Not found'}), 404
-    # 尝试返回静态文件（js/css/assets）
+    if path.startswith(SPA_ASSET_PREFIX):
+        try:
+            resp = send_from_directory(SPA_DIST, path)
+        except NotFound:
+            return jsonify({
+                'error': f'静态资源不存在: {path}',
+                'hint': '前端产物已更新，请强制刷新页面（Cmd/Ctrl+Shift+R）',
+            }), 404
+        resp.headers['Cache-Control'] = SPA_ASSET_CACHE_CONTROL
+        return resp
+    # 非产物路径（前端路由 / 根目录静态文件）→ 命中即返回，否则回退 index.html
     if path:
         try:
             return send_from_directory(SPA_DIST, path)

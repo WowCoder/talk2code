@@ -263,6 +263,8 @@ def _same_origin_probe(url: str) -> bool:
         timeout_ms=SAME_ORIGIN_TIMEOUT_MS,
     ) as browser:
         page = browser.new_page()
+        # 同 preview_runner：声明为复验请求，跳过 badge 装饰（避免浮层干扰探针）
+        page.set_extra_http_headers({"X-T2C-Verify": "1"})
         page.goto(url, wait_until="load", timeout=SAME_ORIGIN_TIMEOUT_MS)
         # 必须包成函数体：page.evaluate 收到裸语句串时按表达式 eval，
         # 顶层 return 会直接抛 "SyntaxError: Illegal return statement"

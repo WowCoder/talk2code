@@ -23,6 +23,26 @@ const router = createRouter({
       meta: { requiresAuth: true },
     },
     {
+      // 创意市集：免登录可逛。匿名访客能看见作品、能点赞（第 3 次互动才引导注册），
+      // 这是「陌生人 → 注册」转化路径的入口。
+      path: '/market',
+      name: 'Market',
+      component: () => import('@/views/MarketView.vue'),
+      meta: { requiresAuth: false },
+    },
+    {
+      path: '/market/:slug',
+      name: 'MarketDetail',
+      component: () => import('@/views/MarketDetailView.vue'),
+      meta: { requiresAuth: false },
+    },
+    {
+      path: '/market/u/:id',
+      name: 'MarketAuthor',
+      component: () => import('@/views/MarketAuthorView.vue'),
+      meta: { requiresAuth: false },
+    },
+    {
       path: '/history',
       name: 'History',
       component: () => import('@/views/HistoryView.vue'),
@@ -46,7 +66,11 @@ router.beforeEach((to, _from, next) => {
   const authStore = useAuthStore()
 
   // 登录态已在 main.ts 中通过 initAuth() 恢复
-  if (to.meta.requiresAuth && !authStore.isAuthenticated) {
+  if (!authStore.isAuthenticated && to.path === '/') {
+    // 游客的默认落点是市集：先让人看见别人做出来的东西，比先甩一个登录框
+    // 更能说明这产品能干什么。（/history、/settings 仍走下面的登录门禁）
+    next({ name: 'Market' })
+  } else if (to.meta.requiresAuth && !authStore.isAuthenticated) {
     next({ name: 'Login' })
   } else if (to.name === 'Login' && authStore.isAuthenticated) {
     next({ name: 'Home' })

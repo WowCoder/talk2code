@@ -12,6 +12,7 @@ from factory import app, logger
 from utils.db import get_db, transactional_db
 
 from models.models import Requirement, PublishedSite
+from services.market.cover import get_cover
 from services.publish.service import PublishService, PublishError
 from services.publish.slug import is_valid_slug
 from services.publish.urls import published_host as _published_host
@@ -58,6 +59,15 @@ def _site_payload(site) -> dict:
         'created_at': site.created_at.isoformat() if site.created_at else None,
         'updated_at': site.updated_at.isoformat() if site.updated_at else None,
         'verified_at': site.verified_at.isoformat() if site.verified_at else None,
+        # 创意市集：上架状态与作者侧开关。这三个端点都是**作者本人**可见，
+        # 把上架态并进同一份载荷，省掉发布面板再发一次请求。
+        'listed': bool(site.market_visible),
+        'author_note': site.author_note or '',
+        'badge_enabled': bool(site.badge_enabled),
+        'category': site.category or '',
+        # 是否用了自定义封面（缩略图端点会优先出封面，这里只回一个布尔，
+        # 作者面板靠它决定显示「移除封面」还是「上传封面」）
+        'cover': get_cover(site.slug)[0] is not None,
     }
 
 

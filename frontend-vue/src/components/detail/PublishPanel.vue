@@ -45,7 +45,7 @@
         <div class="pc-url-box disabled">
           <span class="pc-url-text muted">— 当前环境无可用域名 —</span>
         </div>
-        <button class="btn-publish btn-secondary" :disabled="publishing || unpublishing" @click="onPublish">
+        <button class="btn-publish btn-secondary" :disabled="publishing || unpublishing || !canPublish" @click="onPublish">
           {{ publishing ? '发布中…' : '重新发布（仍不可访问）' }}
         </button>
         <div class="pc-actions">
@@ -79,14 +79,68 @@
           <button class="pc-copy" :disabled="!openUrl" @click="copyUrl">复制</button>
         </div>
         <a class="btn-publish" :href="openUrl" target="_blank" rel="noopener">打开站点</a>
+
+        <!-- 创意市集：上架是 opt-in，默认不勾（尊重 unlisted 的既有预期） -->
+        <div class="pc-market">
+          <label class="pc-switch">
+            <input type="checkbox" v-model="marketListed" @change="syncMarket" />
+            <span>同步到创意市集</span>
+          </label>
+          <p class="pc-market-hint">
+            上架后会出现在市集列表，访客无需登录就能看见并点赞。
+          </p>
+          <div v-if="marketListed" class="pc-market-extra">
+            <input class="pc-note" type="text" maxlength="120" v-model="authorNote"
+                   placeholder="一句话介绍（选填）" @change="syncMarket" />
+            <select class="pc-note" v-model="category" @change="syncMarket">
+              <option value="">分类（选填）</option>
+              <option v-for="c in categoryOptions" :key="c.value" :value="c.value">
+                {{ c.label }}
+              </option>
+            </select>
+            <label class="pc-switch small">
+              <input type="checkbox" v-model="badgeEnabled" @change="syncMarket" />
+              <span>站点右下角显示来源入口</span>
+            </label>
+
+            <!-- 封面：默认就是首页截图，这里只是给作者一个「我另挑一张」的入口。
+                 预览直接吃缩略图端点（服务时优先出封面），所以看到的就是市集里
+                 实际展示的那张图，不存在「上传成功但列表没变」的错觉。 -->
+            <div class="pc-cover">
+              <div class="pc-cover-preview">
+                <img v-if="!previewFailed" class="pc-cover-img" :src="previewUrl" alt="封面"
+                     @error="previewFailed = true" />
+                <span v-else class="pc-cover-ph">预览不可用</span>
+              </div>
+              <div class="pc-cover-ops">
+                <label class="pc-cover-btn">
+                  {{ hasCover ? '更换封面' : '上传封面' }}
+                  <input class="pc-file" type="file" accept="image/png,image/jpeg"
+                         @change="onCoverPick" />
+                </label>
+                <button v-if="hasCover" class="pc-link" :disabled="coverBusy" @click="removeCover">
+                  移除封面
+                </button>
+                <p class="pc-cover-hint">
+                  不上传就用首页截图。PNG / JPEG，2 MB 以内。
+                </p>
+              </div>
+            </div>
+          </div>
+          <p v-if="marketError || coverError" class="pc-market-err">{{ marketError || coverError }}</p>
+        </div>
+
         <div class="pc-actions">
-          <button class="pc-link" :disabled="publishing || unpublishing" @click="onPublish">
+          <button class="pc-link" :disabled="publishing || unpublishing || !canPublish" @click="onPublish">
             {{ publishing ? '发布中…' : '重新发布（新版本）' }}
           </button>
           <button class="pc-link pc-danger" :disabled="unpublishing" @click="onUnpublish">
             {{ unpublishing ? '取消中…' : '取消发布' }}
           </button>
         </div>
+        <p v-if="!canPublish" class="pc-gate-hint block">
+          {{ gate.label }}——发布新版本同样需要一次通过 QA 验收的生成结果。
+        </p>
       </div>
     </div>
 
@@ -102,15 +156,19 @@
         <p class="pc-intro">
           把当前生成的静态产物发布为一个可分享的链接。链接与内容解耦——重新发布同一需求，URL 不变、版本号 +1。
         </p>
-        <div class="pc-meta-card">
-          <span class="pc-dot ready"></span>
-          <span class="pc-meta-ready">代码已就绪，可发布</span>
+        <div :class="['pc-meta-card', gate.tone]">
+          <span :class="['pc-dot', gate.tone]"></span>
+          <span :class="['pc-meta-label', gate.tone]">{{ gate.label }}</span>
           <span v-if="assetSummary" class="pc-meta-sub">{{ assetSummary }}</span>
         </div>
-        <button class="btn-publish" :disabled="publishing || !reqId" @click="onPublish">
+        <p v-if="gate.hint" :class="['pc-gate-hint', gate.tone]">{{ gate.hint }}</p>
+        <button class="btn-publish" :disabled="publishing || !canPublish" @click="onPublish">
           {{ publishing ? '发布中…' : '发布此需求' }}
         </button>
         <p class="pc-tip">发布后会得到一个可分享的链接，访问者无需登录即可打开。</p>
+        <button v-if="gate.retryable" class="pc-link pc-retry" :disabled="store.isGenerating" @click="onRetry">
+          {{ store.isGenerating ? '正在重新生成…' : '重新生成代码' }}
+        </button>
       </div>
     </div>
 
@@ -152,7 +210,15 @@ interface PublishResult {
   view_count?: number
   created_at?: string | null
   updated_at?: string | null
+  // 创意市集（作者本人可见）
+  listed?: boolean
+  author_note?: string
+  badge_enabled?: boolean
+  category?: string
+  cover?: boolean
 }
+
+const emit = defineEmits<{ resume: [] }>()
 
 const store = useRequirementStore()
 const { show } = useToast()
@@ -181,6 +247,127 @@ const isPublishedButUnavailable = computed(
 
 const warnings = computed(() => result.value?.warnings ?? [])
 
+// ===== 创意市集 =====
+// 上架一律 opt-in：默认不勾。现状所有站点都是 unlisted，用户预期是"只分享链接"，
+// 默认搬进公共列表是对既有预期的背叛。
+const marketListed = ref(false)
+const authorNote = ref('')
+const badgeEnabled = ref(true)
+const category = ref('')
+const marketError = ref('')
+
+// ===== 封面 =====
+// 预览 = 缩略图端点当前实际会出的那张图（有封面出封面，没有就出首页截图）。
+// 换封面是作者动作、频率极低，靠 coverSeq 手动打缓存钉，比 no-cache 更可靠。
+const hasCover = ref(false)
+const coverSeq = ref(0)
+const coverBusy = ref(false)
+const coverError = ref('')
+const previewFailed = ref(false)
+const previewUrl = computed(() => {
+  const slug = result.value?.slug
+  if (!slug) return ''
+  return `/api/market/thumbs/${slug}.png?v=${coverSeq.value}`
+})
+
+// 分类枚举与后端 CATEGORIES 保持一致（后端非法值会静默归为未分类，不报错）
+const categoryOptions = [
+  { value: 'game', label: '游戏' },
+  { value: 'tool', label: '工具' },
+  { value: 'admin', label: '后台' },
+  { value: 'landing', label: '展示' },
+  { value: 'other', label: '其它' },
+]
+
+watch(
+  result,
+  (r) => {
+    marketListed.value = !!r?.listed
+    authorNote.value = r?.author_note || ''
+    badgeEnabled.value = r?.badge_enabled !== false
+    category.value = r?.category || ''
+    hasCover.value = !!r?.cover
+    coverSeq.value += 1
+    previewFailed.value = false
+  },
+  { immediate: true }
+)
+
+async function onCoverPick(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  // 清空 value：否则连续选同一个文件不会再触发 change，看起来像「点了没反应」
+  input.value = ''
+  if (!file) return
+  const slug = result.value?.slug
+  if (!slug) return
+
+  // 客户端先挡一道，只是为了让作者立刻看到原因；真正的校验在服务端（魔数 + 2MB）
+  if (file.size > 2 * 1024 * 1024) {
+    coverError.value = '封面不能超过 2 MB'
+    return
+  }
+  coverError.value = ''
+  coverBusy.value = true
+  try {
+    const fd = new FormData()
+    fd.append('file', file)
+    await api(`/api/market/sites/${slug}/cover`, { method: 'POST', body: fd })
+    hasCover.value = true
+    coverSeq.value += 1
+    previewFailed.value = false
+    show('封面已更新', 'success')
+  } catch (err) {
+    coverError.value = err instanceof Error ? err.message : '上传失败'
+  } finally {
+    coverBusy.value = false
+  }
+}
+
+async function removeCover() {
+  const slug = result.value?.slug
+  if (!slug) return
+  coverError.value = ''
+  coverBusy.value = true
+  try {
+    await api(`/api/market/sites/${slug}/cover`, { method: 'DELETE' })
+    hasCover.value = false
+    coverSeq.value += 1
+    previewFailed.value = false
+    show('已恢复为首页截图', 'success')
+  } catch (err) {
+    coverError.value = err instanceof Error ? err.message : '移除失败'
+  } finally {
+    coverBusy.value = false
+  }
+}
+
+async function syncMarket() {
+  const slug = result.value?.slug
+  if (!slug) return
+  marketError.value = ''
+  // 失败必须把开关回滚：v-model 已经把界面改成"已上架"，只写一行错误文案的话
+  // 界面显示成功、后端没保存 —— 这正是「点了同步、市集里却没有」的观感来源。
+  // 文本类字段（介绍/分类）保留用户输入，方便他改完重试。
+  const prev = { listed: marketListed.value, badge: badgeEnabled.value }
+  try {
+    await api(`/api/publish/${slug}/market`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        listed: marketListed.value,
+        author_note: authorNote.value,
+        badge_enabled: badgeEnabled.value,
+        category: category.value,
+      }),
+    })
+    show(marketListed.value ? '已同步到创意市集' : '已从创意市集撤下', 'success')
+  } catch (e) {
+    marketListed.value = prev.listed
+    badgeEnabled.value = prev.badge
+    marketError.value = e instanceof Error ? e.message : '保存失败'
+  }
+}
+
 // 「index.html · 共 N 个文件」：按需求实际的代码文件数算。
 // 此前这一行是硬编码的「index.html · 3 个资源」——文件数不是 3 时就是在给用户
 // 报错误信息，且「资源」与「文件」含义含混。无文件时不渲染这一行。
@@ -191,6 +378,62 @@ const assetSummary = computed(() => {
     ? 'index.html'
     : files[0].filename
   return `${entry} · 共 ${files.length} 个文件`
+})
+
+// ===== 发布门禁 =====
+// 唯一放行条件：需求通过了 QA 验收（后端把 verify_passed 为真的需求标成 'finished'）
+// 并且产物确实存在。此前按钮只看「有没有需求 ID」，元信息卡还无条件写着
+// 「代码已就绪，可发布」——需求 162 一个文件都没生成，卡片照样宣称就绪。
+const reqStatus = computed(() => store.currentRequirement?.status ?? null)
+const qaPassed = computed(() => reqStatus.value === 'finished')
+const hasFiles = computed(() => (store.currentRequirement?.code_files?.length ?? 0) > 0)
+const canPublish = computed(() => qaPassed.value && hasFiles.value)
+const inProgress = computed(() =>
+  ['pending', 'planning', 'processing', 'interrupted'].includes(reqStatus.value ?? '')
+)
+
+interface Gate {
+  tone: 'ready' | 'wait' | 'block'
+  label: string
+  hint: string
+  /** 能否就地重试生成（仅失败且无产物时） */
+  retryable: boolean
+}
+
+const gate = computed<Gate>(() => {
+  if (canPublish.value) {
+    return { tone: 'ready', label: '代码已就绪，可发布', hint: '', retryable: false }
+  }
+  if (inProgress.value) {
+    return {
+      tone: 'wait',
+      label: '代码生成中',
+      hint: '生成完成并通过 QA 验收后即可发布。',
+      retryable: false,
+    }
+  }
+  if (!hasFiles.value) {
+    return {
+      tone: 'block',
+      label: '尚未生成代码',
+      hint: '这次生成没有产出任何代码文件，发布需要一次通过 QA 验收的生成结果。',
+      retryable: reqStatus.value === 'failed',
+    }
+  }
+  if (reqStatus.value === 'needs_user_input') {
+    return {
+      tone: 'block',
+      label: '存在未解决的关键缺陷',
+      hint: 'QA 验收发现了关键缺陷并拦截了交付，建议先在对话中修复再通过验收。',
+      retryable: false,
+    }
+  }
+  return {
+    tone: 'block',
+    label: '代码已生成，QA 验收未通过',
+    hint: '产物可用，但验收未全部通过；通过验收后再发布能让拿到链接的人获得完整体验。',
+    retryable: false,
+  }
 })
 
 // 进入 TAB 时拉一次发布状态：解决「刷新后只剩一个发布按钮」的持久化问题。
@@ -261,6 +504,13 @@ async function onPublish() {
   } finally {
     publishing.value = false
   }
+}
+
+// 生成失败且无产物时，就地再跑一次。重新入队与 SSE 重连都由外层 DetailView 的
+// onResume 统一处理（它同时服务顶部的中断/失败提示条），这里只发信号，
+// 避免两处各写一份 resume 逻辑、各弹一次 toast。
+function onRetry() {
+  emit('resume')
 }
 
 async function onUnpublish() {
@@ -416,15 +666,154 @@ async function copyUrl() {
   border: 1px solid var(--border);
   font-size: 12px;
 }
-.pc-meta-ready {
-  color: #16a34a;
-  font-weight: 500;
-}
 .pc-meta-sub {
   color: var(--muted);
   margin-left: auto;
   font-family: var(--font-mono);
   font-size: 12px;
+}
+
+/* ===== 门禁态：ready=通过验收可发布 / wait=生成中 / block=未过验收 ===== */
+.pc-meta-card.wait {
+  background: #fffbeb;
+  border-color: #fde68a;
+}
+.pc-meta-card.block {
+  background: #fff5f5;
+  border-color: #fecaca;
+}
+.pc-dot.wait { background: #d97706; }
+.pc-dot.block { background: #dc2626; }
+.pc-meta-label { font-weight: 500; }
+.pc-meta-label.ready { color: #16a34a; }
+.pc-meta-label.wait { color: #a16207; }
+.pc-meta-label.block { color: #b91c1c; }
+.pc-gate-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.pc-gate-hint.wait { color: #a16207; }
+.pc-gate-hint.block { color: #b91c1c; }
+
+/* ===== 创意市集 ===== */
+.pc-market {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.pc-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  color: var(--fg);
+  cursor: pointer;
+}
+.pc-switch.small {
+  font-size: 12px;
+  color: var(--muted);
+}
+.pc-market-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+.pc-market-extra {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.pc-note {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 13px;
+}
+.pc-note:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.pc-market-err {
+  margin: 0;
+  font-size: 12px;
+  color: var(--color-danger);
+}
+
+/* ===== 封面 ===== */
+.pc-cover {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+.pc-cover-preview {
+  width: 116px;
+  height: 68px;
+  flex-shrink: 0;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #fafafa;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.pc-cover-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.pc-cover-ph {
+  font-size: 11px;
+  color: var(--muted);
+}
+.pc-cover-ops {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-start;
+}
+.pc-cover-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 12px;
+  cursor: pointer;
+}
+.pc-cover-btn:hover { border-color: var(--accent); color: var(--accent); }
+/* 原生 file input 藏起来（样式不可控），点 label 即触发 */
+.pc-file {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+  width: 100%;
+}
+.pc-cover-hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.pc-retry {
+  align-self: flex-start;
+  color: var(--accent);
 }
 
 /* ===== URL 区 ===== */

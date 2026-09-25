@@ -7,6 +7,7 @@ import routes.health      # noqa: F401 - register health routes
 import routes.preview     # noqa: F401 - register preview routes
 import routes.publish     # noqa: F401 - register publish routes (Ship B)
 import routes.published_site  # noqa: F401 - register published Host routing (Ship B)
+import routes.market         # noqa: F401 - register 创意市集 routes
 
 if __name__ == '__main__':
     # PORT 可覆盖，便于在不占用主线 5001 端口的隔离实例上跑发布链路 e2e（B10）。
