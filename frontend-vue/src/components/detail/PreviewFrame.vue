@@ -22,7 +22,8 @@
     </div>
     <div class="preview-canvas">
       <div v-if="!hasContent" class="preview-empty">
-        等待代码生成…
+        <p class="pe-title">{{ emptyTitle }}</p>
+        <p class="pe-hint">{{ emptyHint }}</p>
       </div>
       <div v-else class="preview-wrapper">
         <iframe
@@ -40,8 +41,11 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
 import { useRequirementStore } from '@/stores/requirement'
+import { useArtifactEmptyState } from '@/composables/useArtifactEmptyState'
 
 const store = useRequirementStore()
+// 空态文案与代码 TAB 共用一套，避免同一件事在两个 TAB 说法不一致
+const { title: emptyTitle, hint: emptyHint } = useArtifactEmptyState()
 
 interface Device {
   key: string
@@ -208,6 +212,26 @@ watch(
   text-align: center;
   padding: 40px;
   font-size: 14px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.pe-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--fg);
+}
+
+.pe-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #999;
+  max-width: 320px;
 }
 
 .preview-iframe {

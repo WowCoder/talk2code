@@ -1,18 +1,25 @@
 <template>
   <div class="code-layout">
-    <FileTree
-      :files="fileTree"
-      :active-file="activeFile"
-      @select="onSelectFile"
-    />
-    <div class="code-main">
-      <div class="code-filename">{{ activeFile || '--' }}</div>
-      <CodeEditor
-        :content="currentContent"
-        :filename="activeFile || ''"
-        :font-size="settingsStore.codeFontSize"
-        @update:content="onContentChange"
+    <template v-if="hasFiles">
+      <FileTree
+        :files="fileTree"
+        :active-file="activeFile"
+        @select="onSelectFile"
       />
+      <div class="code-main">
+        <div class="code-filename">{{ activeFile || '--' }}</div>
+        <CodeEditor
+          :content="currentContent"
+          :filename="activeFile || ''"
+          :font-size="settingsStore.codeFontSize"
+          @update:content="onContentChange"
+        />
+      </div>
+    </template>
+    <!-- 无产物时空树 + 空编辑器等于一片白，用户看不出是还在生成还是已经失败了 -->
+    <div v-else class="code-empty">
+      <p class="code-empty-title">{{ emptyTitle }}</p>
+      <p class="code-empty-hint">{{ emptyHint }}</p>
     </div>
   </div>
 </template>
@@ -22,6 +29,7 @@ import { computed } from 'vue'
 import { useRequirementStore } from '@/stores/requirement'
 import { useSettingsStore } from '@/stores/settings'
 import { useToast } from '@/composables/useToast'
+import { useArtifactEmptyState } from '@/composables/useArtifactEmptyState'
 import FileTree from './FileTree.vue'
 import type { TreeNode } from './FileTree.vue'
 import CodeEditor from './CodeEditor.vue'
@@ -29,6 +37,9 @@ import CodeEditor from './CodeEditor.vue'
 const store = useRequirementStore()
 const settingsStore = useSettingsStore()
 const { show } = useToast()
+
+// 空态文案与预览 TAB 共用一套（useArtifactEmptyState），避免两处说法不一致
+const { hasFiles, title: emptyTitle, hint: emptyHint } = useArtifactEmptyState()
 
 const fileTree = computed<TreeNode[]>(() => buildTree(Object.keys(store.codeFiles)))
 const activeFile = computed(() => store.activeFile)
@@ -99,6 +110,32 @@ function onContentChange(content: string) {
   display: flex;
   flex-direction: column;
   min-width: 0;
+}
+
+.code-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 24px;
+  text-align: center;
+}
+
+.code-empty-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--fg);
+}
+
+.code-empty-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+  max-width: 320px;
 }
 
 .code-filename {
