@@ -229,6 +229,35 @@ def _archive_tool_trail(state: dict, workspace) -> str:
         return ""
 
 
+def _slim_iteration_batch(msg: dict) -> dict:
+    """给 iteration_batch 瘦身，使其可以安全落库 / 跨轮恢复。
+
+    迭代卡片的 arguments 里带着 write_file 的**全文**（实测单个 js/game.js 就有
+    15,605 字符），原样落进 DB 会让 dialogue_history 膨胀到数 MB。前端展示只需要
+    文件名与简短参数，这里把长值替换为长度标记。
+    """
+    tools = msg.get("tools") or []
+    slim_tools = []
+    for t in tools:
+        if not isinstance(t, dict):
+            slim_tools.append(t)
+            continue
+        args = t.get("arguments") or {}
+        slim_args = {}
+        if isinstance(args, dict):
+            for k, v in args.items():
+                if k == "content":
+                    # 正文不落库，只留体量信息（前端展示用 display_label 已足够）
+                    slim_args["content_chars"] = len(v) if isinstance(v, str) else 0
+                    continue
+                if isinstance(v, str) and len(v) > 200:
+                    slim_args[k] = f"<{len(v)} 字符，已省略>"
+                else:
+                    slim_args[k] = v
+        slim_tools.append({**t, "arguments": slim_args})
+    return {**msg, "tools": slim_tools}
+
+
 def finalize_delivery(state: dict, workspace) -> str:
     """交付边界折叠（§3.H）：写 .task/DELIVERY.md（handoff）+ **归档**工具轨迹。
 
@@ -248,7 +277,16 @@ def finalize_delivery(state: dict, workspace) -> str:
     # 先归档工具轨迹（供开发排查），再收敛对话历史为「人类对话」
     _archive_tool_trail(state, workspace)
     hist = state.get("dialogue_history", []) or []
-    kept = [m for m in hist if m.get("role") in ("user", "agent", "assistant")]
+    # ⚠️ iteration_batch 必须保留：coder 的 assistant 自述消息带 hidden=True
+    # （runtime 约定由迭代卡片承载展示），一旦把 iteration_batch 也丢掉，
+    # 详情页「开发工程师」这一整段编码过程就彻底为空（实测 req 183）。
+    kept = []
+    for m in hist:
+        role = m.get("role")
+        if role in ("user", "agent", "assistant"):
+            kept.append(m)
+        elif role == "iteration_batch":
+            kept.append(_slim_iteration_batch(m))
     if path:
         kept.append({
             "role": "user",

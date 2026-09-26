@@ -6,9 +6,68 @@
 register_file_tools() 函数注册。
 """
 
+import json as _json
+import subprocess
+
 from harness.tools.registry import (
     ToolDefinition, ToolResult, ToolHandler, register_tool,
 )
+
+
+def _syntax_problem(filename: str, content: str) -> str:
+    """检查内容是否存在**确定性**残缺/语法错误，无问题返回空串。
+
+    为什么需要它（需求 183 根因）：coder 一轮内连续写多个大文件时，LLM 输出额度
+    会被 reasoning 吃掉，后写的文件在运行到一半时被截断（实测 js/game.js 停在
+    `DragonGame.prototype._`、index.html 停在 47 行且缺 </html> 与全部 <script>）。
+    残缺文件通过 write_file **覆盖**了此前已经写好的完整版本，QA 两轮评分因此
+    只有 4.2 / 2.4。写入前看不见截断，只能在写后校验并回滚。
+
+    判据与 lint_js / lint_css 对齐，只针对可机器判定的问题：
+    - .js   → node --check
+    - .css  → 花括号平衡
+    - .html → 声明为完整文档（含 <html / <!doctype）时必须以 </html> 收尾
+    - .json → 可解析
+    """
+    low = (filename or "").lower()
+    if low.endswith(".js"):
+        try:
+            r = subprocess.run(["node", "--check", "-"], input=content,
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode != 0:
+                # node --check 的 stderr 首行是源码位置（形如 "[stdin]:1"），
+                # 真正的判据在含 "Error" 的那一行，取它才对模型有意义。
+                lines = [l.strip() for l in (r.stderr or "").splitlines() if l.strip()]
+                detail = next((l for l in lines if "Error" in l), "")
+                if not detail and len(lines) > 1:
+                    detail = lines[1]
+                return f"JS 语法错误: {(detail or 'JS 语法错误')[:160]}"
+        except FileNotFoundError:
+            return ""
+        except Exception:
+            return ""
+        # 末尾启发式：node 判不出「半句话」——`DragonGame.prototype._` 是合法
+        # 表达式语句，语法检查照样通过，但文件明显被截断（req 183 就是这个形态）。
+        tail = content.rstrip()
+        if tail:
+            last_line = tail.splitlines()[-1].rstrip()
+            if last_line and not last_line.startswith("//") and not last_line.endswith("*/"):
+                if last_line[-1] in "_=+-*/(&|<.":
+                    return f"文件末尾不完整（最后一行以 '{last_line[-1]}' 结束，疑似输出被截断）"
+    elif low.endswith(".css"):
+        if content.count("{") != content.count("}"):
+            return f"花括号不匹配 ({{ {content.count('{')}, }} {content.count('}')})"
+    elif low.endswith(".html") or low.endswith(".htm"):
+        # 只对「完整文档」要求闭合标签，避免误判片段模板
+        head = content[:400].lower()
+        if ("<html" in head or "<!doctype" in head) and not content.rstrip().endswith("</html>"):
+            return "HTML 未以 </html> 结束（疑似内容被截断）"
+    elif low.endswith(".json"):
+        try:
+            _json.loads(content)
+        except Exception as e:
+            return f"JSON 解析失败: {str(e)[:100]}"
+    return ""
 
 
 # ==================== ToolHandler 子类 ====================
@@ -33,11 +92,21 @@ class ReadFileHandler(ToolHandler):
                 end = min(total_lines, end_line or total_lines)
                 selected = lines[start:end]
                 content = '\n'.join(selected)
-                range_info = f" (行 {start + 1}-{end} / 共 {total_lines} 行)"
+                # 旧写法 "(行 200-373 / 共 435 行)" 让弱模型把 373 读成文件总行数，
+                # 进而怀疑文件被截断并反复回读确认（需求 182）。改为总行数前置 +
+                # 明确说明剩余部分如何读取。
+                if end >= total_lines:
+                    tail_note = "已到文件末尾"
+                else:
+                    tail_note = (
+                        f"第 {end + 1}-{total_lines} 行未包含在本段，"
+                        f"需要时用 start_line={end + 1} 继续读取"
+                    )
+                range_info = f"共 {total_lines} 行；本次返回第 {start + 1}-{end} 行，{tail_note}"
             else:
-                range_info = f" (共 {total_lines} 行)"
+                range_info = f"全文共 {total_lines} 行，未截断"
 
-            header = f"[文件: {filename}{range_info}]\n\n"
+            header = f"[文件: {filename} — {range_info}]\n\n"
             return ToolResult(
                 content=header + content,
                 metadata={
@@ -60,6 +129,25 @@ class ReadFileHandler(ToolHandler):
         })
 
 
+def _completeness_hints(filename: str, content: str) -> list[str]:
+    """返回「不阻断但值得立刻看一眼」的完整性提示。
+
+    与 _syntax_problem 的区别：这里的问题不一定要回滚（可能是有意为之），
+    但放任不管几乎必然导致 QA 低分（实测 req 183 首轮 4.2 分即由此而来：
+    index.html 只有 47 行，既没有 <script> 也没有 </html>，页面点了没反应）。
+    """
+    hints = []
+    low = (filename or "").lower()
+    if low.endswith(".html") or low.endswith(".htm"):
+        head = content[:400].lower()
+        if "<html" in head or "<!doctype" in head:
+            if "<script" not in content.lower():
+                hints.append("入口 HTML 未引入任何 <script>，页面不会有任何交互逻辑")
+            if "<link" not in content.lower() and "css" not in content.lower():
+                hints.append("入口 HTML 未引入任何样式表")
+    return hints
+
+
 class WriteFileHandler(ToolHandler):
     """创建或覆盖工作区文件"""
 
@@ -72,7 +160,36 @@ class WriteFileHandler(ToolHandler):
         try:
             lines = content.count('\n') + 1
             char_count = len(content)
+
+            # ---- 写入保护：先取上一版，写坏时能回滚（需求 183 根因防御） ----
+            prev = None
+            try:
+                prev = ws.read(filename)
+            except Exception:
+                prev = None
+
             ws.write(filename, content)
+
+            # ---- 写后完整性校验 ----
+            problem = _syntax_problem(filename, content)
+            prev_ok = bool(prev and prev.strip() and not _syntax_problem(filename, prev))
+            if problem and prev_ok:
+                # 上一版是好的、这一版写坏了 → 回滚。绝不允许把完整文件覆盖成残件。
+                ws.write(filename, prev)
+                prev_lines = prev.count('\n') + 1
+                return ToolResult(
+                    error=(
+                        f"已拒绝本次写入并回滚 {filename}：新内容不完整（{problem}）。"
+                        f"写入前的版本（{prev_lines} 行）已恢复，文件保持可用状态。\n"
+                        f"这通常是一次性输出过长、额度不足导致内容被截断 —— 请改用：\n"
+                        f"1) edit_file 做局部修改（SEARCH/REPLACE，只传改动片段）；\n"
+                        f"2) 或把文件拆成两个更小的文件，分轮写入；\n"
+                        f"3) 或先写一个骨架文件，再逐段 edit_file 补齐。"
+                    ),
+                    metadata={"filename": filename, "rolled_back": True,
+                              "lines": prev_lines, "chars": len(prev)},
+                )
+
             # 返回内容预览（前80行+后10行），让 Agent 不读文件就知道自己写了什么
             all_lines = content.split('\n')
             head_lines = all_lines[:80]
@@ -81,9 +198,25 @@ class WriteFileHandler(ToolHandler):
             if tail_lines:
                 preview += f"\n\n... (中间省略 {len(all_lines) - 90} 行) ...\n\n" + '\n'.join(tail_lines)
             preview_note = f"已创建 {filename} ({lines} 行, {char_count} 字符)\n\n--- 文件内容预览 ---\n{preview[:3000]}"
+
+            if problem:
+                preview_note += (
+                    f"\n\n⚠️ 完整性告警：{problem}。内容疑似被截断，"
+                    f"请立即用 edit_file 补齐或用 start_line/end_line 分段重写，不要留给下一轮。"
+                )
+            if prev is not None and prev.strip():
+                prev_lines = prev.count('\n') + 1
+                if prev_lines >= 120 and lines < prev_lines * 0.5:
+                    preview_note += (
+                        f"\n\n⚠️ 本次写入 {lines} 行，远少于写入前的 {prev_lines} 行。"
+                        f"若非有意精简，说明输出被截断 —— 请检查文件末尾是否完整。"
+                    )
+            for hint in _completeness_hints(filename, content):
+                preview_note += f"\n\n⚠️ {hint} —— 如属遗漏请立即补上，不要留到验证阶段。"
             return ToolResult(
                 content=preview_note,
-                metadata={"filename": filename, "lines": lines, "chars": char_count}
+                metadata={"filename": filename, "lines": lines, "chars": char_count,
+                          "truncated": bool(problem)}
             )
         except Exception as e:
             return ToolResult(error=str(e))
@@ -166,8 +299,10 @@ def register_file_tools(registry):
         name="read_file",
         description=(
             "读取工作区中的文件内容。对于大文件（>300行），请使用 start_line/end_line 分页读取，"
-            "避免一次性读取整个文件。读取后注意查看返回的 total_lines 元数据，"
-            "如果文件被截断，用 start_line 定位到文件末尾查看 export/关键逻辑。"
+            "避免一次性读取整个文件。返回头部会给出文件总行数与本次返回的行范围。\n"
+            "重要：你自己刚写入的文件，内容已由 write_file 返回（含首尾预览），"
+            "不要为了确认 class/id 反复读取同一个文件；同一文件在一次任务中最多读 1-2 次，"
+            "把时间用在创建尚未生成的文件上。"
         ),
         parameters={
             "type": "object",

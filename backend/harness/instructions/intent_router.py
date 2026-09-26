@@ -14,7 +14,7 @@ OUT_OF_SCOPE 的存在意义：本平台只产出纯静态前端站点。缺少�
 localStorage 假登录，验收不通过却不告诉用户真实原因。
 
 设计原则：
-1. 分类调用极轻量（max_tokens=20, timeout=10s），失败时默认走 TASK
+1. 分类调用极轻量（max_tokens=100，timeout 走 LLM_CLASSIFY_TIMEOUT），失败时默认走 TASK
 2. 分类规则写在 system prompt 中，无需硬编码关键词匹配
 3. Chat 模式下的分类逻辑略有不同（区分"提问"和"修改指令"）
 """
@@ -28,6 +28,18 @@ from harness.observability.logger import get_logger
 from harness.instructions.prompts import load_prompt
 
 logger = get_logger(__name__)
+
+
+def _aux_timeout() -> int:
+    """辅助 LLM 调用超时（此处为 QUICK 直接回答）。配置化，见 config.LLM_AUX_TIMEOUT"""
+    from config import settings
+    return settings.LLM_AUX_TIMEOUT
+
+
+def _classify_timeout() -> int:
+    """意图分类超时。同步阻塞用户输入，故比辅助档更短，见 config.LLM_CLASSIFY_TIMEOUT"""
+    from config import settings
+    return settings.LLM_CLASSIFY_TIMEOUT
 
 
 class IntentType(Enum):
@@ -120,7 +132,7 @@ class IntentRouter:
                 system_prompt=system_prompt,
                 use_memory=False,
                 max_tokens=100,
-                timeout=15,
+                timeout=_classify_timeout(),
             )
 
             if response.is_error or not response.content:
@@ -197,7 +209,7 @@ class IntentRouter:
                 system_prompt=system_prompt,
                 use_memory=False,
                 max_tokens=2000,
-                timeout=30,
+                timeout=_aux_timeout(),
             )
 
             if response.is_error:

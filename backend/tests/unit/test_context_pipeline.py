@@ -459,3 +459,55 @@ def test_stale_read_masked_before_older_valid_read():
     # 更旧但内容仍有效的 b.js 保住正文
     assert "MARK-b.js" in joined
 
+
+
+# ---------------- 交付折叠必须保留 iteration_batch（需求 183） ----------------
+
+def test_finalize_delivery_keeps_iteration_batch():
+    """coder 的 assistant 自述带 hidden=True，编码过程完全由 iteration_batch 承载。
+    折叠时再把它丢掉，详情页「开发工程师」整段编码过程就会消失（req 183 实测）。"""
+    from harness.state.context_pipeline import finalize_delivery
+
+    class WS:
+        def write(self, path, content):
+            return True
+
+    state = {
+        "dialogue_history": [
+            {"role": "user", "content": "做一个贪吃龙"},
+            {"role": "assistant", "name": "Henry", "content": "我先写样式", "hidden": True},
+            {"role": "iteration_batch", "name": "Henry", "content": "第 1 轮迭代 — 1 个操作",
+             "tools": [{"name": "write_file", "readable": "写入 css/style.css",
+                        "arguments": {"filename": "css/style.css", "content": "x" * 9000}}]},
+            {"role": "tool_call", "name": "read_file", "content": "正文"},
+        ]
+    }
+    finalize_delivery(state, WS())
+    roles = [m.get("role") for m in state["dialogue_history"]]
+    assert "iteration_batch" in roles, "迭代卡片必须保留"
+    assert "tool_call" not in roles, "工具轨迹仍应被归档移除"
+
+
+def test_finalize_delivery_slims_big_arguments():
+    """迭代卡片的 arguments 带着 write_file 全文（实测 15,605 字符），
+    原样落库会把 dialogue_history 撑到数 MB，必须瘦身。"""
+    from harness.state.context_pipeline import finalize_delivery
+
+    class WS:
+        def write(self, path, content):
+            return True
+
+    big = "a" * 20000
+    state = {
+        "dialogue_history": [
+            {"role": "iteration_batch", "name": "Henry", "content": "第 1 轮",
+             "tools": [{"name": "write_file", "readable": "写入 js/game.js",
+                        "arguments": {"filename": "js/game.js", "content": big}}]},
+        ]
+    }
+    finalize_delivery(state, WS())
+    batch = state["dialogue_history"][0]
+    args = batch["tools"][0]["arguments"]
+    assert "content" not in args, "正文不得落库"
+    assert args.get("content_chars") == 20000
+    assert args.get("filename") == "js/game.js"

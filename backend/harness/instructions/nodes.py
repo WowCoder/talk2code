@@ -25,6 +25,22 @@ from harness.instructions.ac_verdict_policy import _ac_state, _should_invalidate
 logger = get_logger(__name__)
 
 
+def _aux_timeout() -> int:
+    """辅助 LLM 调用的超时预算（research / 文件审查 / Playwright 分析 / 澄清问生成）。
+
+    此前这些调用点硬编码 timeout=20~30：对 reasoning 模型严重偏紧，req 186 多次
+    `Read timed out (read timeout=30)` 并一次耗尽重试额度。统一由配置控制。
+    """
+    from config import settings
+    return settings.LLM_AUX_TIMEOUT
+
+
+def _classify_timeout() -> int:
+    """极轻量分类/筛选调用的超时预算（同步阻塞用户输入，故比辅助档更短）。"""
+    from config import settings
+    return settings.LLM_CLASSIFY_TIMEOUT
+
+
 def _log_llm_turn_safe(requirement_id, iteration, client, system_prompt, prompt,
                        response, thinking=None, latency_ms=None):
     """exec_log 埋点：记录一轮 LLM 请求 / 原始返回（开发视角执行明细）。
@@ -107,6 +123,69 @@ def _detect_truncation(content: str) -> bool:
     return True
 
 
+def _rescue_unescaped_quotes(raw: str) -> str:
+    """把 JSON 字符串值内部的**裸双引号**换成中文引号，使 JSON 重新合法。
+
+    需求 187 事故：agnes-3.0-flash 输出的 plan JSON 里写
+    `"how_to_verify": "玩一局...分数栏"最高分"显示10..."`——内层双引号未转义，
+    json.loads 全线失败，四层提取（纯 JSON / 代码围栏 / 括号计数 / 兜底正则）
+    无一命中 → TeamLeader 抛「无法从 LLM 响应中提取 JSON」→ 整个需求判废。
+    而此时 LLM 明明返回了 HTTP 200 与完整合法的 plan 内容。
+
+    大模型在中文文案里夹带裸引号是普遍行为，提示词约束只能降低频率、无法根除，
+    因此在提取侧做确定性兜底：区分「结束引号」与「内容引号」。
+
+    判定规则（字符串内遇到 `"` 时）：跳过后续空白，若下一个字符是
+    `,` `}` `]` `:` 或已到结尾 → 它是结束引号；否则是内容引号，成对替换为 “ ”。
+    """
+    out: list[str] = []
+    in_str = False
+    escaped = False
+    parity = 0          # 内容引号配对：0 → 开引号 “，1 → 闭引号 ”
+    n = len(raw)
+    for i, ch in enumerate(raw):
+        if escaped:
+            out.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            out.append(ch)
+            escaped = True
+            continue
+        if ch != '"':
+            out.append(ch)
+            continue
+        if not in_str:
+            in_str = True
+            parity = 0
+            out.append(ch)
+            continue
+        j = i + 1
+        while j < n and raw[j] in " \t\r\n":
+            j += 1
+        nxt = raw[j] if j < n else ""
+        if nxt in ("", ",", "}", "]", ":"):
+            in_str = False
+            out.append(ch)
+        else:
+            out.append("\u201c" if parity == 0 else "\u201d")
+            parity ^= 1
+    return "".join(out)
+
+
+def _try_json_loads(text: str) -> dict | None:
+    """先按原样解析；失败则修复字符串内裸引号后重试（见 _rescue_unescaped_quotes）。"""
+    text = text.strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            parsed = json.loads(_rescue_unescaped_quotes(text))
+        except json.JSONDecodeError:
+            return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _extract_json_from_llm_response(content: str) -> dict | None:
     """
     从 LLM 原始响应中提取 JSON 对象（纯提取，不修复）。
@@ -133,10 +212,9 @@ def _extract_json_from_llm_response(content: str) -> dict | None:
     raw = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', raw)
 
     # Step 1: 尝试直接解析
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        pass
+    parsed = _try_json_loads(raw)
+    if parsed is not None:
+        return parsed
 
     # Step 2: 去除 ```json ... ``` 或 ``` ... ``` 代码块
     code_block_patterns = [
@@ -148,11 +226,9 @@ def _extract_json_from_llm_response(content: str) -> dict | None:
     for pattern in code_block_patterns:
         match = pattern.search(raw)
         if match:
-            inner = match.group(1).strip()
-            try:
-                return json.loads(inner)
-            except json.JSONDecodeError:
-                pass
+            parsed = _try_json_loads(match.group(1))
+            if parsed is not None:
+                return parsed
 
     # Step 3: 括号计数法匹配最外层 {}
     # 找到第一个 {，然后计数匹配到对应的 }
@@ -186,19 +262,16 @@ def _extract_json_from_llm_response(content: str) -> dict | None:
                     break
 
     if end_idx > start_idx:
-        json_str = raw[start_idx:end_idx + 1]
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError:
-            pass
+        parsed = _try_json_loads(raw[start_idx:end_idx + 1])
+        if parsed is not None:
+            return parsed
 
     # Step 4: 最后尝试 regex 提取（向后兼容）
     match = re.search(r'\{.*\}', raw, re.DOTALL)
     if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
+        parsed = _try_json_loads(match.group())
+        if parsed is not None:
+            return parsed
 
     logger.warning(
         f"[JSON提取] 所有方法均失败，content 前200字符: {content[:200]!r}, "
@@ -254,7 +327,7 @@ def _generate_clarify_questions(client, requirement: str) -> list:
     response = client.chat(
         prompt=prompt,
         system_prompt="你是一位产品经理，帮助澄清用户需求。用户已经说过的信息不要再问。",
-        use_memory=False, max_tokens=500, timeout=20
+        use_memory=False, max_tokens=500, timeout=_aux_timeout()
     )
     if response.is_error or not response.content:
         return []
@@ -627,7 +700,7 @@ def _execute_delegated_tasks(state: AgentState) -> Dict[str, Any]:
                 prompt=f"请研究以下问题并给出简洁回答：\n\n{task_desc}\n\n"
                        f"上下文需求：{requirement[:500]}",
                 max_tokens=2000,
-                timeout=30,
+                timeout=_aux_timeout(),
             )
             research_result = resp.content if resp and resp.content else ""
             # 将 research 结果注入 dialogue_history 供后续任务参考
@@ -690,7 +763,7 @@ def _review_single_file(workspace, filename: str, state: AgentState) -> str:
         f"请以简洁的方式列出发现的问题。如果没有问题，请回复\"LGTM\"。"
     )
     try:
-        resp = client.chat(prompt=prompt, max_tokens=1000, timeout=30)
+        resp = client.chat(prompt=prompt, max_tokens=1000, timeout=_aux_timeout())
         return resp.content if resp and resp.content else "审查未返回结果"
     except Exception as e:
         return f"审查异常: {e}"
@@ -823,8 +896,12 @@ def coder_node(state: AgentState) -> Dict[str, Any]:
         logger.error(f"[Coder] Phase 1 执行失败：{e}")
         return {"current_step": "coding_error", "error": str(e)}
 
-    # Phase 2: 定向补全（仅当 standard 且有缺失文件时触发）
-    if complexity == "standard" and next_step == "coding_done":
+    # Phase 2: 定向补全
+    # 触发条件不再要求 next_step == "coding_done"。批量编码空转结束
+    # （max_iterations / no_progress）恰恰是文件缺失最严重的时候，此前这条兜底
+    # 被条件挡在外面：需求 182 跑满 9 轮只读不写、4 个文件缺失，补全一次都没执行。
+    # llm_error 表示模型不可用，逐文件补全同样会失败，直接跳过避免空耗。
+    if complexity == "standard" and next_step != "llm_error":
         impl_order = state.get("implementation_order") or []
         if impl_order:
             workspace = get_workspace(state)
@@ -949,7 +1026,7 @@ def _translate_acs_to_scripts(acceptance_criteria: list, code_text: str, require
             system_prompt="你是 Playwright 自动化测试专家。只返回 JSON，不要其他文字。",
             use_memory=False,
             max_tokens=2000,
-            timeout=30,
+            timeout=_aux_timeout(),
             thinking='enabled',
         )
         if response.is_error or not response.content:
@@ -1426,10 +1503,23 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             "type": "runtime_error",
             "severity": "critical",
             "dimension": "runtime",
-            "message": f"浏览器运行时错误: {e.get('message', '')[:200]}",
-            "evidence": f"[{e.get('type', 'error')}] {e.get('message', '')}",
+            # req 189：裸 message（"Unexpected token ')'”）不带位置，coder 在多个
+            # JS 文件间盲猜 5 轮未中。pageerror 的 stack 已解析出 文件:行号，前置展示。
+            "message": (
+                f"浏览器运行时错误: {e.get('message', '')[:200]}"
+                + (f"（位置: {e['location']}）" if e.get("location") else "")
+            ),
+            "evidence": (
+                f"[{e.get('type', 'error')}] {e.get('message', '')}"
+                + (f" at {e['location']}" if e.get("location") else "")
+                + (f"\nstack 首帧: {e['stack'].splitlines()[-1].strip()[:200]}"
+                   if e.get("stack") and "\n" in e["stack"] else "")
+            ),
             "suggestion": (
-                "这是**根因级证据**，优先修它：按报错定位到具体文件与方法，"
+                (f"先打开 {e['location']} 检查该行附近的语法/引用。"
+                 if e.get("location") else
+                 "这是**根因级证据**，优先修它：按报错定位到具体文件与方法，")
+                +
                 "确认该方法已正确定义并可被该调用点访问（例如原型方法是否真的挂载到了类上），"
                 "修完再重新验证。「页面无反应/无变化」往往是本错误导致初始化中断的结果，"
                 "不要只改事件绑定。"
@@ -2616,6 +2706,30 @@ def defect_repair_node(state: AgentState) -> Dict[str, Any]:
                 logger.warning(f"[DefectRepair] {fname} 长度比异常: {len(fcontent)}/{orig_len}")
                 continue
         except Exception:
+            pass
+        # 语法闸门（req 189）：本节点绕过 ToolCallLoop 直接 workspace.write，
+        # 不经过 write_file/edit_file 的任何守卫。189 实测补丁把 `UtilsExt.$$`
+        # 写成 `$$/` —— 括号配平、长度正常，_content_looks_complete 拦不住，
+        # 写入即全站 JS 瘫痪，且后续 4 轮修复全部超时白烧。此处守住最后一道：
+        # 新内容语法坏而磁盘版本好 → 拒绝写回，保留好版本等下一轮。
+        try:
+            from harness.tools.file_tools import _syntax_problem
+            _new_problem = _syntax_problem(fname, fcontent)
+            if _new_problem:
+                try:
+                    _old_problem = _syntax_problem(fname, workspace.read(fname))
+                except Exception:
+                    _old_problem = ""
+                if not _old_problem:
+                    skipped.append(
+                        f"{fname}: 补丁引入语法错误（{_new_problem}），"
+                        "已拒绝写回并保留原版本"
+                    )
+                    logger.warning(
+                        f"[DefectRepair] {fname} 补丁语法错误，拒绝写回: {_new_problem}"
+                    )
+                    continue
+        except ImportError:
             pass
         try:
             workspace.write(fname, fcontent)

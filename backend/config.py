@@ -186,6 +186,22 @@ class Settings(BaseSettings):
     # 与其干等 300s，不如 45s 断掉重来一次；第二次不熔断，避免误杀真需要长输出的轮次。
     # 设为 0 关闭熔断。
     LLM_SLOW_TURN_TIMEOUT: int = Field(default=45, ge=0, le=300, description='单轮 LLM 熔断预算（秒），0=关闭')
+    # 辅助 LLM 调用超时（research / 文件审查 / 记忆整合 / Playwright 用例分析 / 闲聊问答）。
+    # 此前这些调用点各自硬编码 timeout=15/20/30：对 reasoning 模型严重偏紧 ——
+    # agnes-3.0-flash 会返回 reasoning_content，req 186 多次
+    # `Read timed out (read timeout=30)` 并直接把重试额度耗光（辅助调用失败即降级，
+    # 不重跑，等于静默丢功能）。统一提到 60s 并由配置控制。
+    LLM_AUX_TIMEOUT: int = Field(
+        default=60, ge=5, le=300,
+        description='辅助 LLM 调用超时时间（秒）'
+    )
+    # 极轻量分类/筛选调用（max_tokens ≤ 500，同步阻塞用户输入的意图路由、记忆校验）。
+    # 单独一档：这类调用在用户敲下回车的那一刻同步等待，给 60s 会让界面明显卡顿，
+    # 但 15s 对 reasoning 模型又不够，折中 30s。
+    LLM_CLASSIFY_TIMEOUT: int = Field(
+        default=30, ge=5, le=120,
+        description='极轻量分类/筛选 LLM 调用超时时间（秒）'
+    )
     LLM_MAX_RETRIES: int = Field(default=2, ge=0, le=5, description='LLM 调用最大重试次数')
     LLM_CRAFT_ENABLED: bool = Field(default=True, description='是否启用 Craft 设计质量规则注入')
 

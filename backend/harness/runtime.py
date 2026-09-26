@@ -28,6 +28,19 @@ class ToolCallLoop:
 
     MAX_ITERATIONS = 15
     NO_PROGRESS_LIMIT = 5  # 连续无进展轮次限制
+    # 读写比检测：窗口轮数 / 触发几次干预后强制终止。
+    # 窗口必须明显小于迭代预算（min(文件数+3, 10) ≤ 10），否则终止分支永远跑不到。
+    READ_HEAVY_WINDOW = 6
+    READ_HEAVY_ABORT = 3
+    # 同一文件被读取多少轮、且连续多少轮没有写入 → 判定反复回读
+    REPEAT_READ_LIMIT = 4
+    REPEAT_READ_NO_WRITE = 3
+    # 写入后多少轮内回读该文件，追加"内容未变"提示
+    READBACK_GUARD_ROUNDS = 5
+    # 同一文件在一次任务内最多读取几次（超出直接跳过执行）。
+    # 实测 req 183：index.html 被读 6 次、main.js 4 次，全是"确认式重读"，
+    # 每次都要付一整轮 LLM 往返（2-45s），却零产出。软提示挡不住，只能硬限。
+    READ_FILE_LIMIT_PER_TASK = 4
     # 自修复保底：预算将尽且手上有确定性运行时错误时，一次性追加的轮数
     SELF_REPAIR_EXTRA_ITERATIONS = 3
 
@@ -74,6 +87,18 @@ class ToolCallLoop:
         state["_missing_files_rounds"] = 0
         state["_same_missing_count"] = 0
         state.pop("_last_missing_files_key", None)
+        # 死循环检测计数器同样必须重置：此前只重置了上面几个，
+        # _read_heavy_count / _recent_core_sigs / _recent_has_write / _recent_writes
+        # 会跨阶段（批量编码 → 修复轮 → 逐文件补全）残留，与本处
+        # "避免多轮调用间状态污染"的意图自相矛盾。
+        state["_read_heavy_count"] = 0
+        state["_recent_core_sigs"] = []
+        state["_recent_has_write"] = []
+        state["_read_file_rounds"] = {}
+        state["_consecutive_no_write"] = 0
+        state["_recent_writes"] = {}
+        state["_missing_reminder_key"] = ""
+        state["_missing_reminder_count"] = 0
 
         # 可配置的角色名称（多角色协作用，默认兼容旧行为）
         meta = state.get("metadata", {})
@@ -305,8 +330,14 @@ class ToolCallLoop:
                     "hidden": True,
                 })
 
-            # ---- 有工具调用 = 有实质进展，重置缺失文件计数器 ----
-            state["_missing_files_rounds"] = 0
+            # ---- 只有写入/编辑才算实质进展 ----
+            # 此前把"有工具调用"等同于"有进展"，于是模型每轮发两个 read_file
+            # 就能无限重置缺失文件计数器，系统再也不会催它补文件（需求 182 空转根因）。
+            _round_has_write = any(
+                _tc.name in ("write_file", "edit_file") for _tc in response.tool_calls
+            )
+            if _round_has_write:
+                state["_missing_files_rounds"] = 0
 
             # 执行所有工具调用（收集到 batch_tools，统一发送迭代批量事件）
             batch_tools: list[ToolCallEvent] = []
@@ -315,7 +346,28 @@ class ToolCallLoop:
                 # 动作级进度：在**执行前**推送，让用户看到"正在写 X"而不是转圈
                 self._push_activity(state, tc.name, tc.arguments,
                                     iteration, effective_max_iterations)
-                result = self._execute_tool(state, tc)
+
+                # 读取次数硬上限：确认式重读到第 N 次直接跳过，省掉一整轮往返
+                _read_limited = False
+                if tc.name == "read_file" and isinstance(tc.arguments, dict):
+                    _rf = tc.arguments.get("filename", "") or ""
+                    _counts = state.setdefault("_read_file_counts", {})
+                    _counts[_rf] = _counts.get(_rf, 0) + 1
+                    if _counts[_rf] > self.READ_FILE_LIMIT_PER_TASK:
+                        _read_limited = True
+                        from harness.tools.registry import ToolResult as _ToolResult
+                        result = _ToolResult(
+                            blocked=True,
+                            content=(
+                                f"[已跳过] {_rf} 在本次任务中已被读取 {_counts[_rf] - 1} 次，"
+                                f"达到上限 {self.READ_FILE_LIMIT_PER_TASK} 次。内容就在上方对话历史里，"
+                                f"请直接基于已有内容继续写代码，不要再读它确认。"
+                            ),
+                        )
+                        logger.info(f"[ToolLoop] read_file 次数上限: {_rf} 第 {_counts[_rf]} 次，跳过执行")
+
+                if not _read_limited:
+                    result = self._execute_tool(state, tc)
                 logger.info(f"[ToolLoop] 执行 {tc.name}: success={result.success} content={result.content[:100] if result.success else ''} error={result.error[:100] if not result.success else ''}")
 
                 # 开发排查：记录工具调用入参/结果（AGENT_EXEC_LOG=1 时生效）
@@ -340,6 +392,10 @@ class ToolCallLoop:
                 if result.success and tc.name in ("write_file", "edit_file"):
                     fname = tc.arguments.get("filename", "unknown") if isinstance(tc.arguments, dict) else "unknown"
                     written_files.append(fname)
+
+                # 防回读：消费 _recent_writes（此前只有写入侧，全库无消费方 → 死字段）
+                if tc.name == "read_file" and result.success:
+                    self._annotate_readback(state, tc, result)
 
                 # 实时推送 code 事件（代码面板需要实时更新）
                 if self.sse:
@@ -425,6 +481,11 @@ class ToolCallLoop:
                         commit_msg = f"[tool] 写入 {len(written_files)} 个文件: {', '.join(written_files[:3])} 等"
                     self.git.commit(commit_msg)
 
+            # ===== 缺文件提醒：每轮投递 =====
+            # 此前"还缺 X 文件"只挂在"本轮零 tool_calls"分支上，模型只要在空转中
+            # 顺手发一个 read_file，就永远收不到这条指令（需求 182 空转 18 轮根因）。
+            self._maybe_remind_missing_files(state, iteration)
+
             # ===== 增强死循环检测：核心操作签名累积 + 读写比 =====
             # 提取当前轮的核心操作签名（tool_name:filename，忽略行范围等参数差异）
             core_sigs = set()
@@ -446,47 +507,86 @@ class ToolCallLoop:
                 recent_history.pop(0)
                 recent_has_write.pop(0)
 
-            # 检测 1: 读写比异常 —— 最近 8 轮中纯 read_file 占比过高且无写操作
-            if len(recent_history) >= 8:
+            # 检测 1: 读写比异常 —— 最近若干轮几乎全是读、且没有写入
+            # 收紧前：窗口 8 轮 + 终止阈值 4，而迭代预算 = min(文件数+3, 10)，
+            # 检测最早第 8 轮才可能首次触发，终止分支数学上不可达（死代码）。
+            # 需求 182 空转 18 轮只拿到干预提示，从未被终止。
+            if len(recent_history) >= self.READ_HEAVY_WINDOW:
+                window = recent_history[-self.READ_HEAVY_WINDOW:]
                 read_only_rounds = sum(
-                    1 for i, sigs in enumerate(recent_history[-8:])
+                    1 for sigs in window
                     if sigs and all(s.startswith("read_file:") for s in sigs)
                 )
-                no_write_rounds = sum(1 for w in recent_has_write[-8:] if not w)
-                if read_only_rounds >= 3 and no_write_rounds >= 8:
+                no_write_rounds = sum(
+                    1 for w in recent_has_write[-self.READ_HEAVY_WINDOW:] if not w
+                )
+                if read_only_rounds >= 3 and no_write_rounds >= self.READ_HEAVY_WINDOW - 1:
                     state["_read_heavy_count"] = state.get("_read_heavy_count", 0) + 1
-                    if state["_read_heavy_count"] >= 2:
-                        read_files = set()
-                        for sigs in recent_history[-3:]:
-                            for s in sigs:
-                                if s.startswith("read_file:"):
-                                    read_files.add(s.split(":", 1)[1])
-                        intervention = (
-                            f"你已连续读取同一批文件 {state['_read_heavy_count'] * 4} 轮，"
-                            f"没有做任何代码修改。请选择下一步：\n"
-                            f"1. 如果代码没问题 → 不要继续读文件，直接结束任务\n"
-                            f"2. 如果发现具体问题 → 立即用 edit_file 修改，不要只读不改\n"
-                            f"3. 不确定 → 用 run_preview 验证一次，根据结果执行 1 或 2\n"
-                            f"已反复读取: {', '.join(read_files)}"
-                        )
-                        state["dialogue_history"].append({
-                            "role": "system", "name": "System",
-                            "content": intervention, "hidden": True,
-                        })
+                    count = state["_read_heavy_count"]
+
+                    if count >= self.READ_HEAVY_ABORT:
                         logger.warning(
-                            f"[ToolLoop] 读写比异常: 最近 8 轮无写操作，"
-                            f"read_heavy_count={state['_read_heavy_count']}，注入干预提示"
+                            f"[ToolLoop] 读写比异常经 {count} 次干预仍未写入，强制终止"
                         )
-                        if state["_read_heavy_count"] >= 4:
-                            logger.warning("读写比异常持续多轮干预，强制终止")
-                            state["current_step"] = "no_progress"
-                            state["error"] = "诊断死循环: 连续多轮只有读取、无写入操作"
-                            break
+                        state["current_step"] = "no_progress"
+                        state["error"] = "诊断死循环: 连续多轮只有读取、无写入操作"
+                        break
+
+                    read_files = set()
+                    for sigs in recent_history[-3:]:
+                        for s in sigs:
+                            if s.startswith("read_file:"):
+                                read_files.add(s.split(":", 1)[1])
+                    intervention = (
+                        f"你已连续读取同一批文件多轮，没有做任何代码修改。请选择下一步：\n"
+                        f"1. 如果代码没问题 → 不要继续读文件，直接结束任务\n"
+                        f"2. 如果发现具体问题 → 立即用 edit_file 修改，不要只读不改\n"
+                        f"3. 不确定 → 用 run_preview 验证一次，根据结果执行 1 或 2\n"
+                        f"已反复读取: {', '.join(read_files)}\n"
+                        f"警告：继续只读不改将被系统判定为无进展并终止本轮编码。"
+                    )
+                    state["dialogue_history"].append({
+                        "role": "system", "name": "System",
+                        "content": intervention, "hidden": True,
+                    })
+                    logger.warning(
+                        f"[ToolLoop] 读写比异常: 最近 {self.READ_HEAVY_WINDOW} 轮几乎无写操作，"
+                        f"read_heavy_count={count}，注入干预提示"
+                    )
                 else:
                     if state.get("_read_heavy_count", 0) > 0:
                         state["_read_heavy_count"] = max(0, state["_read_heavy_count"] - 1)
 
-            # 检测 2: 连续相同实质性签名（忽略 run_preview/execute_code/lint_js 等辅助工具扰动）
+            # 检测 2: 同一文件被反复读取（按文件累计轮次，不看签名集合）
+            # 旧实现要求两轮的签名集合完全相等，模型只要每轮换一个搭配
+            # （css+utils → css+contract → 单读 css）就能绕过，且"同一文件读 10 次"
+            # 根本不算重复。改为按文件累计读取轮次判定。
+            read_this_round = {
+                s.split(":", 1)[1] for s in core_sigs if s.startswith("read_file:")
+            }
+            read_round_counts = state.setdefault("_read_file_rounds", {})
+            for fname in read_this_round:
+                if fname:
+                    read_round_counts[fname] = read_round_counts.get(fname, 0) + 1
+            state["_consecutive_no_write"] = (
+                0 if has_write_or_edit else state.get("_consecutive_no_write", 0) + 1
+            )
+            if has_write_or_edit:
+                read_round_counts.clear()
+
+            hot_reads = [
+                f for f, c in read_round_counts.items() if c >= self.REPEAT_READ_LIMIT
+            ]
+            if hot_reads and state["_consecutive_no_write"] >= self.REPEAT_READ_NO_WRITE:
+                logger.warning(
+                    f"[ToolLoop] 文件被反复读取且持续无写入，判定为无进展: "
+                    f"{[(f, read_round_counts[f]) for f in hot_reads]}"
+                )
+                state["current_step"] = "no_progress"
+                state["error"] = f"反复读取且未写入: {', '.join(hot_reads)}"
+                break
+
+            # 检测 3: 连续相同实质性签名（忽略 run_preview/execute_code/lint_js 等辅助工具扰动）
             last_signatures = state.get("last_tool_signatures", set())
             substantive_tools = {"read_file", "write_file", "edit_file"}
             substantive_now = {s for s in core_sigs if s.split(":")[0] in substantive_tools}
@@ -1418,6 +1518,89 @@ class ToolCallLoop:
             return f"{head} {detail}"[:200]
         return head
 
+    def _pending_plan_files(self, state: AgentState) -> list[str]:
+        """按实现计划比对文件系统，返回尚未创建的文件列表。
+
+        与 _check_missing_files 的区别（两者不可互相替代）：
+        - 只认文件系统真相 + implementation_order，不读 CompletionContract；
+        - 不受 contract.clear() 死锁兜底影响——那个兜底会把"还缺文件"这件事
+          一起抹掉，用它的结果做提醒会在第 3 轮之后彻底静音；
+        - 逐文件补全模式下只关注当前目标文件。
+        """
+        if state.get("metadata", {}).get("is_chat", False):
+            return []
+
+        if state.get("_per_file_mode"):
+            current_file = state.get("_current_target_file", "")
+            if not current_file:
+                return []
+            existing = set(self.workspace.list())
+            if current_file in existing:
+                return []
+            basename = current_file.split("/")[-1]
+            if any(e.endswith(basename) for e in existing):
+                return []
+            return [current_file]
+
+        impl_order = state.get("implementation_order") or []
+        if not impl_order:
+            plan = state.get("plan") or {}
+            if isinstance(plan, dict):
+                raw = plan.get("file_structure") or []
+                impl_order = [
+                    f if isinstance(f, str) else str(f.get("path", ""))
+                    for f in raw
+                ]
+        impl_order = [f for f in impl_order if f]
+        if not impl_order:
+            return []
+
+        existing = set(self.workspace.list())
+        missing = []
+        for f in impl_order:
+            if f in existing:
+                continue
+            basename = f.split("/")[-1]
+            if any(e.endswith(basename) for e in existing):
+                continue
+            missing.append(f)
+        return missing
+
+    def _maybe_remind_missing_files(self, state: AgentState, iteration: int):
+        """每轮投递"还缺哪些文件"的提醒（同清单降频，避免刷屏淹没上下文）。"""
+        missing = self._pending_plan_files(state)
+        if not missing:
+            state["_missing_reminder_key"] = ""
+            state["_missing_reminder_count"] = 0
+            return
+
+        key = ",".join(sorted(missing))
+        if key == state.get("_missing_reminder_key"):
+            state["_missing_reminder_count"] = state.get("_missing_reminder_count", 0) + 1
+        else:
+            state["_missing_reminder_key"] = key
+            state["_missing_reminder_count"] = 1
+
+        count = state["_missing_reminder_count"]
+        # 同一清单连续提醒 2 轮后改为隔轮提醒，避免重复句占据上下文
+        if count > 2 and count % 2 == 0:
+            return
+
+        state["dialogue_history"].append({
+            "role": "system", "name": "System",
+            "content": (
+                f"进度检查：按实现计划还差 {len(missing)} 个文件没有创建 —— "
+                f"{', '.join(missing)}。\n"
+                f"请立刻用 write_file 创建它们，不要再读取已有文件做确认："
+                f"你写过的文件内容已在上面，class/id 契约以你自己写入的版本为准。"
+            ),
+            "hidden": True,
+            "preserve": True,
+        })
+        logger.info(
+            f"[ToolLoop] 第 {iteration + 1} 轮投递缺文件提醒: {missing}"
+        )
+
     def _check_missing_files(self, state: AgentState) -> list[str]:
         """检查目标文件是否全部生成。返回缺失文件名列表。
 
@@ -1670,13 +1853,55 @@ class ToolCallLoop:
                 contract.add_file(filename, created=True)
         contract.mark_validated(filename)
 
+    def _annotate_readback(self, state: AgentState, tc, result):
+        """防回读：对"刚被自己写过的文件"加回读提示。
+
+        write_file/edit_file 的返回值已包含内容预览（前 80 行 + 后 10 行），
+        写完立刻回读同一文件纯属浪费（需求 182：css/style.css 被回读 18 次）。
+        这里不阻断读取（保留模型取用分页内容的能力），只明确告知内容未变。
+        """
+        fname = tc.arguments.get("filename", "") if isinstance(tc.arguments, dict) else ""
+        if not fname:
+            return
+        write_round = (state.get("_recent_writes") or {}).get(fname)
+        if write_round is None:
+            return
+        current_round = state.get("tool_call_count", 0)
+        if current_round - write_round > self.READBACK_GUARD_ROUNDS:
+            return
+        note = (
+            f"[提示] {fname} 是你在第 {write_round} 轮亲自写入的文件，此后没有被修改过，"
+            f"内容与你写入时完全一致（write_file 的返回值已包含首尾预览）。"
+            f"不要再为确认 class/id 反复读取它，直接以你写入的版本为准继续写其它文件。\n\n"
+        )
+        result.content = note + (result.content or "")
+        logger.info(f"[ToolLoop] 防回读提示: {fname}（第 {write_round} 轮写入）")
+
+    @staticmethod
+    def _is_deliverable(path: str) -> bool:
+        """是否交付文件（排除 .task/ 等元数据目录与隐藏文件）"""
+        parts = path.split("/")
+        if any(p.startswith(".") for p in parts[:-1]):
+            return False
+        return not parts[-1].startswith(".")
+
+    def _deliverable_files(self) -> set:
+        """工作区中的交付文件集合。
+
+        无进展判定必须只看交付文件：workspace.list() 还包含 .task/** 元数据
+        （contract.json、TASK_STATE.md、evaluator/result.json），它们被 hook、
+        update_task_notes、verify 持续重写，会让"文件集合没变"这个判据永远
+        不成立，no_progress_count 被反复重置（需求 182）。
+        """
+        return {f for f in self.workspace.list() if self._is_deliverable(f)}
+
     def _check_no_progress(self, state: AgentState) -> bool:
         """检查连续无进展（前 3 轮豁免，给 LLM 足够的探索空间）"""
         if state.get("tool_call_count", 0) <= 3:
             return False
-        current_files = set(self.workspace.list())
+        current_files = self._deliverable_files()
         last_files = set(state.get("last_file_list") or [])
-        state["last_file_list"] = list(current_files)
+        state["last_file_list"] = sorted(current_files)
         if current_files == last_files:
             state["no_progress_count"] = state.get("no_progress_count", 0) + 1
         else:

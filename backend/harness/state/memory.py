@@ -27,6 +27,18 @@ from harness.observability.logger import get_logger
 logger = get_logger(__name__)
 
 
+def _aux_timeout() -> int:
+    """记忆整合/反思类 LLM 调用超时（thinking=enabled，reasoning 也要算时间）"""
+    from config import settings
+    return settings.LLM_AUX_TIMEOUT
+
+
+def _classify_timeout() -> int:
+    """记忆候选校验（max_tokens=100）超时"""
+    from config import settings
+    return settings.LLM_CLASSIFY_TIMEOUT
+
+
 # ==================== 注入预算 ====================
 #
 # 背景：记忆以 few-shot 形式追加在 system prompt 末尾，直接挤占主任务的
@@ -896,7 +908,7 @@ class MemoryManager:
                 system_prompt=REFLECTION_SYSTEM,
                 use_memory=False,
                 max_tokens=400,
-                timeout=20,
+                timeout=_aux_timeout(),
                 thinking='enabled',
             )
             if response.is_error or not response.content:
@@ -935,7 +947,7 @@ class MemoryManager:
                 system_prompt=VERIFY_SYSTEM,
                 use_memory=False,
                 max_tokens=100,
-                timeout=15,
+                timeout=_classify_timeout(),
                 thinking='enabled',
             )
             if response.is_error or not response.content:
@@ -1000,7 +1012,7 @@ class MemoryManager:
             system_prompt=CONSOLIDATE_SYSTEM,
             use_memory=False,
             max_tokens=500,
-            timeout=30,
+            timeout=_aux_timeout(),
             thinking='enabled',
         )
 

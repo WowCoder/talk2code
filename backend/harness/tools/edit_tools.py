@@ -165,6 +165,26 @@ class EditFileHandler(ToolHandler):
             else:
                 new_content = new_content.replace(search, replace, 1)
 
+        # 写入前语法守卫（req 189 同源）：编辑把语法正常的文件改坏 → 拒绝。
+        # 语义：只拦「确定性的解析错误」（node --check / 括号配平），
+        # 旧文件本身就语法坏时不拦（模型可能正在修它）。
+        try:
+            from harness.tools.file_tools import _syntax_problem
+            _new_problem = _syntax_problem(filename, new_content)
+            if _new_problem:
+                _old_problem = _syntax_problem(filename, content)
+                if not _old_problem:
+                    return ToolResult(
+                        error=(
+                            f"本次修改会让 {filename} 出现语法错误，已拒绝写入（原文件未动）：\n"
+                            f"{_new_problem}\n"
+                            "请检查 SEARCH/REPLACE 块是否完整覆盖了受影响的表达式"
+                            "（括号/引号/运算符是否成对）。"
+                        )
+                    )
+        except ImportError:
+            pass
+
         # 写入
         try:
             ws.write(filename, new_content)

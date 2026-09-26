@@ -23,6 +23,18 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+def _aux_timeout() -> int:
+    """长期记忆抽取类 LLM 调用超时"""
+    from config import settings
+    return settings.LLM_AUX_TIMEOUT
+
+
+def _classify_timeout() -> int:
+    """记忆候选筛选（max_tokens=200）超时"""
+    from config import settings
+    return settings.LLM_CLASSIFY_TIMEOUT
+
+
 class MemoryStore:
     """
     长期记忆管理
@@ -67,7 +79,7 @@ class MemoryStore:
 如果没有值得长期记忆的内容，返回空数组 []。"""
 
         try:
-            response = self._llm.chat(prompt, use_memory=False, max_tokens=500, timeout=20)
+            response = self._llm.chat(prompt, use_memory=False, max_tokens=500, timeout=_aux_timeout())
             import json
             items = json.loads(response.content) if response.content else []
             for item in items:
@@ -239,7 +251,7 @@ class MemoryStore:
 只返回相关的记忆序号 JSON 数组，如 [0, 3, 5]。不相关的不返回。最多返回 {top_k} 条。"""
 
         try:
-            response = self._llm.chat(prompt, use_memory=False, max_tokens=200, timeout=15)
+            response = self._llm.chat(prompt, use_memory=False, max_tokens=200, timeout=_classify_timeout())
             import json
             indices = json.loads(response.content) if response.content else []
             return [memories[i] for i in indices if 0 <= i < len(memories)][:top_k]

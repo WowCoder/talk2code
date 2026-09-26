@@ -446,3 +446,130 @@ class TestDomIdContract:
         assert env.check_dom_id_contract({}, '<div id="x"></div>') == []
         assert env.check_dom_id_contract({"js/a.js": "$('#x')"}, "") == []
 
+
+
+# ---------- 入口 HTML ↔ JS 引用契约（需求 183 首轮 4.2 分根因） ----------
+
+def test_entry_html_without_script_is_defect():
+    from harness.constraints.environment_contract import check_entry_script_contract
+    d = check_entry_script_contract(
+        {"js/game.js": "var a = 1;"},
+        {"index.html": "<!DOCTYPE html><html><body><div>x</div></body></html>"},
+    )
+    assert any(x["type"] == "entry_script_missing" for x in d)
+
+
+def test_js_file_never_referenced_is_defect():
+    from harness.constraints.environment_contract import check_entry_script_contract
+    d = check_entry_script_contract(
+        {"js/game.js": "var a = 1;", "js/main.js": "var b = 2;"},
+        {"index.html": "<html><body><script src=\"js/main.js\"></script></body></html>"},
+    )
+    assert [x["type"] for x in d] == ["js_not_referenced"]
+
+
+def test_all_referenced_is_clean():
+    from harness.constraints.environment_contract import check_entry_script_contract
+    d = check_entry_script_contract(
+        {"js/game.js": "var a = 1;"},
+        {"index.html": "<html><body><script src=\"js/game.js\"></script></body></html>"},
+    )
+    assert d == []
+
+
+def test_dynamic_script_injection_not_flagged():
+    """JS 动态注入 script 属于正常实现，不得误报"""
+    from harness.constraints.environment_contract import check_entry_script_contract
+    d = check_entry_script_contract(
+        {"js/loader.js": "var s = document.createElement('script'); s.src='js/game.js';"},
+        {"index.html": "<html><body><script src=\"js/loader.js\"></script></body></html>"},
+    )
+    assert d == []
+
+
+def test_iife_local_alias_not_reported():
+    """`var U = global.Utils;` 是合法简写，U.setBestScore 不得误报 missing_global。
+
+    需求 184 事故：5/5 验收条件全过、console 零报错，就因这条静态误报
+    被硬性一致性规则判成 NEEDS_WORK（5.5 分）。
+    """
+    from harness.constraints.environment_contract import check_cross_file_contract
+    utils = (
+        "(function (global) {\n"
+        "  'use strict';\n"
+        "  var Utils = {\n"
+        "    setBestScore: function (v) { return v; },\n"
+        "    getBestScore: function () { return 0; }\n"
+        "  };\n"
+        "  global.Utils = Utils;\n"
+        "})(window);\n"
+    )
+    app = (
+        "(function (global) {\n"
+        "  'use strict';\n"
+        "  var U = global.Utils;\n"
+        "  function over() { U.setBestScore(1); var t = U.getBestScore(); }\n"
+        "  global.__app = { over: over };\n"
+        "})(window);\n"
+    )
+    defects, _ = check_cross_file_contract(
+        {"js/utils.js": utils, "js/app.js": app, "index.html": "<html></html>"}
+    )
+    assert not any(d.get("evidence") == "U.setBestScore(" for d in defects), defects
+    assert not any(d["type"] == "missing_global" for d in defects), defects
+
+
+# ---------- 实例导出 X = new Y()（需求 186 事故） ----------
+
+def test_new_instance_inherits_prototype_methods():
+    """`global.Game = new DragonGame()` 是最常见的 ES5 实例导出。
+
+    186 事故：这种写法此前完全不被解析（_ALIAS_RE 要求 `= Y[,;\\n]`，
+    而 `new DragonGame()` 后跟 `(`），Game 继承来的方法集全丢；
+    调用方顺手挂的回调反而被当成 Game 的全部方法 → 正常调用被判 missing_api。
+    """
+    from harness.constraints.environment_contract import check_cross_file_contract
+    game_js = (
+        "function DragonGame() { this.score = 0; }\\n"
+        "DragonGame.prototype.getScore = function () { return this.score; };\\n"
+        "DragonGame.prototype.getHighScoreValue = function () { return 0; };\\n"
+        "global.Game = new DragonGame();\\n"
+    )
+    app_js = (
+        "(function (global) {\\n"
+        "  function updateHUD() {\\n"
+        "    var s = String(global.Game.getScore());\\n"
+        "    var h = String(global.Game.getHighScoreValue());\\n"
+        "  }\\n"
+        "  global.Game.onScoreChange = function () {};\\n"
+        "  global.__app = { updateHUD: updateHUD };\\n"
+        "})(window);\\n"
+    )
+    defects, _ = check_cross_file_contract(
+        {"js/game.js": game_js, "js/app.js": app_js, "index.html": "<html></html>"}
+    )
+    assert not any(d["type"] == "missing_api" for d in defects), defects
+    assert not any(d["type"] == "missing_global" for d in defects), defects
+
+
+def test_new_instance_defined_in_another_file():
+    """prototype 与 new 分处两个文件时，跨文件兜底必须生效"""
+    from harness.constraints.environment_contract import check_cross_file_contract
+    game_js = (
+        "function DragonGame() {}\\n"
+        "DragonGame.prototype.start = function () {};\\n"
+    )
+    app_js = "global.Game = new DragonGame();\\nvar x = Game.start();\\n"
+    defects, _ = check_cross_file_contract(
+        {"js/game.js": game_js, "js/app.js": app_js, "index.html": "<html></html>"}
+    )
+    assert not any(d.get("evidence") == "Game.start(" for d in defects), defects
+
+
+def test_new_builtin_not_reported():
+    """`var d = new Date()` 之类的内置实例化不得产生任何缺陷"""
+    from harness.constraints.environment_contract import check_cross_file_contract
+    js = "var d = new Date();\\nvar t = d.getTime();\\n"
+    html = '<html><body><script src="js/app.js"></script></body></html>'
+    defects, _ = check_cross_file_contract({"js/app.js": js, "index.html": html})
+    assert defects == []

@@ -316,6 +316,13 @@ _OBJECT_ASSIGN_RE = re.compile(
 _ALIAS_RE = re.compile(
     r'(?:window|global|self)\s*\.\s*([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\s*[,;\n]'
 )
+# IIFE 内的局部简写：`var U = global.Utils;` / `var U = global.Utils || {};`
+# 需求 184 事故：app.js 通篇用 U.setBestScore / U.getBestScore，静态检查不认这个别名，
+# 把 U 判成「项目中从未定义的全局对象」→ 硬性一致性规则强制判 NEEDS_WORK，
+# 而实际上 5/5 验收条件全过、浏览器 console 零报错（5.5 分是纯误报扣出来的）。
+_LOCAL_ALIAS_RE = re.compile(
+    r'\bvar\s+([A-Za-z_$][\w$]*)\s*=\s*(?:window|global|self)\s*\.\s*([A-Za-z_$][\w$]*)\b'
+)
 _FUNCTION_DECL_RE = re.compile(r'\bfunction\s+([A-Za-z_$][\w$]*)')
 _CLASS_DECL_RE = re.compile(r'\bclass\s+([A-Za-z_$][\w$]*)')
 _PROTO_METHOD_RE = re.compile(
@@ -326,6 +333,16 @@ _PROTO_METHOD_RE = re.compile(
 _ATTR_METHOD_RE = re.compile(
     r'(?:window|global|self)\s*\.\s*([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*='
     r'\s*function|([A-Z][\w$]*)\.([A-Za-z_$][\w$]*)\s*=\s*function'
+)
+# 实例导出：X = new Y() / global.X = new Y()
+# 需求 186 事故：`global.Game = new DragonGame()` 是 ES5 最常见的实例导出写法，
+# 但 _ALIAS_RE 要求 `= Y[,;\n]`，而 `new DragonGame()` 后紧跟 `(`，匹配不上 →
+# Game 继承来的 DragonGame.prototype.* 方法集全丢；
+# 与此同时 app.js 顺手挂的回调 `Game.onGameOver = function` 被 _ATTR_METHOD_RE
+# 收进 apis["Game"]，于是「Game 只有 2 个方法」→ 正常的 Game.getScore() 被判
+# missing_api，5.6 分里有相当一部分是这么扣出来的。
+_NEW_INSTANCE_RE = re.compile(
+    r'(?:(?:window|global|self)\s*\.\s*)?\b([A-Za-z_$][\w$]*)\s*=\s*new\s+([A-Za-z_$][\w$]*)\s*\('
 )
 
 _CALL_RE = re.compile(r'\b(?:window\s*\.\s*)?([A-Z][\w$]*)\s*\.\s*([a-z_$][\w$]*)\s*\(')
@@ -392,6 +409,16 @@ def _extract_js_apis(src: str) -> tuple[dict[str, set[str]], set[str], set[str]]
         apis.setdefault(gname, set()).add(meth)
         declared.add(gname)
 
+    # 实例导出：X = new Y() → X 继承 Y 的 prototype 方法集
+    for m in _NEW_INSTANCE_RE.finditer(src):
+        inst, cls = m.group(1), m.group(2)
+        declared.add(inst)
+        if cls in apis:
+            apis.setdefault(inst, set()).update(apis[cls])
+        else:
+            # 构造函数在本文件内无可枚举方法（或定义在别的文件）→ 按不透明处理
+            opaque.add(inst)
+
     # Utils.method = function / window.Utils.method = function —— 对象逐方法赋值
     for fm in _ATTR_METHOD_RE.finditer(src):
         gname = fm.group(1) or fm.group(3)
@@ -430,7 +457,8 @@ def _extract_js_apis(src: str) -> tuple[dict[str, set[str]], set[str], set[str]]
         pos = close_idx + 1
 
     # 别名导出：window.X = Y / global.X = Y（Y 是此前解析过的对象字面量）
-    for m in _ALIAS_RE.finditer(src):
+    # 再加 IIFE 局部简写 var U = global.Utils（见 _LOCAL_ALIAS_RE 注释）
+    for m in list(_ALIAS_RE.finditer(src)) + list(_LOCAL_ALIAS_RE.finditer(src)):
         gname, source = m.group(1), m.group(2)
         declared.add(gname)
         # req 148 事故：`var Store = {}; Store.getHighScore = function(){...};
@@ -484,6 +512,22 @@ def check_cross_file_contract(files: dict[str, str]) -> tuple[list[dict], list[d
             api_source.setdefault(gname, fname)
         all_opaque.update(opaque)
         known_globals.update(declared)
+
+    # 实例导出的跨文件兜底：`new Y()` 与 `Y.prototype.*` 可能落在不同 JS 文件里，
+    # 单文件解析时 cls 不在本文件 apis 会退化成 opaque（不误报但也不精确）。
+    # 这里用合并后的全量方法集再解析一次，让 Game.getScore() 这类正常调用被认出。
+    for fname, src in js_files.items():
+        for m in _NEW_INSTANCE_RE.finditer(src):
+            inst, cls = m.group(1), m.group(2)
+            known_globals.add(inst)
+            if cls in all_apis:
+                all_apis.setdefault(inst, set()).update(all_apis[cls])
+                api_source.setdefault(inst, fname)
+                all_opaque.discard(inst)
+            elif cls in all_opaque or cls in known_globals:
+                # 构造函数方法不可静态枚举 → 实例同样不可枚举，按不透明处理避免误报
+                all_opaque.add(inst)
+                all_apis.pop(inst, None)
 
     defects: list[dict] = []
     warnings: list[dict] = []
@@ -590,7 +634,81 @@ def check_cross_file_contract(files: dict[str, str]) -> tuple[list[dict], list[d
 
     # DOM-id 契约（需求 132：JS 绑了 HTML 不存在的 id，Utils.on 静默 no-op，交互失效无报错）
     defects += check_dom_id_contract(js_files, html_text)
+
+    # 入口 HTML ↔ JS 引用契约（需求 183 首轮 QA 仅 4.2 分的直接原因：
+    # index.html 47 行版既没有 <script> 也没有 </html>，浏览器加载后
+    # 所有 JS 一行都不会执行，「点击开始无反应」）。这是零 LLM 的确定性检查。
+    defects += check_entry_script_contract(js_files, files)
     return defects, warnings
+
+
+def check_entry_script_contract(
+    js_files: dict[str, str], files: dict[str, str]
+) -> list[dict]:
+    """入口 HTML 必须真正引用到 JS，否则整个页面没有任何交互逻辑。
+
+    两类确定性断裂：
+    1. 存在 .js 文件，但所有 HTML 里没有任何 <script>（src 或内联都没有）
+    2. 某个 .js 文件从未被任何 <script src=...> 引用（代码写了但不会执行）
+
+    误报控制：JS 里用 createElement('script') 动态注入的也计入「已引用」，
+    避免把动态加载的正常实现判成缺陷。
+    """
+    html_files = {f: c for f, c in files.items() if f.endswith((".html", ".htm"))}
+    if not js_files or not html_files:
+        return []
+
+    html_text = "\n".join(html_files.values())
+    js_text = "\n".join(js_files.values())
+
+    has_script_tag = bool(re.search(r"<script\b", html_text, re.I))
+    src_refs = re.findall(r'<script\b[^>]*\bsrc\s*=\s*["\']([^"\']+)["\']', html_text, re.I)
+    dynamic_load = bool(re.search(r"createElement\(\s*['\"]script['\"]", js_text))
+
+    defects: list[dict] = []
+
+    if not has_script_tag and not dynamic_load:
+        defects.append({
+            "type": "entry_script_missing",
+            "severity": "critical",
+            "dimension": "runtime",
+            "message": (
+                f"入口 HTML 未引入任何 <script>，但项目里有 {len(js_files)} 个 JS 文件"
+                f"（{', '.join(sorted(js_files)[:5])}）。"
+                f"浏览器加载后这些代码一行都不会执行，页面必然「点击无反应」。"
+                f"请在 index.html 末尾按顺序补上 <script src=\"...\"></script>，"
+                f"并把初始化调用放在最后一个 script 之后。"
+            ),
+            "evidence": "<script> not found in HTML",
+            "source_file": sorted(html_files)[0],
+            "_source": "entry_script_contract",
+        })
+        return defects
+
+    if dynamic_load:
+        return defects  # 动态注入场景不做逐文件比对
+
+    referenced = set()
+    for src in src_refs:
+        referenced.add(src.split("/")[-1])
+        referenced.add(src)
+
+    for fname in sorted(js_files):
+        if fname in referenced or fname.split("/")[-1] in referenced:
+            continue
+        defects.append({
+            "type": "js_not_referenced",
+            "severity": "critical",
+            "dimension": "runtime",
+            "message": (
+                f"{fname} 未被任何 <script src=...> 引用：代码写了但不会被执行。"
+                f"请在 index.html 中补上对应 script 标签（注意放在依赖它的脚本之后）。"
+            ),
+            "evidence": fname,
+            "source_file": fname,
+            "_source": "entry_script_contract",
+        })
+    return defects
 
 
 # ==================== DOM-id 契约检查（需求 132 事故） ====================

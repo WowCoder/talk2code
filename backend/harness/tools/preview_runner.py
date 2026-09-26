@@ -138,10 +138,13 @@ def _run_preview_in_browser_session(
                         logs.append(f"[{msg.type}] {msg.text}")
 
                 def _on_pageerror(err):
+                    stack = (getattr(err, "stack", "") or "")[:1200]
                     errors.append({
                         "type": "pageerror",
                         "message": str(err),
                         "name": getattr(err, "name", ""),
+                        "stack": stack,
+                        "location": _parse_error_location(stack),
                     })
 
                 def _on_request_failed(req):
@@ -780,6 +783,29 @@ def _loc(loc) -> str:
         return ""
 
 
+def _parse_error_location(stack: str) -> str:
+    """从 pageerror 的 stack 里提取「文件:行号」。
+
+    req 189：裸 message（"Unexpected token ')'”）不带位置，coder 在 4 个 JS
+    文件间盲猜 5 轮也没修掉。stack 首个 at 帧形如
+    "at http://host/js/app.js:216:20"（file:// 直读同理），取末段文件名 + 行号
+    即可把错误钉到具体位置。解析失败返回空串，绝不抛异常。
+    """
+    try:
+        for _line in (stack or "").splitlines():
+            _line = _line.strip()
+            if _line.startswith("at ") and (".js" in _line or ".html" in _line):
+                _ref = _line[3:].split(" ")[0]
+                _parts = _ref.split(":")
+                if len(_parts) >= 2:
+                    _file = _parts[-3] if len(_parts) >= 3 else _parts[0]
+                    return f"{_file.split('/')[-1]}:{_parts[-2]}"
+                break
+    except Exception:
+        pass
+    return ""
+
+
 def capture_screenshot(html_path: Path, out_path: Path,
                        timeout_ms: int = 12_000, preview_url: str = None) -> str | None:
     """在全新线程里执行截图会话（req 154）。超时返回 None（与既有失败语义一致）。"""
@@ -1317,6 +1343,22 @@ def _run_universal_smoke_session(html_path: Path, timeout_ms: int = 15_000, prev
                             # 收不到 keydown，循环永远起不来——这是 harness 焦点问题而非
                             # 产品缺陷。改用 doc.press("body", key)，按键会冒泡到内层
                             # document 的 keydown 监听。
+                            # req 190 复盘：自动移动类游戏（贪吃蛇形态）在上方 2.5s 观察
+                            # 窗口内可能已撞墙结束（开局居中、直行朝墙，实测 ~1.4s 即
+                            # game over）。死局下按键合法地无效，旧逻辑据此把「游戏已
+                            # 正常结束」误判成「游戏循环从未启动」。这里重按一次主入口
+                            # （结束态下它正是「再来一局」；对其它应用是重复同一动作，
+                            # 无观察层破坏），把键盘检查拉回"活着"的窗口内。
+                            try:
+                                doc.evaluate("""
+                                    (idx) => {
+                                        const els = [...document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')];
+                                        els[idx]?.click();
+                                    }
+                                """, cta["i"])
+                                page.wait_for_timeout(150)
+                            except Exception:
+                                pass
                             try:
                                 _cv = doc.query_selector("canvas")
                                 if _cv:
@@ -1330,9 +1372,9 @@ def _run_universal_smoke_session(html_path: Path, timeout_ms: int = 15_000, prev
                                 except Exception:
                                     pass
                                 page.wait_for_timeout(350)
-                            page.wait_for_timeout(1600)
+                            page.wait_for_timeout(900)
                             k1 = _canvas_sig()
-                            page.wait_for_timeout(1200)
+                            page.wait_for_timeout(700)
                             k2 = _canvas_sig()
                             real_alive = (k0 != k1) or (k1 != k2)
 
@@ -1377,16 +1419,19 @@ def _run_universal_smoke_session(html_path: Path, timeout_ms: int = 15_000, prev
                                     "severity": "critical",
                                     "dimension": "functionality",
                                     "message": (
-                                        "点击开始后按方向键，画面在 2.8s 内完全静止 —— "
-                                        "游戏循环从未启动，应用打开能看但根本玩不了"
+                                        "点击开始并重按主入口后，方向键输入与画面自动演进"
+                                        "在约 2.5s 采样窗口内均未使 canvas 变化 —— "
+                                        "应用打开能看但无法通过输入交互"
                                     ),
                                     "evidence": f"canvas 签名连续三次采样一致: {k0} == {k1} == {k2}",
                                     "suggestion": (
-                                        "就绪(ready)状态必须由首次方向输入切换到运行(playing)并启动循环。"
-                                        "检查点：(1) 是否存在独立的 startLoop() 且内部真的调用了 "
-                                        "setInterval/requestAnimationFrame；(2) 方向键处理函数里是否有 "
+                                        "先确认点击主入口后游戏循环真的启动："
+                                        "(1) 是否存在独立的 startLoop() 且内部真的调用了 "
+                                        "setInterval/requestAnimationFrame，且开始处理函数确实调用了它；"
+                                        "(2) 方向键处理函数里是否有 "
                                         "`if (state === 'ready') { state = 'playing'; startLoop(); }`；"
-                                        "(3) 不要只在 tick() 内部重设定时器——首次启动就没人调用 tick。"
+                                        "(3) 不要只在 tick() 内部重设定时器——首次启动就没人调用 tick；"
+                                        "(4) tick 内部是否有异常导致提前 return（可用 run_preview 看 console）。"
                                         "这是流程缺陷，必须改 JS 逻辑"
                                     ),
                                 })
