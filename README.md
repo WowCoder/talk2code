@@ -94,7 +94,8 @@ talk2code/
 │   ├── app.py                    # 应用入口（装配 factory.app + 注册路由蓝图）
 │   ├── factory.py                # Flask 应用工厂（app 实例 / CORS / JWT / 限流 / SSE 与任务队列装配）
 │   ├── config.py                 # 配置管理
-│   ├── routes/                   # API 路由蓝图（auth / requirements / preview / health）
+│   ├── routes/                   # API 路由蓝图（auth / requirements / preview / health / market / publish / invite / admin）
+│   ├── manage.py                 # 运维 CLI（演示帐号 / 需求转移 / 邀请码 / 后台管理员）
 │   ├── celery_app.py             # Celery 异步任务定义
 │   ├── models/                   # 数据模型
 │   ├── llm/                      # LLM 统一客户端（OpenAI/Anthropic 双协议）

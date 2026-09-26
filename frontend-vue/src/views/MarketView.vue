@@ -53,6 +53,7 @@ import SiteCard, { type MarketSite } from '@/components/market/SiteCard.vue'
 import AuthNudge from '@/components/market/AuthNudge.vue'
 import { useAuthStore } from '@/stores/auth'
 import { useMarketGuest } from '@/composables/useMarketGuest'
+import { useToast } from '@/composables/useToast'
 
 // 市集自带请求封装，不走 useApi：useApi 在 401 时会清空登录态并跳 /login，
 // 而市集的匿名点赞**预期**就是 401 —— 那是引导注册的时机，不是会话失效。
@@ -123,6 +124,10 @@ async function load() {
 }
 
 async function onLike(site: MarketSite) {
+  if (authStore.isDemo) {
+    useToast().show('演示模式为只读，注册后即可点赞', 'info')
+    return
+  }
   if (!authStore.isAuthenticated) {
     if (bumpGuestAction(false)) pendingSlug.value = site.slug
     return

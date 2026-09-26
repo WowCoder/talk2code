@@ -34,6 +34,16 @@
     >
       {{ loading ? '登录中…' : '登录' }}
     </button>
+    <div class="demo-entry">
+      <button
+        type="button"
+        class="demo-btn"
+        :disabled="demoLoading"
+        @click="handleDemo"
+      >
+        {{ demoLoading ? '进入中…' : '以演示模式进入（只读）' }}
+      </button>
+    </div>
   </form>
 </template>
 
@@ -51,6 +61,7 @@ const router = useRouter()
 const username = ref('')
 const password = ref('')
 const loading = ref(false)
+const demoLoading = ref(false)
 const errorMsg = ref('')
 
 async function handleSubmit() {
@@ -71,6 +82,19 @@ async function handleSubmit() {
     errorMsg.value = err.message || '登录失败'
   } finally {
     loading.value = false
+  }
+}
+
+async function handleDemo() {
+  demoLoading.value = true
+  errorMsg.value = ''
+  try {
+    await authStore.enterDemo()
+    router.push('/')
+  } catch (err: any) {
+    errorMsg.value = err.message || '演示模式暂不可用'
+  } finally {
+    demoLoading.value = false
   }
 }
 </script>
@@ -98,5 +122,28 @@ async function handleSubmit() {
   color: oklch(50% 0.15 20);
   text-align: center;
   padding: 4px 0;
+}
+
+.demo-entry {
+  text-align: center;
+  margin-top: 2px;
+}
+
+.demo-btn {
+  width: 100%;
+  padding: 10px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  font-family: var(--font-body);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.demo-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 </style>

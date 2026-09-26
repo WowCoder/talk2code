@@ -319,6 +319,52 @@ class Settings(BaseSettings):
         description='true 时从 X-Forwarded-For 解析客户端 IP（须部署在可信反向代理之后）'
     )
 
+    # ==================== 演示模式配置 ====================
+
+    # 演示帐号是 users 表里的一行真实用户（由 manage.py demo init 创建）。
+    # 演示模式以它的身份登录，JWT 额外带 demo claim，写操作被 before_request 守卫拦下。
+    # 之所以复用真实用户身份：所有按 user_id 过滤的既有查询无需任何改动。
+    DEMO_USERNAME: str = Field(
+        default='demo',
+        description='演示帐号用户名（真实存在于 users 表）'
+    )
+
+    # ==================== 邀请码配置 ====================
+
+    # 邀请码有效期：一次性 + 有限期，比永久码多一层「码扩散后自动失效」的兜底
+    INVITE_CODE_TTL_DAYS: int = Field(default=7, ge=1, le=365, description='邀请码有效期（天）')
+    # 同一邮箱的重复申请冷却时间。0=不限制
+    INVITE_REQUEST_COOLDOWN_HOURS: int = Field(
+        default=24, ge=0, le=720,
+        description='同一邮箱重复提交申请的冷却时间（小时）'
+    )
+    INVITE_CODE_PREFIX: str = Field(default='T2C-', description='邀请码前缀')
+
+    # ==================== 邮件配置（邀请码发放） ====================
+
+    # 默认关闭：不配置 SMTP 也必须能完整跑通审批流（后台直接展示码明文供手动复制）。
+    # 发信与审批解耦 —— 发信失败不会让审批失败，只记 delivery_status=failed 供重发。
+    SMTP_ENABLED: bool = Field(default=False, description='是否启用邮件发送')
+    SMTP_HOST: str = Field(default='', description='SMTP 服务器地址')
+    SMTP_PORT: int = Field(default=587, ge=1, le=65535, description='SMTP 端口')
+    SMTP_USER: str = Field(default='', description='SMTP 用户名')
+    SMTP_PASSWORD: str = Field(default='', description='SMTP 密码')
+    SMTP_FROM: str = Field(default='', description='发件人地址，为空时回退 SMTP_USER')
+    SMTP_USE_TLS: bool = Field(default=True, description='是否使用 STARTTLS')
+
+    # ==================== 管理后台配置 ====================
+
+    # 后台 token 走 Authorization header（不进 cookie），有效期比前台短得多。
+    # 短有效期是「token 存 sessionStorage」这一取舍的主要补偿手段。
+    ADMIN_TOKEN_EXPIRES_HOURS: int = Field(
+        default=2, ge=1, le=24,
+        description='后台管理员 token 有效期（小时）'
+    )
+
+    @property
+    def ADMIN_TOKEN_EXPIRES(self) -> timedelta:
+        return timedelta(hours=self.ADMIN_TOKEN_EXPIRES_HOURS)
+
     # 预览能力 URL 的外部基础地址（如 https://preview.example.com）。
     # 为空时生成同源相对路径（本机/同源反代场景无需配置）。
     PREVIEW_PUBLIC_BASE_URL: str = Field(

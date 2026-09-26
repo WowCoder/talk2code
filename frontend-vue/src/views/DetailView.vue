@@ -81,6 +81,7 @@
 import { ref, computed, watch, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useRequirementStore, emptyProgress } from '@/stores/requirement'
+import { useAuthStore } from '@/stores/auth'
 import { useToast } from '@/composables/useToast'
 import { useSSE } from '@/composables/useSSE'
 import AppNav from '@/components/layout/AppNav.vue'
@@ -98,6 +99,7 @@ import type { SSETraceSummaryData } from '@/types/sse'
 const route = useRoute()
 const router = useRouter()
 const store = useRequirementStore()
+const authStore = useAuthStore()
 const { show } = useToast()
 const activeTab = ref('preview')
 
@@ -243,6 +245,12 @@ async function onSendMessage(
   message: string,
   clarify?: { questions: any[]; answers: Record<string, string> }
 ) {
+  // 演示模式只读：后端有 demo 守卫兜底，这里提前拦截给更好的引导
+  if (authStore.isDemo) {
+    show('演示模式为只读，注册后即可继续对话修改', 'info')
+    return
+  }
+
   // 消息以 [用户补充说明] 开头说明是澄清后的合成消息，
   // 已提交卡片由 DialoguePanel 落入消息流，不重复添加纯文本消息
   const isClarifyFollowUp = message.startsWith('[用户补充说明]')
@@ -285,6 +293,10 @@ async function onSendMessage(
 // Stop handler: 取消正在执行的 Agent 任务
 async function onStopGeneration() {
   if (!store.currentRequirement?.id) return
+  if (authStore.isDemo) {
+    show('演示模式为只读，不可取消任务', 'info')
+    return
+  }
 
   try {
     await fetch(`/api/requirements/${store.currentRequirement.id}/cancel`, {
@@ -307,6 +319,10 @@ async function onStopGeneration() {
 const resuming = ref(false)
 async function onResume() {
   if (resuming.value || !store.currentRequirement?.id) return
+  if (authStore.isDemo) {
+    show('演示模式为只读，注册后即可续跑任务', 'info')
+    return
+  }
   resuming.value = true
   const wasFailed = store.currentRequirement.status === 'failed'
   try {

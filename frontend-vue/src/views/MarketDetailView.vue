@@ -87,6 +87,7 @@ import HeatBadge from '@/components/market/HeatBadge.vue'
 import AuthNudge from '@/components/market/AuthNudge.vue'
 import { useAuthStore } from '@/stores/auth'
 import { useMarketGuest } from '@/composables/useMarketGuest'
+import { useToast } from '@/composables/useToast'
 
 interface SiteDetail {
   slug: string
@@ -172,6 +173,10 @@ async function loadComments() {
 }
 
 function requireAuth(action: Pending, title: string): boolean {
+  if (authStore.isDemo) {
+    useToast().show('演示模式为只读，注册后即可参与互动', 'info')
+    return false
+  }
   if (authStore.isAuthenticated) return true
   if (bumpGuestAction(false)) {
     pending.value = action
@@ -235,6 +240,10 @@ async function send() {
 }
 
 async function remove(id: number) {
+  if (authStore.isDemo) {
+    useToast().show('演示模式为只读，不可删除留言', 'info')
+    return
+  }
   try {
     await mfetch(`/api/market/sites/${slug}/comments/${id}`, { method: 'DELETE' })
     await load()

@@ -329,6 +329,66 @@ class UserFollow(Base):
     __table_args__ = (UniqueConstraint("follower_id", "followee_id", name="uq_user_follow"),)
 
 
+
+
+class InviteCode(Base):
+    """邀请码 / 准入申请单（单表承载申请→审批→发放→使用全流程）。
+
+    为什么不分「申请单 + 邀请码」两张表：本阶段的真实约束是「一个申请对应一个码」，
+    拆表要额外维护同步与外键，是过度设计。审批通过后 code 字段才被填充。
+
+    状态机：
+        pending ──approve──▶ issued ──注册核销──▶ used
+                ──reject───▶ rejected          ──过期──▶ expired
+                                               ──吊销──▶ revoked
+    """
+    __tablename__ = 'invite_codes'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(32), unique=True, nullable=True, index=True)  # 审批通过时才生成
+    applicant_email = Column(String(255), nullable=False, index=True)
+    # 手机号只作留存与人工联系用 —— 不接短信网关（企业资质 + 签名报备 + 按条计费，
+    # 且本地开发无法真发）。发放渠道走邮箱。
+    applicant_phone = Column(String(32), nullable=False, default='')
+    applicant_note = Column(String(500), nullable=False, default='')
+
+    # pending / issued / rejected / used / expired / revoked
+    status = Column(String(16), default='pending', nullable=False, index=True)
+    # pending / sent / failed / skipped（SMTP 未启用或发信异常，见 services/notify/email.py）
+    delivery_status = Column(String(16), default='pending', nullable=False)
+
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    decided_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+    used_at = Column(DateTime, nullable=True)
+
+    decided_by = Column(Integer, ForeignKey('admin_users.id'), nullable=True)
+    used_by_user_id = Column(Integer, ForeignKey('users.id'), nullable=True)
+    reject_reason = Column(String(200), nullable=True)
+
+    def __repr__(self):
+        return f'<InviteCode {self.code or self.id}: {self.status}>'
+
+
+class AdminUser(Base):
+    """后台管理员 —— 与 users 表物理隔离。
+
+    不给 users 加 is_admin 列：那样每个注册用户都成了潜在提权面，一个越权
+    UPDATE 就能拿到后台。独立表让后台权限与用户体系零交集。
+    """
+    __tablename__ = 'admin_users'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String(80), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    role = Column(String(16), default='admin', nullable=False)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    last_login_at = Column(DateTime, nullable=True)
+
+    def __repr__(self):
+        return f'<AdminUser {self.username}>'
+
+
 def _sql_false() -> str:
     return "FALSE" if settings.IS_POSTGRES else "0"
 

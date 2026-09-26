@@ -1,4 +1,5 @@
 <template>
+  <DemoBanner />
   <router-view />
   <ToastContainer />
 </template>
@@ -7,6 +8,7 @@
 import { onMounted } from 'vue'
 import { useSettingsStore } from '@/stores/settings'
 import ToastContainer from '@/components/common/ToastContainer.vue'
+import DemoBanner from '@/components/common/DemoBanner.vue'
 
 const settingsStore = useSettingsStore()
 

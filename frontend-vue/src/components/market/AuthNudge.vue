@@ -11,6 +11,8 @@
              autocomplete="username" />
       <input v-model="password" class="nudge-input" type="password" placeholder="密码（至少 6 位）"
              autocomplete="current-password" />
+      <input v-if="mode === 'register'" v-model="inviteCode" class="nudge-input invite"
+             type="text" placeholder="邀请码（必填）" />
       <p v-if="err" class="nudge-err">{{ err }}</p>
       <div class="nudge-actions">
         <button class="nudge-btn ghost" type="button" @click="mode = mode === 'login' ? 'register' : 'login'">
@@ -35,6 +37,7 @@ const authStore = useAuthStore()
 const mode = ref<'login' | 'register'>('register')
 const username = ref('')
 const password = ref('')
+const inviteCode = ref('')
 const busy = ref(false)
 const err = ref('')
 
@@ -42,10 +45,13 @@ async function submit() {
   err.value = ''
   if (username.value.trim().length < 3) { err.value = '用户名至少 3 个字符'; return }
   if (password.value.length < 6) { err.value = '密码至少 6 个字符'; return }
+  if (mode.value === 'register' && !inviteCode.value.trim()) {
+    err.value = '请填写邀请码'; return
+  }
   busy.value = true
   try {
     if (mode.value === 'register') {
-      await authStore.register(username.value.trim(), password.value)
+      await authStore.register(username.value.trim(), password.value, inviteCode.value.trim())
     }
     await authStore.login(username.value.trim(), password.value)
     emit('success')
@@ -104,6 +110,11 @@ async function submit() {
 .nudge-input:focus {
   outline: none;
   border-color: var(--accent);
+}
+
+.nudge-input.invite {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 .nudge-err {

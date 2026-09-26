@@ -9,12 +9,25 @@ Talk2Code — Flask + Vue 3 前后端分离的 AI 编程助手。后端通过 La
 ```bash
 # 完整启动
 source venv/bin/activate && bash start.sh
+
+# 运维 CLI（演示帐号 / 需求转移 / 邀请码 / 后台管理员）
+cd backend && python manage.py demo init
+cd backend && python manage.py demo transfer --from <id|用户名> --all --dry-run
+cd backend && python manage.py invite create --count 10
+cd backend && python manage.py admin create-user --username ops
 ```
+
+## 运维与权限要点
+
+- **演示模式**：演示帐号 = users 表真实用户（`DEMO_USERNAME`），`/api/demo/enter` 签发带 `demo:true` 的 JWT。写操作由 `utils/demo_guard.py` 在 before_request 阶段**默认拒绝**（白名单：login/logout/register/邀请码申请/admin）——新增写接口默认被拦，若演示模式需放行，必须显式评审加入 `DEMO_WRITE_ALLOWLIST`。
+- **注册准入**：`/api/register` 必填 `invite_code`，同一事务内经 `services/invite.py::consume_code` 原子核销（rowcount 防并发双用）。错误文案统一「邀请码无效或已被使用」，不得区分失败原因（防枚举）。
+- **运营后台**：`/api/admin/*` 由 `utils/admin_guard.py::admin_required` 保护（校验 `type=admin` claim）。管理员 token 走 **Authorization header**（不进 cookie，避免与前台登录态互相覆盖），独立 `admin_users` 表。
+- **邮件**：`services/notify/email.py` 发信失败**绝不向上抛**——审批与发信解耦，失败只记 `delivery_status=failed` 供后台重发。`SMTP_ENABLED=false` 时返回 skipped，后台直接展示码明文。
 
 ## 架构约定
 
 - **LLM 调用必须走 `llm/client.py`**（`get_client()`），禁止直接调 provider API。通过 `LLM_PROVIDER` 环境变量切换协议。
-- **新增 API 路由**：在 `routes/` 目录下对应的路由模块中添加 `@app.route()` 装饰器。路由按职责分模块：`routes/auth.py`、`routes/requirements.py`、`routes/health.py`、`routes/preview.py`。应用工厂在 `factory.py`（`create_app()`），入口在 `app.py`。
+- **新增 API 路由**：在 `routes/` 目录下对应的路由模块中添加 `@app.route()` 装饰器。路由按职责分模块：`routes/auth.py`（含演示进入）、`routes/requirements.py`、`routes/health.py`、`routes/preview.py`、`routes/invite.py`（邀请码申请）、`routes/admin.py`（运营后台）、`routes/publish.py`。应用工厂在 `factory.py`（`create_app()`），入口在 `app.py`。
 - **数据库 Session**：统一使用 `utils/db.py` 的 `get_db()` / `transactional_db()` context manager，禁止手动 `SessionLocal()` + `try/finally: db.close()`。
 - **新增 LangGraph 节点**：在 `harness/instructions/nodes.py` 中定义节点函数（签名：`def node_name(state: AgentState) -> Dict[str, Any]:`），在 `harness/graph.py` 中注册到工作流。
 - **新增工具**：在 `harness/tools/` 对应模块中定义 handler，然后在 `registry.py` 的 `create_tool_registry()` 中注册。工具定义使用 `ToolDefinition` dataclass（name/description/parameters/handler/permission）。
