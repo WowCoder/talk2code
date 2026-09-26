@@ -27,6 +27,7 @@
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useToast } from '@/composables/useToast'
+import { useAuthStore } from '@/stores/auth'
 
 const emit = defineEmits<{
   selectExample: [value: string]
@@ -51,6 +52,12 @@ function onKeydown(e: KeyboardEvent) {
 async function submit() {
   const text = content.value.trim()
   if (!text) return
+
+  // 演示模式：后端有 demo 守卫兜底，这里提前拦截给更好的引导
+  if (useAuthStore().isDemo) {
+    show('演示模式为只读，注册后即可创建你自己的应用', 'info')
+    return
+  }
 
   submitting.value = true
   try {

@@ -10,12 +10,12 @@
         </div>
         <div class="header-right">
           <button
-            v-if="!isMultiSelect"
+            v-if="!isDemo && !isMultiSelect"
             class="multi-select-toggle"
             @click="enterMultiSelect"
           >多选</button>
           <button
-            v-else
+            v-else-if="!isDemo"
             class="multi-select-toggle active"
             @click="exitMultiSelect"
           >取消</button>
@@ -25,7 +25,7 @@
       <!-- Tabs -->
       <div class="tabs">
         <button :class="['tab-btn', { active: activeTab === 'active' }]" @click="switchTab('active')">运行中</button>
-        <button :class="['tab-btn', { active: activeTab === 'trash' }]" @click="switchTab('trash')">
+        <button v-if="!isDemo" :class="['tab-btn', { active: activeTab === 'trash' }]" @click="switchTab('trash')">
           回收站
           <span v-if="trashProjects.length" class="tab-badge">{{ trashProjects.length }}</span>
         </button>
@@ -137,6 +137,8 @@ const { api } = useApi()
 const { show } = useToast()
 
 const activeTab = ref<'active' | 'trash'>('active')
+// 演示模式只读：后端有 demo 守卫兜底，这里只做 UX（隐藏入口 + 点击提示）
+const isDemo = computed(() => authStore.isDemo)
 const projects = ref<(RequirementSummary & { content?: string; file_count?: number })[]>([])
 const trashProjects = ref<(RequirementSummary & { content?: string; file_count?: number })[]>([])
 const searchQuery = ref('')
@@ -251,7 +253,16 @@ function toggleSelectAll() {
 
 // ===== Single operations =====
 
+function guardDemo(): boolean {
+  if (isDemo.value) {
+    show('演示模式为只读，注册后即可管理自己的项目', 'info')
+    return true
+  }
+  return false
+}
+
 function onTrash(id: number) {
+  if (guardDemo()) return
   const item = projects.value.find(p => p.id === id)
   confirmDialog.message = `确定要将「${item?.title || '该项目'}」移入回收站吗？`
   confirmDialog.onConfirm = async () => {
@@ -266,6 +277,7 @@ function onTrash(id: number) {
 }
 
 function onRestore(id: number) {
+  if (guardDemo()) return
   const item = trashProjects.value.find(p => p.id === id)
   confirmDialog.message = `确定要恢复「${item?.title || '该项目'}」吗？`
   confirmDialog.onConfirm = async () => {
@@ -280,6 +292,7 @@ function onRestore(id: number) {
 }
 
 function onPermanentDelete(id: number) {
+  if (guardDemo()) return
   const item = trashProjects.value.find(p => p.id === id)
   confirmDialog.message = `确定要彻底删除「${item?.title || '该项目'}」吗？此操作不可撤销。`
   confirmDialog.onConfirm = async () => {
@@ -296,6 +309,7 @@ function onPermanentDelete(id: number) {
 // ===== Batch operations =====
 
 async function onBatchTrash() {
+  if (guardDemo()) return
   const count = selectedCount.value
   confirmDialog.message = `确定要将 ${count} 个项目移入回收站吗？`
   confirmDialog.onConfirm = async () => {
@@ -311,6 +325,7 @@ async function onBatchTrash() {
 }
 
 async function onBatchRestore() {
+  if (guardDemo()) return
   const count = selectedCount.value
   confirmDialog.message = `确定要恢复 ${count} 个项目吗？`
   confirmDialog.onConfirm = async () => {
@@ -326,6 +341,7 @@ async function onBatchRestore() {
 }
 
 async function onBatchPermanentDelete() {
+  if (guardDemo()) return
   const count = selectedCount.value
   confirmDialog.message = `确定要彻底删除 ${count} 个项目吗？此操作不可撤销。`
   confirmDialog.onConfirm = async () => {

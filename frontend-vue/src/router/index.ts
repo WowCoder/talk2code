@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
+import { getAdminToken } from '@/composables/useAdmin'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -55,6 +56,26 @@ const router = createRouter({
       meta: { requiresAuth: true },
     },
     {
+      // 运营后台：入口不进主导航（普通用户不感知）。token 存 sessionStorage，
+      // 有效期 2h，过期由 useAdmin 统一踢回登录页。
+      path: '/admin/login',
+      name: 'AdminLogin',
+      component: () => import('@/views/admin/AdminLoginView.vue'),
+      meta: { requiresAuth: false, admin: true },
+    },
+    {
+      path: '/admin/invites',
+      name: 'AdminInvites',
+      component: () => import('@/views/admin/AdminInvitesView.vue'),
+      meta: { requiresAuth: false, requiresAdmin: true },
+    },
+    {
+      path: '/admin/metrics',
+      name: 'AdminMetrics',
+      component: () => import('@/views/admin/AdminMetricsView.vue'),
+      meta: { requiresAuth: false, requiresAdmin: true },
+    },
+    {
       path: '/:pathMatch(.*)*',
       redirect: '/',
     },
@@ -64,6 +85,12 @@ const router = createRouter({
 // Navigation guard
 router.beforeEach((to, _from, next) => {
   const authStore = useAuthStore()
+
+  // 后台路由：独立的 sessionStorage 登录态，与前台 cookie 互不干扰
+  if (to.meta.requiresAdmin && !getAdminToken()) {
+    next({ name: 'AdminLogin' })
+    return
+  }
 
   // 登录态已在 main.ts 中通过 initAuth() 恢复
   if (!authStore.isAuthenticated && to.path === '/') {

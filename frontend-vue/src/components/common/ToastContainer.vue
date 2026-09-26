@@ -47,4 +47,9 @@ const { toasts } = useToast()
   background: oklch(94% 0.03 20);
   color: oklch(42% 0.15 20);
 }
+
+.toast.info {
+  background: oklch(94% 0.02 250);
+  color: oklch(40% 0.08 250);
+}
 </style>

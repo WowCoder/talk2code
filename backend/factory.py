@@ -91,6 +91,12 @@ def _set_rate_limit_identity():
         g.user_id = None
 
 
+# 演示模式只读守卫：注册在限流身份解析之后（后者已把 JWT 上下文准备好）。
+# 默认拒绝所有写方法，白名单放行 —— 详见 utils/demo_guard.py 的取舍说明。
+from utils.demo_guard import register_demo_guard  # noqa: E402
+register_demo_guard(app)
+
+
 # 限流配置 - 测试环境下禁用
 DISABLE_RATE_LIMIT = os.environ.get('DISABLE_RATE_LIMIT', 'false').lower() == 'true'
 if DISABLE_RATE_LIMIT:

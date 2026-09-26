@@ -5,7 +5,8 @@
 
 from .models import (
     User, Requirement, AgentMemory, AgentMemoryV2, AgentTrace, CheckpointRecord, AgentMemoryVector,
-    MemoryHit, PublishedBundle, PublishedSite,
+    MemoryHit, PublishedBundle, PublishedSite, SiteVisitDedup, SiteLike, SiteComment, UserFollow,
+    InviteCode, AdminUser,
     init_db, SessionLocal, engine, Base,
 )
 
@@ -18,6 +19,14 @@ __all__ = [
     'CheckpointRecord',
     'AgentMemoryVector',
     'MemoryHit',
+    'PublishedBundle',
+    'PublishedSite',
+    'SiteVisitDedup',
+    'SiteLike',
+    'SiteComment',
+    'UserFollow',
+    'InviteCode',
+    'AdminUser',
     'init_db',
     'SessionLocal',
     'engine',
