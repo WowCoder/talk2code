@@ -1,5 +1,9 @@
 # Talk2Code Harness 6 层架构改造 — 详细设计方案
 
+> ⚠️ **历史设计稿（2026-06-07）**：文中引用的路径（`agents/workflow.py`、`agents/nodes.py`、
+> `frontend/index.html` 等）已被后续重构取代，当前代码结构以 `docs/ARCHITECTURE.md` 为准。
+> 保留本文仅用于追溯改造背景与决策依据，不要据此理解现状。
+>
 > 基于 Addy Osmani "Agent Harness Engineering" 6 层架构模型
 >
 > 设计日期：2026-06-07
