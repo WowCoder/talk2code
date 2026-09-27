@@ -55,7 +55,13 @@ def _mk_invite(code: str) -> None:
     db.commit()
 
 
-def _register(client, username: str, code: str = "DEMOGUARDCODE1") -> None:
+def _register(client, username: str, code: str = "DEMOGUARDCODE1") -> str:
+    """注册一个普通用户，返回**实际**用户名。
+
+    注意必须用返回值：这里会给用户名加本次运行后缀（隔离共享测试库残留），
+    调用方若继续用传入的原名去登录，会因帐号不存在而静默拿到 401，
+    后续断言就以错误理由通过或 KeyError。
+    """
     _mk_invite(code)
     username = f"{username}_{_run}"
     db = SessionLocal()
@@ -67,10 +73,13 @@ def _register(client, username: str, code: str = "DEMOGUARDCODE1") -> None:
         "username": username, "password": "test123456", "invite_code": code,
     })
     assert resp.status_code == 201, resp.get_json()
+    return username
 
 
 def _login(client, username: str, password: str = "test123456"):
-    return client.post("/api/login", json={"username": username, "password": password})
+    resp = client.post("/api/login", json={"username": username, "password": password})
+    assert resp.status_code == 200, resp.get_json()
+    return resp
 
 
 def _enter_demo(client):
@@ -101,8 +110,8 @@ def test_demo_enter_requires_init(app_client):
 
 
 def test_normal_user_is_not_demo(app_client, demo_user):
-    _register(app_client, "notdemo_user")
-    _login(app_client, "notdemo_user")
+    uname = _register(app_client, "notdemo_user")
+    _login(app_client, uname)
     info = app_client.get("/api/user/info").get_json()
     assert info["user"]["is_demo"] is False
 
@@ -173,8 +182,8 @@ def test_demo_can_register_and_invite_request(app_client, demo_user):
 # ---------------- 守卫：不误伤 ----------------
 
 def test_normal_user_write_not_blocked(app_client, demo_user):
-    _register(app_client, "writer_user")
-    _login(app_client, "writer_user")
+    uname = _register(app_client, "writer_user")
+    _login(app_client, uname)
     # 内容过短是业务校验（400），只要不是 403 就说明守卫没误伤
     resp = app_client.post("/api/requirements", json={"content": "x"})
     assert resp.status_code != 403

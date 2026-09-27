@@ -3,8 +3,29 @@
 Functional tests for authentication (FUNC-01)
 """
 import pytest
-from models import User, SessionLocal
+from datetime import datetime, timedelta
+from models import User, SessionLocal, InviteCode
 from utils.security import verify_password
+
+_run = __import__("uuid").uuid4().hex[:8]  # 隔离共享测试库中的残留数据
+
+
+def _mk_invite(prefix: str) -> str:
+    """造一个可用邀请码 —— 注册接口已改为邀请码必填，裸注册会拿 400。"""
+    code = f"T2C-{prefix}-{_run.upper()}"
+    db = SessionLocal()
+    db.query(InviteCode).filter(InviteCode.code == code).delete()
+    db.add(InviteCode(
+        code=code,
+        applicant_email="t@t.com",
+        applicant_phone="13800000000",
+        status="issued",
+        expires_at=datetime.utcnow() + timedelta(days=1),
+        delivery_status="skipped",
+    ))
+    db.commit()
+    db.close()
+    return code
 
 
 class TestUserRegistration:
@@ -16,7 +37,8 @@ class TestUserRegistration:
         uname = f'newuser{int(time.time()*1000)%100000}'
         response = app_client.post('/api/register', json={
             'username': uname,
-            'password': 'password123'
+            'password': 'password123',
+            'invite_code': _mk_invite('NEWUSER'),
         })
         data = response.get_json()
         assert response.status_code == 201
@@ -30,12 +52,14 @@ class TestUserRegistration:
         # First registration
         app_client.post('/api/register', json={
             'username': 'duplicate_user',
-            'password': 'password123'
+            'password': 'password123',
+            'invite_code': _mk_invite('DUPUSER1'),
         })
-        # Second registration should fail
+        # Second registration should fail —— 用户名冲突先于邀请码核销判定
         response = app_client.post('/api/register', json={
             'username': 'duplicate_user',
-            'password': 'password456'
+            'password': 'password456',
+            'invite_code': _mk_invite('DUPUSER2'),
         })
         assert response.status_code == 409
         data = response.get_json()
