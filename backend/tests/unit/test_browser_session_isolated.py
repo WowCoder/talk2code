@@ -25,6 +25,28 @@ from harness.tools.sandboxed_browser import (
 )
 
 
+def _chromium_launchable() -> bool:
+    """真启动一次 Chromium 才算可用。
+
+    只判断 `import playwright` 不够：CI 会 pip install 到 playwright 包，
+    但从不执行 `playwright install chromium`——此时 import 成功而 launch 失败。
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            p.chromium.launch(timeout=10000).close()
+        return True
+    except Exception:  # noqa: BLE001  缺依赖/缺浏览器/启动失败一律视为不可用
+        return False
+
+
+requires_chromium = pytest.mark.skipif(
+    not _chromium_launchable(),
+    reason="需要可启动的 Chromium（pip install playwright && playwright install chromium）",
+)
+
+
 class TestRunBrowserSessionIsolated:
     def test_result_passthrough(self):
         assert run_browser_session_isolated(lambda a, b: a + b, 5, 1, b=2) == 3
@@ -110,6 +132,8 @@ class TestScreenshotWrapper:
         assert preview_runner.capture_screenshot("/tmp/x.html", "/tmp/out.png", timeout_ms=100) is None
 
 
+@requires_chromium
+@pytest.mark.slow
 class TestWatchdogKillUnblocksSession:
     """req 154 第二层修复：watchdog 从「跨线程 browser.close()」改为「杀 driver 进程」。
 
@@ -120,22 +144,18 @@ class TestWatchdogKillUnblocksSession:
     """
 
     @staticmethod
-    def _fixture_html(tmp_path_factory=None):
-        from pathlib import Path
-
-        out_dir = Path("/Users/huahao/Desktop/code/claudecode/talk2code/tmp/watchdog_race_fixture")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        p = out_dir / "index.html"
-        if not p.exists():
-            p.write_text(
-                '<!DOCTYPE html><html><body><button id="go">x</button></body></html>',
-                encoding="utf-8",
-            )
+    def _fixture_html(tmp_path):
+        """在 pytest 临时目录里落一个最小页面（不写进仓库工作区）"""
+        p = tmp_path / "index.html"
+        p.write_text(
+            '<!DOCTYPE html><html><body><button id="go">x</button></body></html>',
+            encoding="utf-8",
+        )
         return p
 
-    def test_watchdog_race_does_not_wedge_session(self):
+    def test_watchdog_race_does_not_wedge_session(self, tmp_path):
         """watchdog=2000 与 click 自身超时=2000 同刻竞争——会话必须仍能快速返回"""
-        html = self._fixture_html()
+        html = self._fixture_html(tmp_path)
         t0 = time.time()
         results = preview_runner.run_ac_checks(
             html,
@@ -148,7 +168,7 @@ class TestWatchdogKillUnblocksSession:
         assert r["passed"] is False
         assert r["harness_errors"], "click 不存在的元素必须产生驱动失败"
 
-    def test_no_race_session_completes_normally(self):
+    def test_no_race_session_completes_normally(self, tmp_path):
         """watchdog 拉远（无竞争）时，click 超时正常抛错、会话正常收尾。
 
         注：run_ac_checks 把 page 超时与 watchdog 绑成同一个 timeout_ms，
@@ -157,7 +177,7 @@ class TestWatchdogKillUnblocksSession:
         """
         from harness.tools.sandboxed_browser import sandboxed_browser
 
-        html = self._fixture_html()
+        html = self._fixture_html(tmp_path)
 
         def session():
             with sandboxed_browser(timeout_ms=15000) as browser:

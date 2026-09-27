@@ -7,8 +7,8 @@
 ## 0. 前置：测试基线
 
 ```bash
-cd /Users/huahao/Desktop/code/claudecode/talk2code/backend
-/Users/huahao/.workbuddy/binaries/python/envs/default/bin/python -m pytest tests/unit -q
+cd backend
+python -m pytest tests/unit -q
 ```
 
 **先跑一遍记下红绿分布基线**。若基线本身有红，停工先搞清楚 —— 不能把新改动和既存失败混在一起。
