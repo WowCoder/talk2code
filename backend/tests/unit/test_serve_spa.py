@@ -85,10 +85,17 @@ def test_missing_asset_body_is_actionable(app_client, spa_dist):
 
 
 def test_existing_asset_is_served_and_immutable(app_client, spa_dist):
-    """命中的产物要可长期缓存：文件名内容寻址，不需要反复回源校验。"""
+    """命中的产物要可长期缓存：文件名内容寻址，不需要反复回源校验。
+
+    `.js` 的 MIME 拼写随平台变：Linux 的 `mimetypes` 读 /etc/mime.types 得到
+    `application/javascript`，macOS 走 Python 内置表得到 `text/javascript`。
+    两者都是合法 JS MIME（`text/javascript` 是 WHATWG 标准，`application/*`
+    是旧别名），浏览器都按脚本执行。所以只断言"确实是 JS"这一跨平台事实，
+    别把某个 OS 的 mime 库输出当成契约。
+    """
     r = app_client.get("/assets/app-abc123.js")
     assert r.status_code == 200
-    assert r.mimetype == "text/javascript"
+    assert r.mimetype in {"text/javascript", "application/javascript"}
     assert r.get_data(as_text=True) == "console.log(1)\n"
     assert "immutable" in r.headers.get("Cache-Control", "")
     assert "max-age=31536000" in r.headers.get("Cache-Control", "")
