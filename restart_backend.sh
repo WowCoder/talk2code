@@ -6,8 +6,10 @@
 #    所有 LLM 请求 ProxyError: Connection refused，需求必然跑失败。
 # 3. 只识别 LISTEN 状态的进程（避免把前端的 ESTABLISHED 连接误判为旧后端），
 #    并等待端口真正释放后再启动新进程（优雅退出约需 5s）。
-VENV=/Users/huahao/Desktop/code/claudecode/talk2code/venv/bin/python
-LOG=/Users/huahao/Desktop/code/claudecode/talk2code/backend/logs/server.log
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BACKEND="$ROOT/backend"
+VENV="$ROOT/venv/bin/python"
+LOG="$BACKEND/logs/server.log"
 
 list_listener() { lsof -tiTCP:5001 -sTCP:LISTEN 2>/dev/null | head -1; }
 
@@ -37,8 +39,8 @@ os.setsid()
 log_fd = os.open('$LOG', os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
 os.dup2(log_fd, 1); os.dup2(log_fd, 2)
 devnull = os.open('/dev/null', os.O_RDONLY); os.dup2(devnull, 0)
-os.chdir('/Users/huahao/Desktop/code/claudecode/talk2code/backend')
-sys.path.insert(0, '/Users/huahao/Desktop/code/claudecode/talk2code/backend')
+os.chdir('$BACKEND')
+sys.path.insert(0, '$BACKEND')
 subprocess.Popen(['$VENV', 'app.py'])
 " > /dev/null 2>&1 &
 disown
