@@ -40,13 +40,15 @@ jobs:
         working-directory: backend
         env:
           # 清掉可能继承的代理，避免 LLM 请求被代理拦死（同本地 req #134 根因）
+          # 注意：GitHub Actions 的 env 键大小写不敏感，同一处同时写 HTTP_PROXY 与
+          # http_proxy 会被判为 "already defined"、整个工作流文件失效（历史上正是如此，
+          # 门禁从加进来那天起一次都没跑起来）。所以这里只写大写，小写在脚本里 unset。
           HTTP_PROXY: ""
           HTTPS_PROXY: ""
-          http_proxy: ""
-          https_proxy: ""
           ALL_PROXY: ""
-          all_proxy: ""
         run: |
+          # 部分工具只认小写代理变量，一并清掉
+          unset http_proxy https_proxy all_proxy
           PYTHONPATH=. python ../eval/run_eval.py --no-preview \
             --compare "${{ github.workspace }}/eval/baseline_golden.json"
 
