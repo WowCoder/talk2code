@@ -105,8 +105,29 @@ def test_should_inject_matrix():
     assert should_inject_badge(**{**base, "is_entry": False}) is False
 
 
-def test_market_url_uses_apex():
-    assert market_url().endswith("/market")
+def test_market_url_uses_apex(monkeypatch):
+    """apex 配好时应拼出 <scheme>://<apex>[:port]/market。
+
+    必须显式 monkeypatch 配置，**不能读环境里的 settings**：CI / 全新检出没有
+    `backend/.env`（.gitignore 第 2 行），PUBLISH_APEX 为空 → market_url() 返回
+    None → 这里 `.endswith` 直接 AttributeError。本机因为 .env 里写了
+    PUBLISH_APEX=localhost 而恒绿，是典型的「本机绿、CI 红」。
+    """
+    monkeypatch.setattr(settings, "MARKET_SITE_URL", "")
+    monkeypatch.setattr(settings, "PUBLISH_APEX", "decorate.test")
+    monkeypatch.setattr(settings, "PUBLISH_URL_SCHEME", "http")
+    monkeypatch.setattr(settings, "PUBLISH_URL_PORT", "5001")
+    assert market_url() == "http://decorate.test:5001/market"
+
+
+def test_market_url_none_when_unconfigured(monkeypatch):
+    """未配置 apex 时返回 None，调用方据此跳过 badge 注入（不把站点打坏）。
+
+    这条正是 CI 上的初始状态——补上它，配置缺失的行为才有断言兜着。
+    """
+    monkeypatch.setattr(settings, "MARKET_SITE_URL", "")
+    monkeypatch.setattr(settings, "PUBLISH_APEX", "")
+    assert market_url() is None
 
 
 # ---------------- Host 路由集成 ----------------
