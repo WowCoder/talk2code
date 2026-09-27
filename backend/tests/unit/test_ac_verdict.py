@@ -13,6 +13,15 @@ watchdog 同量级（req 154 复盘：watchdog=3000 与页面操作自身超时=
 import pytest
 
 from harness.tools.preview_runner import run_ac_checks
+from tests._browser_support import requires_chromium
+
+# 本文件三条用例都靠 run_ac_checks **真驱动浏览器**（点击、canvas 断言），
+# 判定契约（harness_errors / not_applicable / compromised）只有在浏览器正常
+# 工作时才有意义。CI 只 pip install、从不执行 playwright install chromium，
+# 浏览器缺席时这些用例会退化成断言"降级结果"，必然红——且 test_harness_errors
+# 那条还会因"浏览器起不来恰好也算 harness_errors"而假绿。
+# 按仓库既有惯例（test_browser_session_isolated.py）加 slow + 探活跳过。
+pytestmark = [requires_chromium, pytest.mark.slow]
 
 
 _FIXTURE_HTML = """<!DOCTYPE html>

@@ -23,28 +23,7 @@ from harness.tools.sandboxed_browser import (
     BrowserSessionTimeout,
     run_browser_session_isolated,
 )
-
-
-def _chromium_launchable() -> bool:
-    """真启动一次 Chromium 才算可用。
-
-    只判断 `import playwright` 不够：CI 会 pip install 到 playwright 包，
-    但从不执行 `playwright install chromium`——此时 import 成功而 launch 失败。
-    """
-    try:
-        from playwright.sync_api import sync_playwright
-
-        with sync_playwright() as p:
-            p.chromium.launch(timeout=10000).close()
-        return True
-    except Exception:  # noqa: BLE001  缺依赖/缺浏览器/启动失败一律视为不可用
-        return False
-
-
-requires_chromium = pytest.mark.skipif(
-    not _chromium_launchable(),
-    reason="需要可启动的 Chromium（pip install playwright && playwright install chromium）",
-)
+from tests._browser_support import requires_chromium
 
 
 class TestRunBrowserSessionIsolated:
