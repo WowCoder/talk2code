@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 660" width="1200" height="660" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 890" width="1200" height="890" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
   <defs>
     <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0%" stop-color="#ff7a45"/>
@@ -19,7 +19,7 @@
     </filter>
   </defs>
 
-  <rect width="1200" height="660" fill="#0c0d11"/>
+  <rect width="1200" height="890" fill="#0c0d11"/>
   <g opacity="0.045">
     <g stroke="#ffffff" stroke-width="1">
       <line x1="0" y1="60" x2="1200" y2="60"/><line x1="0" y1="120" x2="1200" y2="120"/>
@@ -27,11 +27,13 @@
       <line x1="0" y1="300" x2="1200" y2="300"/><line x1="0" y1="360" x2="1200" y2="360"/>
       <line x1="0" y1="420" x2="1200" y2="420"/><line x1="0" y1="480" x2="1200" y2="480"/>
       <line x1="0" y1="540" x2="1200" y2="540"/><line x1="0" y1="600" x2="1200" y2="600"/>
-      <line x1="60" y1="0" x2="60" y2="660"/><line x1="180" y1="0" x2="180" y2="660"/>
-      <line x1="300" y1="0" x2="300" y2="660"/><line x1="420" y1="0" x2="420" y2="660"/>
-      <line x1="540" y1="0" x2="540" y2="660"/><line x1="660" y1="0" x2="660" y2="660"/>
-      <line x1="780" y1="0" x2="780" y2="660"/><line x1="900" y1="0" x2="900" y2="660"/>
-      <line x1="1020" y1="0" x2="1020" y2="660"/><line x1="1140" y1="0" x2="1140" y2="660"/>
+      <line x1="0" y1="660" x2="1200" y2="660"/><line x1="0" y1="720" x2="1200" y2="720"/>
+      <line x1="0" y1="780" x2="1200" y2="780"/><line x1="0" y1="840" x2="1200" y2="840"/>
+      <line x1="60" y1="0" x2="60" y2="890"/><line x1="180" y1="0" x2="180" y2="890"/>
+      <line x1="300" y1="0" x2="300" y2="890"/><line x1="420" y1="0" x2="420" y2="890"/>
+      <line x1="540" y1="0" x2="540" y2="890"/><line x1="660" y1="0" x2="660" y2="890"/>
+      <line x1="780" y1="0" x2="780" y2="890"/><line x1="900" y1="0" x2="900" y2="890"/>
+      <line x1="1020" y1="0" x2="1020" y2="890"/><line x1="1140" y1="0" x2="1140" y2="890"/>
     </g>
   </g>
 
@@ -39,7 +41,7 @@
   <rect x="40" y="34" width="44" height="44" rx="12" fill="url(#accent)"/>
   <text x="62" y="63" font-size="20" font-weight="700" fill="#ffffff" text-anchor="middle">T</text>
   <text x="100" y="55" font-size="24" font-weight="700" fill="#f3f4f6">Talk2Code 工作流</text>
-  <text x="100" y="76" font-size="13" fill="#9ca3af">LangGraph v5 多节点编排 · SSE 实时推送 · 确定性证据优先的质量门禁</text>
+  <text x="100" y="76" font-size="13" fill="#9ca3af">LangGraph 多节点编排 · SSE 实时推送 · 以实测结果为准的质量门禁 · 发布与市集闭环</text>
 
   <!-- 输入 -->
   <rect x="380" y="110" width="440" height="56" rx="14" fill="#14161f" stroke="#2a2e3d" stroke-width="1"/>
@@ -58,9 +60,9 @@
     <text x="115" y="266" font-size="20" text-anchor="middle">📋</text>
     <text x="152" y="256" font-size="17" font-weight="700" fill="#f3f4f6">TeamLeader</text>
     <text x="152" y="277" font-size="12" fill="#ff7a45">Leon · 技术负责人</text>
-    <text x="94" y="310" font-size="12.5" fill="#c7cad1">需求结构化 → 开发计划 + AC</text>
-    <text x="94" y="330" font-size="12.5" fill="#c7cad1">复杂度分级（simple / standard）</text>
-    <text x="94" y="350" font-size="12" fill="#7d8494">Plan DoD 程序化校验后才放行</text>
+    <text x="94" y="310" font-size="12.5" fill="#c7cad1">需求结构化 → 开发计划 + 验收条件</text>
+    <text x="94" y="330" font-size="12.5" fill="#c7cad1">复杂度分级（简单 / 完整）</text>
+    <text x="94" y="350" font-size="12" fill="#7d8494">开发计划程序化校验后才放行</text>
 
     <!-- Coder -->
     <rect x="440" y="212" width="320" height="150" rx="18" fill="url(#nodeBlue)" stroke="#3a4152" stroke-width="1"/>
@@ -69,8 +71,8 @@
     <text x="522" y="256" font-size="17" font-weight="700" fill="#f3f4f6">Coder</text>
     <text x="522" y="277" font-size="12" fill="#ff7a45">Henry · 开发工程师</text>
     <text x="464" y="310" font-size="12.5" fill="#c7cad1">批量创建文件（一次 2–3 个）</text>
-    <text x="464" y="330" font-size="12.5" fill="#c7cad1">跨文件 API 契约注入防断裂</text>
-    <text x="464" y="350" font-size="12" fill="#7d8494">write_file 返回预览，免回读</text>
+    <text x="464" y="330" font-size="12.5" fill="#c7cad1">跨文件接口契约注入，防止调用落空</text>
+    <text x="464" y="350" font-size="12" fill="#7d8494">写文件即返回预览，无需回读</text>
 
     <!-- QA -->
     <rect x="810" y="212" width="320" height="150" rx="18" fill="url(#nodeBlue)" stroke="#3a4152" stroke-width="1"/>
@@ -79,8 +81,8 @@
     <text x="892" y="256" font-size="17" font-weight="700" fill="#f3f4f6">QA</text>
     <text x="892" y="277" font-size="12" fill="#ff7a45">Catherine · 质量工程师</text>
     <text x="834" y="310" font-size="12.5" fill="#c7cad1">Playwright 真实浏览器验收</text>
-    <text x="834" y="330" font-size="12.5" fill="#c7cad1">AC 逐条执行 DOM 操作序列</text>
-    <text x="834" y="350" font-size="12" fill="#7d8494">全通过走快速通道，跳过 LLM 评估</text>
+    <text x="834" y="330" font-size="12.5" fill="#c7cad1">验收条件逐条翻译成点击/输入操作</text>
+    <text x="834" y="350" font-size="12" fill="#7d8494">全部通过走快速通道，省去深度评估</text>
   </g>
 
   <!-- 节点间箭头 -->
@@ -103,32 +105,72 @@
   <!-- 交付门禁 -->
   <rect x="880" y="446" width="250" height="72" rx="14" fill="#14161f" stroke="#2a2e3d" stroke-width="1"/>
   <text x="904" y="474" font-size="13" font-weight="700" fill="#f3f4f6">🛡️ 交付门禁</text>
-  <text x="904" y="494" font-size="11.5" fill="#9ca3af">critical 缺陷未清零</text>
-  <text x="904" y="509" font-size="11.5" fill="#9ca3af">转 needs_user_input + 差异报告</text>
+  <text x="904" y="494" font-size="11.5" fill="#9ca3af">关键缺陷未清零</text>
+  <text x="904" y="509" font-size="11.5" fill="#9ca3af">转人工确认并附差异报告</text>
+
+  <!-- 分隔：交付之后 -->
+  <line x1="70" y1="552" x2="1130" y2="552" stroke="#2a2e3d" stroke-width="1" stroke-dasharray="4 6"/>
+  <text x="70" y="578" font-size="12" font-weight="600" fill="#7d8494">交付之后</text>
+
+  <!-- 一键发布 -->
+  <line x1="400" y1="518" x2="400" y2="586" stroke="#ff7a45" stroke-width="2" marker-end="url(#arrowAccent)"/>
+  <rect x="70" y="592" width="520" height="88" rx="16" fill="#14161f" stroke="#2a2e3d" stroke-width="1"/>
+  <rect x="94" y="616" width="38" height="38" rx="10" fill="#232733"/>
+  <text x="113" y="641" font-size="19" text-anchor="middle">🚀</text>
+  <text x="146" y="620" font-size="15.5" font-weight="700" fill="#f3f4f6">一键发布</text>
+  <text x="146" y="640" font-size="12" fill="#c7cad1">内容没变就不重复写入；改了内容链接也不变</text>
+  <text x="146" y="658" font-size="12" fill="#c7cad1">每个站点跑在自己的独立网址上，互不串登录态</text>
+  <text x="146" y="674" font-size="11.5" fill="#7d8494">发布后用真实链接再验一遍：线上与预览并不等价</text>
+
+  <!-- 创意市集 -->
+  <line x1="590" y1="636" x2="606" y2="636" stroke="#5b6273" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <rect x="610" y="592" width="520" height="88" rx="16" fill="#14161f" stroke="#2a2e3d" stroke-width="1"/>
+  <rect x="634" y="616" width="38" height="38" rx="10" fill="#232733"/>
+  <text x="653" y="641" font-size="19" text-anchor="middle">🛒</text>
+  <text x="686" y="620" font-size="15.5" font-weight="700" fill="#f3f4f6">创意市集（作者自己点公开）</text>
+  <text x="686" y="640" font-size="12" fill="#c7cad1">热度 =（当天去重访客 + 点赞×3 + 留言×2）÷ 时间衰减</text>
+  <text x="686" y="658" font-size="12" fill="#c7cad1">互动都在主站；未上架的不会出现在公开列表里</text>
+  <text x="686" y="674" font-size="11.5" fill="#7d8494">访客按天去重，同一人当天只算一次；只存哈希，不存原始信息</text>
+
+  <!-- 横切能力 -->
+  <rect x="70" y="700" width="340" height="66" rx="14" fill="#14161f" stroke="#2a2e3d" stroke-width="1"/>
+  <text x="94" y="726" font-size="13" font-weight="700" fill="#f3f4f6">🔒 服务端沙箱</text>
+  <text x="94" y="745" font-size="11.5" fill="#9ca3af">验收浏览器零外网出口</text>
+  <text x="94" y="760" font-size="11.5" fill="#9ca3af">DNS 封锁 + 黑洞代理，双重兜底</text>
+
+  <rect x="430" y="700" width="340" height="66" rx="14" fill="#14161f" stroke="#2a2e3d" stroke-width="1"/>
+  <text x="454" y="726" font-size="13" font-weight="700" fill="#f3f4f6">🧭 边界与进度</text>
+  <text x="454" y="745" font-size="11.5" fill="#9ca3af">能力边界说清楚 · 进展播报到具体动作</text>
+  <text x="454" y="760" font-size="11.5" fill="#9ca3af">慢轮次熔断 · 14 个内置技能包</text>
+
+  <rect x="790" y="700" width="340" height="66" rx="14" fill="#14161f" stroke="#2a2e3d" stroke-width="1"/>
+  <text x="814" y="726" font-size="13" font-weight="700" fill="#f3f4f6">👁️ 可观测性</text>
+  <text x="814" y="745" font-size="11.5" fill="#9ca3af">按需求查询日志与耗时</text>
+  <text x="814" y="760" font-size="11.5" fill="#9ca3af">token 成本 · 执行明细留痕</text>
 
   <!-- 技术栈 -->
-  <text x="70" y="570" font-size="12" font-weight="600" fill="#7d8494">技术栈</text>
+  <text x="70" y="800" font-size="12" font-weight="600" fill="#7d8494">技术栈</text>
   <g font-size="11.5" fill="#c7cad1">
-    <rect x="70" y="582" width="96" height="28" rx="9" fill="#1b1e29" stroke="#2a2e3d"/>
-    <text x="118" y="601" text-anchor="middle">Vue 3 + TS</text>
-    <rect x="176" y="582" width="76" height="28" rx="9" fill="#1b1e29" stroke="#2a2e3d"/>
-    <text x="214" y="601" text-anchor="middle">Flask</text>
-    <rect x="262" y="582" width="98" height="28" rx="9" fill="#1b1e29" stroke="#2a2e3d"/>
-    <text x="311" y="601" text-anchor="middle">LangGraph</text>
-    <rect x="370" y="582" width="70" height="28" rx="9" fill="#1b1e29" stroke="#2a2e3d"/>
-    <text x="405" y="601" text-anchor="middle">SSE</text>
-    <rect x="450" y="582" width="66" height="28" rx="9" fill="#1b1e29" stroke="#2a2e3d"/>
-    <text x="483" y="601" text-anchor="middle">JWT</text>
-    <rect x="526" y="582" width="96" height="28" rx="9" fill="#1b1e29" stroke="#2a2e3d"/>
-    <text x="574" y="601" text-anchor="middle">Playwright</text>
-    <rect x="632" y="582" width="86" height="28" rx="9" fill="#1b1e29" stroke="#2a2e3d"/>
-    <text x="675" y="601" text-anchor="middle">BGE-M3</text>
-    <rect x="728" y="582" width="76" height="28" rx="9" fill="#1b1e29" stroke="#2a2e3d"/>
-    <text x="766" y="601" text-anchor="middle">SQLite</text>
+    <rect x="70" y="812" width="96" height="28" rx="9" fill="#1b1e29" stroke="#2a2e3d"/>
+    <text x="118" y="831" text-anchor="middle">Vue 3 + TS</text>
+    <rect x="176" y="812" width="76" height="28" rx="9" fill="#1b1e29" stroke="#2a2e3d"/>
+    <text x="214" y="831" text-anchor="middle">Flask</text>
+    <rect x="262" y="812" width="98" height="28" rx="9" fill="#1b1e29" stroke="#2a2e3d"/>
+    <text x="311" y="831" text-anchor="middle">LangGraph</text>
+    <rect x="370" y="812" width="70" height="28" rx="9" fill="#1b1e29" stroke="#2a2e3d"/>
+    <text x="405" y="831" text-anchor="middle">SSE</text>
+    <rect x="450" y="812" width="66" height="28" rx="9" fill="#1b1e29" stroke="#2a2e3d"/>
+    <text x="483" y="831" text-anchor="middle">JWT</text>
+    <rect x="526" y="812" width="96" height="28" rx="9" fill="#1b1e29" stroke="#2a2e3d"/>
+    <text x="574" y="831" text-anchor="middle">Playwright</text>
+    <rect x="632" y="812" width="86" height="28" rx="9" fill="#1b1e29" stroke="#2a2e3d"/>
+    <text x="675" y="831" text-anchor="middle">BGE-M3</text>
+    <rect x="728" y="812" width="140" height="28" rx="9" fill="#1b1e29" stroke="#2a2e3d"/>
+    <text x="798" y="831" text-anchor="middle">PostgreSQL + pgvector</text>
   </g>
 
   <!-- 学习闭环 -->
-  <rect x="880" y="574" width="250" height="46" rx="12" fill="#14161f" stroke="#2a2e3d" stroke-width="1"/>
-  <text x="904" y="594" font-size="12.5" font-weight="700" fill="#f3f4f6">📊 学习闭环</text>
-  <text x="904" y="611" font-size="11.5" fill="#9ca3af">21 个回归任务基线 + 失败经验入库</text>
+  <rect x="880" y="804" width="250" height="46" rx="12" fill="#14161f" stroke="#2a2e3d" stroke-width="1"/>
+  <text x="904" y="824" font-size="12.5" font-weight="700" fill="#f3f4f6">📊 学习闭环</text>
+  <text x="904" y="841" font-size="11.5" fill="#9ca3af">21 个回归任务基线 + 失败经验入库</text>
 </svg>
