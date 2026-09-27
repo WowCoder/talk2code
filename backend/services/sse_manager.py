@@ -15,6 +15,7 @@ SSE 连接管理器（Redis Pub/Sub 增强）
 import threading
 import queue
 import json
+import uuid
 from collections import deque
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -28,6 +29,14 @@ MAX_BUFFERED_MESSAGES = 200
 
 # Redis Pub/Sub channel 前缀
 SSE_CHANNEL_PREFIX = "sse:"
+
+# 本进程唯一标识：用于识别「自己 publish 出去又被自己 subscribe 回来」的消息。
+# 背景（需求 196 轮次卡片错乱根因）：broadcast() 会先本地直推一份，再 publish 到 Redis；
+# Redis 订阅线程收到后又会 _local_broadcast 一份 —— 同一条消息本进程客户端收到两次。
+# iteration_start 双发会让前端建出两张 live 轮次卡片，后续 iteration_append 全部错位
+# 追加进上一轮的残留空卡，表现为「一轮操作没合并成一条消息 / 刷新后格式乱」。
+# 带上 origin 后，订阅端发现是自己发出的就跳过转发，从根上消除同进程回环双发。
+SSE_ORIGIN_ID = uuid.uuid4().hex
 
 
 class SSEClient:
@@ -166,7 +175,18 @@ class SSEManager:
                         continue
 
                     client_id = channel[len(SSE_CHANNEL_PREFIX):]
-                    data = message['data']
+                    raw = message['data']
+
+                    # 回环抑制：publish 方已本地直推过，自己再转发一次会让客户端收到两份
+                    data = raw
+                    try:
+                        envelope = json.loads(raw)
+                        if isinstance(envelope, dict) and 'origin' in envelope:
+                            if envelope.get('origin') == SSE_ORIGIN_ID:
+                                continue  # 本进程发出的，跳过
+                            data = envelope.get('msg', raw)
+                    except (ValueError, TypeError):
+                        pass  # 非 envelope 格式的旧消息，按原文转发
 
                     # 转发给本地客户端（不写入缓冲,因为 publish 的 worker 已经写过缓冲）
                     self._local_broadcast(client_id, data)
@@ -266,10 +286,13 @@ class SSEManager:
         local_count = self._local_broadcast(client_id, message)
 
         # 3. Redis publish（跨进程分发）
+        #    包装成 envelope 带上 origin，让订阅端能识别并跳过自己发出的消息
+        #    （同进程回环双发会让前端轮次卡片状态机错乱，详见 SSE_ORIGIN_ID 注释）
         if self._redis_available:
             try:
                 channel = f"{SSE_CHANNEL_PREFIX}{client_id}"
-                self._redis.publish(channel, message)
+                payload = json.dumps({"origin": SSE_ORIGIN_ID, "msg": message})
+                self._redis.publish(channel, payload)
             except Exception as e:
                 logger.warning(f"Redis publish 失败（降级为本地）: {e}")
 

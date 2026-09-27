@@ -21,6 +21,11 @@ import type {
   SSEChecklistUpdateData,
   SSEEvaluatorResultData,
   SSEIterationBatchData,
+  SSEIterationStartData,
+  SSEIterationAppendData,
+  SSEIterationEndData,
+  SSEQAStepData,
+  SSEQAAcData,
 } from '@/types/sse'
 
 const INITIAL_RETRY_DELAY = 1000
@@ -45,6 +50,9 @@ export function useSSE(reqId: Ref<number | null>) {
   let stopped = false
   // 连接代数：探测鉴权的异步窗口内若有新连接建立，则放弃本次重连调度
   let connectEpoch = 0
+  // 首连标记：首次 onopen 时对话已通过 loadRequirement 完整加载，无需再补齐；
+  // 仅重连（非首次）成功时才调用 fetchDialogue 增量补齐断连窗口漏掉的历史消息。
+  let firstConnect = true
 
   function connect() {
     if (!reqId.value) return
@@ -62,6 +70,12 @@ export function useSSE(reqId: Ref<number | null>) {
       isConnected.value = true
       retryCount = 0
       retryDelay = INITIAL_RETRY_DELAY
+      // 重连成功后增量补齐断连窗口漏掉的历史消息（迭代轮次、QA 验收步骤等）。
+      // 首连跳过：loadRequirement 已加载完整对话，重复补齐无意义且会造成一闪。
+      if (!firstConnect) {
+        store.fetchDialogue().catch(() => {})
+      }
+      firstConnect = false
     }
 
     es.addEventListener('connected', () => {
@@ -181,6 +195,70 @@ export function useSSE(reqId: Ref<number | null>) {
         agent_text: data.agent_text,
         tools: batchTools,
       })
+    })
+
+    // ---- 迭代轮次实时累积（取代整轮一次性 iteration_batch）----
+    // 一轮开始 → 前端创建可累积轮次卡片；过程每步 iteration_append 实时填充；
+    // 轮次结束 → iteration_end 固定卡片。刷新页面时由 dialogue_history 的迭代记录恢复静态卡片。
+    es.addEventListener('iteration_start', (e: MessageEvent) => {
+      try {
+        const data: SSEIterationStartData = JSON.parse(e.data)
+        // 防御：没有 iteration 的畸形事件无法定位轮次，丢弃
+        if (data.iteration == null) return
+        store.startIteration(data)
+      } catch {
+        // ignore parse errors
+      }
+    })
+
+    es.addEventListener('iteration_append', (e: MessageEvent) => {
+      try {
+        const data: SSEIterationAppendData = JSON.parse(e.data)
+        store.appendIterationTool(data)
+      } catch {
+        // ignore parse errors
+      }
+    })
+
+    es.addEventListener('iteration_end', (e: MessageEvent) => {
+      try {
+        const data: SSEIterationEndData = JSON.parse(e.data)
+        if (data.iteration == null) return
+        store.endIteration(data.iteration, (data as any).content)
+      } catch {
+        // ignore parse errors
+      }
+    })
+
+    // QA 验收逐步操作：Catherine 在浏览器里的每一步（点击/输入/断言），
+    // 追加进所属 AC 验收卡（一个验收项一张卡，不再逐条平铺）
+    es.addEventListener('qa_step', (e: MessageEvent) => {
+      try {
+        const data: SSEQAStepData = JSON.parse(e.data)
+        store.appendQaStep(data)
+      } catch {
+        // ignore parse errors
+      }
+    })
+
+    // 一个验收项开始：建一张可实时累积的 AC 卡
+    es.addEventListener('qa_start', (e: MessageEvent) => {
+      try {
+        const data: SSEQAAcData = JSON.parse(e.data)
+        store.startQaAc(data)
+      } catch {
+        // ignore parse errors
+      }
+    })
+
+    // 一个验收项结束：固定 AC 卡并给出结论
+    es.addEventListener('qa_result', (e: MessageEvent) => {
+      try {
+        const data: SSEQAAcData = JSON.parse(e.data)
+        store.endQaAc(data)
+      } catch {
+        // ignore parse errors
+      }
     })
 
     es.addEventListener('hook_check', (e: MessageEvent) => {

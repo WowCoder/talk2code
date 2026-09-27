@@ -954,6 +954,19 @@ def repair_node(state: AgentState) -> Dict[str, Any]:
 # ==================== Verify 辅助：AC → Playwright 脚本翻译 ====================
 
 
+# AC 脚本生成器版本：当「翻译器产出脚本的语义」发生**不兼容变更**时递增，
+# 旧缓存随之自动作废并重译。
+#
+# 为什么必须有：修好翻译器/动作语义后，老需求仍会命中旧缓存继续用旧脚本 ——
+# 用户看到的现象是「你说修了，可我的验收结论一点没变」。req 199 的 AC-1/AC-2
+# 假 critical 就是旧脚本留下的（那一版 click 还没有「落点」概念，只能点元素中心，
+# 多点交互全部失效）；不递增版本号，修好的翻译器对新触发的验收依然不起作用。
+#
+# v1 → v2：click 支持 at 比例坐标 / offset 像素落点；选择器提示纳入
+#          JS 动态生成与 CSS 中定义的类名（req 199）。
+AC_SCRIPT_SCHEMA_VERSION = 2
+
+
 def _render_signature(code_text: str) -> str:
     """从代码文本确定性检测渲染方式，返回 "canvas" / "dom"。
 
@@ -967,6 +980,47 @@ def _render_signature(code_text: str) -> str:
     canvas_hits = len(_re.findall(r'<canvas', code_text, _re.I)) + \
         len(_re.findall(r'createElement\(\s*[\'"]canvas', code_text, _re.I))
     return "canvas" if canvas_hits else "dom"
+
+
+def _extract_selector_hints(code_text: str):
+    """从产物代码提取可用 CSS 选择器提示，返回 (static_hints, dynamic_hints)。
+
+    - static：静态 HTML 里 `id=""` / `class=""` 直接写出的选择器。
+    - dynamic：JS 运行时 createElement 出来、或 CSS 里定义过的类名/id —— 静态
+      HTML 里看不到，但页面加载后**真实存在**。
+
+    req 199 事故：棋盘交叉点 `.cell` 由 `document.createElement` 生成，只扫静态
+    属性的提取器完全漏掉它 → 翻译器手里只有容器 `.board`，只能写 `click .board`；
+    而 Playwright 的 click 默认点元素中心，多条 click 全部压在同一个格子上
+    （只有第一条生效）→「同一元素上多点交互」的 AC（下棋/画板/地图）必然假失败。
+    """
+    import re as _re
+
+    static: list = []
+    for _m in _re.finditer(r'id=["\']([^"\']+)["\']', code_text):
+        static.append(f"#{_m.group(1)}")
+    for _m in _re.finditer(r'class=["\']([^"\']+)["\']', code_text):
+        for _cls in _m.group(1).split():
+            static.append(f".{_cls}")
+
+    dynamic: list = []
+    for _pat in (
+        r'className\s*=\s*[\'"]([^\'"]+)[\'"]',
+        r'classList\.(?:add|remove|toggle)\(\s*[\'"]([^\'"]+)[\'"]',
+    ):
+        for _m in _re.finditer(_pat, code_text):
+            for _cls in _m.group(1).split():
+                if _re.fullmatch(r'[A-Za-z_][\w-]*', _cls):
+                    dynamic.append(f".{_cls}")
+    # CSS 里定义的选择器（静态 HTML 可能只写容器，格子/子元素靠 JS 生成）
+    for _m in _re.finditer(r'^\s*\.([A-Za-z_][\w-]*)', code_text, _re.M):
+        dynamic.append(f".{_m.group(1)}")
+    for _m in _re.finditer(r'^\s*#([A-Za-z_][\w-]*)', code_text, _re.M):
+        dynamic.append(f"#{_m.group(1)}")
+
+    static = list(dict.fromkeys(static))
+    dynamic = [s for s in dict.fromkeys(dynamic) if s not in static]
+    return static, dynamic
 
 
 def _translate_acs_to_scripts(acceptance_criteria: list, code_text: str, requirement: str) -> list[dict]:
@@ -984,19 +1038,14 @@ def _translate_acs_to_scripts(acceptance_criteria: list, code_text: str, require
     )
 
     # 从代码中提取可用的 CSS 选择器（供 LLM 参考，减少 selector 猜测错误）
-    import re as _re
-    selectors_hint = []
-    id_pattern = _re.compile(r'id=["\']([^"\']+)["\']')
-    class_pattern = _re.compile(r'class=["\']([^"\']+)["\']')
-    for m in id_pattern.finditer(code_text):
-        selectors_hint.append(f"#{m.group(1)}")
-    for m in class_pattern.finditer(code_text):
-        for cls in m.group(1).split():
-            selectors_hint.append(f".{cls}")
+    # 拆成「静态 + 动态」两段；动态段是 req 199 的修复点：`.cell` 这类由
+    # JS createElement 生成、只在 CSS 里出现的元素，静态属性扫描看不到，
+    # 不补进候选就会让翻译器只能退而写容器选择器（→ 只能点元素中心）。
+    selectors_hint, dynamic_hint = _extract_selector_hints(code_text)
 
     # 渲染方式：由 harness 确定性检测，作为"事实"喂给 LLM。
     # req 147 复盘根因：模板原先写死「游戏类 AC → assert_canvas_change」，
-    # 而该<｜hy_place▁holder▁no▁813｜>是 DOM 实现的 1024，三条 AC 因此永久「不适用」。
+    # 而该游戏是 DOM 实现的，三条 AC 因此永久「不适用」。
     has_canvas = _render_signature(code_text) == "canvas"
     if has_canvas:
         render_info = (
@@ -1010,7 +1059,16 @@ def _translate_acs_to_scripts(acceptance_criteria: list, code_text: str, require
         )
 
     from harness.instructions.prompts import load_prompt_template
-    selector_text = ", ".join(list(set(selectors_hint))[:40]) if selectors_hint else "(从代码中提取)"
+    # 保持出现顺序（原实现用 set → 顺序随机，同一输入每轮提示词都可能不同，
+    # 不利于"第一版就翻对"）
+    _static_sel = ", ".join(list(dict.fromkeys(selectors_hint))[:40])
+    selector_text = _static_sel if _static_sel else "(从代码中提取)"
+    if dynamic_hint:
+        selector_text += (
+            "\n- 动态生成（JS createElement / CSS 中定义，静态 HTML 里看不到；"
+            "同类元素有多个时须配合 [data-*] 属性选择器或 click 的 at 比例坐标定位）: "
+            + ", ".join(dynamic_hint[:40])
+        )
     prompt = load_prompt_template(
         "verify/ac_translator.md",
         selector_text=selector_text,
@@ -1385,6 +1443,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                 (
                     json.dumps(acceptance_criteria, ensure_ascii=False, sort_keys=True)
                     + f"||render={_render_sig}"
+                    + f"||schema={AC_SCRIPT_SCHEMA_VERSION}"
                 ).encode()
             ).hexdigest()
             ac_scripts = None
@@ -1401,7 +1460,8 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                         logger.info(f"[Verify] AC 脚本命中缓存（{len(ac_scripts)} 条，首轮锁定不重译）")
                     else:
                         logger.info(
-                            f"[Verify] AC 脚本缓存失效（渲染方式 {_render_sig} 与缓存不符），重新翻译"
+                            f"[Verify] AC 脚本缓存失效（渲染方式 {_render_sig} / "
+                            f"脚本 schema v{AC_SCRIPT_SCHEMA_VERSION} 与缓存不符），重新翻译"
                         )
                 except Exception:
                     pass
@@ -1435,7 +1495,12 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                     _verify_progress(
                         85, f"正在逐条验证 {len(ac_scripts)} 条验收标准"
                     )
-                    ac_check_results = run_ac_checks(index_path, ac_scripts, preview_url=preview_url)
+                    ac_check_results = run_ac_checks(
+                        index_path, ac_scripts, preview_url=preview_url,
+                        sse=tl.sse if tl else None,
+                        requirement_id=state.get("requirement_id"),
+                        dialogue_history=state.get("dialogue_history"),
+                    )
                     _prod_fail = sum(1 for r in ac_check_results if r.get("failures"))
                     _harness_fail = sum(1 for r in ac_check_results if r.get("harness_errors"))
                     _unverified = sum(1 for r in ac_check_results if r.get("unverified"))
@@ -1925,6 +1990,28 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             findings = deterministic_findings + [
                 f for f in findings if f.get("description") not in seen_desc
             ]
+            # 同一条 AC 的验收失败只保留一条 critical。
+            # 确定性通道记「验收条件未达成 AC-1: …」，LLM 又记「[ac_failure] 验收条件 AC-1 …」，
+            # 描述不同、事实同一 —— 两条都进 critical 会把缺陷数虚高一倍
+            # （req 198 实测：2 条未达成 AC 记出 4 条 critical，直接触发交付拦截）。
+            import re as _re_ac
+            _seen_ac: set[str] = set()
+            _deduped: list[dict] = []
+            for _f in findings:
+                _desc = _f.get("description") or ""
+                _prefix_dup = _desc.startswith("[ac_failure]") or _desc.startswith("验收条件未达成")
+                if _prefix_dup:
+                    _m = _re_ac.search(r"AC-\d+", _desc)
+                    if _m:
+                        if _m.group(0) in _seen_ac:
+                            continue
+                        _seen_ac.add(_m.group(0))
+                _deduped.append(_f)
+            if len(_deduped) != len(findings):
+                logger.info(
+                    f"[Verify] 验收缺陷去重: {len(findings)} → {len(_deduped)} 条"
+                )
+            findings = _deduped
             if verdict == "PASS":
                 logger.warning(
                     f"[Verify] LLM 判定 PASS 被确定性证据推翻"

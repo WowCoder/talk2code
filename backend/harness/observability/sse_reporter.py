@@ -102,6 +102,60 @@ class SSEReporter:
             return
         self._send(requirement_id, "iteration_batch", data)
 
+    # ---- 迭代轮次实时累积（取代旧的整轮一次性 iteration_batch）----
+    # 一轮开始 → 前端创建一张可累积的轮次卡片；过程每步 iteration_append 实时填充；
+    # 轮次结束 → iteration_end 固定卡片。刷新页面时由 dialogue_history 的迭代记录恢复静态卡片。
+    def iteration_start(self, requirement_id: int, batch):
+        """一轮迭代开始：前端据此创建可实时累积的轮次卡片。"""
+        from harness.events import IterationBatchEvent
+        if isinstance(batch, IterationBatchEvent):
+            data = batch.to_dict()
+        else:
+            data = dict(batch)
+        data.setdefault("tools", [])
+        self._send(requirement_id, "iteration_start", data)
+
+    def iteration_append(self, requirement_id: int, tool):
+        """一轮迭代中的单个工具操作：前端实时追加进当前轮次卡片。"""
+        tool_dict = tool.to_dict() if hasattr(tool, "to_dict") else tool
+        self._send(requirement_id, "iteration_append", {"tool": tool_dict})
+
+    def iteration_end(self, requirement_id: int, iteration: int):
+        """一轮迭代结束：前端固定当前轮次卡片（不再实时变化）。"""
+        self._send(requirement_id, "iteration_end", {"iteration": iteration})
+
+    def qa_step(self, requirement_id: int, step: dict):
+        """QA 验收逐步操作：前端实时展示 Catherine 在浏览器里的每一步（点击/输入/断言）。
+
+        注意：逐步事件**只用于实时展示，不落库**。落库由 qa_result 在 AC 结束时
+        汇总成一条（含完整 steps），避免单条需求产出数百条 qa_step 记录刷屏
+        （需求 196 实测 340 条）。
+        """
+        if not isinstance(step, dict):
+            step = dict(step)
+        if "timestamp" not in step:
+            step["timestamp"] = get_current_timestamp()
+        self._send(requirement_id, "qa_step", step)
+
+    def qa_start(self, requirement_id: int, ac: dict):
+        """一个验收项（AC）开始：前端据此创建可实时累积的 AC 验收卡片。"""
+        if not isinstance(ac, dict):
+            ac = dict(ac)
+        ac.setdefault("steps", [])
+        ac.setdefault("status", "running")
+        if "start_ts" not in ac:
+            ac["start_ts"] = get_current_timestamp()
+        self._send(requirement_id, "qa_start", ac)
+
+    def qa_result(self, requirement_id: int, ac: dict):
+        """一个验收项（AC）结束：汇总结论 + 全部步骤，前端固定卡片（同时落库一条）。"""
+        if not isinstance(ac, dict):
+            ac = dict(ac)
+        ac.setdefault("steps", [])
+        if "end_ts" not in ac:
+            ac["end_ts"] = get_current_timestamp()
+        self._send(requirement_id, "qa_result", ac)
+
     def complete(self, requirement_id: int, code_files: list = None):
         self._send(requirement_id, "complete", {
             "requirement_id": requirement_id,

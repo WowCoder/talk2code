@@ -41,6 +41,14 @@ class ToolCallLoop:
     # 实测 req 183：index.html 被读 6 次、main.js 4 次，全是"确认式重读"，
     # 每次都要付一整轮 LLM 往返（2-45s），却零产出。软提示挡不住，只能硬限。
     READ_FILE_LIMIT_PER_TASK = 4
+    # 「创建后免回读」：write_file 创建/整体重写的文件，正文已经在工具结果里，
+    # 此后只要没人改过它，再 read_file 就是纯浪费一轮 LLM 往返 —— 直接跳过执行。
+    # 需求 198 实测：css/style.css 创建后 3 轮里读了 2 次，js/game.js 亦然，
+    # 每次白白付一整轮往返（弱模型尤其爱"先读确认"）。
+    SKIP_READ_AFTER_CREATE = True
+    # write_file 结果保留上限：创建时把完整正文留在上下文里，LLM 就不必再读一遍。
+    # 此前统一截到 4000 字符（首尾预览），模型看不到中间部分，只能回读 → 死循环。
+    WRITE_RESULT_MAX_LEN = 16000
     # 自修复保底：预算将尽且手上有确定性运行时错误时，一次性追加的轮数
     SELF_REPAIR_EXTRA_ITERATIONS = 3
 
@@ -97,6 +105,9 @@ class ToolCallLoop:
         state["_read_file_rounds"] = {}
         state["_consecutive_no_write"] = 0
         state["_recent_writes"] = {}
+        # 「创建后免回读」登记表：filename → {hash, round, lines}。
+        # 同样必须随阶段重置 —— 残留会让修复轮误跳过合法的首次读取。
+        state["_known_content_files"] = {}
         state["_missing_reminder_key"] = ""
         state["_missing_reminder_count"] = 0
 
@@ -342,6 +353,13 @@ class ToolCallLoop:
             # 执行所有工具调用（收集到 batch_tools，统一发送迭代批量事件）
             batch_tools: list[ToolCallEvent] = []
             written_files: list[str] = []  # 本轮成功写入/编辑的文件（用于聚合 Git commit）
+            _iter_started = False  # 本轮是否已发 iteration_start（首工具到达时惰性发送）
+            # 轮次起止时间：落库后前端才能在轮次卡片上显示「起止时间」
+            try:
+                from utils.sse import get_current_timestamp as _gct_iter
+                _iter_start_ts = _gct_iter()
+            except Exception:
+                _iter_start_ts = None
             for tc in response.tool_calls:
                 # 动作级进度：在**执行前**推送，让用户看到"正在写 X"而不是转圈
                 self._push_activity(state, tc.name, tc.arguments,
@@ -365,6 +383,66 @@ class ToolCallLoop:
                             ),
                         )
                         logger.info(f"[ToolLoop] read_file 次数上限: {_rf} 第 {_counts[_rf]} 次，跳过执行")
+
+                # 创建后免回读：文件是你在本次任务里 write_file 创建/整体重写的，
+                # 此后**没有任何人改过它**（磁盘内容与写入时逐字相同）——那完整正文
+                # 就在上方 write_file 的结果里，再读一遍是纯粹浪费一轮往返。
+                # 与次数上限、同内容去重互补：那两条拦的是"第 N 次重读"，这条拦的是
+                # "创建后的第一次确认式回读"（需求 198 实测每文件至少省一轮）。
+                # 同样只对整文件读取生效——分页读取是子集，模型可能在找特定行。
+                if (
+                    self.SKIP_READ_AFTER_CREATE
+                    and not _read_limited
+                    and tc.name == "read_file"
+                    and isinstance(tc.arguments, dict)
+                    and not tc.arguments.get("start_line")
+                    and not tc.arguments.get("end_line")
+                ):
+                    _block = self._created_read_block(
+                        state, tc.arguments.get("filename", "") or ""
+                    )
+                    if _block is not None:
+                        _read_limited = True
+                        result = _block
+
+                # 同内容去重：文件自上次读取后**一个字节都没变**，再读一遍纯属浪费上下文。
+                # 需求 196 实测：fix 循环里 js/game.js / js/app.js / index.html 被连读三轮，
+                # 三次返回完全相同的 10135 字符（弱模型每轮重启"先读确认"计划）。
+                # 次数上限拦不住（每段各读 4 次刚好在上限之下），所以按内容指纹拦截。
+                # 只对"整文件读取"生效——带 start_line/end_line 的分页读取内容是子集，不可比。
+                if (
+                    not _read_limited
+                    and tc.name == "read_file"
+                    and isinstance(tc.arguments, dict)
+                    and not tc.arguments.get("start_line")
+                    and not tc.arguments.get("end_line")
+                ):
+                    _rf2 = tc.arguments.get("filename", "") or ""
+                    if _rf2:
+                        try:
+                            import hashlib as _hashlib
+                            _raw_now = self.workspace.read(_rf2)
+                            _h_now = _hashlib.md5(
+                                _raw_now.encode("utf-8", "ignore")
+                            ).hexdigest()
+                            _prev_hashes = state.setdefault("_read_file_hashes", {})
+                            if _prev_hashes.get(_rf2) == _h_now:
+                                _read_limited = True
+                                from harness.tools.registry import ToolResult as _TR2
+                                result = _TR2(
+                                    blocked=True,
+                                    content=(
+                                        f"[已跳过] {_rf2} 自上次读取后内容完全没有变化，"
+                                        f"你拿到的会是和上一轮逐字相同的结果（已在上方工具结果里）。"
+                                        f"不要为确认而重读它 —— 直接基于已有内容继续；"
+                                        f"需要改动就用 write_file / edit_file 写入。"
+                                    ),
+                                )
+                                logger.info(f"[ToolLoop] 同内容重读跳过: {_rf2}")
+                            else:
+                                _prev_hashes[_rf2] = _h_now
+                        except Exception:
+                            pass  # 读不到（文件不存在等）时放行，交给正常执行路径报错
 
                 if not _read_limited:
                     result = self._execute_tool(state, tc)
@@ -393,9 +471,43 @@ class ToolCallLoop:
                     fname = tc.arguments.get("filename", "unknown") if isinstance(tc.arguments, dict) else "unknown"
                     written_files.append(fname)
 
+                # 实时推送单个工具操作（首工具到达时惰性创建轮次卡片，过程逐步累积）
+                if self.sse:
+                    if not _iter_started:
+                        self.sse.iteration_start(state["requirement_id"], IterationBatchEvent(
+                            iteration=iteration + 1,
+                            coder_name=coder_name,
+                            thinking_preview=(thinking_text or "")[:100],
+                            agent_text=agent_text[:300] if agent_text else "",
+                            tools=[],
+                            content=f"第 {iteration + 1} 轮迭代",
+                        ))
+                        _iter_started = True
+                    self.sse.iteration_append(state["requirement_id"], ToolCallEvent(
+                        name=tc.name,
+                        arguments=tc.arguments,
+                        display_label=display_readable,
+                        success=result.success,
+                        blocked=result.blocked,
+                    ))
+
                 # 防回读：消费 _recent_writes（此前只有写入侧，全库无消费方 → 死字段）
                 if tc.name == "read_file" and result.success:
                     self._annotate_readback(state, tc, result)
+                    # 创建时塞进上下文的正文已被这次读取取代 → 卸载掉，别再占着 token。
+                    # 只在"确实读到新内容"时卸载：读被跳过的（blocked）不能卸载，
+                    # 否则模型手上唯一的正文副本会被抹掉。
+                    self._offload_created_context(state, tc)
+
+                # write_file 成功 → 这个文件的最新完整正文已在上下文里，记下指纹。
+                # 之后只要磁盘内容没变，回读一律跳过（见上方"创建后免回读"）。
+                if tc.name == "write_file" and result.success:
+                    self._track_known_content(state, tc)
+
+                # edit_file 成功 → 磁盘内容变了，模型手上的副本已过期，
+                # 必须允许它重新 read_file 取准确片段（否则 SEARCH 匹配不上会反复失败）。
+                if tc.name == "edit_file" and result.success:
+                    self._untrack_known_content(state, tc)
 
                 # 实时推送 code 事件（代码面板需要实时更新）
                 if self.sse:
@@ -422,7 +534,13 @@ class ToolCallLoop:
                 if tc.name == "read_file":
                     # read_file: 保留完整内容，只对超大文件做首尾保留
                     max_len = 32000 if is_chat else 12000
-                elif tc.name in ("write_file", "edit_file"):
+                elif tc.name == "write_file":
+                    # write_file: 创建/整体重写的结果就是「这份文件的权威副本」。
+                    # 此前和 edit_file 一样只留 4000 字符，模型看不到中间部分，
+                    # 只能再花一轮 read_file 回读（需求 198：创建后立刻回读同一文件）。
+                    # 保留完整输出 = 省掉那一次回读，比省 token 更划算。
+                    max_len = self.WRITE_RESULT_MAX_LEN
+                elif tc.name == "edit_file":
                     max_len = 4000
                 else:
                     max_len = 300
@@ -448,28 +566,36 @@ class ToolCallLoop:
                     "hidden": True,
                 })
 
-            # ---- 推送迭代批量事件（替代逐个 tool_call/tool_result/thinking SSE） ----
+            # ---- 轮次结束事件：通知前端固定累积卡片 ----
+            # 单个工具已通过 iteration_append 实时推送，这里只需发结束信号。
+            # iteration_batch 整轮一次性事件已废弃（不再发送），避免 SSE 缓冲堆积造成断线回放时
+            # 「空转几秒后一次性刷出整轮」的体感问题（需求：Coder 轮次实时累积）。
             if self.sse and batch_tools:
-                batch_event = IterationBatchEvent(
-                    iteration=iteration + 1,
-                    coder_name=coder_name,
-                    thinking_preview=(thinking_text or "")[:100],
-                    agent_text=agent_text[:300] if agent_text else "",
-                    tools=batch_tools,
-                    content=f"第 {iteration + 1} 轮迭代 — {len(batch_tools)} 个操作",
+                self.sse.iteration_end(
+                    state["requirement_id"],
+                    iteration + 1,
                 )
-                self.sse.iteration_batch(state["requirement_id"], batch_event)
 
             # 保存迭代批量消息到对话历史（页面刷新后恢复分组展示）
             if batch_tools:
+                try:
+                    from utils.sse import get_current_timestamp as _gct_iter2
+                    _iter_end_ts = _gct_iter2()
+                except Exception:
+                    _iter_end_ts = None
                 state["dialogue_history"].append({
                     "role": "iteration_batch",
                     "name": coder_name,
                     "content": f"第 {iteration + 1} 轮迭代 — {len(batch_tools)} 个操作",
                     "iteration": iteration + 1,
-                    "thinking_preview": (thinking_text or "")[:100],
-                    "agent_text": agent_text[:300] if agent_text else "",
+                    # 一轮=一条消息：思考与回复一并收进卡片内部渲染（前端折叠展示），
+                    # 不再单独落 thinking/assistant 消息（那两条已是 hidden，仅供 LLM 上下文）
+                    "thinking_preview": (thinking_text or "")[:2000],
+                    "agent_text": agent_text or "",
                     "tools": [t.to_dict() for t in batch_tools],
+                    "start_ts": _iter_start_ts,
+                    "end_ts": _iter_end_ts,
+                    "timestamp": _iter_end_ts,
                 })
 
                 # Git 自动 commit（聚合本轮全部成功写入，避免依赖循环残留变量
@@ -1876,6 +2002,110 @@ class ToolCallLoop:
         )
         result.content = note + (result.content or "")
         logger.info(f"[ToolLoop] 防回读提示: {fname}（第 {write_round} 轮写入）")
+
+    # ------------------------------------------------------------------
+    # 创建文件后的「上下文托管」：追踪 → 免回读 → 卸载
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _content_hash(text: str) -> str:
+        import hashlib
+        return hashlib.md5((text or "").encode("utf-8", "ignore")).hexdigest()
+
+    def _created_read_block(self, state: AgentState, filename: str):
+        """创建后免回读判定：返回 ToolResult（blocked）表示拦截，None 表示放行。
+
+        判据：文件在 `_known_content_files` 登记过，且磁盘当前内容与写入时逐字相同。
+        任一不满足（没登记过 / 已被改动 / 读不到）都放行，交给正常执行路径。
+        """
+        if not filename:
+            return None
+        info = (state.get("_known_content_files") or {}).get(filename)
+        if not info:
+            return None
+        try:
+            disk = self.workspace.read(filename)
+        except Exception:
+            return None
+        if self._content_hash(disk) != info.get("hash"):
+            return None
+        from harness.tools.registry import ToolResult
+        logger.info(f"[ToolLoop] 创建后免回读跳过: {filename}")
+        return ToolResult(
+            blocked=True,
+            content=(
+                f"[已跳过] {filename} 是你在第 {info.get('round', '?')} 轮"
+                f"用 write_file 写入的文件，此后没有被修改过，"
+                f"内容与你写入时逐字相同（{info.get('lines', '?')} 行，"
+                f"完整正文就在上方 write_file 的结果里）。"
+                f"不要为确认 class/id 而重读它 —— 直接以你写入的版本为准继续；"
+                f"需要改动就用 write_file / edit_file 写入。"
+            ),
+        )
+
+    def _track_known_content(self, state: AgentState, tc):
+        """write_file 成功后登记：该文件的完整正文此刻已在上下文里。
+
+        登记内容是**磁盘上的最终内容**（而不是入参 content），这样"写入被截断/回滚"
+        的情况不会被误登记成"模型已知完整正文"。
+        """
+        fname = tc.arguments.get("filename", "") if isinstance(tc.arguments, dict) else ""
+        if not fname:
+            return
+        try:
+            disk = self.workspace.read(fname)
+        except Exception:
+            return
+        known = state.setdefault("_known_content_files", {})
+        known[fname] = {
+            "hash": self._content_hash(disk),
+            "round": state.get("tool_call_count", 0),
+            "lines": disk.count("\n") + 1,
+        }
+        logger.info(f"[ToolLoop] 登记已知正文: {fname}（{known[fname]['lines']} 行）")
+
+    @staticmethod
+    def _untrack_known_content(state: AgentState, tc):
+        """edit_file 成功后撤销登记：内容已被局部改动，模型手上的副本过期了。
+
+        必须撤销，否则模型想用 edit_file 的 SEARCH 精确匹配时会拿不到准确片段，
+        又因为"内容未变被跳过"而陷入反复失败。
+        """
+        fname = tc.arguments.get("filename", "") if isinstance(tc.arguments, dict) else ""
+        if not fname:
+            return
+        known = state.get("_known_content_files") or {}
+        if known.pop(fname, None) is not None:
+            logger.info(f"[ToolLoop] 撤销已知正文（已被 edit_file 修改）: {fname}")
+
+    @staticmethod
+    def _offload_created_context(state: AgentState, tc):
+        """读取成功后卸载创建时的正文副本，避免两份相同内容长期占着上下文。
+
+        「创建后免回读」被绕过只有一种合理情况：文件在写入之后又被改过
+        （被 edit_file / 被其它工具），此时模型需要重新拿正文。既然新正文已经
+        通过这次 read_file 进入上下文，创建时那份就变成纯冗余 —— 替换成一行占位说明。
+        """
+        fname = tc.arguments.get("filename", "") if isinstance(tc.arguments, dict) else ""
+        if not fname:
+            return
+        known = state.get("_known_content_files") or {}
+        if fname not in known:
+            return
+        known.pop(fname, None)
+        history = state.get("dialogue_history") or []
+        for entry in reversed(history):
+            if entry.get("role") != "tool_call" or entry.get("name") != "write_file":
+                continue
+            args = entry.get("arguments") or {}
+            if args.get("filename") != fname:
+                continue
+            entry["content"] = (
+                f"[已卸载] {fname} 创建时的正文已从上下文移除 —— "
+                f"它已被后续改动/读取取代，请以最近一次 read_file 的结果为准。"
+            )
+            logger.info(f"[ToolLoop] 卸载创建时正文: {fname}")
+            return
 
     @staticmethod
     def _is_deliverable(path: str) -> bool:

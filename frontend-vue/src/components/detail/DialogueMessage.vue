@@ -52,8 +52,9 @@
       <span v-if="roleIcon" class="role-icon">{{ roleIcon }}</span>
       {{ displayName }}
     </div>
+    <!-- 长消息：轻量排版 + 默认折叠前几行，点击展开（Leon/Catherine 类长分析尤其需要） -->
     <div class="bubble agent-bubble">
-      {{ msg.content }}
+      <RichMessage :content="msg.content || ''" :fold-lines="6" :fold-chars="500" />
     </div>
   </div>
 
@@ -89,6 +90,15 @@
     </div>
   </div>
 
+  <!-- 一次编码回合：连续的轮次合并成一张卡（内部按轮分层，支持一键开合）。
+       必须排在 _grouped 分支之前 —— 合并卡同样带 _grouped 标记 -->
+  <div
+    v-else-if="msg.role === 'iteration_batch' && (msg as any).rounds"
+    class="msg iteration-msg"
+  >
+    <CoderTurnCard :msg="msg" />
+  </div>
+
   <!-- Grouped tool calls (virtual message from DialoguePanel, 兼容旧版) -->
   <div v-else-if="msg._grouped" class="msg tool-group-msg">
     <div class="tool-group-toggle" @click="toolGroupExpanded = !toolGroupExpanded">
@@ -108,7 +118,7 @@
     </div>
   </div>
 
-  <!-- Iteration batch card（新版迭代分组，替代逐条 tool_call 展示）-->
+  <!-- Iteration batch card（单轮，旧/未合并形态）-->
   <div v-else-if="msg.role === 'iteration_batch'" class="msg iteration-msg">
     <div class="iteration-card">
       <!-- 折叠栏 -->
@@ -119,8 +129,12 @@
           {{ displayName }}
         </span>
         <span v-if="msg.iteration != null" class="iteration-label">第 {{ msg.iteration }} 轮</span>
-        <span class="iteration-tool-count">{{ toolsList.length }} 个操作</span>
+        <span v-if="isLive" class="iteration-live">
+          <span class="iteration-live-dot"></span>进行中…
+        </span>
+        <span class="iteration-tool-count">{{ isLive ? '实时累积' : toolsList.length + ' 个操作' }}</span>
         <span v-if="msg.thinking_preview" class="iteration-thinking-dot" title="有思考内容">💭</span>
+        <span v-if="iterationTimeRange" class="iteration-time">{{ iterationTimeRange }}</span>
       </div>
 
       <!-- 展开内容 -->
@@ -175,6 +189,25 @@
     />
   </div>
 
+  <!-- QA 验收项卡片（一个 AC 一张卡：结论 + 内部逐步时间线）。
+       同一 AC 被反复验收（修复循环）时，DialoguePanel 会把它们合并成一张
+       带 rounds 的卡 —— 卡内按「第 N 次」分层，避免 20 张近乎相同的卡刷屏。 -->
+  <div v-else-if="msg.role === 'qa_result'" class="msg qa-card-msg">
+    <QaAcGroupCard v-if="(msg as any).rounds?.length" :msg="msg" />
+    <QaAcCard v-else :msg="msg" />
+  </div>
+
+  <!-- QA 验收逐步操作流（旧格式单条兜底：正常已聚合进 AC 卡） -->
+  <div v-else-if="msg.role === 'qa_step'" class="msg qa-step-msg">
+    <div class="qa-step-row" :class="'qa-' + ((msg.qa_step?.status) || 'ok')">
+      <span class="qa-step-icon">{{ qaStepIcon }}</span>
+      <span class="qa-step-action">{{ qaStepLabel }}</span>
+      <span v-if="msg.qa_step?.selector" class="qa-step-selector">{{ msg.qa_step.selector }}</span>
+      <span v-if="msg.qa_step?.value" class="qa-step-value">= {{ msg.qa_step.value }}</span>
+      <span v-if="msg.qa_step?.detail" class="qa-step-detail">{{ msg.qa_step.detail }}</span>
+    </div>
+  </div>
+
   <!-- Default: agent-like -->
   <div v-else class="msg agent">
     <div class="agent-name" :style="{ color: roleColor }">
@@ -192,6 +225,10 @@ import { ref, computed } from 'vue'
 import type { DialogueMessage as DialogueMessageType } from '@/types/api'
 import ToolCallCard from './ToolCallCard.vue'
 import HookCheckCard from './HookCheckCard.vue'
+import QaAcCard from './QaAcCard.vue'
+import QaAcGroupCard from './QaAcGroupCard.vue'
+import RichMessage from './RichMessage.vue'
+import CoderTurnCard from './CoderTurnCard.vue'
 
 const props = defineProps<{
   msg: DialogueMessageType
@@ -199,12 +236,30 @@ const props = defineProps<{
 
 const thinkingExpanded = ref(false)
 const toolGroupExpanded = ref(false)
-const iterationExpanded = ref(false)
+// live 卡片（迭代进行中）默认展开，让实时追加的工具操作直接可见；静态卡片默认折叠。
+const isLive = computed(() => (props.msg as any).live === true)
+const iterationExpanded = ref(isLive.value)
 const thinkingDetailExpanded = ref(false)
 const expandedTools = ref(new Set<number>())
 
 const toolsList = computed(() => {
   return props.msg.tools || []
+})
+
+/** 时间戳 "2026-09-26 21:53:06" → "21:53:06" */
+function shortTime(ts?: string | null): string {
+  if (!ts) return ''
+  const m = String(ts).match(/(\d{2}:\d{2}:\d{2})/)
+  return m ? m[1] : String(ts)
+}
+
+/** 聚合类卡片（一轮迭代）的起止时间；只有单点时间时显示该时刻 */
+const iterationTimeRange = computed(() => {
+  const anyMsg = props.msg as any
+  const s = shortTime(anyMsg.start_ts)
+  const e = shortTime(anyMsg.end_ts ?? anyMsg.timestamp)
+  if (s && e) return `${s} – ${e}`
+  return s || e
 })
 
 function hasToolArgs(tool: any): boolean {
@@ -250,6 +305,37 @@ const displayName = computed(() => {
   return props.msg.name || 'AI'
 })
 
+// QA 逐步操作：状态图标 & 动作可读性标签
+const qaStepIcon = computed(() => {
+  const s = (props.msg as any).qa_step?.status
+  return s === 'fail' ? '❌' : s === 'error' ? '⛔' : s === 'na' ? '⚪' : '✅'
+})
+
+const qaStepLabel = computed(() => {
+  const step = (props.msg as any).qa_step
+  if (!step) return '验收步骤'
+  const map: Record<string, string> = {
+    click: '点击',
+    type: '输入',
+    fill: '填写',
+    select: '选择',
+    press: '按键',
+    wait: '等待',
+    assert_exists: '断言存在',
+    assert_visible: '断言可见',
+    assert_text: '断言文本',
+    assert_count: '断言数量',
+    assert_value: '断言取值',
+    assert_canvas_change: '断言画面变化',
+    assert_dom_change: '断言DOM变化',
+    navigate: '跳转',
+    screenshot: '截图',
+  }
+  const label = map[step.action] || step.action
+  const acId = step.ac_id ? `[${step.ac_id}] ` : ''
+  return `${acId}${label}`
+})
+
 // plan_confirmed 卡片：技术栈摘要 & 复杂度徽章样式
 const planTechStackText = computed(() => {
   const ts = props.msg.plan_confirmed?.tech_stack
@@ -288,6 +374,61 @@ const planComplexityClass = computed(() => {
 .msg.tool-msg {
   max-width: 92%;
   align-self: flex-start;
+}
+
+/* ---- QA 验收逐步操作流 ---- */
+.msg.qa-step-msg {
+  max-width: 95%;
+  align-self: flex-start;
+}
+
+.qa-step-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 5px 10px;
+  font-size: 12px;
+  border-radius: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--muted);
+}
+
+.qa-step-row.qa-ok { border-left-color: #16a34a; }
+.qa-step-row.qa-fail { border-left-color: #dc2626; }
+.qa-step-row.qa-error { border-left-color: #dc2626; }
+.qa-step-row.qa-na { border-left-color: var(--muted); }
+
+.qa-step-icon {
+  font-size: 13px;
+  flex-shrink: 0;
+}
+
+.qa-step-action {
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.qa-step-selector {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.qa-step-value {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.qa-step-detail {
+  color: var(--muted);
+  flex-basis: 100%;
+  white-space: pre-wrap;
 }
 
 .msg.tool-group-msg {
@@ -571,6 +712,33 @@ const planComplexityClass = computed(() => {
   font-size: 12px;
   color: var(--muted);
   flex: 1;
+}
+
+/* 进行中（live）徽标：迭代尚未结束，工具操作仍在实时累积 */
+.iteration-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  padding: 2px 8px;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+
+.iteration-live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: iteration-live-pulse 1s infinite alternate;
+}
+
+@keyframes iteration-live-pulse {
+  from { opacity: 0.35; transform: scale(0.8); }
+  to { opacity: 1; transform: scale(1.1); }
 }
 
 .iteration-thinking-dot {

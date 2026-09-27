@@ -53,7 +53,14 @@
         </div>
 
         <!-- Preview view -->
-        <div v-show="activeTab === 'preview'" class="view active">
+        <div v-show="activeTab === 'preview'" class="view active preview-wrap">
+          <!-- QA 验收中：Catherine 正在浏览器里逐步操作，覆盖提示让用户知道画面在被驱动 -->
+          <div v-if="store.qaRunning" class="qa-running-banner">
+            <span class="qa-running-dot"></span>
+            <span>🔍 QA 正在验收…</span>
+            <span v-if="currentAcLabel" class="qa-running-ac">{{ currentAcLabel }}</span>
+            <span v-if="currentAcSteps" class="qa-running-steps">第 {{ currentAcSteps }} 步</span>
+          </div>
           <PreviewFrame />
         </div>
 
@@ -203,6 +210,32 @@ watch(() => store.planStatus, (status) => {
   } else if (status === 'confirmed') {
     activeTab.value = 'tasks' // 用户确认后自动切到任务 Tab
   }
+})
+
+// QA 验收阶段自动切到预览 Tab：Catherine 正在浏览器里操作，
+// 用户应该看到的是被操作的页面，而不是停在对话流里干等
+watch(() => store.qaRunning, (running) => {
+  if (running) activeTab.value = 'preview'
+})
+
+// 当前正在验收的 AC（用于预览区顶部提示）
+const currentAc = computed(() => {
+  const list = store.dialogueMessages
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i].role === 'qa_result') return list[i] as any
+  }
+  return null
+})
+const currentAcLabel = computed(() => {
+  const ac = currentAc.value
+  if (!ac) return ''
+  const r = ac.qa_result || {}
+  return `[${r.ac_id || ''}] ${r.label || ''}`.trim()
+})
+const currentAcSteps = computed(() => {
+  const ac = currentAc.value
+  if (!ac?.qa_result?.steps) return 0
+  return ac.qa_result.steps.length
 })
 
 // SSE 连接状态 → 生成中状态：仅在需求处于进行中状态时连接成功才锁定输入，
@@ -483,6 +516,49 @@ function escapeInlineScript(content: string): string {
   overflow-y: auto;
   display: flex;
   flex-direction: column;
+}
+
+/* QA 验收中提示条：Catherine 正在驱动浏览器，预览画面在被真实操作 */
+.preview-wrap {
+  position: relative;
+}
+
+.qa-running-banner {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: rgba(59, 130, 246, .94);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 500;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, .18);
+  pointer-events: none;
+  white-space: nowrap;
+  max-width: 92%;
+}
+.qa-running-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #fff;
+  animation: qa-running-pulse 1.2s ease-in-out infinite;
+}
+@keyframes qa-running-pulse { 0%, 100% { opacity: 1 } 50% { opacity: .25 } }
+.qa-running-ac {
+  opacity: .92;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.qa-running-steps {
+  opacity: .8;
+  font-variant-numeric: tabular-nums;
 }
 
 /* Responsive: stack vertically on narrow screens */

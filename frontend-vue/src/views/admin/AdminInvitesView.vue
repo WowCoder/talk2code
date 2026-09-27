@@ -127,6 +127,8 @@ async function approve(row: InviteRow) {
 }
 
 async function reject(row: InviteRow) {
+  // 二次确认：拒绝不可撤销，避免误点直接改变邀请状态（需求反馈）
+  if (!window.confirm(`确定拒绝邀请 ${row.code}？此操作不可撤销。`)) return
   const reason = window.prompt('拒绝理由（会随邮件发给申请人，可留空）：') || ''
   busy.value = row.id
   try {

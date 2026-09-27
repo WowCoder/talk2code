@@ -947,3 +947,26 @@ def sse_stream(req_id):
     )
 
 
+@app.route('/api/requirements/<int:req_id>/dialogue')
+@jwt_required()
+@limiter.exempt if limiter else (lambda f: f)
+def requirement_dialogue(req_id):
+    """返回需求的对话历史，用于 SSE 断线重连后补齐漏掉的消息（无需手动刷新整页）。
+
+    前端在 SSE 重连成功后调用本接口，把返回的 dialogue_history 逐条 addDialogueMessage
+    （store 内部按消息键去重），即可把断连期间漏掉的消息补齐，等价于「刷新页面」但无需刷新。
+    """
+    from models import Requirement
+    current_user_id = int(get_jwt_identity())
+    with get_db() as db:
+        requirement = db.query(Requirement).filter(
+            Requirement.id == req_id,
+            Requirement.user_id == current_user_id,
+        ).first()
+        if not requirement:
+            return jsonify({'error': '需求不存在'}), 404
+        return jsonify({'dialogue': requirement.dialogue_history or []})
+
+
+
+

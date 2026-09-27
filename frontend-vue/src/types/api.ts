@@ -27,7 +27,7 @@ export interface CodeFile {
 }
 
 export interface DialogueMessage {
-  role: 'user' | 'agent' | 'assistant' | 'system' | 'tool_call' | 'tool_result' | 'thinking' | 'hook_check' | 'iteration_batch'
+  role: 'user' | 'agent' | 'assistant' | 'system' | 'tool_call' | 'tool_result' | 'thinking' | 'hook_check' | 'iteration_batch' | 'qa_step' | 'qa_result'
   name?: string
   content: string
   timestamp?: string
@@ -56,6 +56,28 @@ export interface DialogueMessage {
     blocked?: boolean
     arguments?: Record<string, unknown>
   }>
+  // 聚合类消息（轮次 / AC 验收）的起止时间，前端在卡片头部展示时间区间
+  start_ts?: string | null
+  end_ts?: string | null
+  // qa_result specific：一条 = 一个验收项（含内嵌步骤，刷新后恢复成同一张卡）
+  qa_result?: {
+    ac_id: string
+    label?: string
+    status?: string
+    passed?: boolean
+    steps?: Array<{
+      ac_id: string
+      action: string
+      selector?: string
+      value?: string
+      status?: string
+      detail?: string
+      timestamp?: string
+    }>
+    start_ts?: string | null
+    end_ts?: string | null
+    summary?: string
+  }
   // clarification
   question_form?: SSEQuestionFormData
   status?: string
@@ -68,6 +90,18 @@ export interface DialogueMessage {
   }
   // hidden: 内部系统提示，不展示在前端
   hidden?: boolean
+  // iteration_batch 进行中标记：true 表示本轮工具操作仍在实时累积（SSE iteration_append）
+  live?: boolean
+  // qa_step 验收逐步操作（Catherine 在浏览器里的每一步）
+  qa_step?: {
+    ac_id?: string
+    action: string
+    selector?: string
+    value?: string
+    status?: 'ok' | 'fail' | 'error' | 'na'
+    detail?: string
+    timestamp?: string
+  }
   // grouped tool_calls (virtual message, 前端旧版兼容)
   _grouped?: boolean
   label?: string

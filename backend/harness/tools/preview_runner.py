@@ -285,6 +285,53 @@ def _run_preview_in_browser_session(
     }
 
 
+def _click_position(doc, selector: str, step: dict):
+    """解析 click 步骤的落点（需求 199 事故：棋盘只能点中心）。
+
+    Playwright 的 `click` 默认点元素**中心**。对 canvas / 棋盘 / 网格 / 地图这类
+    「同一元素上多点交互」的实现，连续多条无落点的 click 会全部压在同一个像素上，
+    只有第一条有效。req 199 实测：AC-1 要点两下切换两次回合，第二下落在已占用
+    交叉点被判无效 → 断言「黑方回合」失败；AC-2 要连下 10 子成五，实际只落下
+    1 子 → 获胜遮罩永不出现。两条都以 critical 产品缺陷呈现，但根因是脚本驱动缺陷。
+
+    支持两种落点表达（坐标原点均为元素padding box 左上角，单位 CSS 像素）：
+    - `at`: [rx, ry] —— 相对元素宽高的**比例**（0~1）。棋盘类 AC 用比例写坐标，
+      不必知道棋盘的像素尺寸，如 [0.2, 0.4] = 横向 20%、纵向 40% 处。
+    - `offset`: {"x": px, "y": px} —— 精确像素偏移，用于需要像素级对齐的场景。
+
+    返回 Playwright 的 position dict；未指定落点则返回 None（走默认中心点击）。
+    """
+    at = step.get("at")
+    off = step.get("offset")
+    if not at and not off:
+        return None
+    try:
+        el = doc.query_selector(selector)
+        if el is None:
+            return None
+        box = el.bounding_box()
+        if not box or not box.get("width") or not box.get("height"):
+            return None
+    except Exception:
+        return None
+
+    w = float(box["width"])
+    h = float(box["height"])
+    if at:
+        try:
+            rx, ry = float(at[0]), float(at[1])
+        except Exception:
+            return None
+        # 夹进元素内部并留 1px 余量：正好压在边界上会被判定为 outside viewport
+        x = min(max(w * rx, 1.0), max(w - 1.0, 1.0))
+        y = min(max(h * ry, 1.0), max(h - 1.0, 1.0))
+        return {"x": x, "y": y}
+    try:
+        return {"x": float(off.get("x", 0)), "y": float(off.get("y", 0))}
+    except Exception:
+        return None
+
+
 def _resolve_selector(doc, selector: str):
     """选择器自适应解析（需求 126 事故：AC 脚本 `#start-btn` vs 产物 id `startBtn`）
 
@@ -392,6 +439,9 @@ def run_ac_checks(
     ac_scripts: list[dict],
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
     preview_url: str = None,
+    sse=None,
+    requirement_id=None,
+    dialogue_history: list | None = None,
 ) -> list[dict]:
     """在全新线程里执行 AC 验收会话（req 154：复用线程二次启动挂死的根治）。
 
@@ -406,6 +456,8 @@ def run_ac_checks(
         return run_browser_session_isolated(
             _run_ac_checks_session, budget, html_path,
             ac_scripts=ac_scripts, timeout_ms=timeout_ms, preview_url=preview_url,
+            sse=sse, requirement_id=requirement_id,
+            dialogue_history=dialogue_history,
         )
     except BrowserSessionTimeout as e:
         logger.warning(
@@ -429,6 +481,9 @@ def _run_ac_checks_session(
     ac_scripts: list[dict],
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
     preview_url: str = None,
+    sse=None,
+    requirement_id=None,
+    dialogue_history: list | None = None,
 ) -> list[dict]:
     """
     执行验收条件（AC）的 Playwright 交互验证脚本。
@@ -544,6 +599,28 @@ def _run_ac_checks_session(
                     steps_executed = 0
                     doc = None
 
+                    # QA 验收聚合：一个 AC 只产生一条可展示记录（头部结论 + 内部步骤时间线），
+                    # 逐步事件仅实时推送不落库。此前每步落一条，单需求实测产出 340 条
+                    # qa_step 记录，前端逐条渲染成满屏 [AC-1] 行（需求 196）。
+                    _ac_steps: list[dict] = []
+                    _ac_start_ts = None
+                    try:
+                        from utils.sse import get_current_timestamp as _gct
+                        _ac_start_ts = _gct()
+                    except Exception:
+                        _ac_start_ts = None
+                    if sse is not None and requirement_id is not None:
+                        try:
+                            sse.qa_start(requirement_id, {
+                                "ac_id": ac_id,
+                                "label": label,
+                                "status": "running",
+                                "steps": [],
+                                "start_ts": _ac_start_ts,
+                            })
+                        except Exception:
+                            pass
+
                     try:
                         doc = _load(sandbox_on)
                         _load_fail = _frame_load_failure(doc)
@@ -551,6 +628,37 @@ def _run_ac_checks_session(
                             # 页面本身打不开 = 真实缺陷（用户看到的就是白屏），
                             # 必须记进 failures 而不是当成脚本问题吞掉
                             failures.append(f"页面无法加载: {_load_fail}")
+
+                        def _is_effectively_visible(sel: str) -> bool:
+                            """「对用户真的可见」判定。
+
+                            Playwright 的 is_visible 只认 display:none / visibility:hidden /
+                            空 bounding box，**不认 opacity:0**。而前端遮罩层最常用的
+                            隐藏写法恰恰是 `opacity:0; pointer-events:none`
+                            （req 198：.overlay--hidden 正是这么写的）——
+                            用户眼里按钮已经消失，Playwright 却认为它可见，
+                            于是读到残留文案「开始游戏」判成 critical 缺陷。
+                            这里沿祖先链把 opacity 也算进去。
+                            """
+                            try:
+                                return bool(doc.evaluate("""
+                                    (sel) => {
+                                        const el = document.querySelector(sel);
+                                        if (!el) return false;
+                                        let e = el;
+                                        while (e && e.nodeType === 1) {
+                                            const cs = getComputedStyle(e);
+                                            if (cs.display === 'none') return false;
+                                            if (cs.visibility === 'hidden') return false;
+                                            if (parseFloat(cs.opacity || '1') === 0) return false;
+                                            e = e.parentElement;
+                                        }
+                                        const r = el.getBoundingClientRect();
+                                        return r.width > 0 && r.height > 0;
+                                    }
+                                """, sel))
+                            except Exception:
+                                return True
 
                         def _canvas_sig():
                             return doc.evaluate("""
@@ -606,6 +714,9 @@ def _run_ac_checks_session(
                             action = step.get("action", "")
                             selector = step.get("selector", "")
                             steps_executed += 1
+                            _f_before = len(failures)
+                            _na_before = len(not_applicable)
+                            _h_before = len(harness_failures)
 
                             try:
                                 if action == "type":
@@ -613,7 +724,13 @@ def _run_ac_checks_session(
                                     doc.fill(eff, step.get("value", ""))
                                 elif action == "click":
                                     eff = _resolve_selector(doc, selector) or selector
-                                    doc.click(eff)
+                                    _pos = _click_position(doc, eff, step)
+                                    if _pos is None:
+                                        doc.click(eff)
+                                    else:
+                                        # 带落点：必须走 Locator.click(position=)，
+                                        # Frame/Page.click(selector) 不支持指定坐标。
+                                        doc.locator(eff).first.click(position=_pos)
                                 elif action == "select":
                                     eff = _resolve_selector(doc, selector) or selector
                                     doc.select_option(eff, step.get("value", ""))
@@ -638,12 +755,36 @@ def _run_ac_checks_session(
                                 elif action == "assert_text":
                                     eff = _resolve_selector(doc, selector) or selector
                                     elem = doc.query_selector(eff)
-                                    text = elem.inner_text() if elem else ""
                                     contains = step.get("contains", "")
-                                    if contains not in text:
+                                    if elem is None:
                                         failures.append(
-                                            f"文本不匹配: 期望包含 '{contains}', 实际 '{text[:100]}'"
+                                            f"元素不存在: {step.get('label', selector)}"
                                         )
+                                    else:
+                                        # 不可见的元素无从断言文案 —— 它的 inner_text
+                                        # 是"上一次可见时的残留文本"，把它当成产品缺陷会
+                                        # 造出大量假阳性。req 198：AC-1 断言 #btnStart
+                                        # 点击后变成「暂停」，而实现是点开始后直接隐藏
+                                        # 整个遮罩层（游戏确实启动了），读到的残留文本
+                                        # 「开始游戏」被判成 critical 缺陷。
+                                        # 元素可见性由 assert_visible 负责判定；
+                                        # 这里只把它归到「断言前提不成立」，不计入产品缺陷。
+                                        try:
+                                            _vis = _is_effectively_visible(eff)
+                                        except Exception:
+                                            _vis = True
+                                        if not _vis:
+                                            not_applicable.append(
+                                                f"文本断言不适用（{selector} 当前不可见，"
+                                                f"无法断言其文案）: 期望包含 '{contains}'"
+                                            )
+                                        else:
+                                            text = elem.inner_text()
+                                            if contains not in text:
+                                                failures.append(
+                                                    f"文本不匹配: 期望包含 '{contains}', "
+                                                    f"实际 '{text[:100]}'"
+                                                )
                                 elif action == "assert_count":
                                     eff = _resolve_selector(doc, selector)
                                     sel = eff or selector
@@ -709,10 +850,89 @@ def _run_ac_checks_session(
                                     browser_dead = True
                                     break
 
+                            # 逐步事件：收集进本 AC 的步骤汇总（无论是否绑定 SSE 都收集，
+                            # 保证落库的 qa_result 始终完整）；绑定 SSE 时额外实时推送。
+                            _f_added = failures[_f_before:]
+                            _na_added = not_applicable[_na_before:]
+                            _h_added = harness_failures[_h_before:]
+                            if _h_added:
+                                _status = "error"
+                                _detail = _h_added[-1]
+                            elif _f_added:
+                                _status = "fail"
+                                _detail = _f_added[-1]
+                            elif _na_added:
+                                _status = "na"
+                                _detail = _na_added[-1]
+                            else:
+                                _status = "ok"
+                                _detail = ""
+                            _qa_step_payload = {
+                                "ac_id": ac_id,
+                                "action": action,
+                                "selector": selector,
+                                "value": step.get("value", ""),
+                                "status": _status,
+                                "detail": (_detail or "")[:300],
+                            }
+                            _ac_steps.append(_qa_step_payload)
+                            if sse is not None and requirement_id is not None:
+                                try:
+                                    sse.qa_step(requirement_id, _qa_step_payload)
+                                except Exception:
+                                    pass
+
                     except Exception as ac_err:
                         harness_failures.append(f"AC 执行异常: {ac_err}")
                         if _is_fatal_transport_error(ac_err):
                             browser_dead = True
+
+                    # ---- AC 结束：汇总成一条验收记录（实时推送 + 落库各一条） ----
+                    _ac_passed = len(failures) == 0 and not harness_failures and not not_applicable
+                    if harness_failures:
+                        _ac_status = "error"
+                    elif failures:
+                        _ac_status = "fail"
+                    elif not_applicable:
+                        _ac_status = "na"
+                    else:
+                        _ac_status = "ok"
+                    _ac_end_ts = None
+                    try:
+                        from utils.sse import get_current_timestamp as _gct2
+                        _ac_end_ts = _gct2()
+                    except Exception:
+                        pass
+                    _ac_payload = {
+                        "ac_id": ac_id,
+                        "label": label,
+                        "status": _ac_status,
+                        "passed": _ac_passed,
+                        "steps": _ac_steps,
+                        "start_ts": _ac_start_ts,
+                        "end_ts": _ac_end_ts,
+                        "summary": "; ".join(
+                            (failures + harness_failures + not_applicable)[:3]
+                        )[:300],
+                    }
+                    if sse is not None and requirement_id is not None:
+                        try:
+                            sse.qa_result(requirement_id, _ac_payload)
+                        except Exception:
+                            pass
+                    # 落库：一个 AC 一条完整记录（含内部步骤），刷新后仍可恢复成同一张卡。
+                    # 0 步不落卡：一个步骤都没跑起来，说明这条 AC 根本没被执行
+                    # （浏览器提前退出 / 页面加载失败 / 事件错位），落进历史只会让刷新后
+                    # 冒出「暂无步骤记录」的空卡，看着像质量工程师什么都没做。
+                    # 前端收到 0 步的 qa_result 也会把那张卡撤掉，两侧保持一致。
+                    if dialogue_history is not None and _ac_steps:
+                        dialogue_history.append({
+                            "role": "qa_result",
+                            "name": "Catherine（质量工程师）",
+                            "content": f"[{ac_id}] {label}",
+                            "qa_result": _ac_payload,
+                            "timestamp": _ac_end_ts,
+                        })
 
                     # 「断言前提不成立」（N/A）不再混进 harness_errors：
                     # 它不是「脚本驱动失败」，而是「这条断言对当前实现根本不适用」。

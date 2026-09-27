@@ -3,7 +3,12 @@
     <div class="dialogue-header">AI 对话</div>
     <div class="dialogue-body" ref="bodyRef">
       <template v-for="(msg, i) in messages" :key="i">
-        <DialogueMessage :msg="msg" />
+        <!-- wrapper 用 display:contents，不生成盒模型，因此不破坏 .msg 的
+             flex align-self 左右对齐；时间条作为独立 flex item 统一渲染 -->
+        <div class="msg-wrapper">
+          <DialogueMessage :msg="msg" />
+          <div v-if="msgTime(msg)" class="msg-time">{{ msgTime(msg) }}</div>
+        </div>
       </template>
 
       <!-- Plan 确认卡片（TL 完成后展示） -->
@@ -79,6 +84,29 @@ const emit = defineEmits<{
 const bodyRef = ref<HTMLElement | null>(null)
 const store = useRequirementStore()
 
+/** 时间戳 "2026-09-26 21:53:06" → "21:53:06" */
+function shortTime(ts?: string | null): string {
+  if (!ts) return ''
+  const m = String(ts).match(/(\d{2}:\d{2}:\d{2})/)
+  return m ? m[1] : String(ts)
+}
+
+/**
+ * 消息时间文案：聚合类消息（轮次 / AC 验收）显示起止区间，普通消息显示单点时间。
+ * 卡片头部自己也渲染了一次时间；这里统一补上，保证「所有消息都显示时间」。
+ */
+function msgTime(msg: DialogueMessageType): string {
+  const m = msg as any
+  // 轮次卡 / AC 卡：起止时间
+  if (m.role === 'iteration_batch' || m.role === 'qa_result') {
+    const s = shortTime(m.start_ts ?? m.qa_result?.start_ts)
+    const e = shortTime(m.end_ts ?? m.qa_result?.end_ts ?? m.timestamp)
+    if (s && e) return `${s} – ${e}`
+    return s || e
+  }
+  return shortTime(m.timestamp)
+}
+
 const messages = computed(() => {
   const raw = store.dialogueMessages.filter(
     (m: DialogueMessageType) =>
@@ -86,38 +114,63 @@ const messages = computed(() => {
       // 「0 个操作」幽灵卡片兜底：无论消息从哪条路径进入 store（SSE 实时推送、
       // 历史恢复、chat 响应合并），只要迭代批次没有操作列表就不渲染。
       // useSSE 与后端 sse_reporter 已在源头过滤，这里是最后一条防线。
-      !(m.role === 'iteration_batch' && !((m as any).tools?.length))
+      // 但「进行中（live）」的轮次卡片即使 tools 暂为空也要渲染——它正实时累积。
+      !(m.role === 'iteration_batch' && !((m as any).tools?.length) && (m as any).live !== true) &&
+      // 「0 步」验收幽灵卡兜底：一条验收记录若最终没有产生任何步骤，说明这条 AC
+      // 根本没被真正执行（浏览器提前退出 / 事件错位），展示成空卡只会让人以为
+      // 「质量工程师什么都没做」。后端已不再为 0 步 AC 落卡，这里是最后一道防线。
+      !(m.role === 'qa_result' && !(((m as any).qa_result?.steps || []).length) && (m as any).live !== true)
   )
 
-  // 合并连续的 tool_call 消息为一个可展开组（兼容旧版后端/页面刷新时的历史数据）
-  const grouped: DialogueMessageType[] = []
-  let toolBatch: DialogueMessageType[] = []
+  // 合并连续的同类消息：
+  //  1) 连续同一角色的 iteration_batch（coder 的多轮迭代）→ 一张「一次编码回合」卡片，
+  //     卡片内部再按轮分层，并支持一键展开/收起全部思考与操作（需求 198 验收反馈：
+  //     一轮一张卡时会话框被 20 张卡刷满，反而看不清做了什么）。
+  //  2) 同一 AC 编号的多次验收 → 一张「N 次验收」卡（见下），卡内按轮次分层。
+  //  3) 连续 tool_call → 一个可展开组（兼容旧版后端/页面刷新时的历史数据）
+  //
+  // —— QA 验收卡按 AC 编号合并 ——
+  // 同一条验收条件在「发现缺陷 → 修复 → 复验」的循环里会被反复验收
+  // （需求 198 实测 5 条 AC × 4 轮 = 20 张卡），每张卡头几乎一模一样，
+  // 把会话框刷满却看不出「这条现在到底过没过」。
+  // 合并后渲染在**该 AC 最后一次出现的位置**：用户读到这里，看到的是终局结论
+  // 加上完整历史轮次，而不是散落 4 处的重复卡。
+  const qaByAc = new Map<string, DialogueMessageType[]>()
+  const qaLastIdx = new Map<string, number>()
+  raw.forEach((m: DialogueMessageType, i: number) => {
+    if (m.role !== 'qa_result') return
+    const id = String((m as any).qa_result?.ac_id || '')
+    // ac_id 缺失的脏数据不参与合并：否则所有无编号的卡会被并成一张
+    if (!id) return
+    if (!qaByAc.has(id)) qaByAc.set(id, [])
+    qaByAc.get(id)!.push(m)
+    qaLastIdx.set(id, i)
+  })
 
-  for (const msg of raw) {
-    if (msg.role === 'tool_call') {
-      toolBatch.push(msg)
-    } else {
-      if (toolBatch.length > 0) {
-        if (toolBatch.length === 1) {
-          grouped.push(toolBatch[0])
-        } else {
-          grouped.push({
-            role: 'tool_call',
-            name: '工具调用',
-            content: '',
-            _grouped: true,
-            label: `📝 工具调用`,
-            items: toolBatch,
-          } as any)
-        }
-        toolBatch = []
-      }
-      grouped.push(msg)
-    }
+  const buildQaGroup = (rounds: DialogueMessageType[]) => {
+    const first: any = rounds[0]
+    const last: any = rounds[rounds.length - 1]
+    return {
+      role: 'qa_result',
+      name: last.name || 'Catherine（质量工程师）',
+      content: '',
+      rounds,
+      // 卡头结论取最新一轮：修了几轮之后，用户只关心现在过了没有
+      qa_result: { ...(last.qa_result || {}) },
+      live: rounds.some((m) => (m as any).live === true),
+      start_ts: first.qa_result?.start_ts ?? first.timestamp,
+      end_ts: last.qa_result?.end_ts ?? last.timestamp,
+      timestamp: last.qa_result?.end_ts ?? last.timestamp,
+    } as any
   }
 
-  // 尾部残余
-  if (toolBatch.length > 0) {
+  const grouped: DialogueMessageType[] = []
+  let toolBatch: DialogueMessageType[] = []
+  let iterBatch: DialogueMessageType[] = []
+  let iterName = ''
+
+  const flushTools = () => {
+    if (!toolBatch.length) return
     if (toolBatch.length === 1) {
       grouped.push(toolBatch[0])
     } else {
@@ -130,7 +183,65 @@ const messages = computed(() => {
         items: toolBatch,
       } as any)
     }
+    toolBatch = []
   }
+
+  const flushIters = () => {
+    if (!iterBatch.length) return
+    const first = iterBatch[0]
+    const last = iterBatch[iterBatch.length - 1]
+    const totalTools = iterBatch.reduce(
+      (n, m) => n + (((m as any).tools || []).length), 0
+    )
+    grouped.push({
+      role: 'iteration_batch',
+      name: first.name,
+      content: `${iterBatch.length} 轮 · ${totalTools} 个操作`,
+      _grouped: true,
+      rounds: iterBatch,
+      start_ts: (first as any).start_ts ?? first.timestamp,
+      end_ts: (last as any).end_ts ?? last.timestamp,
+      timestamp: (last as any).end_ts ?? last.timestamp,
+      // 任一轮仍在实时累积，整张卡就保持「进行中」
+      live: iterBatch.some((m) => (m as any).live === true),
+    } as any)
+    iterBatch = []
+    iterName = ''
+  }
+
+  for (let ri = 0; ri < raw.length; ri++) {
+    const msg = raw[ri]
+    if (msg.role === 'iteration_batch') {
+      flushTools()
+      // 换人即断组：不同角色的轮次不合并
+      if (iterBatch.length && (msg.name || '') !== iterName) flushIters()
+      if (!iterBatch.length) iterName = msg.name || ''
+      iterBatch.push(msg)
+      continue
+    }
+    flushIters()
+    if (msg.role === 'tool_call') {
+      toolBatch.push(msg)
+      continue
+    }
+    flushTools()
+
+    if (msg.role === 'qa_result') {
+      const id = String((msg as any).qa_result?.ac_id || '')
+      const rounds = qaByAc.get(id) || [msg]
+      // 只验收过一次就保持原样，不引入多余的层级
+      if (rounds.length > 1) {
+        if (qaLastIdx.get(id) !== ri) continue
+        grouped.push(buildQaGroup(rounds))
+        continue
+      }
+    }
+
+    grouped.push(msg)
+  }
+
+  flushIters()
+  flushTools()
 
   return grouped
 })
@@ -294,6 +405,21 @@ watch(
 .dialogue-body::-webkit-scrollbar-thumb {
   background: var(--border);
   border-radius: 3px;
+}
+
+/* 不生成盒模型：让内部 .msg 继续作为父级 flex 的直接参与项（保留左右对齐），
+   同时允许时间条作为同级 flex item 统一渲染 */
+.msg-wrapper {
+  display: contents;
+}
+
+.msg-time {
+  align-self: center;
+  font-size: 11px;
+  color: #9ca3af;
+  font-variant-numeric: tabular-nums;
+  margin: -8px 0 0;
+  letter-spacing: .2px;
 }
 
 .progress-card {

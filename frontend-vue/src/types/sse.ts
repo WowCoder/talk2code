@@ -21,6 +21,12 @@ export type SSEEventType =
   | 'evaluator_result'
   | 'cancelled'
   | 'iteration_batch'
+  | 'iteration_start'
+  | 'iteration_append'
+  | 'iteration_end'
+  | 'qa_step'
+  | 'qa_start'
+  | 'qa_result'
 
 // ===== SSE Event Data Shapes =====
 
@@ -246,6 +252,61 @@ export interface SSEIterationBatchData {
   thinking_preview: string
   agent_text: string
   tools: SSEIterationBatchTool[]
+}
+
+// ===== 迭代轮次实时累积（取代整轮一次性 iteration_batch）=====
+// 一轮开始（iteration_start）→ 过程每步 iteration_append 实时填充 →
+// 轮次结束（iteration_end）固定卡片。刷新页面时由 dialogue_history 的迭代记录恢复静态卡片。
+
+/** iteration_start：一张可实时累积的轮次卡片 */
+export interface SSEIterationStartData {
+  iteration: number
+  coder_name: string
+  thinking_preview?: string
+  agent_text?: string
+  tools?: SSEIterationBatchTool[]
+  content?: string
+}
+
+/** iteration_append：单个工具操作，实时追加进当前轮次卡片 */
+export interface SSEIterationAppendData {
+  tool: SSEIterationBatchTool
+}
+
+/** iteration_end：固定当前轮次卡片（不再实时变化） */
+export interface SSEIterationEndData {
+  iteration: number
+  content?: string
+}
+
+// ===== QA 验收逐步操作流 =====
+
+export type QAStepStatus = 'ok' | 'fail' | 'error' | 'na'
+
+export interface SSEQAStepData {
+  ac_id: string
+  action: string
+  selector?: string
+  value?: string
+  status: QAStepStatus
+  detail?: string
+  timestamp?: string
+}
+
+// ===== QA 验收项（AC）聚合 =====
+// 一个 AC 一张卡片：qa_start 建卡 → qa_step 逐步实时填充 → qa_result 固定并给出结论。
+// 逐步事件只做实时展示不落库，落库的是 qa_result（含内嵌 steps），
+// 因此刷新后恢复的仍是同一张 AC 卡片，不会退化成几百条独立行（需求 196 实测 340 条）。
+
+export interface SSEQAAcData {
+  ac_id: string
+  label?: string
+  status?: 'running' | QAStepStatus
+  passed?: boolean
+  steps?: SSEQAStepData[]
+  start_ts?: string | null
+  end_ts?: string | null
+  summary?: string
 }
 
 // Task 状态联合类型增加 blocked/failed
