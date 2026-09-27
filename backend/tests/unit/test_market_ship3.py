@@ -13,7 +13,9 @@ from models.models import PublishedSite
 from utils.security import hash_password
 
 from services.market.service import CATEGORIES, normalize_category
-from services.market.thumbs import get_thumb, thumb_path
+
+# 注：缩略图用例统一在函数内 `import services.market.thumbs as t` 再 monkeypatch
+# 缓存目录，故这里不再顶层导入 get_thumb / thumb_path（避免未使用导入）。
 
 # ⚠️ 20 位 Crockford Base32，且**不含 I/L/O/U**（字母表排除易混淆字符）。
 # 用「前缀 + 纯数字」的写法，避免再手滑写出 GAME/TOOL 这种含 O 的 slug。
@@ -125,27 +127,34 @@ def test_week_and_category_compose(env, app_client):
 
 # ---------------- 缩略图 ----------------
 
-def test_thumb_404_when_not_generated(env, app_client, monkeypatch):
-    """截不到是 404（前端回退色块），绝不能 500 或空响应。"""
+def test_thumb_404_when_not_generated(env, app_client, monkeypatch, tmp_path):
+    """截不到是 404（前端回退色块），绝不能 500 或空响应。
+
+    缓存目录指向 tmp_path：路由会先查 get_thumb 缓存，若指向真实
+    published/_thumbs，一旦本机有上一次跑次的残留就会误命中 → 期望 404 得 200。
+    """
+    import services.market.thumbs as t
+    monkeypatch.setattr(t, "thumb_dir", lambda: tmp_path)
     monkeypatch.setattr("routes.market.ensure_thumb", lambda *a, **k: None)
     r = app_client.get(f"/api/market/thumbs/{env['game']}.png")
     assert r.status_code == 404
 
 
-def test_thumb_serves_cached_png(env, app_client, tmp_path):
-    p = thumb_path("h" * 64)
-    p.parent.mkdir(parents=True, exist_ok=True)
+def test_thumb_serves_cached_png(env, app_client, tmp_path, monkeypatch):
+    """已缓存的缩略图正常回图。
+
+    必须把缓存目录指到 tmp_path，**绝不写真实 published/_thumbs**：
+    该目录下留一个 <hash>.png 就会让下一次跑次里的 404 用例误命中，
+    变成与代码无关的偶发失败（tmp_path 由 pytest 自动清理，无需 finally unlink）。
+    """
+    import services.market.thumbs as t
+    monkeypatch.setattr(t, "thumb_dir", lambda: tmp_path)
+    p = t.thumb_path("h" * 64)
     p.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 32)
-    try:
-        r = app_client.get(f"/api/market/thumbs/{env['game']}.png")
-        assert r.status_code == 200
-        assert r.headers["Content-Type"] == "image/png"
-        assert r.data.startswith(b"\x89PNG")
-    finally:
-        try:
-            p.unlink()
-        except OSError:
-            pass
+    r = app_client.get(f"/api/market/thumbs/{env['game']}.png")
+    assert r.status_code == 200
+    assert r.headers["Content-Type"] == "image/png"
+    assert r.data.startswith(b"\x89PNG")
 
 
 def test_thumb_invalid_slug_404(env, app_client):
