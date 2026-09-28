@@ -86,6 +86,8 @@ export interface DialogueMessage {
     features?: string[]
     tech_stack?: { css?: string; storage?: string; framework?: string }
     file_structure?: string[]
+    // 数据模型描述：确认后卡片与待确认浮层卡保持同样内容
+    data_model?: string
     complexity?: string
   }
   // hidden: 内部系统提示，不展示在前端

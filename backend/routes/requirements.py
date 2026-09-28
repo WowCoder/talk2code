@@ -639,18 +639,20 @@ def confirm_plan(req_id):
         if req_record.status != 'planning':
             return jsonify({'error': f'需求状态为 {req_record.status}，无需确认'}), 400
 
-        # 直接确认（无反馈）时，把确认动作作为结构化 user 消息持久化（前端按已确认卡片样式渲染）
+        # 直接确认（无反馈）时，把确认动作作为结构化 user 消息持久化（前端渲染成
+        # 与待确认卡片同一张卡的「已确认态」，内容不缩水）
         # 有反馈时会重新走 TL 分析，不落确认卡片（由 plan_feedback 消息记录）
         if not feedback:
             from sqlalchemy.orm.attributes import flag_modified
             plan_data = {}
             plan_insert_idx = -1
             dialogue_list = list(req_record.dialogue_history or [])
+            # 取「最后一条」含 plan 的 TL 消息：带反馈重出计划时历史里会留有多轮 plan，
+            # 确认卡片必须贴在本轮（最新）分析结果之后，而不是贴到第一轮后面
             for i, msg in enumerate(dialogue_list):
                 if isinstance(msg, dict) and msg.get('plan'):
                     plan_data = msg['plan']
-                    plan_insert_idx = i  # 确认卡片应在此 TL plan 消息之前
-                    break
+                    plan_insert_idx = i
             confirm_card = {
                 'role': 'user',
                 'name': '用户',
@@ -661,11 +663,12 @@ def confirm_plan(req_id):
                     'features': plan_data.get('features', []),
                     'tech_stack': plan_data.get('tech_stack', {}),
                     'file_structure': plan_data.get('file_structure', []),
+                    'data_model': plan_data.get('data_model', ''),
                     'complexity': plan_data.get('complexity', 'S'),
                 },
             }
             if plan_insert_idx >= 0:
-                dialogue_list.insert(plan_insert_idx, confirm_card)
+                dialogue_list.insert(plan_insert_idx + 1, confirm_card)
             else:
                 dialogue_list.append(confirm_card)
             req_record.dialogue_history = dialogue_list
