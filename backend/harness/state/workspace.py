@@ -55,9 +55,41 @@ class WorkspaceFS:
         if not full_path.is_relative_to(resolved_root):
             raise PermissionError(f"禁止访问工作目录外的文件: {filename}")
 
+    # 设计成品模板在工作区内的落地目录。
+    # 用点号开头：_is_deliverable() 会排除隐藏目录，避免模板文件混进交付产物。
+    DESIGN_SUBDIR = ".design"
+
+    @staticmethod
+    def _design_source_dir() -> Path:
+        """设计成品模板的源目录（backend/assets/design/）。"""
+        from config import settings
+        return Path(settings.BACKEND_DIR) / "assets" / "design"
+
+    def _seed_design_presets(self):
+        """把设计成品模板播种进工作区。
+
+        背景：给轻量模型讲"配色原则"没用，给它可运行的成品 CSS 模板才有用。
+        模板放在隐藏目录，不占 skill 常驻 token —— 模型需要时自己 read_file，
+        且可以 read → 改 → write，而不是每次从零生成样式。
+        """
+        src = self._design_source_dir()
+        if not src.is_dir():
+            return
+        try:
+            dst = self.path / self.DESIGN_SUBDIR
+            dst.mkdir(parents=True, exist_ok=True)
+            for f in src.glob("*.css"):
+                target = dst / f.name
+                if not target.exists():
+                    target.write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception:
+            # 播种失败不能阻断任务初始化 —— 最坏情况只是没有模板可用
+            pass
+
     def init(self, code_files: list[dict] = None):
         """初始化工作目录"""
         self.path.mkdir(parents=True, exist_ok=True)
+        self._seed_design_presets()
         if code_files:
             for f in code_files:
                 self._validate(f["filename"])
@@ -79,13 +111,16 @@ class WorkspaceFS:
         filepath.write_text(content, encoding="utf-8")
 
     def list(self) -> list[str]:
-        """列出工作区所有文件（相对路径），排除 .git"""
+        """列出工作区所有文件（相对路径），排除 .git 与设计模板目录"""
         files = []
         if not self.path.exists():
             return files
         for f in self.path.rglob("*"):
-            if f.is_file() and '.git' not in f.parts:
-                files.append(str(f.relative_to(self.path)))
+            if not f.is_file() or '.git' in f.parts:
+                continue
+            if self.DESIGN_SUBDIR in f.parts:   # 模板不进交付列表
+                continue
+            files.append(str(f.relative_to(self.path)))
         return files
 
     def delete(self, filename: str):
@@ -109,6 +144,8 @@ class WorkspaceFS:
         out = []
         for f in self.path.rglob("*"):
             if not f.is_file() or '.git' in f.parts:
+                continue
+            if self.DESIGN_SUBDIR in f.parts:   # 模板不进交付快照
                 continue
             try:
                 content = f.read_text(encoding="utf-8")

@@ -1,0 +1,235 @@
+/* ============================================================
+   preset-landing.css —— 落地页 / 官网 / 产品页的成品样式基线（浅色）
+   ------------------------------------------------------------
+   用法：以本文件作为样式起点再改，不要从零写 CSS。
+   规则：颜色只取下面定义的 CSS 变量；字号/间距/圆角只取定义的档位。
+   主色 = 正红（行动号召语义，高对比、辨识度强），刻意避开 indigo/purple。
+   注意：不要做"紫蓝渐变 Hero + 三张等宽卡片"的模板化落地页，
+        改用"实色 Hero + 非对称版式"。
+   ============================================================ */
+
+:root {
+  /* ---------- 1. 调色板（含 hover / active / disabled 三态） ---------- */
+  --bg:            #ffffff;
+  --bg-alt:        #f8fafc;   /* 交替区块底色 */
+  --surface:       #ffffff;
+  --border:        #e5e7eb;
+
+  --brand:         #dc2626;   /* 主色（正红，非 indigo） */
+  --brand-hover:   #b91c1c;
+  --brand-active:  #991b1b;
+  --brand-dim:     #fee2e2;
+
+  --ink:           #0b1220;   /* 标题用近黑 */
+  --text:          #1f2937;   /* 正文 */
+  --text-dim:      #6b7280;
+
+  --ok:            #15803d;
+  --warn:          #b45309;
+
+  /* ---------- 2. 排版尺度（不要自创） ---------- */
+  --fs-xs:  12px;
+  --fs-sm:  14px;
+  --fs-md:  16px;
+  --fs-lg:  20px;
+  --fs-xl:  28px;
+  --fs-2xl: 40px;
+  --fs-3xl: 56px;   /* 仅 Hero 主标题 */
+  --lh:     1.6;
+  --lh-tight: 1.15;
+  --fw-bold: 700;
+  --fw-mid:  600;
+
+  /* ---------- 3. 间距 / 圆角 / 阴影 ---------- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-12: 48px;
+  --sp-16: 64px;
+
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-full: 999px;
+
+  --shadow:    0 1px 3px rgb(11 18 32 / 0.08);
+  --shadow-lg: 0 12px 32px rgb(11 18 32 / 0.12);
+
+  --maxw: 1120px;
+  --transition: 180ms ease;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-size: var(--fs-md);
+  line-height: var(--lh);
+  font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+/* ---------- 4. 页面骨架 ---------- */
+.container { max-width: var(--maxw); margin: 0 auto; padding: 0 var(--sp-6); }
+.section { padding: var(--sp-16) 0; }
+.section--alt { background: var(--bg-alt); }
+
+/* 导航 */
+.nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-6);
+  padding: var(--sp-4) 0;
+}
+.nav__logo { font-size: var(--fs-lg); font-weight: var(--fw-bold); color: var(--ink); }
+.nav__links { display: flex; gap: var(--sp-6); }
+.nav__link {
+  color: var(--text-dim);
+  text-decoration: none;
+  font-size: var(--fs-sm);
+  transition: color var(--transition);
+}
+.nav__link:hover { color: var(--brand); }
+
+/* Hero（实色，不做紫蓝渐变） */
+.hero {
+  display: grid;
+  grid-template-columns: 1.1fr 0.9fr;
+  gap: var(--sp-12);
+  align-items: center;
+  padding: var(--sp-16) 0;
+}
+@media (max-width: 860px) {
+  .hero { grid-template-columns: 1fr; gap: var(--sp-8); padding: var(--sp-8) 0; }
+}
+.hero__eyebrow {
+  display: inline-block;
+  margin-bottom: var(--sp-3);
+  padding: 2px var(--sp-3);
+  border-radius: var(--r-full);
+  background: var(--brand-dim);
+  color: var(--brand-active);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-mid);
+}
+.hero__title {
+  margin: 0 0 var(--sp-4);
+  font-size: var(--fs-3xl);
+  line-height: var(--lh-tight);
+  font-weight: var(--fw-bold);
+  color: var(--ink);
+  letter-spacing: -0.02em;
+}
+@media (max-width: 860px) { .hero__title { font-size: var(--fs-2xl); } }
+.hero__lead {
+  margin: 0 0 var(--sp-6);
+  font-size: var(--fs-lg);
+  color: var(--text-dim);
+  max-width: 46ch;
+}
+.hero__actions { display: flex; flex-wrap: wrap; gap: var(--sp-3); }
+
+/* ---------- 5. 成品组件：直接套 class ---------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 48px;                 /* 主 CTA 点击区不小于 48px */
+  padding: 0 var(--sp-6);
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  background: var(--brand);
+  color: #ffffff;
+  font-size: var(--fs-md);
+  font-weight: var(--fw-mid);
+  font-family: inherit;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background var(--transition), transform var(--transition);
+}
+.btn:hover  { background: var(--brand-hover); }
+.btn:active { background: var(--brand-active); transform: translateY(1px); }
+.btn:disabled { background: var(--border); color: var(--text-dim); cursor: not-allowed; }
+.btn--ghost {
+  background: transparent;
+  border-color: var(--border);
+  color: var(--ink);
+}
+.btn--ghost:hover { background: var(--bg-alt); }
+.btn--sm { min-height: 40px; padding: 0 var(--sp-4); font-size: var(--fs-sm); }
+
+/* 特性网格：非等宽，第一块跨两列，打破模板感 */
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--sp-6);
+}
+.feature-grid > :first-child { grid-column: span 3; }
+@media (max-width: 900px) {
+  .feature-grid { grid-template-columns: 1fr; }
+  .feature-grid > :first-child { grid-column: span 1; }
+}
+.feature {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: var(--sp-6);
+}
+.feature__icon {
+  width: 36px; height: 36px;
+  margin-bottom: var(--sp-4);
+  color: var(--brand);
+}
+.feature__title { margin: 0 0 var(--sp-2); font-size: var(--fs-lg); font-weight: var(--fw-mid); color: var(--ink); }
+.feature__text  { margin: 0; color: var(--text-dim); font-size: var(--fs-sm); }
+
+/* 定价 */
+.pricing { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--sp-6); align-items: start; }
+@media (max-width: 900px) { .pricing { grid-template-columns: 1fr; } }
+.plan {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: var(--sp-6);
+}
+.plan--featured {
+  border: 2px solid var(--brand);
+  box-shadow: var(--shadow-lg);
+  position: relative;
+}
+.plan--featured::after {
+  content: "推荐";
+  position: absolute;
+  top: calc(-1 * var(--sp-3));
+  right: var(--sp-4);
+  padding: 2px var(--sp-2);
+  border-radius: var(--r-sm);
+  background: var(--brand);
+  color: #ffffff;
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-mid);
+}
+.plan__name  { margin: 0 0 var(--sp-2); font-size: var(--fs-md); color: var(--text-dim); }
+.plan__price { margin: 0 0 var(--sp-4); font-size: var(--fs-2xl); font-weight: var(--fw-bold); color: var(--ink); }
+.plan__price small { font-size: var(--fs-sm); font-weight: 400; color: var(--text-dim); }
+.plan__list  { margin: 0 0 var(--sp-6); padding: 0; list-style: none; }
+.plan__list li { padding: var(--sp-2) 0; border-bottom: 1px solid var(--border); font-size: var(--fs-sm); }
+.plan__list li:last-child { border-bottom: none; }
+
+/* 数据条（替代编造指标：写成具体可核对的事实） */
+.stat-row { display: flex; flex-wrap: wrap; gap: var(--sp-8); }
+.stat__value { font-size: var(--fs-2xl); font-weight: var(--fw-bold); color: var(--ink); font-variant-numeric: tabular-nums; }
+.stat__label { color: var(--text-dim); font-size: var(--fs-sm); }
+
+/* 页脚 */
+.footer {
+  padding: var(--sp-8) 0;
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+}

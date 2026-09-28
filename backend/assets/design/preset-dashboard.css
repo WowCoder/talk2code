@@ -1,0 +1,234 @@
+/* ============================================================
+   preset-dashboard.css —— 数据看板 / 图表的成品样式基线（浅色）
+   ------------------------------------------------------------
+   用法：以本文件作为样式起点再改，不要从零写 CSS。
+   规则：颜色只取下面定义的 CSS 变量；字号/间距/圆角只取定义的档位。
+   主色 = 翡翠绿（数据/增长语义），刻意避开 indigo/purple。
+   ============================================================ */
+
+:root {
+  /* ---------- 1. 调色板（含 hover / active / disabled 三态） ---------- */
+  --bg:            #f1f5f9;   /* 页面底色 */
+  --surface:       #ffffff;   /* 卡片 / 面板 */
+  --surface-2:     #f8fafc;   /* 次级区块 / 表头 */
+  --border:        #e2e8f0;
+  --border-strong: #cbd5e1;
+
+  --brand:         #059669;   /* 主色（翡翠绿，非 indigo） */
+  --brand-hover:   #047857;
+  --brand-active:  #065f46;
+  --brand-dim:     #d1fae5;   /* 主色浅底 */
+
+  --text:          #0f172a;
+  --text-dim:      #475569;
+  --text-faint:    #94a3b8;
+
+  --ok:            #059669;
+  --warn:          #d97706;
+  --danger:        #dc2626;
+
+  /* 图表配色（分类序列，按顺序取用，避免自创） */
+  --c1: #059669;
+  --c2: #0891b2;
+  --c3: #7c3aed;
+  --c4: #d97706;
+  --c5: #db2777;
+  --grid: #e2e8f0;
+
+  /* ---------- 2. 排版尺度（不要自创） ---------- */
+  --fs-xs:  12px;
+  --fs-sm:  14px;
+  --fs-md:  16px;
+  --fs-lg:  20px;
+  --fs-xl:  28px;
+  --fs-2xl: 36px;   /* 仅用于 KPI 数值 */
+  --lh:     1.5;
+  --fw-bold: 600;
+
+  /* ---------- 3. 间距 / 圆角 / 阴影 ---------- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
+
+  --shadow:    0 1px 3px rgb(15 23 42 / 0.08), 0 1px 2px rgb(15 23 42 / 0.04);
+  --shadow-lg: 0 10px 24px rgb(15 23 42 / 0.10);
+
+  --transition: 160ms ease;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-size: var(--fs-md);
+  line-height: var(--lh);
+  font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+/* ---------- 4. 页面骨架 ---------- */
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  padding: var(--sp-3) var(--sp-6);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.topbar__title { margin: 0; font-size: var(--fs-lg); font-weight: var(--fw-bold); }
+.topbar__meta  { color: var(--text-dim); font-size: var(--fs-sm); }
+
+.page {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: var(--sp-6) var(--sp-4);
+}
+
+/* KPI 行：等宽自适应，窄屏折行 */
+.kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: var(--sp-4);
+  margin-bottom: var(--sp-6);
+}
+
+/* 图表区：主图 + 侧图 */
+.chart-grid {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: var(--sp-4);
+}
+@media (max-width: 900px) {
+  .chart-grid { grid-template-columns: 1fr; }
+}
+
+/* ---------- 5. 成品组件：直接套 class ---------- */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow);
+  padding: var(--sp-4);
+}
+.card__title {
+  margin: 0 0 var(--sp-3);
+  font-size: var(--fs-md);
+  font-weight: var(--fw-bold);
+}
+.card__sub { margin: 0 0 var(--sp-4); color: var(--text-dim); font-size: var(--fs-sm); }
+
+/* KPI 卡 */
+.kpi {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow);
+  padding: var(--sp-4);
+}
+.kpi__label { color: var(--text-dim); font-size: var(--fs-sm); }
+.kpi__value {
+  margin: var(--sp-2) 0 0;
+  font-size: var(--fs-2xl);
+  font-weight: var(--fw-bold);
+  line-height: 1.15;
+  font-variant-numeric: tabular-nums;   /* 数字等宽，防跳动 */
+}
+.kpi__delta { font-size: var(--fs-sm); margin-top: var(--sp-1); }
+.kpi__delta--up   { color: var(--ok); }
+.kpi__delta--down { color: var(--danger); }
+
+/* 数据表 */
+.table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
+.table th {
+  text-align: left;
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border-strong);
+  color: var(--text-dim);
+  font-weight: var(--fw-bold);
+  white-space: nowrap;
+}
+.table td {
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--border);
+}
+.table tbody tr:hover { background: var(--surface-2); }
+.table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* 筛选控件 */
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-4);
+}
+.input, .select {
+  min-height: 40px;
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  color: var(--text);
+  font-size: var(--fs-sm);
+  font-family: inherit;
+}
+.input:focus, .select:focus {
+  outline: 2px solid var(--brand);
+  outline-offset: 1px;
+  border-color: var(--brand);
+}
+
+/* 按钮（含三态） */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  min-height: 40px;                 /* 点击区不小于 40px */
+  padding: var(--sp-2) var(--sp-4);
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  background: var(--brand);
+  color: #ffffff;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-bold);
+  font-family: inherit;
+  cursor: pointer;
+  transition: background var(--transition);
+}
+.btn:hover    { background: var(--brand-hover); }
+.btn:active   { background: var(--brand-active); }
+.btn:disabled { background: var(--border); color: var(--text-faint); cursor: not-allowed; }
+.btn--ghost   { background: transparent; border-color: var(--border-strong); color: var(--text); }
+.btn--ghost:hover { background: var(--surface-2); }
+
+/* 徽章 / 状态 */
+.badge {
+  display: inline-block;
+  padding: 2px var(--sp-2);
+  border-radius: var(--r-sm);
+  background: var(--brand-dim);
+  color: var(--brand-active);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-bold);
+}
+.badge--warn   { background: #fef3c7; color: #92400e; }
+.badge--danger { background: #fee2e2; color: #991b1b; }
+
+/* 进度条 */
+.bar { height: 8px; background: var(--surface-2); border-radius: 999px; overflow: hidden; }
+.bar__fill { height: 100%; background: var(--brand); border-radius: 999px; transition: width var(--transition); }
+
+/* 图例 */
+.legend { display: flex; flex-wrap: wrap; gap: var(--sp-3); font-size: var(--fs-xs); color: var(--text-dim); }
+.legend__dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: var(--sp-1); }

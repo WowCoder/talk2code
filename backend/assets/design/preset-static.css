@@ -1,0 +1,269 @@
+/* ============================================================
+   preset-static.css —— 静态内容页的成品样式基线（浅色）
+   适用：个人名片 / 个人主页 / 作品集 / 博客文章 / 关于页 / 介绍页
+   ------------------------------------------------------------
+   用法：以本文件作为样式起点再改，不要从零写 CSS。
+   规则：颜色只取下面定义的 CSS 变量；字号/间距/圆角只取定义的档位。
+   主色 = 靛青偏青（#0e7490），刻意避开 indigo(#6366f1)/purple 系。
+   渐变背景若被要求，只允许用 --grad-* 里定义的（冷青 / 暖砂），
+   禁止紫蓝渐变（AI 默认色的标志）。
+   ============================================================ */
+
+:root {
+  /* ---------- 1. 调色板（含 hover / active / disabled 三态） ---------- */
+  --bg:            #ffffff;
+  --surface:       #ffffff;
+  --surface-2:     #f6f8fa;
+  --border:        #e4e9ef;
+
+  --brand:         #0e7490;   /* 主色（青，非 indigo） */
+  --brand-hover:   #155e75;
+  --brand-active:  #164e63;
+  --brand-dim:     #cffafe;
+
+  --ink:           #0d1520;   /* 标题近黑 */
+  --text:          #26313d;   /* 正文 */
+  --text-dim:      #5c6b7a;
+  --text-faint:    #93a1ae;
+
+  --ok:            #15803d;
+  --warn:          #b45309;
+
+  /* 允许的渐变（用户明确要求渐变背景时只从这里取） */
+  --grad-cool:  linear-gradient(135deg, #0e7490 0%, #155e75 100%);   /* 冷青 */
+  --grad-warm:  linear-gradient(135deg, #b45309 0%, #92400e 100%);   /* 暖砂 */
+  --grad-soft:  linear-gradient(180deg, #f6f8fa 0%, #ffffff 100%);   /* 极浅 */
+
+  /* ---------- 2. 排版尺度（不要自创） ---------- */
+  --fs-xs:  12px;
+  --fs-sm:  14px;
+  --fs-md:  16px;
+  --fs-lg:  20px;
+  --fs-xl:  28px;
+  --fs-2xl: 38px;
+  --lh:     1.7;          /* 阅读型页面行高放宽 */
+  --lh-tight: 1.2;
+  --fw-bold: 700;
+  --fw-mid:  600;
+
+  /* ---------- 3. 间距 / 圆角 / 阴影 ---------- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-12: 48px;
+  --sp-16: 64px;
+
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 16px;
+  --r-full: 999px;
+
+  --shadow:    0 1px 3px rgb(13 21 32 / 0.06);
+  --shadow-lg: 0 12px 28px rgb(13 21 32 / 0.10);
+
+  --measure: 68ch;        /* 正文最佳阅读宽度 */
+  --transition: 170ms ease;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-size: var(--fs-md);
+  line-height: var(--lh);
+  font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------- 4. 页面骨架 ---------- */
+
+/* 居中卡片式页面（个人名片 / 关于页） */
+.center-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-8) var(--sp-4);
+  background: var(--grad-soft);
+}
+
+/* 常规内容页（文章 / 作品集） */
+.page { max-width: 860px; margin: 0 auto; padding: var(--sp-12) var(--sp-4); }
+
+/* ---------- 5. 成品组件：直接套 class ---------- */
+
+/* 个人名片 */
+.profile-card {
+  width: 100%;
+  max-width: 420px;
+  padding: var(--sp-8);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-lg);
+  text-align: center;
+}
+/* 需要渐变背景时：给 .profile-card--grad 并配 --grad-cool / --grad-warm */
+.profile-card--grad { background: var(--grad-cool); border-color: transparent; color: #ffffff; }
+.profile-card--grad .profile-card__role,
+.profile-card--grad .profile-card__bio { color: rgb(255 255 255 / 0.85); }
+
+.profile-card__avatar {
+  width: 96px; height: 96px;
+  margin: 0 auto var(--sp-4);
+  border-radius: var(--r-full);
+  object-fit: cover;
+  background: var(--brand-dim);
+  color: var(--brand-active);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--fs-xl);
+  font-weight: var(--fw-bold);
+  box-shadow: var(--shadow);
+}
+.profile-card__name { margin: 0 0 var(--sp-1); font-size: var(--fs-xl); font-weight: var(--fw-bold); color: inherit; }
+.profile-card__role { margin: 0 0 var(--sp-4); font-size: var(--fs-sm); color: var(--text-dim); letter-spacing: 0.02em; }
+.profile-card__bio  { margin: 0 0 var(--sp-6); font-size: var(--fs-sm); color: var(--text-dim); }
+.profile-card__links { display: flex; justify-content: center; flex-wrap: wrap; gap: var(--sp-2); }
+
+/* 标签 / 技能点 */
+.tag {
+  display: inline-block;
+  padding: 2px var(--sp-3);
+  border-radius: var(--r-full);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+}
+.tag--brand { background: var(--brand-dim); border-color: transparent; color: var(--brand-active); }
+
+/* 按钮（含三态） */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;                 /* 点击区不小于 44px */
+  padding: 0 var(--sp-4);
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  background: var(--brand);
+  color: #ffffff;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-mid);
+  font-family: inherit;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background var(--transition);
+}
+.btn:hover  { background: var(--brand-hover); }
+.btn:active { background: var(--brand-active); }
+.btn:disabled { background: var(--border); color: var(--text-faint); cursor: not-allowed; }
+.btn--ghost { background: transparent; border-color: var(--border); color: var(--text); }
+.btn--ghost:hover { background: var(--surface-2); }
+.btn--on-grad { background: rgb(255 255 255 / 0.16); border-color: rgb(255 255 255 / 0.5); color: #ffffff; }
+.btn--on-grad:hover { background: rgb(255 255 255 / 0.26); }
+
+/* ---------- 6. 阅读型排版（文章页） ---------- */
+.article__title {
+  margin: 0 0 var(--sp-3);
+  font-size: var(--fs-2xl);
+  line-height: var(--lh-tight);
+  font-weight: var(--fw-bold);
+  color: var(--ink);
+  letter-spacing: -0.01em;
+}
+.article__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-8);
+  padding-bottom: var(--sp-4);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+}
+.article__body { max-width: var(--measure); }
+.article__body p { margin: 0 0 var(--sp-4); }
+.article__body h2 {
+  margin: var(--sp-8) 0 var(--sp-3);
+  font-size: var(--fs-xl);
+  line-height: var(--lh-tight);
+  color: var(--ink);
+}
+.article__body h3 { margin: var(--sp-6) 0 var(--sp-2); font-size: var(--fs-lg); color: var(--ink); }
+.article__body ul, .article__body ol { margin: 0 0 var(--sp-4); padding-left: var(--sp-6); }
+.article__body li { margin-bottom: var(--sp-1); }
+.article__body a { color: var(--brand); text-underline-offset: 3px; }
+.article__body code {
+  padding: 2px var(--sp-1);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  font-size: 0.92em;
+}
+.article__body pre {
+  margin: 0 0 var(--sp-4);
+  padding: var(--sp-4);
+  overflow-x: auto;
+  background: #0d1520;
+  color: #e6edf3;
+  border-radius: var(--r-md);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+}
+.article__body pre code { padding: 0; background: none; border: none; color: inherit; }
+
+/* 引用块：左侧实线 + 斜体，不用彩色圆角气泡 */
+.article__body blockquote {
+  margin: var(--sp-6) 0;
+  padding: var(--sp-2) 0 var(--sp-2) var(--sp-6);
+  border-left: 3px solid var(--brand);
+  color: var(--text-dim);
+  font-style: italic;
+}
+.article__body blockquote p:last-child { margin-bottom: 0; }
+
+/* 作者信息 */
+.author {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin-top: var(--sp-8);
+  padding-top: var(--sp-6);
+  border-top: 1px solid var(--border);
+}
+.author__avatar {
+  width: 44px; height: 44px;
+  flex: 0 0 auto;
+  border-radius: var(--r-full);
+  background: var(--brand-dim);
+  color: var(--brand-active);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: var(--fw-bold);
+}
+.author__name { font-weight: var(--fw-mid); color: var(--ink); }
+.author__desc { font-size: var(--fs-sm); color: var(--text-dim); }
+
+/* 分隔线 */
+.divider { height: 1px; background: var(--border); border: none; margin: var(--sp-8) 0; }
+
+/* 空状态 */
+.empty {
+  padding: var(--sp-8) var(--sp-4);
+  text-align: center;
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+  background: var(--surface-2);
+  border: 1px dashed var(--border);
+  border-radius: var(--r-lg);
+}

@@ -1,0 +1,200 @@
+/* ============================================================
+   preset-game.css —— 棋盘 / 休闲小游戏的成品样式基线
+   ------------------------------------------------------------
+   用法：以本文件作为样式起点再改，不要从零写 CSS。
+   规则：颜色只取下面定义的 CSS 变量；字号/间距/圆角只取定义的档位。
+   本文件由设计基线维护，不需要逐条理解，直接套用即可。
+   ============================================================ */
+
+:root {
+  /* ---------- 1. 调色板（含 hover / active / disabled 三态） ---------- */
+  --bg:            #0f172a;   /* 页面底色 */
+  --surface:       #1e293b;   /* 卡片 / 面板 */
+  --surface-2:     #334155;   /* 悬浮层 / 输入框 */
+  --border:        #475569;
+
+  --brand:         #38bdf8;   /* 主色（青蓝，非 indigo） */
+  --brand-hover:   #0ea5e9;
+  --brand-active:  #0284c7;
+  --brand-dim:     #0c4a6e;   /* 主色的深色底 */
+
+  --text:          #f1f5f9;
+  --text-dim:      #94a3b8;
+  --text-faint:    #64748b;
+
+  --ok:            #34d399;   /* 成功 / 玩家一 */
+  --warn:          #fbbf24;   /* 提示 */
+  --danger:        #fb7185;   /* 失败 / 玩家二 */
+  --danger-hover:  #f43f5e;
+
+  /* 棋盘专用（木色系，与冷色背景形成对比） */
+  --board-bg:      #d9a066;
+  --board-line:    #8b5a2b;
+  --piece-a:       #1f2937;   /* 黑子 */
+  --piece-b:       #f8fafc;   /* 白子 */
+
+  /* ---------- 2. 排版尺度（4 档，不要自创） ---------- */
+  --fs-xs:  12px;
+  --fs-sm:  14px;
+  --fs-md:  16px;
+  --fs-lg:  24px;
+  --fs-xl:  32px;
+  --lh:     1.6;
+  --fw-bold: 600;
+
+  /* ---------- 3. 间距 / 圆角 / 阴影 ---------- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 16px;
+
+  --shadow:    0 4px 12px rgb(0 0 0 / 0.35);
+  --shadow-lg: 0 8px 24px rgb(0 0 0 / 0.45);
+
+  --transition: 160ms ease;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-size: var(--fs-md);
+  line-height: var(--lh);
+  font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+/* ---------- 4. 成品组件：直接套 class ---------- */
+
+/* 布局：主区 + 侧栏 */
+.layout {
+  display: flex;
+  gap: var(--sp-6);
+  align-items: flex-start;
+  justify-content: center;
+  padding: var(--sp-8) var(--sp-4);
+  max-width: 1100px;
+  margin: 0 auto;
+}
+@media (max-width: 820px) {
+  .layout { flex-direction: column; align-items: center; }
+}
+
+/* 面板 */
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: var(--sp-4);
+  box-shadow: var(--shadow);
+}
+.panel__title {
+  margin: 0 0 var(--sp-3);
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-bold);
+}
+
+/* 按钮（含三态） */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-4);
+  min-height: 40px;               /* 点击区不小于 40px */
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  background: var(--brand);
+  color: #06212e;                 /* 深字配亮底，保证对比度 */
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-bold);
+  cursor: pointer;
+  transition: background var(--transition), transform var(--transition);
+}
+.btn:hover       { background: var(--brand-hover); }
+.btn:active      { background: var(--brand-active); transform: translateY(1px); }
+.btn:disabled    { background: var(--surface-2); color: var(--text-faint); cursor: not-allowed; }
+.btn--ghost      { background: transparent; border-color: var(--border); color: var(--text); }
+.btn--ghost:hover{ background: var(--surface-2); }
+.btn--danger     { background: var(--danger); color: #2a0a12; }
+.btn--danger:hover { background: var(--danger-hover); }
+
+/* 棋盘容器 */
+.board {
+  background: var(--board-bg);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-lg);
+  padding: var(--sp-3);
+  display: block;
+}
+.board--grid {
+  display: grid;                  /* 井字棋 / 2048 等格子游戏用 */
+  gap: 2px;
+  background: var(--board-line);
+}
+.cell {
+  background: var(--board-bg);
+  border: none;
+  aspect-ratio: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background var(--transition);
+}
+.cell:hover { background: #e6b17a; }
+
+/* 棋子 */
+.piece {
+  width: 80%;
+  height: 80%;
+  border-radius: 50%;
+  box-shadow: 0 2px 4px rgb(0 0 0 / 0.3);
+}
+.piece--a { background: var(--piece-a); }
+.piece--b { background: var(--piece-b); }
+
+/* 计分板 */
+.scoreboard {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  min-width: 200px;
+}
+.score {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--surface-2);
+  border-radius: var(--r-md);
+  font-size: var(--fs-sm);
+}
+.score__value { font-size: var(--fs-lg); font-weight: var(--fw-bold); }
+
+/* 徽章（当前回合 / 状态提示） */
+.badge {
+  display: inline-block;
+  padding: 2px var(--sp-2);
+  border-radius: var(--r-sm);
+  background: var(--brand-dim);
+  color: var(--brand);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-bold);
+}
+.badge--ok   { background: rgb(52 211 153 / 0.15); color: var(--ok); }
+.badge--warn { background: rgb(251 191 36 / 0.15); color: var(--warn); }
+
+/* 提示文本 */
+.hint {
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+}

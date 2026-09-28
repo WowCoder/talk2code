@@ -1720,3 +1720,355 @@ def _run_universal_smoke_session(html_path: Path, timeout_ms: int = 15_000, prev
     for name, ok in result["checks"].items():
         result["logs"].append(f"[smoke] {name}: {'✅' if ok else '❌'}")
     return result
+
+
+# ==================== 视觉证据提取（DOM + 计算样式） ====================
+
+_EXTRACT_JS = r"""
+() => {
+  const res = {
+    bg: '', fg: '', fontSizes: [], textColors: [], smallTargets: [],
+    hasHover: false, hasFocus: false, domOutline: [], textLength: 0,
+    cssVarCount: 0, inlineStyleCount: 0
+  };
+  const bodyCS = getComputedStyle(document.body);
+  res.bg = bodyCS.backgroundColor;
+  res.fg = bodyCS.color;
+
+  const sizes = new Set(), colors = new Set();
+  document.querySelectorAll('body *').forEach(el => {
+    const s = getComputedStyle(el);
+    const txt = (el.textContent || '').trim();
+    // 只统计叶子节点上的文字，避免父容器字号重复计数
+    if (txt && el.children.length === 0) {
+      sizes.add(s.fontSize);
+      colors.add(s.color);
+    }
+    if (el.getAttribute && el.getAttribute('style')) res.inlineStyleCount++;
+  });
+  res.fontSizes = Array.from(sizes).slice(0, 12);
+  res.textColors = Array.from(colors).slice(0, 12);
+
+  document.querySelectorAll('button, a, [role=button], input[type=button], input[type=submit]').forEach(el => {
+    const r = el.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0 && (r.width < 44 || r.height < 44)) {
+      res.smallTargets.push({
+        tag: el.tagName.toLowerCase(),
+        w: Math.round(r.width), h: Math.round(r.height),
+        text: (el.textContent || '').trim().slice(0, 20)
+      });
+    }
+  });
+  res.smallTargets = res.smallTargets.slice(0, 8);
+
+  try {
+    for (const sheet of document.styleSheets) {
+      let rules;
+      try { rules = sheet.cssRules; } catch (e) { continue; }
+      for (const rule of rules) {
+        const sel = rule.selectorText || '';
+        if (sel.includes(':hover')) res.hasHover = true;
+        if (sel.includes(':focus') || sel.includes(':focus-visible')) res.hasFocus = true;
+        if (rule.style) {
+          for (let i = 0; i < rule.style.length; i++) {
+            if (rule.style[i].startsWith('--')) { res.cssVarCount++; break; }
+          }
+        }
+      }
+    }
+  } catch (e) {}
+
+  const outline = [];
+  document.querySelectorAll('body > *, body > * > *').forEach(el => {
+    let cls = '';
+    if (typeof el.className === 'string' && el.className.trim()) {
+      cls = '.' + el.className.trim().split(/\s+/).slice(0, 2).join('.');
+    }
+    outline.push(el.tagName.toLowerCase() + cls);
+  });
+  res.domOutline = outline.slice(0, 30);
+  res.textLength = (document.body.innerText || '').length;
+  return res;
+}
+"""
+
+
+def _parse_rgb(value: str):
+    """把 'rgb(r, g, b)' / 'rgba(r, g, b, a)' 解析为 (r, g, b)，失败返回 None。"""
+    if not value or not isinstance(value, str):
+        return None
+    nums = ''.join(ch if (ch.isdigit() or ch in ',.() ') else ' ' for ch in value)
+    parts = [p for p in nums.replace('(', ' ').replace(')', ' ').split(',') if p.strip()]
+    try:
+        if len(parts) >= 3:
+            return tuple(max(0, min(255, int(float(p)))) for p in parts[:3])
+    except (ValueError, TypeError):
+        return None
+    return None
+
+
+def _contrast_ratio(fg: str, bg: str):
+    """按 WCAG 计算前景/背景对比度，返回比值（失败返回 None）。
+
+    这些值是**确定性**的（getComputedStyle 读出来的），比让模型看截图猜更准，
+    而且能直接作为可判定缺陷进入修复循环。
+    """
+    f, b = _parse_rgb(fg), _parse_rgb(bg)
+    if not f or not b:
+        return None
+
+    def lum(c):
+        def ch(v):
+            v = v / 255.0
+            return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+        return 0.2126 * ch(c[0]) + 0.7152 * ch(c[1]) + 0.0722 * ch(c[2])
+
+    l1, l2 = lum(f), lum(b)
+    hi, lo = max(l1, l2), min(l1, l2)
+    return round((hi + 0.05) / (lo + 0.05), 2)
+
+
+def _format_dom_css_summary(raw: dict) -> str:
+    """把浏览器提取结果格式化为给 evaluator 看的紧凑文本（≤2K token）。"""
+    if not raw:
+        return ""
+    lines = ["## 页面视觉结构（DOM + 计算样式，浏览器确定性取值，非猜测）"]
+
+    bg, fg = raw.get("bg", ""), raw.get("fg", "")
+    ratio = _contrast_ratio(fg, bg)
+    lines.append(f"- 页面底色: {bg}；正文色: {fg}")
+    if ratio is not None:
+        verdict = "合格" if ratio >= 4.5 else ("偏低（大字可接受）" if ratio >= 3 else "不合格")
+        lines.append(f"- 正文对比度: {ratio}:1 —— {verdict}（WCAG AA 正文需 ≥4.5:1）")
+
+    sizes = raw.get("fontSizes") or []
+    if sizes:
+        px = sorted({int(float(s.replace('px', ''))) for s in sizes if 'px' in s})
+        lines.append(f"- 字号档位: {px} px（共 {len(sizes)} 种；最小 {min(px) if px else '-'}px）")
+        if px and min(px) < 12:
+            lines.append(f"  ⚠️ 存在小于 12px 的字号（{min(px)}px），移动端可读性差")
+
+    colors = raw.get("textColors") or []
+    if colors:
+        lines.append(f"- 文字颜色: {len(colors)} 种 —— {', '.join(colors[:8])}")
+
+    outline = raw.get("domOutline") or []
+    if outline:
+        lines.append(f"- 页面结构: {' › '.join(outline[:18])}")
+
+    lines.append(f"- 正文文本量: {raw.get('textLength', 0)} 字符")
+    lines.append(
+        f"- 交互反馈: hover 样式 {'有' if raw.get('hasHover') else '❌ 无'}"
+        f"；focus 样式 {'有' if raw.get('hasFocus') else '❌ 无'}"
+        f"；CSS 变量 {raw.get('cssVarCount', 0)} 处"
+        f"；内联 style {raw.get('inlineStyleCount', 0)} 处"
+    )
+    small = raw.get("smallTargets") or []
+    if small:
+        shown = "; ".join(f"{t['tag']}({t['w']}×{t['h']})" for t in small[:5])
+        lines.append(f"- ⚠️ 点击区偏小（<44px）: {len(small)} 个 —— {shown}")
+
+    return "\n".join(lines)
+
+
+def extract_dom_css_summary(html_path: Path, timeout_ms: int = 12_000,
+                            preview_url: str = None,
+                            return_raw: bool = False) -> "str | dict | None":
+    """提取页面 DOM 结构 + 关键计算样式，作为 ui_quality 评估的视觉证据。
+
+    为什么不用截图：颜色对比度、字号、间距、点击区这些从 getComputedStyle 读是
+    **确定值**，从截图看是模型猜测。而且这些数值能直接变成可判定缺陷
+    （对比度 <4.5:1、字号 <12px、点击区 <44px）进入修复循环，截图做不到。
+
+    Args:
+        return_raw: True 时返回原始提取字典（供 build_ui_lint_defects 判定硬违规），
+                    False 时返回格式化文本（供 evaluator prompt 注入）。
+
+    Returns:
+        格式化文本 / 原始字典；浏览器不可用等失败时返回 None（不抛异常）。
+    """
+    def _session(html_path, timeout_ms, preview_url):
+        try:
+            from harness.tools.sandboxed_browser import sandboxed_browser
+        except ImportError:
+            return None
+        url = Path(html_path).resolve().as_uri()
+        sandbox, wrapper_uri, wrapper_tmp = _prepare_sandbox(preview_url)
+        try:
+            from playwright.sync_api import Error as PWError
+            with sandboxed_browser(
+                timeout_ms=_watchdog_ms(timeout_ms, 2),
+                allow_hosts=_preview_allow_hosts(preview_url),
+            ) as browser:
+                try:
+                    context = browser.new_context(viewport={"width": 1280, "height": 800})
+                    page = context.new_page()
+                    page.set_extra_http_headers({"X-T2C-Verify": "1"})
+                    page.set_default_timeout(timeout_ms)
+                    target = page
+                    if sandbox:
+                        page.goto(wrapper_uri, wait_until="domcontentloaded", timeout=timeout_ms)
+                        page.wait_for_timeout(1500)
+                        target = _resolve_preview_frame(page) or page
+                        if _frame_load_failure(target):
+                            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                            page.wait_for_timeout(1200)
+                            target = page
+                    else:
+                        page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                        page.wait_for_timeout(1200)
+                    raw = target.evaluate(_EXTRACT_JS)
+                    if not raw:
+                        return None
+                    return raw if return_raw else _format_dom_css_summary(raw)
+                finally:
+                    browser.close()
+        except PWError as e:
+            logger.warning(f"[DomCss] 浏览器不可用，跳过视觉提取: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"[DomCss] 视觉提取失败（跳过）: {e}")
+            return None
+        finally:
+            if wrapper_tmp:
+                try:
+                    import os as _os
+                    _os.unlink(wrapper_tmp)
+                except OSError:
+                    pass
+
+    budget = _watchdog_ms(timeout_ms, 2) / 1000.0 + _SESSION_BUDGET_SLACK_S
+    try:
+        return run_browser_session_isolated(
+            _session, budget, html_path, timeout_ms=timeout_ms, preview_url=preview_url,
+        )
+    except BrowserSessionTimeout as e:
+        logger.warning("[DomCss] 视觉提取会话超时（跳过）: %s", e)
+        return None
+
+
+# ==================== UI 硬违规 → 确定性缺陷 ====================
+
+# 阈值刻意取「宽松下限」而非 WCAG AA 的推荐值，避免把正常设计判成缺陷：
+#   · 对比度 3.0   —— AA 对大字号的下限；低于它连大字都不合格，属硬伤
+#   · 点击区 24px  —— WCAG 2.2 AA 的最小目标尺寸（44px 是 AAA/触屏建议，不作硬门槛）
+#   · 字号   10px  —— 低于 10px 在任何设备上都难以阅读
+# 目的是让「明显不合格」能进修复循环，而不是把评审变成无休止的挑刺。
+_UI_CONTRAST_HARD_MIN = 3.0
+_UI_TARGET_HARD_MIN = 24
+_UI_FONT_HARD_MIN = 10
+_UI_LINT_MAX_DEFECTS = 2
+
+
+def build_ui_lint_defects(raw) -> list:
+    """把浏览器提取的确定性视觉数据转成可修复的缺陷条目。
+
+    背景：预置成品模板（`.design/preset-*.css`）只是「建议」，即便模型完全没按模板
+    走，此前也没有任何环节会发现 —— evaluator 的 ui_quality 是盲评，页面难看也不会
+    阻塞交付，于是模板收益被削掉大半。这里把视觉硬伤变成**确定性缺陷**送入
+    defect_repair，让「不好看」第一次具备了可判定、可修复的闭环。
+
+    只挑三类硬伤，且最多 2 条（避免把修复预算耗在审美分歧上）。
+
+    Args:
+        raw: extract_dom_css_summary(..., return_raw=True) 的返回值。
+
+    Returns:
+        缺陷 dict 列表（可能为空）。任何异常都吞掉并返回空列表 —— 视觉 lint 属于
+        增益功能，绝不允许它把验收流程搞崩。
+    """
+    if not isinstance(raw, dict):
+        return []
+    defects: list = []
+    try:
+        # ---- 1. 正文对比度低于硬下限 ----
+        ratio = _contrast_ratio(raw.get("fg", ""), raw.get("bg", ""))
+        if ratio is not None and ratio < _UI_CONTRAST_HARD_MIN:
+            defects.append({
+                "type": "ui_contrast",
+                "severity": "major",
+                "dimension": "ui_quality",
+                "message": (
+                    f"正文与背景对比度仅 {ratio}:1，低于可读下限 "
+                    f"{_UI_CONTRAST_HARD_MIN}:1（WCAG AA）"
+                ),
+                "evidence": (
+                    f"浏览器实测 getComputedStyle：正文色 {raw.get('fg')}，"
+                    f"页面底色 {raw.get('bg')} → 对比度 {ratio}:1"
+                ),
+                "suggestion": (
+                    "在 CSS 里调整正文色或页面底色，使对比度 ≥ 4.5:1；"
+                    "若已套用 .design/ 下的成品模板，直接改用模板变量"
+                    "（--text 配 --bg）即可满足。"
+                ),
+            })
+
+        # ---- 2. 点击区小于最小可点尺寸 ----
+        small = [
+            t for t in (raw.get("smallTargets") or [])
+            if int(t.get("w", 99)) < _UI_TARGET_HARD_MIN
+            or int(t.get("h", 99)) < _UI_TARGET_HARD_MIN
+        ]
+        if small:
+            shown = "; ".join(f"{t.get('tag')}({t.get('w')}×{t.get('h')})" for t in small[:4])
+            defects.append({
+                "type": "ui_target_size",
+                "severity": "major",
+                "dimension": "ui_quality",
+                "message": (
+                    f"{len(small)} 个可点击元素的尺寸小于 "
+                    f"{_UI_TARGET_HARD_MIN}×{_UI_TARGET_HARD_MIN}px"
+                ),
+                "evidence": f"浏览器实测 boundingClientRect：{shown}",
+                "suggestion": (
+                    f"给按钮/链接设置 min-width / min-height ≥ {_UI_TARGET_HARD_MIN}px"
+                    "（模板里的 .btn 已满足），图标按钮加 padding。"
+                ),
+            })
+
+        # ---- 3. 字号过小 ----
+        px = []
+        for s in (raw.get("fontSizes") or []):
+            try:
+                px.append(int(float(str(s).replace("px", ""))))
+            except (TypeError, ValueError):
+                continue
+        if px and min(px) < _UI_FONT_HARD_MIN:
+            defects.append({
+                "type": "ui_font_size",
+                "severity": "major",
+                "dimension": "ui_quality",
+                "message": f"存在 {min(px)}px 的字号，低于可读下限 {_UI_FONT_HARD_MIN}px",
+                "evidence": f"浏览器实测字号档位: {sorted(set(px))} px",
+                "suggestion": (
+                    "把过小字号提到模板的字号档位上（--fs-xs = 12px 为最小档），"
+                    "正文用 --fs-md(16px)。"
+                ),
+            })
+    except Exception as e:
+        logger.warning(f"[UiLint] 视觉硬伤判定失败（跳过）: {e}")
+        return []
+
+    return defects[:_UI_LINT_MAX_DEFECTS]
+
+
+def collect_ui_lint_defects(html_path: Path, timeout_ms: int = 12_000,
+                            preview_url: str = None) -> list:
+    """采集页面视觉硬伤（自成一次浏览器会话）。
+
+    会话成本约 5~12s，换来的是「UI 不合格」第一次能进修复循环。
+    任何失败都返回空列表 —— 视觉 lint 是增益功能，不允许中断验收。
+    """
+    try:
+        raw = extract_dom_css_summary(
+            html_path, timeout_ms=timeout_ms, preview_url=preview_url, return_raw=True,
+        )
+    except Exception as e:
+        logger.warning(f"[UiLint] 采集失败（跳过）: {e}")
+        return []
+    defects = build_ui_lint_defects(raw)
+    if defects:
+        logger.info(
+            f"[UiLint] 发现 {len(defects)} 个视觉硬伤: {[d['type'] for d in defects]}"
+        )
+    return defects
