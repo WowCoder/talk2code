@@ -166,6 +166,15 @@
   .video-card video{width:100%;display:block;background:#000;aspect-ratio:16/9;object-fit:cover}
   .video-note{margin:22px auto 0;max-width:760px;font-size:14px;color:var(--muted);text-align:center}
   .video-note b{color:var(--ink);font-weight:600}
+  .video-stage{position:relative;line-height:0}
+  .video-stage .play-btn{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+    width:78px;height:78px;border:0;border-radius:50%;cursor:pointer;line-height:1;
+    background:rgba(12,12,16,.72);box-shadow:0 6px 24px rgba(0,0,0,.35);
+    display:flex;align-items:center;justify-content:center;color:#fff;
+    transition:transform .18s ease,background .18s ease}
+  .video-stage .play-btn:hover{transform:translate(-50%,-50%) scale(1.06);background:rgba(12,12,16,.88)}
+  .video-stage .play-btn svg{width:30px;height:30px;margin-left:4px}
+  .video-stage.playing .play-btn{display:none}
 
   /* ---------- cards ---------- */
   .grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
@@ -435,15 +444,20 @@
   <div class="wrap center">
     <span class="eyebrow">端到端演示</span>
     <h2>75 秒看完整流程</h2>
-    <p class="sec-lead">从一句话需求，到验收通过、可以发给别人打开的应用——全程真实录屏，可复现。</p>
+    <p class="sec-lead">从一句话需求，到验收通过、可以发给别人打开的应用——全程真实录屏，可复现。点击播放，带旁白解说。</p>
     <div class="video-card rv">
       <div class="video-bar">
         <i style="background:#FF5F57"></i><i style="background:#FEBC2E"></i><i style="background:#28C840"></i>
         <span class="t">talk2code · 输入需求 → 生成 → 验收 → 放行</span>
       </div>
-      <video src="assets/talk2code_pitch.mp4" poster="assets/talk2code_pitch_poster.jpg"
-             autoplay muted loop playsinline preload="metadata"
-             aria-label="Talk2Code 端到端演示录屏"></video>
+      <div class="video-stage">
+        <video src="assets/talk2code_pitch.mp4" poster="assets/talk2code_pitch_poster.jpg"
+               controls playsinline preload="metadata"
+               aria-label="Talk2Code 端到端演示录屏"></video>
+        <button class="play-btn" type="button" aria-label="播放演示视频（含旁白解说）">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+        </button>
+      </div>
     </div>
     <p class="video-note">
       流程说明：<b>输入一句话需求</b> → 技术负责人拆解方案与验收条件 → 开发工程师批量产出文件
@@ -726,16 +740,23 @@
     rvs.forEach(function (el) { el.classList.add('in'); });
   }
 
-  // 视频进入视口才播放，离开暂停（省带宽）
-  var v = document.querySelector('video');
-  if (v && 'IntersectionObserver' in window) {
-    var vio = new IntersectionObserver(function (entries) {
-      entries.forEach(function (e) {
-        if (e.isIntersecting) { v.play().catch(function () {}); }
-        else { v.pause(); }
-      });
-    }, { threshold: 0.25 });
-    vio.observe(v);
+  // 点击才播（带声音），不再自动静音循环；滚出视口才暂停，回来不自动恢复
+  var stage = document.querySelector('.video-stage');
+  var v = stage && stage.querySelector('video');
+  if (v) {
+    var btn = stage.querySelector('.play-btn');
+    btn.addEventListener('click', function () { v.play().catch(function () { }); });
+    v.addEventListener('play', function () { stage.classList.add('playing'); });
+    v.addEventListener('pause', function () { stage.classList.remove('playing'); });
+    v.addEventListener('ended', function () { stage.classList.remove('playing'); });
+    if ('IntersectionObserver' in window) {
+      var vio = new IntersectionObserver(function (entries) {
+        entries.forEach(function (e) {
+          if (!e.isIntersecting && !v.paused) { v.pause(); }
+        });
+      }, { threshold: 0.25 });
+      vio.observe(v);
+    }
   }
 </script>
 </body>
