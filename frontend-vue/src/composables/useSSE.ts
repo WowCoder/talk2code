@@ -3,6 +3,7 @@ import { useRequirementStore, emptyProgress } from '@/stores/requirement'
 import { usePreviewStore } from '@/stores/preview'
 import { useAuthStore } from '@/stores/auth'
 import router from '@/router'
+import type { RequirementStatus } from '@/types/api'
 import type {
   SSEDialogueData,
   SSECodeData,
@@ -31,6 +32,14 @@ import type {
 const INITIAL_RETRY_DELAY = 1000
 const MAX_RETRY_DELAY = 30000
 const MAX_RETRIES = 10
+
+/** complete 事件允许下发的终态（与后端 requirement.status 的终态取值一致） */
+const TERMINAL_STATUSES: RequirementStatus[] = [
+  'finished',
+  'finished_with_issues',
+  'needs_user_input',
+  'failed',
+]
 
 export function useSSE(reqId: Ref<number | null>) {
   const store = useRequirementStore()
@@ -280,6 +289,15 @@ export function useSSE(reqId: Ref<number | null>) {
       const data: SSECompleteData = JSON.parse(e.data)
       store.isGenerating = false
       store.progress = { ...emptyProgress(), percent: 100 }
+      // 同步后端权威终态。不同步的话「发布」TAB 会一直不可点：它的门禁要求
+      // status === 'finished'，而 currentRequirement 是进页面时的 API 快照，
+      // 永远不会自己变成 finished —— 用户只能手动刷新页面才能发布（req 202）。
+      // 只接受终态白名单：中途态（processing 等）不该由 complete 事件下发，
+      // 收到就说明协议出问题，宁可不同步也不要让状态机乱跳。
+      if (data.status && store.currentRequirement
+          && TERMINAL_STATUSES.includes(data.status)) {
+        store.currentRequirement.status = data.status
+      }
       if (data.code_files) {
         data.code_files.forEach((f) => {
           store.codeFiles[f.filename] = f.content
@@ -318,7 +336,8 @@ export function useSSE(reqId: Ref<number | null>) {
       const data: SSESpecData = JSON.parse(e.data)
       store._specData = data
       // 记录 TL 分析消息的插入位置（spec 事件到达时，TL 消息已通过 dialogue 事件
-      // 追加到消息列表末尾，确认卡片应插入到它前面）
+      // 追加到消息列表末尾，length 即它之后一位 —— 确认卡片落在分析结果之后，
+      // 与后端落库位置一致）
       store._specInsertIndex = store.dialogueMessages.length
       // 如果已经确认过，不要覆盖为 needs_confirmation（刷新页面 SSE 重连时可能重放）
       if (store.planStatus !== 'confirmed') {

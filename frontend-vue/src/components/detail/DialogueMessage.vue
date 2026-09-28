@@ -20,23 +20,13 @@
     </div>
   </div>
 
-  <!-- 已确认开发计划卡片（特殊 user 消息，靠右展示） -->
+  <!-- 已确认开发计划卡片（特殊 user 消息，靠右展示）。
+       与待确认的浮层卡共用同一组件，只是切到 confirmed 态：
+       确认前后内容一字节不差，「已确认」是这张卡的状态而不是另做一张摘要。 -->
   <div v-else-if="msg.role === 'user' && msg.plan_confirmed" class="msg user">
-    <div class="pc-card">
-      <div class="pc-header">
-        <span class="pc-icon">🎯</span>
-        <span class="pc-title">开发计划已确认</span>
-        <span class="pc-badge" :class="planComplexityClass">{{ msg.plan_confirmed.complexity || 'S' }}</span>
-      </div>
-      <div v-if="msg.plan_confirmed.features?.length" class="pc-tags">
-        <span v-for="(f, i) in msg.plan_confirmed.features" :key="i" class="pc-tag">{{ f }}</span>
-      </div>
-      <div v-if="planTechStackText || msg.plan_confirmed.file_structure?.length" class="pc-meta">
-        <span v-if="planTechStackText">{{ planTechStackText }}</span>
-        <span v-if="msg.plan_confirmed.file_structure?.length">📄 {{ msg.plan_confirmed.file_structure.length }} 个文件</span>
-      </div>
+    <PlanSummaryCard :spec="msg.plan_confirmed" confirmed>
       <div class="pc-confirmed">✅ 已确认，开始编码</div>
-    </div>
+    </PlanSummaryCard>
   </div>
 
   <!-- User message -->
@@ -227,6 +217,7 @@ import ToolCallCard from './ToolCallCard.vue'
 import HookCheckCard from './HookCheckCard.vue'
 import QaAcCard from './QaAcCard.vue'
 import QaAcGroupCard from './QaAcGroupCard.vue'
+import PlanSummaryCard from './PlanSummaryCard.vue'
 import RichMessage from './RichMessage.vue'
 import CoderTurnCard from './CoderTurnCard.vue'
 
@@ -336,21 +327,7 @@ const qaStepLabel = computed(() => {
   return `${acId}${label}`
 })
 
-// plan_confirmed 卡片：技术栈摘要 & 复杂度徽章样式
-const planTechStackText = computed(() => {
-  const ts = props.msg.plan_confirmed?.tech_stack
-  if (!ts) return ''
-  const parts: string[] = []
-  if (ts.framework) parts.push(`框架: ${ts.framework}`)
-  if (ts.css) parts.push(`CSS: ${ts.css}`)
-  if (ts.storage) parts.push(`存储: ${ts.storage}`)
-  return parts.join(' · ')
-})
-
-const planComplexityClass = computed(() => {
-  const c = props.msg.plan_confirmed?.complexity || 'S'
-  return `complexity-${c.toLowerCase()}`
-})
+// plan_confirmed 卡片由 PlanSummaryCard 统一渲染（与待确认浮层共用同一外观）
 </script>
 
 <style scoped>
@@ -510,73 +487,7 @@ const planComplexityClass = computed(() => {
   line-height: 1.5;
 }
 
-/* ---- 已确认开发计划卡片（与 PlanConfirmation 卡片样式保持一致，完成态） ---- */
-.pc-card {
-  background: var(--surface);
-  border: 1px solid var(--accent);
-  border-radius: 12px;
-  border-bottom-right-radius: 6px;
-  padding: 16px;
-  opacity: 0.9;
-}
-
-.pc-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 10px;
-}
-
-.pc-icon {
-  font-size: 18px;
-}
-
-.pc-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--fg);
-}
-
-.pc-badge {
-  margin-left: auto;
-  font-size: 11px;
-  font-weight: 600;
-  padding: 2px 8px;
-  border-radius: 999px;
-  color: #fff;
-}
-
-.complexity-xs { background: oklch(55% 0.1 155); }
-.complexity-s { background: oklch(55% 0.1 155); }
-.complexity-m { background: oklch(65% 0.12 85); }
-.complexity-l { background: oklch(50% 0.2 25); }
-
-.pc-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  margin-bottom: 8px;
-}
-
-.pc-tag {
-  font-size: 12px;
-  padding: 2px 8px;
-  border-radius: 999px;
-  font-weight: 500;
-  background: oklch(97% 0.01 250 / 0.5);
-  color: oklch(50% 0.1 250);
-  border: 1px solid oklch(85% 0.02 250);
-}
-
-.pc-meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  font-size: 12px;
-  color: var(--muted);
-  margin-bottom: 8px;
-}
-
+/* ---- 已确认开发计划卡片的页脚（卡片本体样式见 PlanSummaryCard.vue） ---- */
 .pc-confirmed {
   display: flex;
   align-items: center;

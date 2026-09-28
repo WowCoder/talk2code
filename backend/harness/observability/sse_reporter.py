@@ -156,11 +156,20 @@ class SSEReporter:
             ac["end_ts"] = get_current_timestamp()
         self._send(requirement_id, "qa_result", ac)
 
-    def complete(self, requirement_id: int, code_files: list = None):
-        self._send(requirement_id, "complete", {
+    def complete(self, requirement_id: int, status: str = None):
+        """完成事件。status 传需求**终态**（finished 等）。
+
+        必须带终态：前端 currentRequirement 是进页面时的 API 快照，不随 SSE 更新，
+        不带终态时状态永远停在 processing，发布门禁（要求 finished）会一直拦着，
+        用户只能手动刷新页面才能发布。
+        """
+        payload = {
             "requirement_id": requirement_id,
-            "code_files": code_files or []
-        })
+            "code_files": [],
+        }
+        if status:
+            payload["status"] = status
+        self._send(requirement_id, "complete", payload)
 
     def error(self, requirement_id: int, message: str):
         self._send(requirement_id, "error", {"message": message})

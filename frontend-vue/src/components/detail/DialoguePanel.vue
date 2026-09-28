@@ -15,7 +15,6 @@
       <PlanConfirmation
         v-if="showPlanConfirmation"
         :spec-data="specData"
-        @confirmed="onPlanConfirmed"
       />
 
       <!-- Dynamic components from SSE（仅未提交的表单浮动展示；已提交的以消息形式在上方消息流中渲染） -->
@@ -299,27 +298,53 @@ const traceSummary = computed(() => store._traceSummary as SSETraceSummaryData |
 // Plan confirmation
 const showPlanConfirmation = computed(() => store.planStatus === 'needs_confirmation')
 const specData = computed(() => store._specData)
-function onPlanConfirmed(feedback: string) {
-  // 有反馈时会重新走 TL 分析，不落确认卡片
-  if (feedback) return
-  // 直接确认：将 plan_confirmed 卡片插入到 TL plan 消息之前（后端已持久化同样一条）
-  const spec = specData.value
-  const card: any = {
-    role: 'user',
-    name: '用户',
-    content: '已确认开发计划，开始编码',
-    plan_confirmed: {
-      features: spec?.features || [],
-      tech_stack: spec?.tech_stack || {},
-      file_structure: spec?.file_structure || [],
-      complexity: spec?.complexity || 'S',
-    },
+/**
+ * 确认卡片该插在哪：紧跟本轮 TL 分析消息之后，与后端落库位置一致。
+ *
+ * 实时链路的对话消息不携带 plan 字段（SSE dialogue 事件只有纯文本），只能靠 spec 事件
+ * 到达时记下的下标；刷新恢复链路的消息来自 DB、带 plan，可以直接就地定位 —— 那时
+ * `_specInsertIndex` 早被重置为 null，只靠它会把卡片甩到消息流末尾。
+ */
+function planCardInsertIndex(): number {
+  const msgs = store.dialogueMessages
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if ((msgs[i] as any).plan) return i + 1
   }
-  // 确认卡片应插入到 TL 分析消息之前（spec 事件到达时记录的索引，
-  // 避免搜索 plan 字段——SSE dialogue 事件不携带结构化字段）
-  const insertAt = store._specInsertIndex ?? store.dialogueMessages.length
-  store.dialogueMessages.splice(insertAt, 0, card)
+  const recorded = store._specInsertIndex
+  if (typeof recorded === 'number' && recorded >= 0 && recorded <= msgs.length) {
+    return recorded
+  }
+  return msgs.length
 }
+
+// 确认后把计划卡固定成消息流里的一条（后端已持久化同样一条）。
+//
+// 为什么用 watch 而不是让 PlanConfirmation emit 回来：store.confirmPlan 一返回，
+// planStatus 就切到 confirmed，浮层卡当帧被卸载，而 Vue 会丢弃已卸载组件的 emit
+// （runtime-core `emit()` 首行即 `if (instance.isUnmounted) return`）。
+// 之前那样写的结果是「框没了，消息也没留下」，只有刷新/断线补齐才补上这条卡。
+watch(
+  () => store.planStatus,
+  (now, before) => {
+    if (now !== 'confirmed' || before !== 'needs_confirmation') return
+    // 断线补齐可能已经把后端那条卡片带进来了，不能插成两张
+    if (store.dialogueMessages.some((m) => (m as any).plan_confirmed)) return
+    // 内容与刚才那张待确认卡片完全一致 —— 确认是同一张卡的状态切换，不是另做一张摘要
+    const spec = specData.value
+    store.dialogueMessages.splice(planCardInsertIndex(), 0, {
+      role: 'user',
+      name: '用户',
+      content: '已确认开发计划，开始编码',
+      plan_confirmed: {
+        features: spec?.features || [],
+        tech_stack: spec?.tech_stack || {},
+        file_structure: spec?.file_structure || [],
+        data_model: spec?.data_model || '',
+        complexity: spec?.complexity || 'S',
+      },
+    } as any)
+  }
+)
 
 async function onQuestionSubmitted(answers?: Record<string, string>) {
   if (store.pendingChatClarification && answers) {

@@ -166,6 +166,15 @@ msg[0] system = 模板骨架
    + [workspace 实际文件，按需 just-in-time 读]；上一轮工具轨迹不出现。
 5. **不可重建项必须跨边界保留**：需求本身、决策与理由、交付结果、用户反馈，
    只活在 TASK_STATE.md / handoff 与 requirement 状态里，不活在工具轨迹里。
+6. **归属约定（对话消息的角色规则）**：
+   - `user` 角色**只给用户本人发的消息**。系统注入 / Agent 之间转发的内部消息一律不得挂在
+     `user` 上——否则用户会在自己的消息框里看到自己没发过的话（实测：交付 handoff 起点、
+     QA 契约反馈、harness 补全提示都曾以 `role=user` 落库，见 req 79/144/191/202）。
+   - Agent 侧消息只归属三个角色（技术负责人 / 开发工程师 / 质量工程师）；**无法判断归属时归 TL**。
+   - 交付 handoff 起点是「TL 在交付边界留下的状态交接说明」，以 **agent + TL** 身份注入；
+     纯内部提示（补全提醒 / 自动检查）则不进对话流（`hidden`，只进 LLM 上下文）。
+   - 历史遗留的旧角色名与错标消息由前端统一归一化：
+     `frontend-vue/src/utils/dialogueRole.ts`（自检 `npm run check:role`）。
 
 每个 requirement 一个 `dialogue_history`，交付即 checkpoint：同 requirement 延续走同一 history 但触发一次折叠；
 新 requirement 则新 history 从 handoff 起种子。

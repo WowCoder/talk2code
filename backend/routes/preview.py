@@ -58,7 +58,7 @@ def _handle_chat_quick(req_id, requirement, user_message, chat_router, db):
     # SSE 推送
     sse_reporter.dialogue(req_id, 'user', '用户', user_message)
     sse_reporter.dialogue(req_id, 'agent', TL_NAME, answer, 'completed')
-    sse_reporter.complete(req_id)
+    sse_reporter.complete(req_id, requirement.status)
 
     logger.info(f"Chat QUICK 回答完成 (req_id={req_id})")
     return jsonify({

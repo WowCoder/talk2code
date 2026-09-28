@@ -928,7 +928,7 @@ class RequirementService:
                         list(requirement.dialogue_history or [])
                     dialogue_history.append({
                         'role': 'agent',
-                        'name': 'QA',
+                        'name': QA_NAME,
                         'content': (
                             "## ⚠️ 交付拦截：存在未解决的关键缺陷\n\n"
                             f"经 {repair_count} 轮修复仍未清零 critical 缺陷，"
@@ -1130,8 +1130,24 @@ class RequirementService:
         message = SSEMessage.code_message(filename, content, 0, True)
         sse_manager.broadcast(str(requirement_id), message)
 
-    def _send_complete(self, requirement_id: int):
-        message = SSEMessage.complete_message(requirement_id)
+    def _send_complete(self, requirement_id: int, status: str = None):
+        """推送完成事件，并带上需求的**终态**。
+
+        status 从 DB 读、不由调用方传：三个调用点分布在「成功 / 评估未通过 /
+        异常终止」三条分支上，逐个传参总会漏；调用时各分支都已 commit，读到的
+        就是权威终态。DB 读失败时退化成不带 status（前端不覆盖状态，行为与修复
+        前一致），绝不阻断完成事件本身。
+        """
+        if not status:
+            try:
+                with get_db() as db:
+                    status = db.query(Requirement.status).filter(
+                        Requirement.id == requirement_id
+                    ).scalar()
+            except Exception as e:
+                logger.warning(f"读取需求 {requirement_id} 终态失败（不阻断）: {e}")
+                status = None
+        message = SSEMessage.complete_message(requirement_id, status)
         sse_manager.broadcast(str(requirement_id), message)
 
     # ===== IntentRouter 快速通道处理 =====
@@ -1166,7 +1182,7 @@ class RequirementService:
 
         # SSE 推送
         sse.dialogue(requirement_id, 'agent', TL_NAME, answer, 'completed')
-        sse.complete(requirement_id)
+        sse.complete(requirement_id, requirement.status)
         logger.info(f"需求 {requirement_id} QUICK 回答完成")
         return True
 
@@ -1204,7 +1220,7 @@ class RequirementService:
         db.commit()
 
         sse.dialogue(requirement_id, 'agent', TL_NAME, answer, 'completed')
-        sse.complete(requirement_id)
+        sse.complete(requirement_id, requirement.status)
         logger.info(f"需求 {requirement_id} SEARCH 回答完成")
         return True
 

@@ -10,7 +10,13 @@ import { useRequirementStore } from '@/stores/requirement'
 export function useArtifactEmptyState() {
   const store = useRequirementStore()
 
-  const hasFiles = computed(() => (store.currentRequirement?.code_files?.length ?? 0) > 0)
+  // 生成过程中详情接口的 code_files 还是空的，SSE 增量只写入 codeFiles 映射
+  // ——两处任一非空即视为有产物，否则代码/预览 TAB 在整个生成期间都是空态
+  const hasFiles = computed(
+    () =>
+      (store.currentRequirement?.code_files?.length ?? 0) > 0 ||
+      Object.keys(store.codeFiles).length > 0,
+  )
   const status = computed(() => store.currentRequirement?.status ?? null)
   // interrupted 仍可续跑，观感上属于「还没做完」，不算终态
   const inProgress = computed(() =>

@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { ref, reactive } from 'vue'
+import { ref, reactive, computed } from 'vue'
 import type {
   Requirement,
   DialogueMessage,
@@ -7,6 +7,8 @@ import type {
 } from '@/types/api'
 import type { SSEQuestionFormData, SSEEvaluatorResultData, SSESpecData, SSETraceSummaryData, SSETask, SSEIterationStartData, SSEIterationAppendData, SSEQAStepData, SSEQAAcData } from '@/types/sse'
 import { useApi } from '@/composables/useApi'
+import { normalizeDialogueMessage, normalizeDialogueList, roleOfName, DEV_NAME, QA_NAME } from '@/utils/dialogueRole'
+import { mergeProducedFiles } from '@/utils/publishGate'
 
 /** 执行进度：currentAgent 承载"当前在做什么"的动作描述（后端已推动作而非角色名） */
 export interface ProgressState {
@@ -59,6 +61,20 @@ export const useRequirementStore = defineStore('requirement', () => {
   const { api } = useApi()
 
 /**
+ * 本次已经产出的文件名集合 = 进页面时的 API 快照 ∪ SSE 实时增量。
+ * 判定规则与理由见 `utils/publishGate.ts`（那里是纯函数，有自动化断言）。
+ */
+function producedFileNames(req?: { code_files?: Array<{ filename: string }> } | null): Set<string> {
+  return new Set(mergeProducedFiles(req?.code_files, Object.keys(codeFiles)))
+}
+
+/** 是否已有可发布的产物（发布门禁用，唯一真值来源） */
+const hasProducedFiles = computed(() => producedFileNames(currentRequirement.value).size > 0)
+
+/** 产物文件名列表（按产出顺序无关，仅供计数/展示） */
+const producedFiles = computed(() => Array.from(producedFileNames(currentRequirement.value)))
+
+/**
  * 从「计划」+「实际产物」推导任务状态。
  *
  * 这里曾经把 plan.implementation_order 的每个文件一律标成 'completed'——只要计划里
@@ -78,7 +94,7 @@ function deriveTaskList(plan: any, requirement: Requirement): SSETask[] {
     if (t?.file && t?.description) descByFile.set(t.file, t.description)
   }
 
-  const produced = new Set((requirement.code_files || []).map((f) => f.filename))
+  const produced = producedFileNames(requirement)
   // 需求已经终止（成功 / 失败 / 待用户处理）后不会再有新的写入。此时仍未产出的文件
   // 不是「还没轮到」，而是「没写出来」——标 failed 而不是 pending，否则失败的需求会
   // 留下一列永远停在"待处理"的任务，看起来像还有希望（162 就是这个观感）。
@@ -106,7 +122,7 @@ function reconcileTaskList(tasks: SSETask[]): SSETask[] {
   if (!req) return tasks
   const settled = !['pending', 'planning', 'processing', 'interrupted'].includes(req.status)
   if (!settled) return tasks
-  const produced = new Set((req.code_files || []).map((f) => f.filename))
+  const produced = producedFileNames(req)
   return tasks.map((t) => ({
     ...t,
     status: produced.has(t.file) ? 'completed' : 'failed',
@@ -204,19 +220,24 @@ function messageKey(msg: DialogueMessage): string {
         }
       }
 
-      // 从 TL 消息中恢复 SPEC 和 Task 数据（页面刷新后可用）
+      // 从 TL 消息中恢复 SPEC 和 Task 数据（页面刷新后可用）。
+      // 必须把 plan 里的字段整份带过来：早先只恢复了 acceptance_criteria / file_structure /
+      // tech_stack，刷新后重新出现的计划框会丢掉核心功能、数据模型，复杂度也退回默认值。
+      // 取「最后一条」含 plan 的消息：带反馈重出计划时第一轮的计划已经过期。
       for (const msg of data.requirement.dialogue_history) {
-        if ((msg as any).plan) {
-          const plan = (msg as any).plan
-          _specData.value = {
-            title: data.requirement.title,
-            acceptance_criteria: plan.acceptance_criteria || [],
-            file_structure: plan.file_structure || [],
-            tech_stack: plan.tech_stack || {},
-          }
-          _taskList.value = deriveTaskList(plan, data.requirement)
-          break
+        if (!(msg as any).plan) continue
+        const plan = (msg as any).plan
+        _specData.value = {
+          title: data.requirement.title,
+          features: plan.features || [],
+          acceptance_criteria: plan.acceptance_criteria || [],
+          file_structure: plan.file_structure || [],
+          tech_stack: plan.tech_stack || {},
+          data_model: plan.data_model || '',
+          implementation_notes: plan.implementation_notes || '',
+          complexity: plan.complexity || 'S',
         }
+        _taskList.value = deriveTaskList(plan, data.requirement)
       }
 
       // 建立幂等键集合，避免 SSE 重连重放整段历史时重复入列
@@ -244,7 +265,10 @@ function messageKey(msg: DialogueMessage): string {
     return data
   }
 
-  function addDialogueMessage(msg: DialogueMessage) {
+  function addDialogueMessage(raw: DialogueMessage) {
+    // 角色归一必须先于幂等键计算：实时推送与历史恢复两条路径都走这里，
+    // 用同一套归一结果算 key，同一条消息在两条路径下才不会各算一个 key 而重复入列。
+    const msg = normalizeDialogueMessage(raw)
     // 幂等去重（SSE 重连重放防御）：同一事件（时间戳/迭代号相同）只入列一次，
     // 覆盖整段历史重放的场景；无时间戳的本地消息（如用户连发"继续"）不去重
     const key = messageKey(msg)
@@ -286,7 +310,7 @@ function messageKey(msg: DialogueMessage): string {
     if (dupIdx >= 0) return
     dialogueMessages.value.push({
       role: 'iteration_batch',
-      name: data.coder_name || 'Agent',
+      name: roleOfName(data.coder_name || DEV_NAME),
       content: data.content || `第 ${iteration} 轮迭代`,
       iteration,
       thinking_preview: data.thinking_preview || '',
@@ -348,7 +372,10 @@ function messageKey(msg: DialogueMessage): string {
   function hydrateDialogue(list: DialogueMessage[]) {
     dialogueMessages.value = []
     seenMessageKeys.clear()
-    for (const m of list) {
+    // 历史数据里混着旧角色名与错标成 user 的系统消息，统一在此归一：
+    // 实时路径与恢复路径用同一套规则，刷新前后观感才一致（角色名/归属不漂移）。
+    for (const raw of list) {
+      const m = normalizeDialogueMessage(raw)
       const k = messageKey(m)
       if (k) seenMessageKeys.add(k)
       if (m.role === 'qa_step') {
@@ -381,7 +408,30 @@ function messageKey(msg: DialogueMessage): string {
     dialogueMessages.value = dialogueMessages.value.filter(
       (m) => !(m.role === 'qa_result' && !((m.qa_result?.steps || []).length))
     )
+    _normalizePlanConfirmOrder()
     qaRunning.value = false
+  }
+
+  /**
+   * 确认卡片统一归位到「本轮 TL 分析结果」之后。
+   *
+   * 早期落库把确认卡片插在分析消息之前，与实时视图（插在之后）相反，
+   * 同一条动作在新老需求里会显示成两种顺序。这里在重建时统一归位；
+   * 位置已经正确时不改数组（幂等），因此不会引入额外渲染。
+   */
+  function _normalizePlanConfirmOrder() {
+    const list = dialogueMessages.value
+    const cardIdx = list.findIndex((m) => (m as any).plan_confirmed)
+    if (cardIdx < 0) return
+    // 确认的是「最新一轮」计划：卡片应紧随最后一条含 plan 的分析消息
+    let lastPlanIdx = -1
+    for (let i = 0; i < list.length; i++) {
+      if ((list[i] as any).plan) lastPlanIdx = i
+    }
+    if (lastPlanIdx < 0 || cardIdx === lastPlanIdx + 1) return
+    const [card] = list.splice(cardIdx, 1)
+    // 抽出位置在 plan 之前时，plan 会整体前移一位，目标下标随之修正
+    list.splice(cardIdx < lastPlanIdx ? lastPlanIdx : lastPlanIdx + 1, 0, card)
   }
 
   /**
@@ -396,7 +446,7 @@ function messageKey(msg: DialogueMessage): string {
     if (idx < 0) {
       dialogueMessages.value.push({
         role: 'qa_result',
-        name: 'Catherine（质量工程师）',
+        name: QA_NAME,
         content: `[${acId}] ${label || ''}`.trim(),
         qa_result: {
           ac_id: acId,
@@ -459,7 +509,7 @@ function messageKey(msg: DialogueMessage): string {
       // 只收到了结论没收到开始（断线窗口）→ 直接补一张完整卡片
       dialogueMessages.value.push({
         role: 'qa_result',
-        name: 'Catherine（质量工程师）',
+        name: QA_NAME,
         content: `[${data.ac_id}] ${data.label || ''}`.trim(),
         qa_result: {
           ac_id: data.ac_id,
@@ -569,8 +619,9 @@ function messageKey(msg: DialogueMessage): string {
     // 如果后端返回澄清需求，只更新对话历史，不更新代码文件
     if (data.needs_clarification) {
       if (data.dialogue_history?.length) {
-        dialogueMessages.value = data.dialogue_history
-        for (const m of data.dialogue_history) {
+        const list = normalizeDialogueList(data.dialogue_history)
+        dialogueMessages.value = list
+        for (const m of list) {
           const k = messageKey(m)
           if (k) seenMessageKeys.add(k)
         }
@@ -587,11 +638,11 @@ function messageKey(msg: DialogueMessage): string {
       const existingKeys = new Set(
         dialogueMessages.value.map(m => `${m.role}::${m.content}`.slice(0, 120))
       )
-      for (const msg of data.dialogue_history) {
-        const key = `${(msg as any).role || 'agent'}::${(msg as any).content || ''}`.slice(0, 120)
+      for (const rawMsg of data.dialogue_history) {
+        const typed = normalizeDialogueMessage(rawMsg as DialogueMessage)
+        const key = `${(typed as any).role || 'agent'}::${(typed as any).content || ''}`.slice(0, 120)
         if (existingKeys.has(key)) continue
         existingKeys.add(key)
-        const typed = msg as DialogueMessage
         // 验收类消息同样聚合进 AC 卡，避免 chat 路径又把它们拆成独立行
         if (typed.role === 'qa_step' && (typed as any).qa_step?.ac_id) {
           appendQaStep((typed as any).qa_step)
@@ -701,6 +752,8 @@ function messageKey(msg: DialogueMessage): string {
     isGenerating,
     progress,
     serverElapsedS,
+    hasProducedFiles,
+    producedFiles,
     questionForm,
     pendingChatClarification,
     loadRequirement,

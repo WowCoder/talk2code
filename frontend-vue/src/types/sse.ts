@@ -1,5 +1,7 @@
 // ===== SSE Event Types =====
 
+import type { RequirementStatus } from './api'
+
 export type SSEEventType =
   | 'connected'
   | 'dialogue'
@@ -117,6 +119,10 @@ export interface SSEHookCheckData {
 
 export interface SSECompleteData {
   requirement_id: number
+  /** 需求终态（finished / finished_with_issues / needs_user_input / failed）。
+   *  currentRequirement 是进页面时的 API 快照，不随 SSE 更新；不带终态会让
+   *  发布门禁一直停在「未通过验收」，用户必须刷新才能发布。 */
+  status?: RequirementStatus
   code_files?: Array<{
     filename: string
     content: string

@@ -18,6 +18,7 @@ import re
 import uuid
 
 from harness.observability.logger import get_logger
+from harness.agent_names import TL_NAME
 
 logger = get_logger(__name__)
 
@@ -262,8 +263,10 @@ def finalize_delivery(state: dict, workspace) -> str:
     """交付边界折叠（§3.H）：写 .task/DELIVERY.md（handoff）+ **归档**工具轨迹。
 
     - 非重建项（需求/计划/决策/反馈）已落地到 requirement 状态 + TASK_STATE.md + DELIVERY.md。
-    - dialogue_history 保留人类对话（user/agent/assistant）；thinking/tool_call/system_hidden
+    - dialogue_history 保留人类可读的对话（user/agent/assistant）；thinking/tool_call/system_hidden
       属工具轨迹，**归档到 .task/EXECUTION.jsonl** 后再从对话历史移除（保持交付后上下文轻量）。
+    - handoff 起点消息以 **agent（TL）** 身份追加，不用 user：它是系统注入的
+      交接说明而非用户发言，落成 user 会在对话流里伪装成用户消息。
     - 返回 handoff 路径；写入失败返回 ""（不阻断交付）。
     """
     handoff = _build_handoff(state, workspace)
@@ -288,9 +291,15 @@ def finalize_delivery(state: dict, workspace) -> str:
         elif role == "iteration_batch":
             kept.append(_slim_iteration_batch(m))
     if path:
+        # ⚠️ 角色必须是 agent（TL），不能是 user。
+        # 这条是系统在交付边界注入的交接起点，**不是用户说的话**；早先写成
+        # role=user，于是详情页对话流里凭空多出一条「用户消息：上一轮已交付…」
+        # （req 144/191/202 实测），用户看到自己的消息框里出现自己没发过的内容。
+        # 归属规则：用户消息只能来自用户本人；Agent 侧消息只归属三个角色，
+        # 无法判断归属时归 TL。这条是 TL 在交付边界留下的状态交接说明。
         kept.append({
-            "role": "user",
-            "name": "Handoff",
+            "role": "agent",
+            "name": TL_NAME,
             "content": f"上一轮已交付。任务状态 handoff 见 {path}，请据此继续。",
         })
     state["dialogue_history"] = kept

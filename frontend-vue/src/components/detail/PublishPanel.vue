@@ -188,6 +188,7 @@ import { ref, computed, onMounted, watch } from 'vue'
 import { useRequirementStore } from '@/stores/requirement'
 import { useToast } from '@/composables/useToast'
 import { useApi } from '@/composables/useApi'
+import { canPublish as canPublishNow, IN_PROGRESS_STATUSES } from '@/utils/publishGate'
 
 interface PublishResult {
   // 仅 by-requirement 端点携带（永远 200）；POST /api/publish 不会带此字段。
@@ -372,12 +373,10 @@ async function syncMarket() {
 // 此前这一行是硬编码的「index.html · 3 个资源」——文件数不是 3 时就是在给用户
 // 报错误信息，且「资源」与「文件」含义含混。无文件时不渲染这一行。
 const assetSummary = computed(() => {
-  const files = store.currentRequirement?.code_files ?? []
-  if (!files.length) return ''
-  const entry = files.some((f) => f.filename === 'index.html')
-    ? 'index.html'
-    : files[0].filename
-  return `${entry} · 共 ${files.length} 个文件`
+  const names = store.producedFiles
+  if (!names.length) return ''
+  const entry = names.includes('index.html') ? 'index.html' : names[0]
+  return `${entry} · 共 ${names.length} 个文件`
 })
 
 // ===== 发布门禁 =====
@@ -385,12 +384,15 @@ const assetSummary = computed(() => {
 // 并且产物确实存在。此前按钮只看「有没有需求 ID」，元信息卡还无条件写着
 // 「代码已就绪，可发布」——需求 162 一个文件都没生成，卡片照样宣称就绪。
 const reqStatus = computed(() => store.currentRequirement?.status ?? null)
-const qaPassed = computed(() => reqStatus.value === 'finished')
-const hasFiles = computed(() => (store.currentRequirement?.code_files?.length ?? 0) > 0)
-const canPublish = computed(() => qaPassed.value && hasFiles.value)
-const inProgress = computed(() =>
-  ['pending', 'planning', 'processing', 'interrupted'].includes(reqStatus.value ?? '')
-)
+// 产物判定用 store 的并集（API 快照 ∪ SSE 实时增量）：详情接口的 code_files
+// 是进页面那一刻的快照，SSE 的 code 事件只写进实时映射。只看快照时，全新需求
+// 整轮生成期间 hasFiles 恒为 false —— QA 验收都过了，这里仍然是「尚未生成代码」，
+// 必须手动刷新页面才能发布（req 202 实测）。
+const hasFiles = computed(() => store.hasProducedFiles)
+// 门禁判定与「有产物」判定都收敛到纯函数（utils/publishGate.ts），
+// 有自动化断言：npm run check:gate
+const canPublish = computed(() => canPublishNow(reqStatus.value, store.producedFiles))
+const inProgress = computed(() => IN_PROGRESS_STATUSES.includes(reqStatus.value as any))
 
 interface Gate {
   tone: 'ready' | 'wait' | 'block'

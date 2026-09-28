@@ -104,16 +104,23 @@ class SSEMessage:
         return SSEMessage.format_event('question-form', form_data)
 
     @staticmethod
-    def complete_message(requirement_id: int) -> str:
+    def complete_message(requirement_id: int, status: str = None) -> str:
         """
         完成消息
 
         Args:
             requirement_id: 需求 ID
+            status: 需求**终态**（finished / finished_with_issues /
+                needs_user_input / failed）。必须带上：前端 currentRequirement
+                是进页面时的 API 快照，不会随 SSE 更新；不带终态时，QA 验收
+                通过后前端的 isGenerating/进度会结束，但状态仍停在 processing ——
+                发布 TAB 的门禁（要求 status == 'finished'）继续拦着，用户必须
+                手动刷新页面才能点发布。
 
         Returns:
             SSE 消息字符串
         """
-        return SSEMessage.format_event('complete', {
-            'requirement_id': requirement_id
-        })
+        payload = {'requirement_id': requirement_id}
+        if status:
+            payload['status'] = status
+        return SSEMessage.format_event('complete', payload)

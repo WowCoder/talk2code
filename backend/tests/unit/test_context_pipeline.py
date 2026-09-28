@@ -396,13 +396,20 @@ def test_finalize_delivery_writes_handoff_and_archives_trail():
     assert "tool_call" in archived_roles
     assert "system" in archived_roles
     assert any(m.get("name") == "read_file" for m in archived)
-    # 但 dialogue_history 仍只保留人类对话（交付后上下文轻量）
+    # 但 dialogue_history 仍只保留人类可读对话（交付后上下文轻量）
     roles = [m["role"] for m in state["dialogue_history"]]
     assert "tool_call" not in roles
     assert "system" not in roles
     assert "user" in roles and "agent" in roles
-    # handoff 起点消息已注入
-    assert any(m.get("name") == "Handoff" for m in state["dialogue_history"])
+    # handoff 起点消息已注入，且**以 TL 身份**注入（不是伪装成用户消息）
+    from harness.agent_names import TL_NAME
+    handoff_msgs = [
+        m for m in state["dialogue_history"]
+        if "上一轮已交付" in str(m.get("content", ""))
+    ]
+    assert len(handoff_msgs) == 1
+    assert handoff_msgs[0]["role"] == "agent"
+    assert handoff_msgs[0]["name"] == TL_NAME
 
 
 # ---------------- L3b 遮蔽策略：失效的 read 优先遮蔽 ----------------

@@ -151,7 +151,9 @@ const failureText = computed(() => {
   const req = store.currentRequirement
   if (!req) return ''
   const raw = req.error_message || ''
-  const produced = (req.code_files?.length ?? 0) > 0
+  // 产物判定与发布门禁同源（API 快照 ∪ SSE 实时增量），否则失败文案会与实际
+  // 「有没有代码可看」打架：快照为空但实时已产出时，文案会谎称没产出任何代码。
+  const produced = store.hasProducedFiles
   const outcome = produced
     ? '这次生成没有跑完，已产出的代码仍然可用'
     : '这次生成没能产出任何代码'
