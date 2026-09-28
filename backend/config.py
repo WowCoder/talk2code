@@ -179,7 +179,40 @@ class Settings(BaseSettings):
     # 缺陷修复的 LLM 调用要输出整文件 JSON（16k~32k tokens），响应天然更慢，故单独给上限。
     # 此前该值硬编码 150s：LLM 端点慢时单次请求挂 2.5 分钟，前端长时间无 SSE 更新，
     # 观感等同"卡死"（req 146 实测两次 150s 读超时）。
-    DEFECT_REPAIR_TIMEOUT: int = Field(default=90, ge=10, le=300, description='缺陷修复 LLM 调用超时时间（秒）')
+    DEFECT_REPAIR_TIMEOUT: int = Field(default=90, ge=10, le=900, description='缺陷修复 LLM 调用超时时间（秒）')
+    # 超时自动重算开关：按 max_tokens ÷ 实测吞吐 反推真实所需时间，取 min(计算值, 上限)。
+    # 背景：官方标称 252.7 tok/s 实测达不到 —— 官方端点长输出实测 68.6/88.7/91.8 tok/s
+    # （中位 88.7），中转网关生产日志中位 64~78 tok/s，只有标称值的约 1/3。
+    # 按标称值算 16K→150s 会继续超时；这里用保守实测值重算。
+    DEFECT_REPAIR_TIMEOUT_AUTO: bool = Field(
+        default=True,
+        description='是否按实测吞吐自动计算缺陷修复超时（True 时忽略 DEFECT_REPAIR_TIMEOUT 固定值）'
+    )
+    # 实测输出吞吐（token/秒），用于超时反推。保守取实测下四分位，避免乐观值导致超时。
+    LLM_MEASURED_TPS: int = Field(
+        default=60, ge=10, le=500,
+        description='实测输出吞吐 token/秒（官方标称 252.7 实际打不到，实测 68-92）'
+    )
+    # 超时安全系数与固定开销（首 token 延迟 + 排队）
+    DEFECT_REPAIR_TIMEOUT_FACTOR: float = Field(
+        default=1.3, ge=1.0, le=3.0,
+        description='超时计算安全系数'
+    )
+    DEFECT_REPAIR_TIMEOUT_OVERHEAD: int = Field(
+        default=20, ge=0, le=120,
+        description='超时计算固定开销（秒），覆盖首 token 延迟与排队'
+    )
+    DEFECT_REPAIR_TIMEOUT_MAX: int = Field(
+        default=600, ge=60, le=1800,
+        description='缺陷修复超时绝对上限（秒），防止重算值过大把节点拖死'
+    )
+    # 缺陷修复的输出形态：whole_file（旧，输出整个文件，16K~32K tokens，实测需 180~360s）
+    # vs diff（新，只输出 unified diff / 局部补丁，1~3K tokens，20~50s）。
+    # 提超时只是止血，降输出量才是根治 —— 默认切到 diff。
+    DEFECT_REPAIR_OUTPUT_MODE: str = Field(
+        default='diff',
+        description='缺陷修复输出形态：diff=只输出差异补丁（快），whole_file=输出整个文件（慢）'
+    )
     # 长尾熔断：单轮 LLM 超过此预算就中断并按更小的 max_tokens 重试一次。
     # 实测（req 146-159，155 轮）延迟 >60s 的轮次只占 20%，却吃掉 71% 的 LLM 总时间，
     # 且这些慢轮输出很短（中位 583 token）——是空转/抖动，不是"写太长"。
@@ -203,6 +236,19 @@ class Settings(BaseSettings):
         description='极轻量分类/筛选 LLM 调用超时时间（秒）'
     )
     LLM_MAX_RETRIES: int = Field(default=2, ge=0, le=5, description='LLM 调用最大重试次数')
+
+    # 限流（HTTP 429）专用退避。为什么不复用普通退避的 10s 上限：
+    # 429 的窗口通常按分钟计，10s 后重试基本必然再撞一次，等于"重试了但一定还失败"，
+    # 白白吃掉墙钟时间。免费额度账号被自己的批量任务（评测/多需求并行）打满 429
+    # 时尤其明显。服务端若返回 Retry-After，则以服务端为准。
+    LLM_RATE_LIMIT_BACKOFF_BASE_S: float = Field(
+        default=5.0, ge=0.1, le=60.0,
+        description='429 限流的退避基数（秒），第 n 次重试等待 base×2^n（受上限约束）'
+    )
+    LLM_RATE_LIMIT_BACKOFF_MAX_S: float = Field(
+        default=60.0, ge=1.0, le=600.0,
+        description='429 限流的退避上限（秒）。按分钟计的限流窗口建议 ≥60'
+    )
     LLM_CRAFT_ENABLED: bool = Field(default=True, description='是否启用 Craft 设计质量规则注入')
 
     # 思考模式（reasoning 模型）：coder 节点在 runtime 中强制 thinking=enabled，
@@ -220,6 +266,92 @@ class Settings(BaseSettings):
     LLM_REASONING_EFFORT: Literal['low', 'high', 'max'] = Field(
         default='high',
         description='思考强度（low/high/max），仅当 thinking=enabled 时生效'
+    )
+
+    # ==================== 多模型能力适配（Agnes / DeepSeek 切换） ====================
+    # 两个厂商的 thinking 参数格式完全不同，写死任何一种都会在切换时静默失效或报错。
+    #   agnes-3.0-flash：OpenAI 格式 = chat_template_kwargs:{"enable_thinking":true}
+    #                    Anthropic 格式 = thinking:{"type":"enabled","budget_tokens":N}
+    #   deepseek-flash：OpenAI 格式 = thinking:{"type":"enabled"}（SDK 需走 extra_body）
+    #                   + 顶层 reasoning_effort；无 budget_tokens
+    # 故这里做成配置项，切换模型时只改 .env，不动代码。
+    # 注意：不要复用 LLM_PROVIDER —— 那个字段是「协议类型」(openai_compatible /
+    # anthropic_compatible)，这里是「厂商」，两者正交，改名避免覆盖。
+    LLM_VENDOR: Literal['agnes', 'deepseek', 'auto'] = Field(
+        default='auto',
+        description='LLM 厂商：agnes / deepseek / auto（auto 按 base_url 推断）'
+    )
+    LLM_THINKING_FORMAT: Literal['auto', 'openai', 'anthropic'] = Field(
+        default='auto',
+        description='thinking 参数格式：auto=按厂商自动选，openai / anthropic 强制指定'
+    )
+    # 思考 token 预算（仅 agnes 的 anthropic 兼容格式生效）。
+    # 语义是**上限**：设了就会在思考达到该长度时被截断。
+    # 默认 0 = 不限制 —— 保持改动前的行为。coder 强制 thinking=enabled，复杂多文件
+    # 生成需要长思考，给它加帽反而会压低代码质量，与本轮「提质」目标相悖。
+    # 实测参考：把一次简单任务的思考从 675 字符压到 330 字符，延迟 3.49s → 2.79s。
+    # 想拿延迟换质量时再调小（如 1024）。
+    LLM_THINKING_BUDGET_TOKENS: int = Field(
+        default=0, ge=0, le=32768,
+        description='思考 token 预算上限（仅 agnes anthropic 格式生效，0=不限制）'
+    )
+    # DeepSeek 硬性要求：请求携带 tools 时，历史轮次的 reasoning_content 必须完整回传，
+    # 否则 API 返回 400。Agnes 实测不要求。切 DeepSeek 后必须为 True。
+    LLM_THINKING_ECHO_REASONING: bool = Field(
+        default=False,
+        description='是否回传历史 reasoning_content（DeepSeek + tools + thinking 场景必须为 True）'
+    )
+    # DeepSeek 思考模式下 temperature / presence_penalty / frequency_penalty 不生效
+    # （不报错但无效）；top_p 仅 0.95~1.0 有效。开启后自动剔除无效参数，避免误以为调参生效。
+    LLM_STRIP_INVALID_PARAMS: bool = Field(
+        default=True,
+        description='思考模式下是否剔除厂商不支持的采样参数（temperature/top_p 等）'
+    )
+
+    # ==================== Skills 注入预算 ====================
+    # 现状：正则 OR 匹配全部命中全注入，无数量上限 —— 五子棋一次命中 6 个 ≈15.8K 字符。
+    # 硬上限 2 个：名额①常驻 core（generic + anti-ai-slop 合并），名额②场景 skill 取 priority 最高 1 个。
+    # 注意：若只加数量上限而不合并 always 类，generic(100)/anti-ai-slop(100) 会吃满 2 个名额，
+    # 场景 skill 与 UI skill 全部落选 —— 反而更糟。故二者必须同时生效。
+    SKILL_MAX_COUNT: int = Field(
+        default=2, ge=1, le=10,
+        description='单次注入的 skill 数量硬上限（含常驻位）'
+    )
+    SKILL_TOKEN_BUDGET: int = Field(
+        default=3000, ge=500, le=20000,
+        description='全部 skill 合计 token 预算，超出按 priority 从低往高丢弃'
+    )
+
+    # ==================== Evaluator 视觉输入 ====================
+    # 截图每轮都已生成在 .task/evaluator/screenshot.png，但深度评估没把它传给 LLM，
+    # 导致 ui_quality 是"读 CSS 代码猜的"盲评。这里配置是否/如何把视觉证据传给评估模型。
+    #   dom_css  ：不传图，提取 DOM + getComputedStyle 关键属性（默认，零外部依赖，值更准）
+    #   image_url：公网 URL（Agnes 仅支持此方式；需 PREVIEW_PUBLIC_BASE_URL）
+    #   base64   ：data:image/png;base64,...（DeepSeek 支持，本地文件直传）
+    #   auto     ：有公网 URL 用 url，否则本地文件用 base64，都不可用降级 dom_css
+    EVALUATOR_VISION_MODE: Literal['dom_css', 'image_url', 'base64', 'auto'] = Field(
+        default='dom_css',
+        description='evaluator 视觉证据承载方式'
+    )
+    EVALUATOR_VISION_DETAIL: Literal['low', 'high', 'original', 'auto'] = Field(
+        default='low',
+        description='图片细节级别（low=缩放到 512x512，更快更省 token）'
+    )
+    EVALUATOR_VISION_MAX_IMAGES: int = Field(
+        default=2, ge=1, le=10,
+        description='单次评估最多传几张图'
+    )
+    EVALUATOR_SCREENSHOT_MAX_BYTES: int = Field(
+        default=5 * 1024 * 1024, ge=1024, le=32 * 1024 * 1024,
+        description='截图超过此字节数则该传图模式不可用，自动降级为 dom_css'
+    )
+    # 视觉硬伤（对比度 <3:1 / 点区 <24px / 字号 <10px）是否作为确定性缺陷送入修复循环。
+    # 关闭后视觉证据仍会进 evaluator 的评估内容，但不会阻塞交付 —— 即回到
+    # 「UI 丑但不拦截」的旧行为。默认开启：页面美观是明确的产品诉求，
+    # 只有让不合格可判定，预置模板的收益才落得下来。
+    UI_LINT_AS_DEFECT: bool = Field(
+        default=True,
+        description='是否把浏览器实测的视觉硬伤转成确定性缺陷（进入 defect_repair）'
     )
 
     # LLM 熔断器配置

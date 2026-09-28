@@ -133,6 +133,125 @@ def _log_and_raise(response, call_id: str = 'unknown', t0=None):
     response.raise_for_status()
 
 
+# ==================== HTTP 错误分类：决定「重试」还是「立即失败」 ====================
+# 为什么必须分类：401/403 是配置问题（key 失效 / 无权限 / 套餐被禁用），服务端已经
+# 明确拒绝，重试用的是同一个 key，必然复现。此前 chat() 路径把它当普通瞬时错误重试，
+# 日志里堆出成百上千行 401，前端只看到「已达最大重试次数」，完全看不出根因是 key
+# 失效——2026-09-28 实测单日 229 次 401，全部是 `无效的令牌`，而同一时刻用同一个
+# key 手工请求是 200，说明是运行进程持有的 key 已经过期/被替换。
+# 429（限流）则相反：它是**会自己恢复**的，且免费额度下很容易被自己的批量任务打出来，
+# 必须重试，而且退避要比普通网络抖动长得多（默认指数退避上限 10s 对按分钟计的限流太短）。
+_AUTH_STATUS = (401, 403)
+_RATE_LIMIT_STATUS = 429
+
+
+def key_fingerprint(key) -> str:
+    """密钥指纹：前 6 + 后 4 + 长度。
+
+    刻意不输出完整 key：既能回答"是哪个 key、有没有换错"，又不构成泄漏。
+    """
+    if not key:
+        return "<空>"
+    val = str(key).strip()
+    if len(val) <= 12:
+        return f"<过短 len={len(val)}>"
+    return f"{val[:6]}...{val[-4:]}(len={len(val)})"
+
+
+def classify_http_status(status):
+    """把 HTTP 状态码映射为处理策略。
+
+    Returns:
+        'auth'       —— 401/403：配置问题，禁止重试
+        'rate_limit' —— 429：可恢复，用长退避重试
+        'transient'  —— 5xx / 408：正常退避重试
+        'client'     —— 其它 4xx：参数/协议问题，禁止重试
+        None         —— 取不到状态码（纯网络层异常），按 transient 处理
+    """
+    try:
+        code = int(status)
+    except (TypeError, ValueError):
+        return None
+    if code in _AUTH_STATUS:
+        return 'auth'
+    if code == _RATE_LIMIT_STATUS:
+        return 'rate_limit'
+    if 500 <= code < 600 or code == 408:
+        return 'transient'
+    if 400 <= code < 500:
+        return 'client'
+    return None
+
+
+def _status_of(exc) -> Optional[int]:
+    """从 requests 异常里取 HTTP 状态码；取不到返回 None。"""
+    resp = getattr(exc, 'response', None)
+    try:
+        return int(getattr(resp, 'status_code', None))
+    except (TypeError, ValueError):
+        return None
+
+
+def _retry_after_seconds(exc) -> Optional[float]:
+    """读取服务端 Retry-After 响应头（秒）。
+
+    限流时服务端给出的等待时间比任何自算退避都可信；拿不到再退回自算。
+    """
+    resp = getattr(exc, 'response', None)
+    if resp is None:
+        return None
+    try:
+        raw = resp.headers.get('Retry-After')
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def _llm_error_message(exc, client=None, status: Optional[int] = None) -> str:
+    """把底层异常翻译成「人能直接照着修」的错误文案。
+
+    此前所有失败都长成 `[错误] API 请求失败：401 Client Error: Unauthorized for url: ...`，
+    读者无法区分"key 失效"、"没权限"、"被限流"、"端点挂了"。这里按类别给出下一步动作，
+    并且只暴露 key 指纹（不泄漏完整密钥）。
+    """
+    code = status if status is not None else _status_of(exc)
+    kind = classify_http_status(code)
+    base_url = getattr(client, 'base_url', None) or '?'
+    model = getattr(client, 'model', None) or '?'
+    vendor = getattr(client, 'vendor', None) or 'auto'
+    fingerprint = key_fingerprint(getattr(client, 'api_key', '') if client else '')
+
+    if kind == 'auth':
+        return (
+            f"[错误] LLM 鉴权失败（HTTP {code}）：当前 API Key 被服务端拒绝，重试无效。\n"
+            f"  · 端点：{base_url}（厂商配置 vendor={vendor}，模型 {model}）\n"
+            f"  · 当前 Key 指纹：{fingerprint}\n"
+            f"  · 排查：① Key 是否已过期/被重置 ② 是否配了与端点不匹配的 Key"
+            f"（不同渠道的 Key 不通用）③ 套餐是否被禁用。\n"
+            f"  改完 Key 后需重启后端进程才会生效（配置在进程启动时读取）。"
+        )
+    if kind == 'rate_limit':
+        retry_after = _retry_after_seconds(exc)
+        hint = f"，服务端建议等待 {retry_after:.0f}s" if retry_after else ""
+        return (
+            f"[错误] LLM 被限流（HTTP 429）{hint}：账号额度/速率已打满。\n"
+            f"  · 端点：{base_url}，模型 {model}\n"
+            f"  · 排查：降低并发或放慢请求（批量任务加任务间隔），或提升套餐额度。"
+        )
+    if kind == 'client':
+        return (
+            f"[错误] LLM 请求参数被拒（HTTP {code}）：属于请求体/协议问题，重试无效。\n"
+            f"  · 端点：{base_url}，模型 {model}，vendor={vendor}\n"
+            f"  · 原始响应：{str(exc)[:300]}"
+        )
+    return f"[错误] LLM 调用失败：{str(exc)[:300]}"
+
+
 def _try_fix_json(raw: str) -> dict | None:
     """尝试修复 LLM 返回的不完整 JSON"""
     # 方法1: 补齐末尾的 } 和 "
@@ -426,6 +545,12 @@ class LLMClient:
         # 默认关闭以提速；需要更高推理质量时通过 LLM_THINKING=enabled 开启。
         self.thinking = settings.LLM_THINKING
         self.reasoning_effort = settings.LLM_REASONING_EFFORT
+        # 厂商与 thinking 参数格式（Agnes / DeepSeek 格式完全不同，见 _build_thinking_params）
+        self.vendor = settings.LLM_VENDOR
+        self.thinking_format = settings.LLM_THINKING_FORMAT
+        self.thinking_budget_tokens = settings.LLM_THINKING_BUDGET_TOKENS
+        self.echo_reasoning = settings.LLM_THINKING_ECHO_REASONING
+        self.strip_invalid_params = settings.LLM_STRIP_INVALID_PARAMS
 
         # 熔断器：防止 LLM API 不可用时持续无效重试
         self._circuit_breaker = CircuitBreaker(
@@ -505,9 +630,15 @@ class LLMClient:
         self,
         prompt: str,
         system_prompt: Optional[str] = None,
-        use_memory: bool = True
+        use_memory: bool = True,
+        images: Optional[list] = None
     ) -> List[Dict[str, str]]:
-        """构建消息列表"""
+        """构建消息列表
+
+        Args:
+            images: 可选的图片内容块 / URL 列表，会拼进 **user** 消息。
+                    图片放 system 或 assistant 会被端点拒绝（HTTP 400）。
+        """
         messages = []
 
         # 系统提示
@@ -518,8 +649,18 @@ class LLMClient:
         if use_memory:
             messages.extend(self.get_memory())
 
-        # 用户输入
-        messages.append({'role': 'user', 'content': prompt})
+        # 用户输入（可选携带图片内容块）
+        # 注意：图片只能出现在 user 消息里 —— 放进 system / assistant 会被
+        # Agnes 与 DeepSeek 同时拒绝（HTTP 400）。故这里只拼 user。
+        if images:
+            content: list = [{"type": "text", "text": prompt}]
+            for img in images:
+                content.append(img if isinstance(img, dict) else {
+                    "type": "image_url", "image_url": {"url": str(img)}
+                })
+            messages.append({'role': 'user', 'content': content})
+        else:
+            messages.append({'role': 'user', 'content': prompt})
 
         return messages
 
@@ -553,8 +694,9 @@ class LLMClient:
             'temperature': self.temperature,
             'max_tokens': max_tokens if max_tokens is not None else self.max_tokens
         }
-        # 思考模式开关（OpenAI 格式，DeepSeek 扩展字段）：
-        # - enabled：携带 thinking + reasoning_effort；
+        # 思考模式开关：不同厂商参数格式完全不同，统一由 _build_thinking_params 决定。
+        # - enabled ：按厂商 + LLM_THINKING_FORMAT 组装（Agnes 默认 anthropic 格式以启用
+        #   budget_tokens 限流；DeepSeek 为 openai 格式 + 顶层 reasoning_effort）
         # - disabled：**省略字段**。各端点对关闭的语义不一致（实测矩阵）：
         #   · agnes-3.0-flash：省略 = 思考 OFF；携带 thinking 字段（哪怕
         #     {"type":"disabled"}）反而触发思考；
@@ -562,8 +704,12 @@ class LLMClient:
         #     且 disabled 值直接 HTTP 400。
         #   因此省略是唯一安全选项；glm 下如需真正关思考只能换模型/端点。
         if _thinking == 'enabled':
-            data['thinking'] = {'type': _thinking}
-            data['reasoning_effort'] = self.reasoning_effort
+            data.update(self._build_thinking_params())
+            # DeepSeek 思考模式下 temperature / presence_penalty / frequency_penalty
+            # 不生效（不报错但静默无效），top_p 仅 0.95~1.0 有效。
+            # 剔除掉，避免"以为调了参其实没生效"的误判。
+            if self.strip_invalid_params and self._resolve_vendor() == 'deepseek':
+                data.pop('temperature', None)
 
         url = f'{ep.base_url}/chat/completions'
 
@@ -670,14 +816,15 @@ class LLMClient:
                     logger.error(f"LLM 流式传输中断（已产出部分内容，不重试）：{str(e)}")
                     yield f"[错误] 流式传输中断：{str(e)}"
                     return
-                if attempt < self.max_retries:
-                    import random
-                    delay = min(1.0 * (2 ** attempt), 10.0) * (0.5 + random.random() * 0.5)
-                    logger.warning(f"LLM 请求失败：{str(e)}，{delay:.2f}秒后重试 ({attempt + 1}/{self.max_retries})")
-                    time.sleep(delay)
-                else:
-                    logger.error(f"LLM 请求失败，已达最大重试次数：{str(e)}")
-                    yield f"[错误] API 请求失败：{str(e)}"
+                # 统一走分类退避：401/403 不重试、429 用长退避、其余短退避。
+                # 此前这里是裸的内联退避，把 key 失效当网络抖动重试了 3 次。
+                # 注意必须 return：这是循环体内的 yield，不 return 的话会因为
+                # 落到下一轮迭代而继续发请求（"不重试"就名存实亡）。
+                _status = _status_of(e)
+                if self._retry_backoff(attempt, e, context="LLM", status=_status):
+                    continue
+                yield _llm_error_message(e, self, status=_status)
+                return
 
     def _request_anthropic(
         self,
@@ -778,14 +925,15 @@ class LLMClient:
                     logger.error(f"LLM 流式传输中断（已产出部分内容，不重试）：{str(e)}")
                     yield f"[错误] 流式传输中断：{str(e)}"
                     return
-                if attempt < self.max_retries:
-                    import random
-                    delay = min(1.0 * (2 ** attempt), 10.0) * (0.5 + random.random() * 0.5)
-                    logger.warning(f"LLM 请求失败：{str(e)}，{delay:.2f}秒后重试 ({attempt + 1}/{self.max_retries})")
-                    time.sleep(delay)
-                else:
-                    logger.error(f"LLM 请求失败，已达最大重试次数：{str(e)}")
-                    yield f"[错误] API 请求失败：{str(e)}"
+                # 统一走分类退避：401/403 不重试、429 用长退避、其余短退避。
+                # 此前这里是裸的内联退避，把 key 失效当网络抖动重试了 3 次。
+                # 注意必须 return：这是循环体内的 yield，不 return 的话会因为
+                # 落到下一轮迭代而继续发请求（"不重试"就名存实亡）。
+                _status = _status_of(e)
+                if self._retry_backoff(attempt, e, context="LLM", status=_status):
+                    continue
+                yield _llm_error_message(e, self, status=_status)
+                return
 
     def _do_request(
         self,
@@ -845,6 +993,62 @@ class LLMClient:
 
         return content, error, failed
 
+    # ------------------------------------------------------------------
+    # 多厂商 thinking 参数适配
+    # ------------------------------------------------------------------
+    def _resolve_vendor(self) -> str:
+        """推断厂商：显式配置优先，否则按 base_url 关键字推断。
+
+        Agnes 与 DeepSeek 的 thinking 参数格式完全不同（见 _build_thinking_params），
+        必须先确定厂商才能选格式。
+        """
+        vendor = (self.vendor or 'auto').strip().lower()
+        if vendor in ('agnes', 'deepseek'):
+            return vendor
+        url = (self.base_url or '').lower()
+        if 'deepseek' in url:
+            return 'deepseek'
+        # 当前主用 Agnes，未识别时按 Agnes 处理（其端点对两套格式都兼容）
+        return 'agnes'
+
+    def _build_thinking_params(self) -> dict:
+        """组装 thinking 请求参数（仅 thinking=enabled 时调用）。
+
+        实测矩阵（agnes-3.0-flash，同 prompt isPrime，max_tokens=2000）：
+          省略字段                                  → 无思考，1.95s
+          thinking:{type:enabled}+reasoning_effort  → 思考 675c，3.49s
+          thinking:{type:enabled,budget_tokens:1024}→ 思考 330c，2.79s（思考量砍半）
+          chat_template_kwargs:{enable_thinking:1}  → 思考 635c，4.75s
+
+        故 Agnes 默认走 anthropic 格式（可限流思考量），DeepSeek 走 openai 格式
+        （其无 budget_tokens，强度靠顶层 reasoning_effort）。
+        """
+        vendor = self._resolve_vendor()
+        fmt = (self.thinking_format or 'auto').strip().lower()
+        if fmt == 'auto':
+            # Agnes 用 anthropic 格式可拿到 budget_tokens 限流；DeepSeek 只能 openai 格式
+            fmt = 'anthropic' if vendor == 'agnes' else 'openai'
+
+        params: dict = {}
+        if vendor == 'deepseek':
+            if fmt == 'anthropic':
+                # DeepSeek Anthropic 兼容：reasoning.effort，none 表示关闭
+                params['reasoning'] = {'effort': self.reasoning_effort}
+            else:
+                # DeepSeek OpenAI 兼容：thinking.type + 顶层 reasoning_effort
+                params['thinking'] = {'type': 'enabled'}
+                params['reasoning_effort'] = self.reasoning_effort
+        else:
+            if fmt == 'openai':
+                params['chat_template_kwargs'] = {'enable_thinking': True}
+            else:
+                thinking_obj: dict = {'type': 'enabled'}
+                if self.thinking_budget_tokens and self.thinking_budget_tokens > 0:
+                    thinking_obj['budget_tokens'] = int(self.thinking_budget_tokens)
+                params['thinking'] = thinking_obj
+                params['reasoning_effort'] = self.reasoning_effort
+        return params
+
     def chat(
         self,
         prompt: str,
@@ -852,7 +1056,8 @@ class LLMClient:
         use_memory: bool = False,
         max_tokens: Optional[int] = None,
         timeout: Optional[int] = None,
-        thinking: Optional[str] = None
+        thinking: Optional[str] = None,
+        images: Optional[list] = None
     ) -> LLMResponse:
         """
         非流式聊天
@@ -868,6 +1073,9 @@ class LLMClient:
             max_tokens: 最大生成 token 数（覆盖默认值）
             timeout: 超时时间（覆盖默认值）
             thinking: 思考模式覆盖（'enabled'/'disabled'，默认 None 使用实例配置）
+            images: 可选图片（URL 字符串 / data URI / 内容块 dict），
+                    会以 image_url 内容块拼进 user 消息，用于多模态评估。
+                    注意：图片只能出现在 user 消息，放 system 会被端点拒绝。
 
         Returns:
             LLMResponse 对象
@@ -876,7 +1084,7 @@ class LLMClient:
         effective_max_tokens = max_tokens or self.max_tokens
         effective_timeout = timeout or self.timeout
 
-        messages = self._build_messages(prompt, system_prompt, use_memory)
+        messages = self._build_messages(prompt, system_prompt, use_memory, images=images)
         logger.debug(f"LLM 请求：messages_count={len(messages)}, max_tokens={effective_max_tokens}")
 
         content = ""
@@ -1053,41 +1261,86 @@ class LLMClient:
                         timeout=effective_timeout, endpoint=ep)
                 break
             except requests.exceptions.HTTPError as e:
-                status = getattr(getattr(e, 'response', None), 'status_code', None)
-                if status and 400 <= status < 500 and status != 429:
-                    # 参数/鉴权/协议类错误，重试必然复现 → 立即失败
-                    logger.error(f"chat_with_tools 非瞬时错误(HTTP {status})，不再重试：{e}")
+                status = _status_of(e)
+                kind = classify_http_status(status)
+                if kind in ('auth', 'client'):
+                    # 鉴权/参数/协议类错误，重试必然复现 → 立即失败并给可执行提示
+                    err = _llm_error_message(e, self, status=status)
+                    logger.error(f"chat_with_tools 非可重试错误(HTTP {status})，不再重试：{e}")
                     failed = True
-                    content = f"[错误] 工具调用失败：{e}"
+                    content = err
                     break
                 failed = True
-                if self._retry_backoff(attempt, e, effective_retries, context="chat_with_tools"):
+                if self._retry_backoff(attempt, e, effective_retries,
+                                       context="chat_with_tools", status=status):
                     continue
-                content = f"[错误] 工具调用失败：{e}"
+                content = _llm_error_message(e, self, status=status)
             except Exception as e:
                 failed = True
-                if self._retry_backoff(attempt, e, effective_retries, context="chat_with_tools"):
+                if self._retry_backoff(attempt, e, effective_retries,
+                                       context="chat_with_tools", status=_status_of(e)):
                     continue
-                content = f"[错误] 工具调用失败：{e}"
+                content = _llm_error_message(e, self, status=_status_of(e))
 
         return content, reasoning_content, tool_calls, usage, failed
 
     def _retry_backoff(self, attempt: int, e: Exception,
-                       max_retries: Optional[int] = None, context: str = "LLM") -> bool:
-        """重试退避：还有剩余次数则指数退避等待并返回 True（继续重试），否则返回 False
+                       max_retries: Optional[int] = None, context: str = "LLM",
+                       status: Optional[int] = None) -> bool:
+        """重试退避：还有剩余次数则等待并返回 True（继续重试），否则返回 False
+
+        按错误类别分档（这是"该不该重试"的唯一判定点，避免各调用点各写一套）：
+          · auth(401/403)：**永不重试**。同一个 key 重试多少次都是同一个拒绝，
+            白等还会把真正的原因埋在一堆重试日志里。
+          · rate_limit(429)：优先采用服务端 Retry-After，否则用更长的专用退避
+            （LLM_RATE_LIMIT_BACKOFF_BASE_S / _MAX_S）——默认的 10s 上限对按分钟
+            计费的限流窗口太短，等于"重试了但一定还失败"。
+          · 其它（网络抖动/5xx）：保持原有短指数退避。
 
         Args:
             max_retries: 覆盖实例级重试上限（长尾熔断时用 0 关闭重试）
+            status: HTTP 状态码（网络层异常时为 None）
         """
-        logger.error(f"{context} 失败：{e}")
+        kind = classify_http_status(status)
         limit = self.max_retries if max_retries is None else max_retries
-        if attempt < limit:
+
+        if kind == 'auth':
+            # 只记原始原因（短），可执行的排查提示由调用方通过
+            # _llm_error_message 统一生成并回给上层 —— 两边都拼一遍文案
+            # 会在日志里出现"鉴权失败…立即终止：鉴权失败…"的重复。
+            logger.error(
+                f"{context} 鉴权失败(HTTP {status})，重试不会改变结果，立即终止：{str(e)[:200]}"
+            )
+            return False
+        if kind == 'client':
+            logger.error(
+                f"{context} 请求被拒(HTTP {status})，属参数/协议问题，立即终止：{str(e)[:300]}"
+            )
+            return False
+
+        if attempt >= limit:
+            logger.error(f"{context} 失败：{e}（已用满 {limit} 次重试）")
+            return False
+
+        if kind == 'rate_limit':
+            server_wait = _retry_after_seconds(e)
+            if server_wait is not None:
+                delay = server_wait
+            else:
+                import random
+                base = max(0.1, float(getattr(settings, 'LLM_RATE_LIMIT_BACKOFF_BASE_S', 5.0)))
+                cap = max(base, float(getattr(settings, 'LLM_RATE_LIMIT_BACKOFF_MAX_S', 60.0)))
+                delay = min(base * (2 ** attempt), cap) * (0.7 + random.random() * 0.6)
+            logger.warning(
+                f"{context} 被限流(HTTP 429)，{delay:.1f}秒后重试 "
+                f"({attempt + 1}/{limit})；若频繁出现请降低并发/加快任务间隔"
+            )
+        else:
             import random
             delay = min(1.0 * (2 ** attempt), 10.0) * (0.5 + random.random() * 0.5)
-            logger.warning(f"{context} {delay:.2f}秒后重试 ({attempt + 1}/{self.max_retries})")
-            time.sleep(delay)
-            return True
-        return False
+            logger.warning(f"{context} 失败：{e}，{delay:.2f}秒后重试 ({attempt + 1}/{limit})")
+        time.sleep(delay)
+        return True
 
     def chat_with_tools(
         self,

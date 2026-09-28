@@ -1648,6 +1648,31 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
         # 确定性根因前置：AC 证据比静态分析更可信，排在最前
         smoke_defects = _ac_defects + smoke_defects
 
+    # ========== 视觉硬伤 → 确定性缺陷（UI 闭环） ==========
+    # 背景：预置成品模板（.design/preset-*.css）此前只是「建议」—— 模型完全不用它，
+    # 也没有任何环节会发现：evaluator 的 ui_quality 是盲评，页面难看照样 fast_pass。
+    # 这里把浏览器实测的视觉硬伤（对比度 <3:1 / 点区 <24px / 字号 <10px）转成缺陷，
+    # 让「不好看」第一次可判定、可修复。阈值取宽松下限，只拦明显硬伤，最多 2 条。
+    # 副作用是会让这类页面走深度评估 + 一轮定向修复（约 +2 分钟），这是为质量付的价。
+    try:
+        from config import settings as _ui_settings
+        _ui_lint_on = bool(getattr(_ui_settings, "UI_LINT_AS_DEFECT", True))
+    except Exception:
+        _ui_lint_on = True
+    if _ui_lint_on:
+        try:
+            from harness.tools.preview_runner import collect_ui_lint_defects
+            _ui_defects = collect_ui_lint_defects(
+                workspace.path / "index.html", preview_url=preview_url
+            )
+            if _ui_defects:
+                logger.info(
+                    f"[Verify] 视觉硬伤并入修复清单: {[d['type'] for d in _ui_defects]}"
+                )
+                smoke_defects = smoke_defects + _ui_defects
+        except Exception as e:
+            logger.warning(f"[Verify] 视觉硬伤采集异常（跳过）: {e}")
+
     # 判断是否可以走快速通道
     preview_clean = len(browser_result.get("errors", [])) == 0
     ac_all_passed = (
@@ -1748,6 +1773,19 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             failures = "; ".join(r.get("failures", []))
             if failures:
                 ac_results_text += f" — [产品缺陷] {failures}"
+                # P0-4：文本断言失败常常是「断言写错」而不是「代码写错」。
+                # 实证（req 199 AC-1）：断言期望页面显示"黑方回合"，但点击落子后
+                # 回合已经切换成"白方回合"——脚本跑成功了，是期望值写死了旧状态。
+                # 这类失败被当成真缺陷，驱动了 5 轮无效修复。这里显式标注，
+                # 让评估方先判断"是期望值错还是代码错"，别照着错的断言改代码。
+                if ("期望包含" in failures or "文本不匹配" in failures) and "实际" in failures:
+                    ac_results_text += (
+                        "  ⚠️【可能是断言写错，不是产品缺陷】该断言期望一个固定文本，"
+                        "但页面在交互后状态会变化（例如点击落子后回合由黑方切到白方，"
+                        "而期望值仍写死为交互前的黑方回合，就必然失败）。"
+                        "请先判断是这个期望值本身写错了，还是实现真的有问题；"
+                        "若属前者，不要据此判定产品有缺陷，也不要照它去改代码。"
+                    )
             herr = "; ".join(r.get("harness_errors", []))
             if herr:
                 ac_results_text += f" — [脚本错误·可能假阴性] {herr}"
@@ -1773,6 +1811,61 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
         for d in smoke_defects:
             smoke_text += f"- ❌ [{d['type']}] {d['message']}\n  证据: {d.get('evidence', '')}\n"
 
+    # ---- 视觉证据：让 ui_quality 不再是盲评 ----
+    # 截图每轮都已生成（.task/evaluator/screenshot.png），但从未传给评估 LLM，
+    # 于是 ui_quality 是"读 CSS 代码猜的"—— req 199 的评分 2→5→4→5 无规律波动
+    # 就是这么来的，也导致"页面丑"永远进不了修复循环。
+    # 按 EVALUATOR_VISION_MODE 决定传什么；默认 dom_css（确定性取值，零外部依赖）。
+    vision_text = ""
+    try:
+        from config import settings as _vs
+        _v_mode = str(
+            getattr(_vs, "EVALUATOR_VISION_MODE", "dom_css") or "dom_css"
+        ).strip().lower()
+    except Exception:
+        _v_mode = "dom_css"
+
+    if _v_mode in ("dom_css", "auto"):
+        try:
+            from harness.tools.preview_runner import extract_dom_css_summary
+            vision_text = extract_dom_css_summary(
+                workspace.path / "index.html", preview_url=preview_url
+            ) or ""
+        except Exception as e:
+            logger.warning(f"[Verify] 视觉证据提取失败（降级为无）: {e}")
+
+    # 图片模式：先把截图落地，再按厂商能力转成可传的内容块
+    vision_images: list = []
+    if _v_mode in ("image_url", "base64", "auto"):
+        try:
+            from config import settings as _vs
+            _vendor = str(getattr(_vs, "LLM_VENDOR", "auto") or "auto").strip().lower()
+            if _vendor == "auto":
+                _vendor = ("deepseek" if "deepseek" in str(
+                    getattr(_vs, "LLM_BASE_URL", "")).lower() else "agnes")
+        except Exception:
+            _vendor = "agnes"
+        _shot_path = workspace.path / ".task" / "evaluator" / "screenshot.png"
+        if not _shot_path.exists():
+            try:
+                from harness.tools.preview_runner import capture_screenshot
+                capture_screenshot(
+                    workspace.path / "index.html", _shot_path, preview_url=preview_url
+                )
+            except Exception as e:
+                logger.debug(f"[Verify] 截图失败（不传图）: {e}")
+        vision_images = _build_vision_images(_shot_path, _v_mode, vendor=_vendor)
+
+    if vision_text:
+        logger.info(f"[Verify] 注入视觉证据（mode={_v_mode}）: {len(vision_text)} chars")
+    if vision_images:
+        logger.info(f"[Verify] 附带 {len(vision_images)} 张截图参与评估（mode={_v_mode}）")
+    elif _v_mode in ("image_url", "base64"):
+        logger.warning(
+            f"[Verify] 视觉模式={_v_mode} 当前不可用（无公网 URL / 端点不支持 base64），"
+            f"本次评估不含视觉证据"
+        )
+
     evaluator_prompt = load_prompt("verify/evaluator.md")
     user_prompt = f"""## 原始需求
 {requirement}
@@ -1788,6 +1881,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
 {json.dumps(browser_result, ensure_ascii=False, indent=2)}
 ```
 {ac_results_text}{smoke_text}
+{(chr(10) + chr(10) + vision_text) if vision_text else ""}
 
 请基于以上信息，按照 Evaluator 的评估维度和输出格式，给出结构化评估结果。"""
 
@@ -1803,8 +1897,10 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             system_prompt=evaluator_prompt,
             use_memory=False,
             max_tokens=max_tokens,
-            timeout=90,
+            # 实测 thinking 评估耗时 54~107s，90s 会误杀；按实测吞吐留足余量
+            timeout=110,
             thinking='enabled',
+            images=vision_images or None,
         )
         _log_llm_turn_safe(
             state.get("requirement_id"), 0, client, evaluator_prompt, prompt,
@@ -1822,8 +1918,10 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                 system_prompt=evaluator_prompt,
                 use_memory=False,
                 max_tokens=6000,
-                timeout=120,
+                # 6000 tokens 按实测吞吐约需 150s（此前 120s 会撞超时）
+                timeout=150,
                 thinking='enabled',
+                images=vision_images or None,
             )
             if not retry_response.is_error and retry_response.content:
                 response = retry_response
@@ -2549,6 +2647,186 @@ def _collect_defect_repair_context(workspace, defects: list = None) -> tuple[str
 
 
 @_traced_node("defect_repair")
+def _build_vision_images(screenshot_path, mode: str, vendor: str = "agnes") -> list:
+    """按 EVALUATOR_VISION_MODE 把截图转成可传给 LLM 的图片内容块。
+
+    返回空列表 = 本次不传图，调用方降级为纯文本评估（不静默失败，会打日志）。
+
+    厂商能力差异（已核实官方文档）：
+      - agnes-3.0-flash：仅支持**公网可访问 URL**，不支持 base64
+      - deepseek-flash ：支持 base64 data URI / 公网 URL / Files API，
+                         图片自动缩放，**每张最多 1024 token**
+      - 共同约束：图片只能出现在 user 消息，放 system/assistant 会返 400
+    """
+    if mode == "dom_css" or not screenshot_path:
+        return []
+    try:
+        from pathlib import Path
+        p = Path(screenshot_path)
+        if not p.exists():
+            logger.warning(f"[Vision] 截图不存在，不传图: {screenshot_path}")
+            return []
+        from config import settings as _s
+        max_bytes = int(getattr(_s, "EVALUATOR_SCREENSHOT_MAX_BYTES", 5 * 1024 * 1024) or 0)
+        detail = str(getattr(_s, "EVALUATOR_VISION_DETAIL", "low") or "low")
+        max_images = int(getattr(_s, "EVALUATOR_VISION_MAX_IMAGES", 2) or 1)
+        public_base = (getattr(_s, "PREVIEW_PUBLIC_BASE_URL", "") or "").strip()
+    except Exception:
+        return []
+
+    if max_bytes and p.stat().st_size > max_bytes:
+        logger.warning(
+            f"[Vision] 截图 {p.stat().st_size}B 超过上限 {max_bytes}B，不传图"
+        )
+        return []
+
+    def _block(url: str):
+        return {"type": "image_url", "image_url": {"url": url, "detail": detail}}
+
+    # base64：本地文件直传，无公网依赖（DeepSeek 主路径）
+    if mode == "base64":
+        if vendor == "agnes":
+            logger.warning(
+                "[Vision] Agnes 不支持 base64 图片（仅公网 URL），本次降级为不传图"
+            )
+            return []
+        import base64
+        try:
+            b64 = base64.b64encode(p.read_bytes()).decode("utf-8")
+            mime = "image/png" if p.suffix.lower() == ".png" else "image/jpeg"
+            return [_block(f"data:{mime};base64,{b64}")][:max_images]
+        except Exception as e:
+            logger.warning(f"[Vision] base64 编码失败: {e}")
+            return []
+
+    # image_url：需要公网可访问地址
+    if mode == "image_url":
+        if not public_base:
+            logger.warning(
+                "[Vision] image_url 模式需配置 PREVIEW_PUBLIC_BASE_URL（公网域名），"
+                "当前未配置，降级为不传图"
+            )
+            return []
+        return [_block(f"{public_base.rstrip('/')}/{p.name}")][:max_images]
+
+    # auto：有公网用 URL，否则 base64（Agnes 下 base64 不可用则放弃）
+    if mode == "auto":
+        if public_base:
+            return [_block(f"{public_base.rstrip('/')}/{p.name}")][:max_images]
+        if vendor != "agnes":
+            import base64
+            try:
+                b64 = base64.b64encode(p.read_bytes()).decode("utf-8")
+                mime = "image/png" if p.suffix.lower() == ".png" else "image/jpeg"
+                return [_block(f"data:{mime};base64,{b64}")][:max_images]
+            except Exception as e:
+                logger.warning(f"[Vision] auto 模式 base64 编码失败: {e}")
+        logger.warning("[Vision] auto 模式：无公网 URL 且当前厂商不支持 base64，不传图")
+        return []
+
+    return []
+
+
+def _defect_repair_timeout(max_tokens: int) -> int:
+    """按实测吞吐反推缺陷修复的 LLM 超时（秒）。
+
+    背景：官方标称输出 252.7 tok/s，实测根本达不到 ——
+      官方端点长输出实测：68.6 / 88.7 / 91.8 tok/s（中位 88.7）
+      中转网关生产日志：req199 中位 64.3、req200 中位 78.5
+    只有标称值的约 1/3。此前 DEFECT_REPAIR_TIMEOUT=90 是按标称值拍的，
+    输出 16K tokens 实际需要 180~360s，必然超时（日志实锤每次都是
+    `Read timed out (read timeout=90)`）。
+
+    公式：max_tokens ÷ LLM_MEASURED_TPS × 安全系数 + 固定开销，并受绝对上限约束。
+    """
+    try:
+        from config import settings as _s
+        if not getattr(_s, "DEFECT_REPAIR_TIMEOUT_AUTO", True):
+            return int(getattr(_s, "DEFECT_REPAIR_TIMEOUT", 90))
+        tps = max(1, int(getattr(_s, "LLM_MEASURED_TPS", 60) or 60))
+        factor = float(getattr(_s, "DEFECT_REPAIR_TIMEOUT_FACTOR", 1.3) or 1.3)
+        overhead = int(getattr(_s, "DEFECT_REPAIR_TIMEOUT_OVERHEAD", 20) or 0)
+        ceiling = int(getattr(_s, "DEFECT_REPAIR_TIMEOUT_MAX", 600) or 600)
+    except Exception:
+        tps, factor, overhead, ceiling = 60, 1.3, 20, 600
+    computed = int(max_tokens / tps * factor + overhead)
+    return max(30, min(computed, ceiling))
+
+
+def _apply_diff_edits(workspace, edits: list) -> tuple[list, str]:
+    """应用 SEARCH/REPLACE 增量补丁，返回 (已应用的文件列表, 失败原因)。
+
+    复用 harness.tools.edit_tools 里经过实证的匹配逻辑（exact → 行尾空白归一），
+    而不是另写一套 —— 那套逻辑已经在 coder 的 edit_file 工具上跑了很久。
+
+    任一文件的任一块匹配失败即整体放弃（返回空列表 + 原因），由调用方降级到
+    整文件修复。这样"补丁应用失败"永远不会留下半改状态的文件。
+    """
+    try:
+        from harness.tools.edit_tools import (
+            parse_edit_blocks, _match, _replace_normalized,
+        )
+    except ImportError as e:
+        return [], f"无法导入 edit_tools: {e}"
+
+    # 按文件聚合累积应用（2026-09-28 实测修复）：
+    # 模型对同一文件返回多个 edits 条目时，若每条都基于「原始文件内容」计算，
+    # 写回阶段会变成后写覆盖前写 —— 只有最后一个补丁生效，前面的静默丢失，
+    # 而函数仍返回"成功"。真实模型一次返回 2 条同文件补丁即触发该问题。
+    # 故这里按 filename 累积：后续条目基于前一条的结果继续应用，最终每文件只产出 1 条。
+    applied_map: dict = {}
+    order: list = []
+    for item in edits:
+        if not isinstance(item, dict):
+            continue
+        filename = (item.get("filename") or "").strip()
+        edit_text = item.get("edit") or ""
+        if not filename or not edit_text:
+            continue
+
+        # 已有累积内容则继续在其上叠加，否则从磁盘读取一次
+        new_content = applied_map.get(filename)
+        if new_content is None:
+            try:
+                exists = workspace.exists(filename)
+            except Exception:
+                exists = False
+            if not exists:
+                return [], f"文件不存在: {filename}"
+            try:
+                new_content = workspace.read(filename)
+            except Exception as e:
+                return [], f"读取 {filename} 失败: {e}"
+
+        try:
+            blocks = parse_edit_blocks(edit_text)
+        except ValueError as e:
+            return [], f"{filename} 补丁格式非法: {e}"
+
+        for i, (search, replace) in enumerate(blocks, 1):
+            occ, mode = _match(search, new_content)
+            if occ == 0:
+                return [], f"{filename} 第 {i} 块在文件中未匹配到（SEARCH 需逐字符一致）"
+            if occ > 1:
+                return [], f"{filename} 第 {i} 块匹配到 {occ} 处，SEARCH 片段需唯一"
+            if mode == "normalized":
+                new_content = _replace_normalized(new_content, search, replace)
+            else:
+                new_content = new_content.replace(search, replace, 1)
+
+        if filename not in applied_map:
+            order.append(filename)
+        applied_map[filename] = new_content
+
+    if not order:
+        return [], "edits 为空或全部缺少 filename/edit 字段"
+
+    # 只产出「修改后的完整内容」，不直接写盘 —— 交给下方统一的写回流程
+    # （完整性闸门 / 语法闸门 / 长度比闸门）复用，安全边界一致。
+    # 副作用是"任一块匹配失败即整体放弃"天然成立：磁盘此时还没被改动。
+    return [{"filename": fn, "content": applied_map[fn]} for fn in order], ""
+
+
 def defect_repair_node(state: AgentState) -> Dict[str, Any]:
     """小上下文定向修复：针对通用冒烟测试发现的确定性缺陷
 
@@ -2619,25 +2897,47 @@ def defect_repair_node(state: AgentState) -> Dict[str, Any]:
     # ---- 单次 LLM 调用（截断检测 + 一次更大 max_tokens 重试） ----
     from llm.client import get_client
     client = get_client()
-    system_prompt = load_prompt("tasks/defect_repair.md")
 
-    # 超时读统一配置而非硬编码：150s 会让 LLM 端点变慢时前端静默 2.5 分钟（req 146 实测）。
+    # 输出形态：diff = SEARCH/REPLACE 增量块（1~3K tokens，默认）；
+    #           whole_file = 整个文件的完整 JSON（16K~32K tokens，回退用）。
+    # 提超时只是止血，降输出量才是根治 —— 按实测吞吐（约 60~90 tok/s），
+    # 整文件 16K 要 180~360s，增量补丁只要 20~50s。
+    _dr_mode = "diff"
     try:
         from config import settings as _settings
-        _dr_timeout = int(getattr(_settings, "DEFECT_REPAIR_TIMEOUT", 90))
+        _dr_mode = str(
+            getattr(_settings, "DEFECT_REPAIR_OUTPUT_MODE", "diff") or "diff"
+        ).strip().lower()
     except Exception:
-        _dr_timeout = 90
+        pass
+    if _dr_mode not in ("diff", "whole_file"):
+        _dr_mode = "diff"
+
+    if _dr_mode == "diff":
+        system_prompt = load_prompt("tasks/defect_repair_edit.md")
+        _budgets = (8_000, 16_000)
+    else:
+        system_prompt = load_prompt("tasks/defect_repair.md")
+        _budgets = (16_000, 32_000)
+    logger.info(f"[DefectRepair] 输出形态={_dr_mode} 额度序列={_budgets}")
 
     def _call(max_tokens: int):
         _t0 = time.time()
-        resp = client.chat(
-            prompt=user_prompt,
-            system_prompt=system_prompt,
-            use_memory=False,
-            max_tokens=max_tokens,
-            timeout=_dr_timeout,
-            thinking='enabled',  # 补丁 JSON 需要思考模式保证格式正确
-        )
+        _old_retries = client.max_retries
+        # 修复路径不做「相同 prompt 重试」：超时/端点故障换多少次结果都一样，
+        # 实测这正是 550s 的来源（90s × 3 次内部重试 × 2 轮额度 = 540s）。
+        client.max_retries = 0
+        try:
+            resp = client.chat(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                use_memory=False,
+                max_tokens=max_tokens,
+                timeout=_defect_repair_timeout(max_tokens),
+                thinking='enabled',  # 补丁 JSON 需要思考模式保证格式正确
+            )
+        finally:
+            client.max_retries = _old_retries
         _log_llm_turn_safe(
             state.get("requirement_id"), 0, client, system_prompt, user_prompt,
             resp, thinking='enabled',
@@ -2647,7 +2947,7 @@ def defect_repair_node(state: AgentState) -> Dict[str, Any]:
 
     response = None
     llm_down = False
-    for max_tokens in (16_000, 32_000):
+    for max_tokens in _budgets:
         try:
             resp = _call(max_tokens)
         except Exception as e:
@@ -2655,14 +2955,25 @@ def defect_repair_node(state: AgentState) -> Dict[str, Any]:
             llm_down = True
             logger.warning(f"[DefectRepair] LLM 调用失败 (max_tokens={max_tokens}): {e}")
             break
-        if not resp.is_error and resp.content:
-            response = resp
-            if getattr(resp, "finish_reason", None) == "length":
-                logger.warning(
-                    f"[DefectRepair] 响应截断 (max_tokens={max_tokens})，扩大重试"
-                )
-                continue
+        if resp.is_error or not resp.content:
+            # 端点故障/超时：再换更大的 max_tokens 重试毫无意义 —— 同样的 prompt
+            # 必然同样失败。此前这里仅在「异常」时 break，而 resp.is_error 会
+            # 静默 continue 到下一个额度，于是每次烧满 2 轮 × 3 次内部重试 ≈ 550s
+            # 才放弃（实测 6 次调用中 4 次如此）。
+            llm_down = True
+            logger.warning(
+                f"[DefectRepair] LLM 返回错误 (max_tokens={max_tokens}): "
+                f"{getattr(resp, 'error', None)}"
+            )
             break
+        response = resp
+        if getattr(resp, "finish_reason", None) == "length":
+            # 只有"被截断"才值得扩大额度重试
+            logger.warning(
+                f"[DefectRepair] 响应截断 (max_tokens={max_tokens})，扩大重试"
+            )
+            continue
+        break
 
     if llm_down or (not response) or response.is_error or not response.content:
         logger.error("[DefectRepair] LLM 未返回有效内容，本轮不计入修复轮数")
@@ -2699,7 +3010,51 @@ def defect_repair_node(state: AgentState) -> Dict[str, Any]:
             except Exception:
                 parsed = None
 
-    patched = parsed.get("files") if isinstance(parsed, dict) else None
+    # ---- 增量补丁（diff 模式）优先：输出小、应用快，失败回退整文件 ----
+    patched = None
+    if _dr_mode == "diff" and isinstance(parsed, dict):
+        _edits = parsed.get("edits")
+        if isinstance(_edits, list) and _edits:
+            _applied, _err = _apply_diff_edits(workspace, _edits)
+            if _applied:
+                logger.info(
+                    f"[DefectRepair] 增量补丁解析成功（{len(_applied)} 个文件），"
+                    f"交由统一写回闸门处理: {[a['filename'] for a in _applied]}"
+                )
+                patched = _applied
+            else:
+                logger.warning(f"[DefectRepair] 增量补丁应用失败，回退整文件修复: {_err}")
+        else:
+            logger.warning("[DefectRepair] diff 模式未解析到 edits 字段，回退整文件修复")
+
+        if patched is None:
+            # 回退：换整文件 prompt 重新调用一次（额度按整文件给）
+            try:
+                system_prompt = load_prompt("tasks/defect_repair.md")
+                _old_retries = client.max_retries
+                client.max_retries = 0
+                try:
+                    _wf_resp = client.chat(
+                        prompt=user_prompt,
+                        system_prompt=system_prompt,
+                        use_memory=False,
+                        max_tokens=16_000,
+                        timeout=_defect_repair_timeout(16_000),
+                        thinking='enabled',
+                    )
+                finally:
+                    client.max_retries = _old_retries
+                if not _wf_resp.is_error and _wf_resp.content:
+                    try:
+                        parsed = json.loads(_wf_resp.content.strip())
+                    except json.JSONDecodeError:
+                        _m = re.search(r'\{[\s\S]*\}', _wf_resp.content)
+                        parsed = json.loads(_m.group()) if _m else None
+            except Exception as e:
+                logger.warning(f"[DefectRepair] 整文件回退调用失败: {e}")
+
+    if patched is None:
+        patched = parsed.get("files") if isinstance(parsed, dict) else None
     if not isinstance(patched, list) or not patched:
         # 整包 JSON 解析失败（通常是多文件输出超预算被截断）→ 降级为单文件修复
         logger.warning(
@@ -2729,7 +3084,7 @@ def defect_repair_node(state: AgentState) -> Dict[str, Any]:
                     system_prompt=system_prompt,
                     use_memory=False,
                     max_tokens=16_000,
-                    timeout=_dr_timeout,
+                    timeout=_defect_repair_timeout(16_000),
                     thinking='enabled',
                 )
                 _log_llm_turn_safe(

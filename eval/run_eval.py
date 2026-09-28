@@ -440,6 +440,52 @@ def compare(latest: dict, baseline_path: Path) -> str:
 
 # ---------- 主 ----------
 
+def _preflight_llm() -> tuple:
+    """开跑前的 LLM 自检：一次最小调用，验证鉴权 / 额度 / 连通性。
+
+    为什么值得单独做一次（而不是"反正第一个任务会暴露"）：
+      21 个任务全量跑一次要 20+ 分钟。如果是 Key 失效、套餐被禁、额度打满，
+      这 20 分钟会产出 21 个"失败"，而每一个都跟被测代码无关——既浪费配额，
+      又会让人得出"改动后质量下降"的错误结论。
+
+    Returns:
+        (ok: bool, detail: str)
+    """
+    try:
+        from llm.client import get_client, key_fingerprint
+    except Exception as e:
+        return False, f"  无法导入 LLM 客户端: {e}"
+
+    try:
+        client = get_client()
+    except Exception as e:
+        return False, f"  创建 LLM 客户端失败（多为 LLM_API_KEY 未配置）: {e}"
+
+    head = (f"  端点 {getattr(client, 'base_url', '?')} | 模型 {getattr(client, 'model', '?')} "
+            f"| Key {key_fingerprint(getattr(client, 'api_key', ''))}")
+
+    t0 = time.time()
+    try:
+        resp = client.chat(
+            prompt="回复一个字：好",
+            use_memory=False,
+            max_tokens=16,
+            timeout=30,
+        )
+    except Exception as e:
+        return False, f"{head}\n  调用异常：{type(e).__name__}: {str(e)[:200]}"
+
+    elapsed = time.time() - t0
+    content = getattr(resp, 'content', '') or ''
+    if getattr(resp, 'is_error', False) or not content:
+        err = getattr(resp, 'error', None) or content or "(空响应)"
+        return False, (
+            f"{head}\n  调用未返回有效内容：{str(err)[:300]}\n"
+            f"  → 若是鉴权/限流，请先修好配置再跑评测，否则 21 个任务会全数假失败。"
+        )
+    return True, f"{head}\n  往返 {elapsed:.2f}s，返回 {content.strip()[:20]!r}"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Talk2Code 生成质量 Eval")
     parser.add_argument("--tasks", nargs="*", help="只跑指定任务 id（如 t01 t02）")
@@ -451,6 +497,12 @@ def main():
                         help="开启记忆注入（A/B 对照；默认关闭，与历史基线一致）")
     parser.add_argument("--memory-user", type=int, default=0, metavar="USER_ID",
                         help="记忆检索使用的 user_id（默认 0，即 eval 专用用户）")
+    parser.add_argument("--delay", type=float, default=0.0, metavar="SECONDS",
+                        help="任务之间的间隔秒数（默认 0）。免费额度账号建议 ≥10——"
+                             "评测是密集批量调用，不节流会把自己的配额打满，"
+                             "429/401 造成的失败会被误读成代码问题")
+    parser.add_argument("--no-preflight", action="store_true",
+                        help="跳过开跑前的 LLM 连通性/鉴权自检（默认会自检一次）")
     args = parser.parse_args()
 
     # 工作区隔离：每次 run 用唯一目录（时间戳+PID），避免并发/重跑互相覆盖
@@ -476,6 +528,16 @@ def main():
 
     mem_status = f"on(user={args.memory_user})" if args.with_memory else "off"
     print(f"Eval: {len(tasks)} 个任务 (preview={'off' if args.no_preview else 'on'}, memory={mem_status})\n")
+
+    # 开跑前自检：Key 失效/套餐被禁/额度打满时，21 个任务会全部"失败"，
+    # 而失败原因跟被测代码毫无关系——必须在花掉 20 分钟之前就拦住。
+    if not args.no_preflight:
+        ok, detail = _preflight_llm()
+        print(f"LLM 自检: {'✅ 通过' if ok else '❌ 失败'}\n{detail}\n")
+        if not ok:
+            print("自检未通过，已中止评测（避免把配置问题误判成用例失败）。"
+                  "确认修复后可加 --no-preflight 强制开跑。")
+            sys.exit(2)
 
     results = []
     for i, task in enumerate(tasks, 1):
@@ -520,6 +582,11 @@ def main():
         mem_tag = f" [mem:{r.memory_block_chars}c]" if r.memory_enabled else ""
         print(f"{mark} ({r.duration_s}s){mem_tag}" + (f"  {r.error}" if r.error else ""))
         results.append(r)
+        # 任务间节流：评测是密集批量调用，全速跑会把免费额度打满（实测 16 个并发
+        # 请求即触发 429），之后的失败全是配额问题而非代码问题。
+        if args.delay and i < len(tasks):
+            print(f"    节流：等待 {args.delay:.0f}s ...", flush=True)
+            time.sleep(args.delay)
 
     json_path, md_path, data = write_reports(results, len(tasks))
     print(f"\n通过率: {data['passed']}/{data['total']} ({data['pass_rate']}%)")
