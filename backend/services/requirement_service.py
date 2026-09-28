@@ -97,10 +97,17 @@ def _build_injected_memory_block(requirement_content: str, user_id: int,
     结果缓存复用"的策略配合 —— 放进 _build_system_prompt 里会导致每个
     LLM turn 重新检索。
 
-    返回的 hit_ids 是本次注入写下的记账行主键。**生产侧目前只记账、不回填
-    结果**：生产的"任务成功"语义模糊（澄清 / planning / 取消都是正常中间态），
-    现在回填只会用错误口径污染数据。归因数据由 eval 侧提供（那里有明确的
-    passed 判定），等 P1 明确生产口径后再补 resolve_hits 调用。
+    返回的 hit_ids 是本次注入写下的记账行主键，任务到**终态**时用 resolve_hits()
+    回填结果。
+
+    回填口径（2026-09-28 补齐，此前只记账不回填）：只在结局明确的终态回填 ——
+      · 需求交付成功（status='finished'，且拿到 qa_data）→ 按 qa_data['passed'] 记
+      · 交付失败分支（critical 缺陷未清、转 needs_user_input）→ 记 fail
+    澄清 / planning / 取消等中间态**不回填**，这些行保持 pending：
+    pending 既不算命中也不算未命中，不污染统计，同时保留「任务没跑完」的线索。
+    这样绕开了原注释担心的"成功语义模糊"问题，又让"注入的记忆到底有没有用"
+    在生产侧第一次有数据可答（此前 139 条生产命中全是 pending，只能靠 eval 的
+    小样本外推）。
     """
     try:
         return _get_memory_manager().inject_with_receipt(
@@ -270,6 +277,9 @@ class RequirementService:
                 _original_builder = tool_loop._build_system_prompt
                 _req_content = requirement.content
                 _req_user_id = requirement.user_id
+                # 记账行 id，任务终态回填 outcome。先置空，避免检索分支未走到时
+                # 终态回填抛 NameError。
+                _memory_hit_ids = []
                 _memory_block, _memory_hit_ids = _build_injected_memory_block(
                     _req_content, _req_user_id, requirement_id=requirement_id)
 
@@ -984,6 +994,14 @@ class RequirementService:
                 except Exception as e:
                     logger.warning(f"经验学习失败（不阻断）：{e}")
 
+                # 记账回填（失败结局）：此前生产侧只记账不回填，139 条命中记录
+                # 永远是 pending，于是"注入的记忆到底有没有用"这个问题在数据上
+                # 根本无法回答（eval 侧 33% 的通过率没有生产对照）。
+                try:
+                    _get_memory_manager().resolve_hits(_memory_hit_ids, passed=False)
+                except Exception as e:
+                    logger.warning(f"记忆记账回填失败（不阻断）：{e}")
+
                 return True
 
             requirement.status = 'finished'
@@ -1049,6 +1067,15 @@ class RequirementService:
                     qa_result=qa_data,
                     user_id=requirement.user_id,
                 )
+                # 记账回填（终局）：把本次注入的记忆与任务结局关联起来，
+                # 让每条记忆能算出"被注入 N 次、其中 M 次任务通过"。
+                # 注意这是相关性不是因果性 —— 要证明因果得靠 A/B（eval --with-memory）。
+                try:
+                    _passed = bool(qa_data.get("passed")) if isinstance(qa_data, dict) else True
+                    _get_memory_manager().resolve_hits(_memory_hit_ids, passed=_passed)
+                except Exception as e:
+                    logger.warning(f"记忆记账回填失败（不阻断）：{e}")
+
                 pool_stats = _mgr.stats()
                 logger.info(
                     f"需求 {requirement_id} 记忆学习完成，"

@@ -1,7 +1,7 @@
 {
   "name": "generic",
-  "description": "通用前端开发知识：存储方案选择、CDN 引入、文件组织、常见易错点",
+  "description": "【已并入 core】内容已合并到 core/SKILL.md。trigger 置为永不匹配，避免与 core 重复占用常驻名额。原文件保留备查。",
   "type": "knowledge",
-  "trigger": ".*",
-  "priority": 100
+  "trigger": "a^",
+  "priority": 0
 }

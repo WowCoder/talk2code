@@ -1,0 +1,7 @@
+{
+  "name": "core",
+  "description": "常驻基线：通用前端开发纪律 + 反 AI 刻板模式 + 视觉基线（由 generic + anti-ai-slop 合并精简而来）",
+  "type": "knowledge",
+  "trigger": ".*",
+  "priority": 100
+}

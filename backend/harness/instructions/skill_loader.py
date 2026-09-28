@@ -216,6 +216,63 @@ class SkillLoader:
         self._ensure_loaded()
         return [m for m in self._manifests if m.is_workflow()]
 
+    def _budget_limits(self) -> tuple[int, int]:
+        """读取 skill 注入预算（数量上限、token 上限），读不到配置时用安全默认值。"""
+        try:
+            from config import settings as _s
+            max_count = int(getattr(_s, "SKILL_MAX_COUNT", 2) or 2)
+            budget = int(getattr(_s, "SKILL_TOKEN_BUDGET", 3000) or 3000)
+        except Exception:
+            max_count, budget = 2, 3000
+        return max(1, max_count), max(500, budget)
+
+    @staticmethod
+    def _estimate_tokens(manifests: List[SkillManifest]) -> int:
+        """粗估 token：中英混排按 2.5 字符/token 保守估算（宁高勿低）。"""
+        chars = sum(len(m.load_body() or "") for m in manifests)
+        return int(chars / 2.5)
+
+    @staticmethod
+    def _is_always(m: SkillManifest) -> bool:
+        """是否为 always 类（trigger 为 .*，任何需求都命中）。"""
+        return (m.trigger or "").strip() == ".*"
+
+    def _apply_budget(self, matched: List[SkillManifest]) -> List[SkillManifest]:
+        """按预算挑选要注入正文的 Skill。
+
+        背景（2026-09-28）：此前「全部命中全注入」，五子棋一次命中 6 个
+        ≈15.8K 字符，每次 coder 调用都背着 ~5K token 的常驻税。
+
+        策略是「1 个常驻位 + N 个场景位」，而不是简单按 priority 截断：
+        generic(100) 与 anti-ai-slop(100) 都是 always 类，若直接取 top-2，
+        两个 always 类会把名额吃满，game(50) 与全部 UI skill 落选 ——
+        限流反而让页面更难看。故 always 类**整体只占 1 个名额**（正文全注入）。
+        """
+        max_count, budget = self._budget_limits()
+
+        always = [m for m in matched if self._is_always(m)]
+        scene = sorted(
+            [m for m in matched if not self._is_always(m)],
+            key=lambda m: m.priority,
+            reverse=True,
+        )
+
+        # 常驻位占 1 个名额（有 always 类时）；场景位填剩下的名额
+        scene_quota = max(0, max_count - (1 if always else 0))
+        picked = list(always) + scene[:scene_quota]
+
+        # token 预算二次把关：超预算则从场景位尾部（priority 最低）开始丢
+        while len(picked) > 1 and self._estimate_tokens(picked) > budget:
+            picked.pop()
+
+        dropped = [m.name for m in matched if m not in picked]
+        if dropped:
+            logger.info(
+                f"[SkillLoader] 预算内未注入（共 {len(matched)} 命中 / 上限 {max_count} 个"
+                f"·{budget} token）: {dropped}"
+            )
+        return picked
+
     def load_for_task(self, requirement: str) -> str:
         """根据任务需求加载匹配的 Skill 正文
 
@@ -229,8 +286,12 @@ class SkillLoader:
             )
             return ""
 
+        # 注入预算：只在这里生效，match_skills 仍返回全部命中，
+        # 以免 workflow 类可调用能力被预算误砍。
+        picked = self._apply_budget(matched)
+
         parts = []
-        for manifest in matched:
+        for manifest in picked:
             body = manifest.load_body()
             if body:
                 parts.append(body)
@@ -238,8 +299,9 @@ class SkillLoader:
         text = "\n\n---\n\n".join(parts) if parts else ""
         # 命中情况必须可观测：此前无日志，导致"技能到底注进去了吗"只能靠猜
         logger.info(
-            f"[SkillLoader] 命中 {len(matched)} 个 Skill: "
-            f"{[m.name for m in matched]}，注入 {len(text)} chars"
+            f"[SkillLoader] 命中 {len(matched)} 个 Skill，预算内注入 {len(picked)} 个: "
+            f"{[m.name for m in picked]}，注入 {len(text)} chars "
+            f"(≈{self._estimate_tokens(picked)} token)"
         )
         return text
 

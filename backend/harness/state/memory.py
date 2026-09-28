@@ -682,6 +682,71 @@ class MemoryManager:
             logger.warning(f"[MemoryManager] 数据库加载失败: {e}")
             return []
 
+    @staticmethod
+    def _is_failure_memory(m) -> bool:
+        """该记忆是否为失败教训（tags 含 failure）。"""
+        tags = getattr(m, "tags", None) or []
+        return any(isinstance(t, str) and t == "failure" for t in tags)
+
+    def _merge_retry_failure(self, existing, memory) -> bool:
+        """同一需求的又一次失败：就地合并，**不新增条目**。
+
+        背景（req 200 贪吃龙实证）：同一需求反复重试时，v2 表里堆了十几条
+        失败记忆（11 败 1 成），检索时全被召回。模型读到的是"上次这么修失败了"
+        重复十几次，却没有任何一条可学的成功替代方案 —— 等于不断强化失败，
+        且这些失败记忆按原规则（评分更高才取代）永远不会自我清除。
+
+        Returns:
+            True = 已合并，调用方不要再新增；False = 合并失败，回落为新增。
+        """
+        db = None
+        try:
+            n = 1
+            for t in (existing.tags or []):
+                if isinstance(t, str) and t.startswith("retry="):
+                    try:
+                        n = int(t.split("=", 1)[1])
+                    except (ValueError, IndexError):
+                        pass
+            tags = [t for t in (existing.tags or [])
+                    if not (isinstance(t, str) and t.startswith("retry="))]
+            tags.append(f"retry={n + 1}")
+            if "failure" not in tags:
+                tags.append("failure")
+
+            db = SessionLocal()
+            db.query(AgentMemoryV2).filter(AgentMemoryV2.id == existing.id).update(
+                {
+                    AgentMemoryV2.lesson: memory.lesson,
+                    AgentMemoryV2.reflection: memory.reflection,
+                    AgentMemoryV2.rating: memory.rating,
+                    AgentMemoryV2.code_summary: memory.code_summary,
+                    AgentMemoryV2.tags: tags,
+                    AgentMemoryV2.created_at: time.time(),
+                },
+                synchronize_session=False,
+            )
+            db.commit()
+            logger.info(
+                f"[MemoryManager] 同需求失败合并: 记忆 {existing.id} 记录第 {n + 1} "
+                f"次重试（不新增条目，避免失败链淹没知识库）"
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"[MemoryManager] 失败记忆合并失败（回落为新增）: {e}")
+            if db is not None:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+            return False
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
     def _store(self, memory: Memory):
         """存储一条新记忆到数据库（含去重逻辑，去重仅限同一用户）"""
         db = None
@@ -699,6 +764,12 @@ class MemoryManager:
             memories = self._get_active_memories(user_id=memory.user_id)
             for existing in memories:
                 if self._jaccard_similarity(memory.requirement, existing.requirement) > 0.6:
+                    # 同一需求的连续失败 → 合并而非堆叠（详见 _merge_retry_failure）。
+                    # 这是"知识被失败重试淹没"的根治：12 次重试只占 1 条记忆，
+                    # 且 lesson 始终是最新一次的诊断，重试次数保留在 tags 里。
+                    if self._is_failure_memory(memory) and self._is_failure_memory(existing):
+                        if self._merge_retry_failure(existing, memory):
+                            return
                     if _should_supersede(memory, existing):
                         self._mark_superseded(existing.id)
                         logger.info(
@@ -884,6 +955,109 @@ class MemoryManager:
                     db.close()
                 except Exception:
                     pass
+
+    def effectiveness_report(self, min_hits: int = 3) -> dict:
+        """记忆有效性报表：回答"注入的记忆到底有没有用"。
+
+        背景：在 `resolve_hits` 接通生产侧回填之前，这个问题**无法回答** ——
+        `memory_hits` 里的记录永远是 pending，既不算命中也不算未命中。现在有了
+        终态回填，可以按记忆逐条算出「被注入 N 次，其中任务通过 M 次」。
+
+        三个口径（每个都有明确边界，避免过度解读）：
+
+        1. `by_memory`：逐条记忆的注入次数与通过率。通过率低且注入次数足够多
+           （≥ min_hits）的记忆列为 `weak_memories` —— 它们是淘汰/重写的候选。
+           注意这里记的是**相关性不是因果性**：一条记忆被注入到失败任务里，
+           不代表任务失败是它的错（也可能是它匹配的任务本身就更难）。
+        2. `by_requirement`：逐需求的实际结果，用于人工抽查归因。
+        3. `coverage`：注入覆盖率 —— 有多少需求拿到了记忆、有多少一条都没有。
+           这个数字本身就有信息量：如果覆盖率极低，说明检索层没在工作，
+           再谈"记忆有没有用"就没意义。
+
+        Returns:
+            报表 dict；数据库不可用时返回 {"error": ...}，不抛异常。
+        """
+        db = None
+        try:
+            db = SessionLocal()
+            rows = db.query(
+                MemoryHit.memory_id,
+                MemoryHit.requirement_id,
+                MemoryHit.outcome,
+            ).all()
+        except Exception as e:
+            logger.warning(f"[MemoryManager] 有效性报表查询失败: {e}")
+            return {"error": str(e)}
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
+        per_mem: dict = {}
+        per_req: dict = {}
+        for memory_id, req_id, outcome in rows:
+            m = per_mem.setdefault(memory_id, {"hits": 0, "pass": 0, "fail": 0, "pending": 0})
+            m["hits"] += 1
+            o = (outcome or "pending").lower()
+            m[o if o in ("pass", "fail", "pending") else "pending"] += 1
+            if req_id is not None:
+                r = per_req.setdefault(req_id, {"hits": 0, "pass": 0, "fail": 0, "pending": 0})
+                r["hits"] += 1
+                r[o if o in ("pass", "fail", "pending") else "pending"] += 1
+
+        by_memory = []
+        for mid, s in per_mem.items():
+            resolved = s["pass"] + s["fail"]
+            by_memory.append({
+                "memory_id": mid,
+                "hits": s["hits"],
+                "pass": s["pass"],
+                "fail": s["fail"],
+                "pending": s["pending"],
+                # 只统计已回填的，pending 不进分母（否则"任务没跑完"会被算成"没用"）
+                "pass_rate": round(s["pass"] / resolved, 3) if resolved else None,
+            })
+        by_memory.sort(key=lambda x: (x["pass_rate"] if x["pass_rate"] is not None else 9,
+                                      -x["hits"]))
+
+        weak = [
+            x for x in by_memory
+            if x["pass_rate"] is not None
+            and (x["pass"] + x["fail"]) >= min_hits
+            and x["pass_rate"] < 0.5
+        ]
+        overall = {
+            "hit_rows": len(rows),
+            "distinct_memories": len(per_mem),
+            "distinct_requirements": len(per_req),
+            "pass": sum(1 for r in rows if (r[2] or "") == "pass"),
+            "fail": sum(1 for r in rows if (r[2] or "") == "fail"),
+            "pending": sum(1 for r in rows if (r[2] or "pending") not in ("pass", "fail")),
+        }
+        # pending 占比高 = 大量任务没跑到终态，此时任何通过率都不可信
+        overall["pending_ratio"] = (
+            round(overall["pending"] / overall["hit_rows"], 3) if overall["hit_rows"] else None
+        )
+        return {
+            "overall": overall,
+            "coverage": {
+                "requirements_with_memory": len(per_req),
+                "avg_memories_per_requirement": (
+                    round(overall["hit_rows"] / len(per_req), 2) if per_req else 0
+                ),
+            },
+            "by_memory": by_memory,
+            "by_requirement": [
+                {"requirement_id": k, **v} for k, v in sorted(per_req.items())
+            ],
+            "weak_memories": weak,
+            "note": (
+                "通过率记的是相关性不是因果性；要证因果需要跑 eval 的记忆 on/off 对照。"
+                "pending 占比高时通过率不可信（任务没跑到终态）。"
+            ),
+        }
 
     def _reflect(self, requirement: str, code_summary: str, rating: float,
                  failure_context: str = "") -> dict:
