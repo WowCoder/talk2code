@@ -269,6 +269,43 @@ class ToolCallLoop:
                     })
                     iteration += 1
                     continue
+                # ---- 语法硬门禁：带语法错误不允许结束 coder 阶段 ----
+                # 背景（req 200）：js/app.js 在第 5 轮就被 lint 报出
+                # `SyntaxError: missing ) after argument list`，但 coder 带着它走完
+                # 剩余轮次进了 verify —— verify 再用 54s 的 thinking 评估去"发现"
+                # 这个 coder 阶段就已知的错误，defect_repair 又全部超时失败。
+                # 一个本可在 coder 阶段 10 秒内修掉的语法错误，烧掉了后续 30 分钟。
+                _syntax_errs = self._check_deliverable_syntax()
+                if _syntax_errs:
+                    _syn_rounds = state.get("_syntax_block_rounds", 0) + 1
+                    state["_syntax_block_rounds"] = _syn_rounds
+                    if _syn_rounds >= 3:
+                        # 终止性保证：连续 3 轮仍修不好就放行，交给 verify /
+                        # defect_repair 兜底，避免门禁本身把循环卡死到迭代上限
+                        logger.warning(
+                            f"[ToolLoop] 语法门禁连续 {_syn_rounds} 轮阻断仍未修复，"
+                            f"放行完成: {_syntax_errs[:2]}"
+                        )
+                    else:
+                        logger.warning(
+                            f"[ToolLoop] 语法门禁阻断完成（第 {_syn_rounds} 轮）: {_syntax_errs}"
+                        )
+                        state["dialogue_history"].append({
+                            "role": "system", "name": "System",
+                            "content": (
+                                "⚠️ 你的交付存在**机器可判定的硬伤，必须先修好才能结束**"
+                                "（带病交付会让后续验收全部失败）：\n"
+                                + "\n".join(f"- {e}" for e in _syntax_errs)
+                                + "\n（语法错误用 edit_file 修复对应片段；引用了不存在的文件"
+                                  "就补写该文件，或把引用改成你实际创建的文件名。）\n"
+                                  "修好后再次声明完成，不要直接结束。"
+                            ),
+                            "hidden": True,
+                            "preserve": True,
+                        })
+                        iteration += 1
+                        continue
+
                 state["current_step"] = "task_complete"
                 # 完成硬约束接线：Agent 以"无 tool_calls"声明完成时，触发
                 # PRE_TOOL_USE（约定信号 tool_name=None + current_step=task_complete），
@@ -380,6 +417,7 @@ class ToolCallLoop:
                                 f"[已跳过] {_rf} 在本次任务中已被读取 {_counts[_rf] - 1} 次，"
                                 f"达到上限 {self.READ_FILE_LIMIT_PER_TASK} 次。内容就在上方对话历史里，"
                                 f"请直接基于已有内容继续写代码，不要再读它确认。"
+                                f"{self._file_preview_snippet(_rf)}"
                             ),
                         )
                         logger.info(f"[ToolLoop] read_file 次数上限: {_rf} 第 {_counts[_rf]} 次，跳过执行")
@@ -436,6 +474,8 @@ class ToolCallLoop:
                                         f"你拿到的会是和上一轮逐字相同的结果（已在上方工具结果里）。"
                                         f"不要为确认而重读它 —— 直接基于已有内容继续；"
                                         f"需要改动就用 write_file / edit_file 写入。"
+                                        # 同内容重读同理：直接把首尾贴出来，省掉下一次尝试
+                                        f"{self._file_preview_snippet(_rf2)}"
                                     ),
                                 )
                                 logger.info(f"[ToolLoop] 同内容重读跳过: {_rf2}")
@@ -744,6 +784,49 @@ class ToolCallLoop:
                     # 继续循环（不 break），让 LLM 用 write_file 重写
                     iteration += 1
                     continue
+                # ---- 交付门禁保底：迭代耗尽也必须先过「确定性硬伤」检查 ----
+                # 背景（t16 实测）：交付门禁此前只挂在「模型主动声明完成」这条路径上
+                # （无 tool_calls → task_complete），而真实失败大多发生在「迭代耗尽」
+                # 这条路：t16 连续 4 次运行全部在第 6 轮耗尽退出，其中一次已经写出了
+                # index.html 却引用了从未创建的 js 文件 —— 门禁一次都没执行，坏代码
+                # 被静默交付给 verify，再由 verify 花几十秒的 thinking 去「发现」它。
+                # 这里只放行一次扩容（与上面的自修复保底同款纪律），避免把
+                # 「迭代上限」退化成「无上限」。
+                if not state.get("_gate_extended"):
+                    # 两类确定性硬伤都要在耗尽前兜一次：
+                    #   ① 必需文件根本没创建（t16 实测形态：索引页缺失 / 仍被引用）
+                    #   ② 写了但语法错，或引用了不存在的资源
+                    _final_errs = []
+                    if not state.get("metadata", {}).get("is_chat", False):
+                        _missing_final = self._check_missing_files(state)
+                        if _missing_final:
+                            _final_errs.append(
+                                "必需文件还没创建：" + ", ".join(_missing_final)
+                            )
+                    _final_errs.extend(self._check_deliverable_syntax())
+                    if _final_errs:
+                        state["_gate_extended"] = True
+                        effective_max_iterations += self.SELF_REPAIR_EXTRA_ITERATIONS
+                        logger.warning(
+                            f"[ToolLoop] 迭代耗尽但交付仍有确定性硬伤，扩容 "
+                            f"{effective_max_iterations - self.SELF_REPAIR_EXTRA_ITERATIONS} → "
+                            f"{effective_max_iterations} 轮: {_final_errs[:3]}"
+                        )
+                        state["dialogue_history"].append({
+                            "role": "system", "name": "System",
+                            "content": (
+                                "⚠️ 迭代即将用完，但你的交付仍不完整，已为你追加若干轮。"
+                                "请立刻补齐（不要再写新功能、不要再更新笔记）：\n"
+                                + "\n".join(f"- {e}" for e in _final_errs)
+                                + "\n（缺文件就 write_file 补上；语法错误用 edit_file 修复；"
+                                  "引用了不存在的文件就补写该文件，"
+                                  "或把引用改成你实际创建的文件名。）"
+                            ),
+                            "hidden": True,
+                            "preserve": True,
+                        })
+                        iteration += 1
+                        continue
                 state["current_step"] = "max_iterations"
                 break
 
@@ -2012,6 +2095,47 @@ class ToolCallLoop:
         import hashlib
         return hashlib.md5((text or "").encode("utf-8", "ignore")).hexdigest()
 
+    def _file_preview_snippet(self, filename: str, head: int = 15, tail: int = 15) -> str:
+        """生成文件首尾各 N 行的带行号预览，用于「拦截重读」时让模型当场看到内容。
+
+        为什么需要它：重读拦截保住了正确性，但拦截消息本身不给内容，模型只能靠
+        记忆回溯"我到底写了什么"——对 flash 档模型这等于没给，于是它换个文件名或者
+        过两轮又发起一次 read_file，空转轮次照烧迭代预算和延迟（需求 183 实测同一
+        文件被读 6 次）。
+
+        把首尾若干行直接贴进拦截消息，是成本最低的\"当场满足\"：模型想确认的通常就是
+        类名 / 函数签名 / 结构骨架，首尾各 15 行基本够用；而中间正文它自己刚写过，
+        不必再花一轮往返去取。
+
+        Returns:
+            形如 \"\\n1| ...\\n2| ...\" 的预览；文件读不到或为空时返回空字符串。
+        """
+        try:
+            raw = self.workspace.read(filename)
+        except Exception:
+            return ""
+        lines = (raw or "").splitlines()
+        if not lines:
+            return ""
+        total = len(lines)
+        # 文件足够短 → 全给（比截首尾更有用，且总量可控）
+        if total <= head + tail:
+            picked = [(i + 1, lines[i]) for i in range(total)]
+        else:
+            picked = [(i + 1, lines[i]) for i in range(head)]
+            picked.append((0, f"… 省略中间 {total - head - tail} 行 …"))
+            picked.extend(
+                (i + 1, lines[i]) for i in range(total - tail, total)
+            )
+        body = "\n".join(
+            f"{n:>4}| {txt}" if n else f"    | {txt}" for n, txt in picked
+        )
+        # 单行过长会撑爆上下文，按 200 字符截断（只看结构，不看长行细节）
+        body = "\n".join(
+            (ln[:200] + " …" if len(ln) > 200 else ln) for ln in body.split("\n")
+        )
+        return f"\n\n【{filename} 共 {total} 行，首尾预览】\n{body}"
+
     def _created_read_block(self, state: AgentState, filename: str):
         """创建后免回读判定：返回 ToolResult（blocked）表示拦截，None 表示放行。
 
@@ -2040,6 +2164,8 @@ class ToolCallLoop:
                 f"完整正文就在上方 write_file 的结果里）。"
                 f"不要为确认 class/id 而重读它 —— 直接以你写入的版本为准继续；"
                 f"需要改动就用 write_file / edit_file 写入。"
+                # 附首尾预览：模型想确认的多半是类名/签名/结构骨架，直接给就不必再发一轮
+                f"{self._file_preview_snippet(filename)}"
             ),
         )
 
@@ -2106,6 +2232,153 @@ class ToolCallLoop:
             )
             logger.info(f"[ToolLoop] 卸载创建时正文: {fname}")
             return
+
+    def _check_deliverable_syntax(self) -> list[str]:
+        """检查交付文件的**确定性硬伤**，返回问题列表（空列表 = 无问题）。
+
+        两类判据（都是机器可判定、不依赖模型审美判断）：
+        1. 语法：与 lint_js / lint_css / _syntax_problem 对齐 ——
+           .js → node --check、.css → 花括号平衡、.html → </html> 收尾、.json → 可解析
+        2. 引用闭合：HTML 的 src/href、CSS 的 url()/@import 指向的本地文件必须存在
+           （语法全对但引用了没创建的文件，预览会直接白屏）
+
+        设计要点：
+        - 只查交付文件（排除 .task/、.design/ 等元数据与模板目录）
+        - 任一步异常一律视为"无问题"——**门禁自身故障绝不能阻断交付**
+        """
+        try:
+            from harness.tools.file_tools import _syntax_problem
+        except ImportError:
+            return []
+        try:
+            files = [f for f in self.workspace.list() if self._is_deliverable(f)]
+        except Exception:
+            return []
+
+        problems: list[str] = []
+        for fname in files:
+            if not fname.lower().endswith((".js", ".css", ".html", ".json")):
+                continue
+            try:
+                content = self.workspace.read(fname)
+            except Exception:
+                continue
+            try:
+                problem = _syntax_problem(fname, content)
+            except Exception:
+                continue
+            if problem:
+                problems.append(f"{fname}: {problem}")
+
+        # 引用闭合：语法正确但引用了不存在的文件，同样是确定性缺陷。
+        # 单独 try 兜底：引用检查崩了也不能让语法检查的结果一起丢掉。
+        try:
+            problems.extend(self._check_broken_references())
+        except Exception:
+            pass
+        return problems
+
+    # 引用里这些前缀指向外部/内联资源，不属于工作区文件，一律跳过
+    _REF_SKIP_PREFIX = (
+        "http://", "https://", "//", "data:", "blob:", "mailto:",
+        "tel:", "javascript:", "about:", "#",
+    )
+
+    def _check_broken_references(self) -> list[str]:
+        """检查交付文件是否引用了不存在的本地资源（空列表 = 无问题）。
+
+        背景（t16 实测）：模型写出 `index.html` 引用 `js/sort.js`，但只创建了
+        `js/storage.js`。语法门禁全过（每个文件单独看都是合法 JS/HTML），
+        预览却直接 `ERR_FILE_NOT_FOUND` 白屏 —— 从"能跑通"的角度看这是硬伤，
+        而且是**机器可判定**的：解析出引用、判断文件在不在即可。
+
+        与语法门禁合并返回，共用同一个阻断/放行逻辑（含 3 轮终止性保证）。
+
+        设计要点：
+        - 只查交付文件（.task/、.design/ 等元数据与模板目录不参与）
+        - 解析 HTML 的 src/href、CSS 的 url() 与 @import
+        - 跳过外部/内联引用（http、data:、#锚点…）
+        - 跳过指向工作区外的相对路径（`..`）与目录引用（以 `/` 结尾）
+        - 最多报 5 条，避免一次灌满上下文
+        - 任一步异常一律返回"无问题"——门禁自身故障绝不能阻断交付
+        """
+        import posixpath
+        import re as _re
+
+        _html_ref = _re.compile(r'''(?:src|href)\s*=\s*["']([^"']*)["']''', _re.I)
+        _css_url = _re.compile(r'''url\(\s*["']?([^"')]+?)["']?\s*\)''', _re.I)
+        _css_import = _re.compile(r'''@import\s+(?:url\(\s*)?["']([^"']+)["']''', _re.I)
+
+        try:
+            files = [f for f in self.workspace.list() if self._is_deliverable(f)]
+        except Exception:
+            return []
+        if not files:
+            return []
+
+        # 预建文件集与目录集：目录引用（如 <a href="css">）不算断链
+        file_set = set(files)
+        dir_set: set[str] = set()
+        for f in files:
+            d = posixpath.dirname(f)
+            while d:
+                dir_set.add(d)
+                d = posixpath.dirname(d)
+
+        problems: list[str] = []
+        seen: set = set()
+        for fname in files:
+            low = fname.lower()
+            if low.endswith((".html", ".htm")):
+                kind = "html"
+            elif low.endswith(".css"):
+                kind = "css"
+            else:
+                continue
+            try:
+                content = self.workspace.read(fname)
+            except Exception:
+                continue
+            # 门禁绝不能因内容形态异常而崩：非字符串（None / Mock / bytes）直接跳过。
+            # 这里必须显式判类型而非 `or ""` —— Mock 是 truthy，会一路带进正则报 TypeError。
+            if not isinstance(content, str) or not content:
+                continue
+
+            try:
+                refs = _html_ref.findall(content) if kind == "html" else (
+                    _css_url.findall(content) + _css_import.findall(content)
+                )
+            except Exception:
+                continue
+
+            for raw in refs:
+                try:
+                    ref = (raw or "").strip().strip("\"'")
+                    if not ref or ref.lower().startswith(self._REF_SKIP_PREFIX):
+                        continue
+                    # 去掉查询串与锚点：style.css?v=2#top → style.css
+                    ref = ref.split("#", 1)[0].split("?", 1)[0].strip()
+                    if not ref or ref.endswith("/") or any(ch in ref for ch in "{}<>"):
+                        continue
+                    if ref.startswith("/"):
+                        target = posixpath.normpath(ref.lstrip("/"))
+                    else:
+                        target = posixpath.normpath(
+                            posixpath.join(posixpath.dirname(fname), ref)
+                        )
+                    if target.startswith(".."):
+                        continue                      # 工作区外的路径不属交付范围
+                    if target in file_set or target in dir_set:
+                        continue
+                    if (fname, ref) in seen:
+                        continue
+                    seen.add((fname, ref))
+                    problems.append(f"{fname} 引用了不存在的资源：{ref}")
+                    if len(problems) >= 5:
+                        return problems
+                except Exception:
+                    continue
+        return problems
 
     @staticmethod
     def _is_deliverable(path: str) -> bool:
