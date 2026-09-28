@@ -57,7 +57,12 @@ const router = createRouter({
     },
     {
       // 运营后台：入口不进主导航（普通用户不感知）。token 存 sessionStorage，
-      // 有效期 2h，过期由 useAdmin 统一踢回登录页。
+      // 有效期 2h，过期由 useAdmin 统一踢回登录页。默认落点是总览 —— 先看数
+      // 字再处理待办，比一进来就掉进审批队列更顺。
+      path: '/admin',
+      redirect: '/admin/metrics',
+    },
+    {
       path: '/admin/login',
       name: 'AdminLogin',
       component: () => import('@/views/admin/AdminLoginView.vue'),

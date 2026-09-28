@@ -6,6 +6,7 @@
 from datetime import datetime
 
 from flask import request, jsonify
+from sqlalchemy import or_
 from flask_jwt_extended import (
     create_access_token, get_jwt_identity, unset_jwt_cookies,
 )
@@ -107,6 +108,9 @@ def list_invites():
     from models import InviteCode
 
     status = (request.args.get('status') or '').strip()
+    # 搜索：邮箱或邀请码模糊匹配。放在 DB 侧而不是前端过滤 —— 前端只持有当前页
+    # 50 条，在那一页里搜「找不到」会让人误以为数据不存在。
+    keyword = (request.args.get('keyword') or '').strip()
     page = max(1, int(request.args.get('page', 1) or 1))
     page_size = min(50, max(1, int(request.args.get('page_size', 20) or 20)))
 
@@ -114,6 +118,14 @@ def list_invites():
         q = db.query(InviteCode)
         if status:
             q = q.filter(InviteCode.status == status)
+        if keyword:
+            like = f'%{keyword}%'
+            q = q.filter(
+                or_(
+                    InviteCode.applicant_email.ilike(like),
+                    InviteCode.code.ilike(like),
+                )
+            )
         total = q.count()
         rows = (
             q.order_by(InviteCode.created_at.desc())
