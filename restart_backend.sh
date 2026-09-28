@@ -1,9 +1,9 @@
 #!/bin/bash
 # 重启 talk2code 后端（干净环境启动）
 # 1. 规避 TRAE 注入的 PYTHONHOME/PYTHONPATH
-# 2. 清除代理变量：LLM 端点（apihub.agnes-ai.com）可直连，无需本地代理。
-#    本机代理端口会漂移（如 51322 → 61412），进程启动后继承的旧代理失效会导致
-#    所有 LLM 请求 ProxyError: Connection refused，需求必然跑失败。
+# 2. 清除代理变量：LLM 端点可直连，无需本地代理。本机代理端口会漂移，
+#    进程启动后继承的旧代理失效会导致所有 LLM 请求
+#    ProxyError: Connection refused，需求必然跑失败。
 # 3. 只识别 LISTEN 状态的进程（避免把前端的 ESTABLISHED 连接误判为旧后端），
 #    并等待端口真正释放后再启动新进程（优雅退出约需 5s）。
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
