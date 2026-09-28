@@ -24,7 +24,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/talk2code_pitch.gif" alt="Talk2Code 演示：一句话生成贪吃蛇小游戏" width="100%" />
+  <img src="docs/talk2code_pitch.gif" alt="Talk2Code 演示：一句话生成贪吃龙小游戏" width="100%" />
 </p>
 
 <p align="center">
