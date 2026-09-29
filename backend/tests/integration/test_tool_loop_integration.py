@@ -14,32 +14,55 @@ class TestPlannerToToolLoopFlow:
 
     @patch("harness.instructions.nodes.get_client")
     def test_planner_node_returns_plan(self, mock_get_client):
-        """测试 TeamLeader 节点（原 planner_node）返回结构化计划"""
+        """测试 TeamLeader 节点（原 planner_node）返回结构化计划
+
+        mock 必须按调用类型分派：澄清生成和 plan 生成打的是同一个 client。
+        此前这里对**所有**调用都返回 plan JSON —— 澄清那次拿到 plan JSON 解析不出
+        问题列表，旧代码"解析失败即当无需追问"顺手放行，测试于是长期成立；
+        修掉静默放行之后（失败不再等价于放行），这个 mock 才暴露出来。
+        """
         mock_client = Mock()
         plan_json = json.dumps({
-            "features": [{"title": "添加待办", "description": "支持新增待办项"}],
-            "acceptance_criteria": [{"id": "AC1", "description": "可新增待办"}],
+            "requirement_restated": "一个能增删待办、刷新后还在的清单",
+            "features": ["添加待办", "删除待办"],
+            "assumptions": ["数据存在浏览器本地"],
+            "acceptance_criteria": [
+                {"id": "AC-1", "label": "能添加待办", "feature": "添加待办",
+                 "anchor": "页面顶部的输入框与旁边的添加按钮",
+                 "how_to_verify": "输入内容后点击添加按钮，列表中出现这条新待办"},
+                {"id": "AC-2", "label": "能删除待办", "feature": "删除待办",
+                 "anchor": "列表中每一条待办右侧的删除按钮",
+                 "how_to_verify": "点击某条待办的删除按钮，列表项数量减少一项"},
+            ],
             "file_structure": ["index.html", "style.css", "app.js"],
             "tech_stack": {"css": "tailwind", "storage": "localStorage"},
-            "implementation_notes": "使用 Tailwind CSS",
-            "implementation_order": ["index.html", "style.css", "app.js"],
+            "implementation_order": ["style.css", "app.js", "index.html"],
             "tasks": [
-                {"file": "index.html", "description": "页面骨架"},
-                {"file": "app.js", "description": "交互逻辑"},
+                {"file": "index.html", "purpose": "页面骨架与容器挂载",
+                 "description": "写结构", "dependencies": []},
+                {"file": "app.js", "purpose": "待办增删的全部交互逻辑",
+                 "description": "写逻辑", "dependencies": []},
+                {"file": "style.css", "purpose": "全局样式与列表布局定义",
+                 "description": "写样式", "dependencies": []},
             ],
             "complexity": "standard",
         })
-        mock_client.chat.return_value = Mock(
-            content=plan_json,
-            is_error=False, error=None, finish_reason="stop"
-        )
+
+        def _chat(prompt, **kwargs):
+            # 澄清调用（intent/clarify_generate.md）返回空数组 = LLM 判定无需追问；
+            # 需求里已写明"极简风格"，也不会再补必问的视觉风格题。
+            if "澄清" in prompt and "开发计划" not in prompt:
+                return Mock(content="[]", is_error=False, error=None, finish_reason="stop")
+            return Mock(content=plan_json, is_error=False, error=None, finish_reason="stop")
+
+        mock_client.chat.side_effect = _chat
         mock_get_client.return_value = mock_client
 
         from harness.instructions.nodes import team_leader_node
 
         state = {
             "requirement_id": 1,
-            "requirement_content": "创建待办事项应用",
+            "requirement_content": "创建待办事项应用，极简风格，数据存本地",
             "dialogue_history": [],
             "metadata": {},
         }
@@ -48,6 +71,9 @@ class TestPlannerToToolLoopFlow:
         assert result is not None
         assert "current_step" in result
         assert result.get("plan", {}).get("file_structure") == ["index.html", "style.css", "app.js"]
+        # 新契约：AC 必须带 anchor（验收脚本据此定位，而不是从产物代码反推）
+        acs = result["plan"]["acceptance_criteria"]
+        assert all(a.get("anchor") for a in acs)
 
     @patch("harness.instructions.nodes.get_client")
     def test_tool_coder_node_with_tool_calls(self, mock_get_client):

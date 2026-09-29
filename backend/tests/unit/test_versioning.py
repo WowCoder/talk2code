@@ -116,9 +116,12 @@ class TestGitVersioningRollback:
         git = GitVersioning(workspace)
         result = git.rollback("abc123")
 
+        from harness.state.versioning import _GIT_TIMEOUT_S
+
         mock_run.assert_called_with(
             ["git", "reset", "--hard", "abc123"],
-            cwd="/tmp/test_ws", capture_output=True
+            cwd="/tmp/test_ws", capture_output=True, text=True,
+            timeout=_GIT_TIMEOUT_S,
         )
         assert result is True
 
@@ -169,3 +172,65 @@ class TestGitVersioningHasChanges:
 
         git = GitVersioning(workspace)
         assert git.has_changes() is False
+
+
+class TestGitCallsHaveExplicitTimeout:
+    """所有 git 调用都必须带超时。
+
+    此前 versioning.py 里 9 处 `subprocess.run` 都不带 timeout —— 单个 git 命令
+    正常在毫秒级，但仓库被另一个进程 lock 住时会**永久阻塞**。版本记录只是
+    旁路能力，却足以把整个编码循环挂死在这一步上。
+    """
+
+    def test_subprocess_run_only_lives_inside_the_helper(self):
+        """调用一律走 `_run_git`；散落的 subprocess.run 会绕过超时约束。"""
+        from pathlib import Path
+
+        src = (Path(__file__).resolve().parents[2]
+               / "harness/state/versioning.py").read_text(encoding="utf-8")
+        code = "\n".join(
+            line for line in src.splitlines() if not line.lstrip().startswith("#")
+        )
+
+        assert code.count("subprocess.run(") == 1, "只允许 _run_git 内部调用一次"
+        assert "timeout=_GIT_TIMEOUT_S" in code
+
+    def test_timeout_is_a_sane_positive_number(self):
+        from harness.state.versioning import _GIT_TIMEOUT_S
+
+        assert 1 <= _GIT_TIMEOUT_S <= 300
+
+    def test_timeout_does_not_propagate_into_the_loop(self):
+        """git 卡住时返回 None，不能把异常抛进编码循环。"""
+        import subprocess as sp
+
+        from harness.state.versioning import _run_git
+
+        with patch("subprocess.run",
+                   side_effect=sp.TimeoutExpired(cmd="git", timeout=30)):
+            assert _run_git(["status"], "/tmp") is None
+
+    def test_missing_git_binary_returns_none(self):
+        from harness.state.versioning import _run_git
+
+        with patch("subprocess.run", side_effect=FileNotFoundError("git not found")):
+            assert _run_git(["status"], "/tmp") is None
+
+    def test_rollback_returns_false_when_git_times_out(self):
+        """超时不能被误判成"回滚成功"。"""
+        import subprocess as sp
+
+        with patch("pathlib.Path.exists", return_value=True), \
+                patch("subprocess.run",
+                      side_effect=sp.TimeoutExpired(cmd="git", timeout=30)):
+            git = GitVersioning(Mock(path="/tmp/test_ws"))
+            assert git.rollback("abc123") is False
+
+    def test_head_is_empty_when_git_times_out(self):
+        import subprocess as sp
+
+        with patch("pathlib.Path.exists", return_value=True), \
+                patch("subprocess.run",
+                      side_effect=sp.TimeoutExpired(cmd="git", timeout=30)):
+            git = GitVersioning(Mock(path="/tmp/test_ws"))
+            assert git.commit("msg") == ""
