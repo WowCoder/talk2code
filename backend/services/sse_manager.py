@@ -244,6 +244,31 @@ class SSEManager:
 
             return client
 
+    def touch(self, client_id: str, client_queue: queue.Queue) -> bool:
+        """刷新某个连接的存活心跳，但不投递任何消息。
+
+        为什么需要它（需求 207 实测根因）：
+        `last_heartbeat` 原先只在 `SSEClient.send()` 里更新，而 `cleanup_stale()`
+        每 60 秒摘除心跳超过 300 秒的连接。于是**一条完全健康的连接，只要 5 分钟
+        没有业务事件就会被判死摘除**——HTTP 连接还在，浏览器 EventSource 也没有
+        任何错误（心跳是路由生成器自己 yield 的，不经过 SSEClient），但此后所有
+        `broadcast()` 都找不到这个客户端，事件**静默丢失**。
+
+        触发场景很常见：TL 出完计划后等用户确认（本次实测等了 33 分钟）、
+        LLM 长调用挂起、编码前的静默期。用户看到的现象是「coder 的消息不实时
+        推送，刷新才看得到」「质量工程师的验收消息一条都没有」。
+
+        路由在每次发送心跳时调用本方法，让「连接还活着」这件事对清理线程可见。
+        """
+        with self._lock:
+            clients = self._clients.get(client_id) or []
+            hit = False
+            for client in clients:
+                if client.queue is client_queue:
+                    client.update_heartbeat()
+                    hit = True
+            return hit
+
     def remove_client(self, client_id: str, client_queue: queue.Queue) -> bool:
         """移除 SSE 客户端"""
         with self._lock:
