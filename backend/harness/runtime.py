@@ -918,6 +918,30 @@ class ToolCallLoop:
         low = (text or "").lower()
         return any(m in low for m in self._TIMEOUT_MARKERS)
 
+    def _turn_wall_plan(self) -> tuple[int, int]:
+        """把「单轮墙钟上限」拆成 `(单次尝试超时, 最大重试次数)`。
+
+        为什么要拆：`timeout` 约束的是**一次请求**，而用户感知的是**一轮**
+        （含内部重试）。`LLM_TIMEOUT=300` + `LLM_MAX_RETRIES=2` 实际是 900s/轮，
+        但这个乘积在代码里从没被写出来过 —— 它只活在"两个参数相乘"这个隐式
+        关系里，所以 config 里那条"LLM_TIMEOUT 是绝对天花板"的注释才会一直
+        和实现对不上。拆开之后，墙钟是一个能写进配置、能被测试断言的量。
+
+        规则：
+        - `LLM_TURN_MAX_WALL_S` 为 0 → 不设墙钟，原样返回（保持旧行为可选）
+        - 单次尝试超时取 `min(LLM_TIMEOUT, 墙钟)`，`LLM_TIMEOUT` 仍是单次请求的硬上限
+        - 重试次数取 `min(LLM_MAX_RETRIES, wall // per_call - 1)`，
+          保证 `per_call × (retries + 1) ≤ wall`
+        """
+        per_call = int(getattr(self._settings, "LLM_TIMEOUT", 60) or 60)
+        retries = int(getattr(self._settings, "LLM_MAX_RETRIES", 2) or 0)
+        wall = int(getattr(self._settings, "LLM_TURN_MAX_WALL_S", 0) or 0)
+        if wall <= 0:
+            return per_call, retries
+        per_call = max(1, min(per_call, wall))
+        allowed = max(0, wall // per_call - 1)
+        return per_call, min(retries, allowed)
+
     def _chat_with_breaker(self, client, messages: list, tools: list,
                            thinking_mode: str, iteration: int):
         """单轮 LLM 调用，带长尾熔断。
@@ -937,9 +961,16 @@ class ToolCallLoop:
         """
         budget = int(getattr(self._settings, "LLM_SLOW_TURN_TIMEOUT", 0) or 0)
         if budget <= 0:
+            # 熔断关闭 ≠ 不设上限。这一支此前直接裸调：不传 timeout、不传
+            # max_retries → 两个参数各自落回实例默认（LLM_TIMEOUT × LLM_MAX_RETRIES），
+            # 单轮墙钟最坏 = 300 × (2+1) = 900s —— 而代码里**没有任何一处**写出过
+            # 这个 900，它是"两个参数相乘"的隐式产物，调参时看不见。
+            # 现在按显式的「单轮墙钟上限」反推这两个参数（见 _turn_wall_plan）。
+            per_call, retries = self._turn_wall_plan()
             return client.chat_with_tools(
                 messages=messages, tools=tools,
                 max_tokens=self._max_tokens, thinking=thinking_mode,
+                timeout=per_call, max_retries=retries,
             )
 
         first = client.chat_with_tools(
@@ -1004,7 +1035,14 @@ class ToolCallLoop:
                 text = "正在运行代码验证"
             else:
                 text = f"正在检查 {filename or '文件'} 语法"
-            percent = 20 + int(75 * (iteration + 1) / max(max_iterations, 1))
+            # 百分比统一由 progress_plan 分配：编码带 20..75（按轮次右移），
+            # 上界刻意低于验证带起点，否则验证一亮相进度条就回退
+            # （此前这里是 `20 + 75*ratio`，能冲到 95，而验证从 80 重来）。
+            from harness.observability import progress_plan as _pp
+            percent = _pp.coding_percent(
+                (iteration + 1) / max(max_iterations, 1),
+                _pp.round_index(state),
+            )
             self.sse.progress(req_id, percent, text, stage="coding")
         except Exception as e:
             logger.debug(f"[ToolLoop] 动作进度推送失败（不阻断）: {e}")
@@ -1431,7 +1469,8 @@ class ToolCallLoop:
         if complexity == "simple":
             return self._build_simple_prompt(requirement, plan_section, existing_text, existing_files,
                                              task_state=task_state,
-                                             first_round_section=first_round_section)
+                                             first_round_section=first_round_section,
+                                             plan=plan if isinstance(plan, dict) else None)
         else:
             # 跨文件 API 契约：从 plan.tasks[].exports 渲染，每轮都注入
             # （体积小且是硬约束，不参与第 2 轮起的 plan 摘要压缩）
@@ -1598,16 +1637,26 @@ class ToolCallLoop:
 
     def _build_simple_prompt(self, requirement: str, plan_section: str,
                               existing_text: str, existing_files: list,
-                              task_state: str = "", first_round_section: str = "") -> str:
+                              task_state: str = "", first_round_section: str = "",
+                              plan: dict = None) -> str:
         """simple 复杂度：自由文件结构，极简流程，5 轮快速通道"""
         from harness.instructions.prompts import load_prompt, load_prompt_template
         from harness.constraints.environment_contract import render_environment_contract
+        from harness.constraints.plan_validator import build_api_contracts_section
         craft_rules = self._get_craft_context(requirement)
+        # API 契约此前只在 standard 分支注入，simple 恒为空串。
+        # 但 simple 同样会跨文件调用（index.html + app.js 是常态），
+        # 需求 124 的断层在这里照样能发生 —— 两个复杂度必须共用同一份契约。
+        file_hint = ""
+        if isinstance(plan, dict):
+            file_structure = plan.get("file_structure", [])
+            if file_structure:
+                file_hint = "## 推荐文件结构\n" + "\n".join(f"- {f}" for f in file_structure)
         return load_prompt_template("coding/coder_base.md",
             requirement=requirement,
             plan_section=plan_section,
-            api_contracts="",
-            file_hint="",
+            api_contracts=build_api_contracts_section(plan if isinstance(plan, dict) else None),
+            file_hint=file_hint,
             first_round_section=first_round_section,
             existing_text=existing_text,
             task_state=task_state,

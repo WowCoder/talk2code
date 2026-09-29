@@ -130,7 +130,8 @@ class TestDefectClassification:
 class TestPlanValidator:
     def _base_plan(self):
         return {
-            "features": ["贪吃蛇"],
+            "requirement_restated": "一个能用方向键操作的贪吃蛇小游戏",
+            "features": ["贪吃蛇游戏", "得分记录"],
             "complexity": "standard",
             "file_structure": ["index.html", "js/game.js", "css/style.css"],
             "tasks": [
@@ -141,16 +142,82 @@ class TestPlanValidator:
             ],
             "implementation_order": ["js/game.js", "index.html"],
             "acceptance_criteria": [
-                {"id": "AC-1", "label": "开始游戏后蛇移动",
+                {"id": "AC-1", "label": "开始游戏后蛇移动", "feature": "贪吃蛇游戏",
+                 "anchor": "开始遮罩层上的开始按钮，以及键盘的方向键输入",
                  "how_to_verify": "点击开始按钮，按方向键，画面中蛇的位置发生变化"},
-                {"id": "AC-2", "label": "得分记录",
-                 "how_to_verify": "输入名字后点击提交，排行榜显示新纪录"},
+                {"id": "AC-2", "label": "得分记录", "feature": "得分记录",
+                 "anchor": "结算弹层里的名字输入框与提交按钮，以及下方的排行榜列表",
+                 "how_to_verify": "输入名字后点击提交，排行榜出现新的记录"},
             ],
         }
 
     def test_valid_plan_passes(self):
         ok, issues = validate_plan(self._base_plan())
         assert ok, issues
+
+    def test_missing_requirement_restated_rejected(self):
+        """需求复述缺失 = 确认卡片没有给人看的内容，必须拦住"""
+        plan = self._base_plan()
+        del plan["requirement_restated"]
+        ok, issues = validate_plan(plan)
+        assert not ok
+        assert any("requirement_restated" in i for i in issues)
+
+    def test_ac_anchor_written_as_selector_rejected(self):
+        """anchor 写成 CSS 选择器就失去了「按页面语义定位」的意义"""
+        plan = self._base_plan()
+        plan["acceptance_criteria"][0]["anchor"] = "#start-btn 按钮"
+        ok, issues = validate_plan(plan)
+        assert not ok
+        assert any("选择器" in i for i in issues)
+
+    @pytest.mark.parametrize("anchor,is_selector", [
+        # 正常的人话描述不能被误伤（误报会让 plan 白挨一次打回重出）
+        ("页面顶部的输入框与添加按钮", False),
+        ("第 1.5 项旁边的按钮", False),      # 数字里的点不是 class 选择器
+        ("列表中的每一项右侧的删除按钮", False),
+        ("顶部的月份切换区域与合计金额文本", False),
+        # 真正的选择器必须拦下
+        ("#add-btn", True),
+        (".todo-item 那一行", True),
+        ("带 data-role 的容器", True),
+        ("document.querySelector 拿到的元素", True),
+        ("[type=text] 输入框", True),
+    ])
+    def test_anchor_selector_detection_precision(self, anchor, is_selector):
+        plan = self._base_plan()
+        plan["acceptance_criteria"][0]["anchor"] = anchor
+        ok, issues = validate_plan(plan)
+        flagged = any("选择器" in i for i in issues)
+        assert flagged == is_selector, f"anchor={anchor!r} issues={issues}"
+
+    def test_ac_without_observable_change_rejected(self):
+        """能操作但没有可断言观察点的 AC 不合格"""
+        plan = self._base_plan()
+        plan["acceptance_criteria"][0]["how_to_verify"] = "点击开始按钮并把鼠标移开"
+        ok, issues = validate_plan(plan)
+        assert not ok
+        assert any("观察点" in i for i in issues)
+
+    def test_uncovered_feature_rejected(self):
+        """承诺了功能却没有对应验收项，该功能等于从没被验证过"""
+        plan = self._base_plan()
+        plan["features"].append("暂停/继续")
+        ok, issues = validate_plan(plan)
+        assert not ok
+        assert any("没有任何 AC 覆盖" in i for i in issues)
+
+    def test_duplicate_ac_rejected(self):
+        """同区域 + 同起点动作的两条 AC 会让同一缺陷被算两次"""
+        plan = self._base_plan()
+        plan["acceptance_criteria"].append({
+            "id": "AC-3", "label": "开始游戏后画面变化", "feature": "贪吃蛇游戏",
+            "anchor": "开始遮罩层上的开始按钮，以及键盘的方向键输入",
+            "how_to_verify": "点击开始按钮之后，画面出现可操作的棋盘",
+        })
+        ok, issues = validate_plan(plan)
+        assert not ok
+        assert any("语义重复" in i for i in issues)
 
     def test_missing_exports_rejected(self):
         """被依赖的 js 未声明 exports → 打回（需求 124 跨文件 API 断层）"""

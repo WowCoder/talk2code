@@ -41,6 +41,18 @@ def _classify_timeout() -> int:
     return settings.LLM_CLASSIFY_TIMEOUT
 
 
+def _plan_timeout() -> int:
+    """TeamLeader 规划调用的超时预算。
+
+    与辅助档分开：辅助调用输出 <500 token，60s 够；规划调用是长结构化输出
+    （max_tokens 6000~10000 且开 thinking），实测中位 40s 出头。固定 60s 时，
+    需求多轮澄清后 prompt 变长就会顶到上限并**连续** Read timed out
+    （req 205 实测连撞 3 次，白等 3 分钟后把 TL 判失败）。
+    """
+    from config import settings
+    return settings.LLM_PLAN_TIMEOUT
+
+
 def _log_llm_turn_safe(requirement_id, iteration, client, system_prompt, prompt,
                        response, thinking=None, latency_ms=None):
     """exec_log 埋点：记录一轮 LLM 请求 / 原始返回（开发视角执行明细）。
@@ -302,12 +314,108 @@ FALLBACK_CLARIFY_QUESTIONS = [
      "options": ["极简白", "暖柔风格", "暗黑科技", "活泼多彩", "无偏好"]},
 ]
 
+# 需求文本里出现这些词，就认为用户已经表达过风格偏好，不再反问。
+# 判定必须确定性：把"要不要问风格"交给 LLM 判断是不可靠的——需求 204 实测，
+# 「做一个个人记账本应用，能记录每天的花费和收入」这种完全没提风格的需求，
+# LLM 也直接返回空数组放行，于是风格悄悄由 TL 替用户猜。猜错的代价是整份 UI
+# 返工（十几分钟 + 一次人工重来），而问一句是零成本。
+STYLE_HINTS = [
+    "极简", "简约", "简洁", "暗黑", "暗色", "深色", "浅色", "明亮",
+    "科技", "霓虹", "赛博", "活泼", "多彩", "渐变", "暖色", "冷色",
+    "清新", "复古", "像素", "卡通", "商务", "拟物", "玻璃", "手绘",
+    "无偏好", "随意", "都行", "你决定", "你看着办", "自动选择",
+]
 
-def _generate_clarify_questions(client, requirement: str) -> list:
-    """生成澄清问题----LLM 根据已有信息自主判断还缺什么
+VISUAL_STYLE_QUESTION = {
+    "id": "visual_style", "type": "radio",
+    "label": "你偏好哪种视觉风格？",
+    "options": ["极简白 -- 白底灰字，大量留白", "暖柔风格 -- 暖色调圆角卡片（默认）",
+                "暗黑科技 -- 深色背景霓虹强调", "活泼多彩 -- 明亮渐变大色块",
+                "无偏好，自动选择"],
+}
 
-    如果需求已经很详细，只问 1-2 个最关键的问题（如视觉风格偏好）；
-    如果需求模糊，问 2-3 个问题帮助明确方向。
+
+def _requirement_mentions_style(requirement: str) -> bool:
+    """需求文本里是否已经表达了视觉风格偏好。"""
+    text = (requirement or "").lower()
+    return any(hint in text for hint in STYLE_HINTS)
+
+
+def _ensure_style_question(questions: list) -> list:
+    """确保问题列表里有一条视觉风格问题；已有则不重复添加。"""
+    for q in questions or []:
+        if not isinstance(q, dict):
+            continue
+        if q.get("id") == "visual_style" or "风格" in str(q.get("label", "")):
+            return questions
+    return [*(questions or []), VISUAL_STYLE_QUESTION]
+
+
+CLARIFY_STATUS_ASKED = "asked"      # LLM 给出了问题 → 应当追问
+CLARIFY_STATUS_NONE = "none"        # LLM 明确表示无需追问（返回空数组）
+CLARIFY_STATUS_FAILED = "failed"    # 调用失败 / 返回不可解析 → **不等于**需求已明确
+
+# 澄清问题生成的最大输出。原值 500 太小：该模型会把每个选项写成
+# "基础账本 -- 仅记录金额、日期、收支类型、备注（默认）"这样的长句，
+# 两个问题就能把 500 token 撑爆，响应被截断 → JSON 不闭合 → 整个问题列表被丢弃、
+# 退化成罐头提问（req 206 实测：模型问出了"是否需要账本分类维度"这种高质量问题，
+# 却因为截断被扔掉）。1200 约为其正常输出的 2 倍。
+_CLARIFY_MAX_TOKENS = 1200
+
+
+def _extract_clarify_payload(content: str):
+    """从 LLM 响应里提取澄清问题（数组或单个对象）。
+
+    模型在这一点上有三个稳定习惯，都要接住，否则好问题会被白白丢掉：
+    1. 把 JSON 包在 ```json ``` 代码围栏里（实测最常见）
+    2. 只问一个问题时返回**裸对象**而不是数组
+    3. 选项写得长，响应可能被 max_tokens 截断 → JSON 不闭合
+
+    Returns: list / dict / None（None = 确实提取不到）
+    """
+    if not content:
+        return None
+
+    # 控制字符会让 json.loads 直接失败
+    raw = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', content.strip())
+
+    candidates = [raw]
+    # 代码围栏内的内容
+    for pat in (re.compile(r'```json\s*(.*?)```', re.DOTALL),
+                re.compile(r'```\s*(.*?)```', re.DOTALL)):
+        m = pat.search(raw)
+        if m:
+            candidates.append(m.group(1).strip())
+    # 最外层数组 / 对象（用 rfind 取最后一个闭合符，避免截掉尾部条目）
+    for opener, closer in (('[', ']'), ('{', '}')):
+        start, end = raw.find(opener), raw.rfind(closer)
+        if start != -1 and end > start:
+            candidates.append(raw[start:end + 1])
+
+    for text in candidates:
+        try:
+            data = json.loads(text)
+        except Exception:
+            data = None
+        if data is None:
+            try:
+                data = try_fix_json(text)   # 截断的半截 JSON
+            except Exception:
+                data = None
+        if isinstance(data, (list, dict)):
+            return data
+    return None
+
+
+def _generate_clarify_questions_ex(client, requirement: str) -> tuple[list, str]:
+    """生成澄清问题，并区分「问了 / 明确不问 / 压根没问成」三种结果。
+
+    返回 (questions, status)，status 取值见上面的常量。
+
+    为什么必须区分：此前三种情况一律返回空列表，调用方只能 `if questions:` 判断，
+    于是 LLM 一超时/返回散文，需求确认门禁就**静默全开**，需求和改造前一样直接
+    进 TL 由它替用户拍板——这正是"用户事后才发现方向错了、整条链路白跑"的成因。
+    "没问成"必须能和"不用问"区分开，否则门禁的失效是不可观测的。
     """
     from harness.instructions.prompts import load_prompt_template
 
@@ -327,83 +435,198 @@ def _generate_clarify_questions(client, requirement: str) -> list:
     response = client.chat(
         prompt=prompt,
         system_prompt="你是一位产品经理，帮助澄清用户需求。用户已经说过的信息不要再问。",
-        use_memory=False, max_tokens=500, timeout=_aux_timeout()
+        use_memory=False, max_tokens=_CLARIFY_MAX_TOKENS, timeout=_aux_timeout()
     )
     if response.is_error or not response.content:
-        return []
-    try:
-        return json.loads(response.content)
-    except json.JSONDecodeError:
-        match = re.search(r'\[.*\]', response.content, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except:
-                pass
-    return []
+        logger.warning(
+            f"[TeamLeader] 澄清问题调用失败 (is_error={response.is_error}, "
+            f"content_len={len(response.content or '')})"
+        )
+        return [], CLARIFY_STATUS_FAILED
+
+    data = _extract_clarify_payload(response.content)
+
+    if isinstance(data, dict):
+        # 模型可能用容器包一层：{"questions": [...]}（键名不固定，故按值的形状识别）。
+        # 只认"唯一一个值是对象数组"的包装，避免把真正的问题对象误当容器。
+        list_vals = [v for v in data.values()
+                     if isinstance(v, list) and any(isinstance(x, dict) for x in v)]
+        if len(list_vals) == 1 and len(data) <= 3:
+            data = list_vals[0]
+        else:
+            # 只问一个问题时**经常返回裸对象而不是数组**（req 206 实测）。
+            # 包一层即可——为这点格式偏差丢掉一个好问题、退化成罐头提问，是净损失。
+            data = [data]
+
+    if not isinstance(data, list):
+        # 保留原文片段：这类"模型答非所问/被截断"以前完全不可见，只能靠猜
+        logger.warning(
+            f"[TeamLeader] 澄清问题返回不可解析，按调用失败处理: {response.content[:200]!r}"
+        )
+        return [], CLARIFY_STATUS_FAILED
+
+    # 只保留结构合法的条目：残缺条目会让前端渲染出空白选项（比不问更糟）
+    questions = [q for q in data if isinstance(q, dict) and (q.get("label") or q.get("question"))]
+    if len(questions) != len(data):
+        logger.warning(
+            f"[TeamLeader] 澄清问题里有 {len(data) - len(questions)} 条结构不合法，已丢弃"
+        )
+    return questions, (CLARIFY_STATUS_ASKED if questions else CLARIFY_STATUS_NONE)
+
+
+def _generate_clarify_questions(client, requirement: str) -> list:
+    """兼容旧调用方：只要问题列表（失败与"无需追问"都返回空列表）。
+
+    需要区分失败的新调用方请用 _generate_clarify_questions_ex。
+    """
+    questions, _ = _generate_clarify_questions_ex(client, requirement)
+    return questions
 
 
 def _format_plan_summary(plan: dict) -> str:
-    """将 TL plan 格式化为用户可见的结构化 Markdown 摘要"""
-    if not isinstance(plan, dict):
-        return "已完成需求分析和架构设计"
+    """将 TL plan 格式化为用户可见的结构化 Markdown 摘要。
 
-    lines = ["## 📋 需求分析结果\n"]
+    对话流里这条消息是给人读的，所以按「需求确认」而不是「开发计划」的顺序组织：
+    先复述要做什么，再列验收清单，最后才是工程细节。此前把文件结构放在最前面，
+    用户第一眼看到的是一堆 .js 文件名，等于把技术细节顶到脸上。
+    """
+    if not isinstance(plan, dict):
+        return "已完成需求分析"
+
+    lines = []
+
+    restated = (plan.get("requirement_restated") or "").strip()
+    if restated:
+        lines.append(f"**我理解你要做的是**：{restated}\n")
 
     features = plan.get("features", [])
     if features:
-        lines.append("### 核心功能")
+        lines.append("### 功能清单")
         for f in features:
             lines.append(f"- ✅ {f}")
         lines.append("")
 
     acceptance = plan.get("acceptance_criteria", [])
     if acceptance:
-        lines.append("### 验收条件")
+        lines.append("### 做完后我会逐条检查")
         for ac in acceptance:
-            ac_id = ac.get("id", "?") if isinstance(ac, dict) else "?"
-            ac_label = ac.get("label", str(ac)) if isinstance(ac, dict) else str(ac)
-            lines.append(f"- **{ac_id}**: {ac_label}")
+            if not isinstance(ac, dict):
+                continue
+            ac_id = ac.get("id", "?")
+            ac_label = ac.get("label", "")
+            verify = ac.get("how_to_verify", "")
+            lines.append(f"- **{ac_id}** {ac_label}：{verify}")
         lines.append("")
 
-    file_structure = plan.get("file_structure", [])
-    if file_structure:
-        lines.append("### 文件结构")
-        for f in file_structure:
-            lines.append(f"- `{f}`")
+    assumptions = plan.get("assumptions", [])
+    if assumptions:
+        lines.append("### 我替你定的默认设置")
+        for a in assumptions:
+            lines.append(f"- {a}")
         lines.append("")
 
-    tasks = plan.get("tasks", [])
-    if tasks:
-        lines.append("### 任务列表")
-        for t in tasks:
-            fpath = t.get("file", "?") if isinstance(t, dict) else str(t)
-            desc = t.get("description", "") if isinstance(t, dict) else ""
-            lines.append(f"- **{fpath}**: {desc[:80]}")
-        lines.append("")
-
-    complexity = plan.get("complexity", "S")
-    tech = plan.get("tech_stack", {})
-    lines.append(f"**复杂度**: {complexity}  |  **技术栈**: CSS={tech.get('css', '?')}, Storage={tech.get('storage', '?')}")
-
-    return "\n".join(lines)
+    return "\n".join(lines) if lines else "已完成需求分析"
 
 
 def _extract_plan_metadata(plan: dict) -> dict:
-    """从 plan 中提取关键元数据（供程序使用，前端可选渲染）"""
+    """从 plan 中提取关键元数据（供程序使用，前端可选渲染）。
+
+    只保留下游真正会读的字段。visual_direction / layout_structure /
+    key_interactions / implementation_notes / data_model 此前写满了、
+    传了一路、然后被 `_compact_plan_text` 在第 2 轮压掉——纯损耗，已移除。
+    """
     if not isinstance(plan, dict):
         return {}
     return {
+        "requirement_restated": plan.get("requirement_restated", ""),
         "features": plan.get("features", []),
+        "assumptions": plan.get("assumptions", []),
         "acceptance_criteria": plan.get("acceptance_criteria", []),
         "file_structure": plan.get("file_structure", []),
         "tech_stack": plan.get("tech_stack", {}),
-        "data_model": plan.get("data_model", ""),
-        "implementation_notes": plan.get("implementation_notes", ""),
         "implementation_order": plan.get("implementation_order", []),
         "tasks": plan.get("tasks", []),
         "complexity": plan.get("complexity", "S"),
     }
+
+
+def _recover_previous_plan(dialogue_history: list) -> dict | None:
+    """从对话历史里回捞上一版 plan（供「增量修订」使用）。
+
+    用户在确认卡片上写了修改意见时，服务层会清掉 checkpoint 并重跑 TL
+    ——plan 确实必须变，这一步省不掉。但对话历史是持久的：TL 那条消息的
+    `plan` 字段里就存着上一版计划。回捞它，TL 才能做「增量修订」而不是
+    「从零重新分析」；后者会把用户已经认可的部分（技术栈、文件结构）
+    也一并改掉，用户看到的是「我只说加个按钮，怎么整个计划都变了」。
+    """
+    for msg in reversed(dialogue_history or []):
+        if not isinstance(msg, dict):
+            continue
+        plan = msg.get("plan")
+        if isinstance(plan, dict) and plan.get("features"):
+            return plan
+    return None
+
+
+def _render_previous_plan_section(prev_plan: dict) -> str:
+    """把上一版 plan 渲染成「增量修订」指令段。"""
+    lines = [
+        "## 上一版计划（用户已看过，并提出修改意见）",
+        "",
+        "用户不是要你推倒重来，而是在这份计划上提了一条修改意见。",
+        "**除反馈明确涉及的部分外，其余内容（技术栈、文件结构、已有功能、验收条件）",
+        "必须与上一版保持一致**——擅自改掉用户没提的部分，用户会认为你没听懂他的话。",
+        "",
+    ]
+
+    restated = (prev_plan.get("requirement_restated") or "").strip()
+    if restated:
+        lines.append(f"- 需求复述：{restated}")
+
+    tech = prev_plan.get("tech_stack")
+    if isinstance(tech, dict) and tech:
+        lines.append(
+            "- 技术栈：" + "、".join(f"{k}={v}" for k, v in tech.items() if v)
+        )
+
+    features = [f for f in (prev_plan.get("features") or []) if isinstance(f, str)]
+    if features:
+        lines.append("- 功能清单：")
+        lines.extend(f"  - {f}" for f in features)
+
+    files = [f for f in (prev_plan.get("file_structure") or []) if isinstance(f, str)]
+    if files:
+        lines.append("- 文件结构：" + "、".join(files))
+
+    # AC 必须整条给全（anchor / feature 一并渲染）。
+    # 少给这两项会同时踩两个坑：
+    #   1) `feature` 要与 features 逐字一致才有意义（_validate_feature_coverage 硬校验），
+    #      模型看不到原值只能重新措辞 → 校验失败 → 白跑一轮重试；
+    #   2) `anchor` 是验收脚本唯一的外部参照，而「用户只提一条修改」正是最该稳住它的
+    #      场景。上面刚写完「验收条件必须与上一版保持一致」却把 anchor 藏起来，
+    #      等于让模型自己重新发明参照物 —— 指令与事实互相矛盾。
+    acs = prev_plan.get("acceptance_criteria") or []
+    ac_lines = []
+    for ac in acs:
+        if not isinstance(ac, dict):
+            continue
+        ac_lines.append(f"  - {ac.get('id', '?')} {ac.get('label', '')}")
+        feature = str(ac.get("feature") or "").strip()
+        if feature:
+            ac_lines.append(f"    - 覆盖功能（须与上方功能清单逐字一致）：{feature}")
+        anchor = str(ac.get("anchor") or "").strip()
+        if anchor:
+            ac_lines.append(f"    - 页面位置（anchor，未受影响的须原样保留）：{anchor}")
+        how = str(ac.get("how_to_verify") or "").strip()
+        if how:
+            ac_lines.append(f"    - 验证步骤：{how}")
+    if ac_lines:
+        lines.append("- 验收条件（保留未受影响的，按反馈增删）：")
+        lines.extend(ac_lines)
+
+    lines.append("")
+    lines.append("请输出修订后的**完整**计划 JSON（结构同上，不是补丁片段）。")
+    return "\n".join(lines)
 
 
 def team_leader_node(state: AgentState) -> Dict[str, Any]:
@@ -413,46 +636,85 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
     """
     requirement = state['requirement_content']
 
-    # ---- 输入质量门禁：过短的需求不应直接编造 plan，转为追问澄清 ----
-    # 阈值设为 8 字符：低于此值可能是无意义的短输入（如"帮我"、"一个"等），
-    # 而"贪吃蛇游戏"、"Todo App"、"计算器"等经典明确需求可达 8+ 字符
-    MIN_REQUIREMENT_CHARS = 8
-    if len(requirement.strip()) < MIN_REQUIREMENT_CHARS:
-        logger.info(
-            f"[TeamLeader] 输入过短 ({len(requirement)} 字符)，"
-            f"转发澄清流程"
-        )
+    # ---- 需求确认门禁：未经用户事先确认的选择，不让 TL 替用户做决定 ----
+    # 此前的触发条件是"输入过短（<8 字符）"，等于这道门几乎从不上锁：
+    # "帮我做一个个人记账本应用"（12 字）会直接放行给 TL，视觉风格、数据落地
+    # 方式全靠 TL 猜；猜错的结果不是重出一版计划，而是整条编码链路白跑
+    # ——所以门禁改成"只要还没问过，就先问一次"。
+    #
+    # 门是全开还是拦一下由 LLM 判断：需求里已经写明风格/数据方案的，
+    # 它会返回空数组直接放行，不给用户添没有意义的必答题。
+    # `already_clarified` 是死循环的守门栓。两个标记都要认，缺一会出现
+    # "用户明明只是提了条修改意见，却被同一个问题问第二遍"：
+    # [用户补充说明] 来自澄清表单回填；[用户反馈] 来自 plan 确认时的反馈
+    # （那条路径会清 checkpoint 重跑 TL，此时需求里没有任何补充说明标记）。
+    already_clarified = (
+        '[用户补充说明]' in requirement or '[用户反馈]' in requirement
+    )
+    if not already_clarified:
+        # 低于此值连"要做什么"都读不出来（"帮我"、"一个"），必须拦住
+        MIN_REQUIREMENT_CHARS = 8
         try:
             client = get_client()
-            questions = _generate_clarify_questions(client, requirement)
+            questions, clarify_status = _generate_clarify_questions_ex(client, requirement)
         except Exception as e:
             logger.warning(f"[TeamLeader] 生成澄清问题失败: {e}")
-            questions = []
-        if not questions:
-            questions = FALLBACK_CLARIFY_QUESTIONS
+            questions, clarify_status = [], CLARIFY_STATUS_FAILED
 
-        # question_form 同时写入对话消息（前端刷新恢复）和 metadata（SSE 即时推送）
-        question_form = {'questions': questions}
-        return {
-            'plan': {},
-            'current_step': 'needs_clarification',
-            'dialogue_history': [{
-                'role': 'agent', 'name': 'Leon（负责人）',
-                'content': (
-                    f"你的需求「{requirement}」比较简短。"
-                    f"为了生成更准确的开发计划，请补充以下信息："
-                ),
-                'status': 'needs_clarification',
-                'question_form': question_form,
-                'timestamp': _ts(),
-            }],
-            'metadata': {
-                **state.get('metadata', {}),
-                'team_leader_success': False,
-                'needs_clarification_reason': 'input_too_short',
-                'question_form': question_form,
-            },
-        }
+        if clarify_status == CLARIFY_STATUS_FAILED:
+            # 调用失败 ≠ 需求明确。失败时用兜底问题守住门禁——宁可多问一句，
+            # 也不要让 TL 在没有任何用户输入的情况下替用户拍板视觉风格与数据方案。
+            # 用户确实不想答可以直接跳过（question_form 支持 _skip）。
+            questions = FALLBACK_CLARIFY_QUESTIONS
+            clarify_reason = 'clarify_unavailable'
+        elif not questions and len(requirement.strip()) < MIN_REQUIREMENT_CHARS:
+            # LLM 没问出东西，但输入短到连"要做什么"都读不出来
+            # （"帮我"、"一个"这类），此时必须拦住，不能交给 TL 去编。
+            questions = FALLBACK_CLARIFY_QUESTIONS
+            clarify_reason = 'input_too_short'
+        else:
+            clarify_reason = 'not_confirmed_by_user'
+
+        # 视觉风格：确定性兜底。无论 LLM 是否问出东西，只要用户没表达过风格偏好，
+        # 这条必须问到——它是"事后才发现方向错了"最常见也最便宜的一个来源。
+        llm_asked = bool(questions)
+        if not _requirement_mentions_style(requirement):
+            merged = _ensure_style_question(questions)
+            if len(merged) != len(questions or []):
+                questions = merged
+                # 只有"LLM 什么都没问、全靠这条兜底"时才归因给风格；
+                # LLM 本来就问了别的问题时，归因保持 not_confirmed_by_user。
+                if not llm_asked:
+                    clarify_reason = 'style_not_confirmed'
+
+        # LLM 判定"需求已经足够明确，无需追问"时放行，不再无谓卡一道
+        if questions:
+            logger.info(
+                f"[TeamLeader] 需求未经确认，先澄清 "
+                f"({len(questions)} 个问题) 再生成 plan"
+            )
+            question_form = {'questions': questions}
+            return {
+                'plan': {},
+                'current_step': 'needs_clarification',
+                'dialogue_history': [{
+                    'role': 'agent', 'name': 'Leon（负责人）',
+                    'content': (
+                        f"收到，开工前有 {len(questions)} 件事想跟你确认一下，"
+                        f"免得做完才发现方向不对："
+                    ),
+                    'status': 'needs_clarification',
+                    'question_form': question_form,
+                    'timestamp': _ts(),
+                }],
+                'metadata': {
+                    **state.get('metadata', {}),
+                    'team_leader_success': False,
+                    'needs_clarification_reason': clarify_reason,
+                    'question_form': question_form,
+                },
+            }
+        logger.info("[TeamLeader] 澄清判定：需求已足够明确，直接进入需求分析")
 
     try:
         client = get_client()
@@ -464,6 +726,17 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
         )
         user_prompt = f"请分析以下需求并生成开发计划：\n\n{requirement}"
 
+        # 增量修订：需求里带 [用户反馈] 说明用户在上一版 plan 上提了修改意见。
+        # 把上一版 plan 一并交给 TL，要求只改反馈涉及的部分——否则 TL 从零重分析，
+        # 会把用户已经认可的决策也一并改掉（"我只说加个按钮，计划全变了"）。
+        if '[用户反馈]' in requirement:
+            prev_plan = _recover_previous_plan(state.get('dialogue_history') or [])
+            if prev_plan:
+                logger.info("[TeamLeader] 检测到用户反馈，按增量修订处理（附上一版 plan）")
+                user_prompt += "\n\n---\n\n" + _render_previous_plan_section(prev_plan)
+            else:
+                logger.info("[TeamLeader] 检测到用户反馈，但未回捞到上一版 plan，按全新需求处理")
+
         # L0: 前置检测 + 分层容错
         # 策略：检测截断 → 重试(最多2次) → 降级修复 → 完整性校验 → DoD 程序化校验
 
@@ -472,7 +745,7 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
             resp = client.chat(
                 prompt=prompt_override or user_prompt,
                 system_prompt=system_prompt,
-                use_memory=False, max_tokens=max_tokens, timeout=60,
+                use_memory=False, max_tokens=max_tokens, timeout=_plan_timeout(),
                 thinking='enabled',  # 结构化 plan JSON 需要思考模式保证格式正确
             )
             if resp.is_error:
@@ -572,19 +845,22 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
 
         # 把 plan 数据编码到 dialogue 消息中（持久化到 DB，页面刷新后可用）
         tl_plan_data = {
+            'requirement_restated': plan.get('requirement_restated', ''),
             'features': plan.get('features', []),
+            'assumptions': plan.get('assumptions', []),
             'acceptance_criteria': plan.get('acceptance_criteria', []),
             'file_structure': plan.get('file_structure', []),
             'tech_stack': plan.get('tech_stack', {}),
-            'data_model': plan.get('data_model', ''),
-            'implementation_notes': plan.get('implementation_notes', ''),
             'implementation_order': impl_order,
             'tasks': tasks,
             'complexity': complexity,
-            'visual_direction': plan.get('visual_direction', ''),
-            'layout_structure': plan.get('layout_structure', ''),
-            'key_interactions': plan.get('key_interactions', []),
         } if isinstance(plan, dict) else {}
+
+        # DoD 校验结果挂在 plan 上而非只写 metadata：plan 是唯一确定会被持久、
+        # 跨 checkpoint 传递并进到 verify 的载体。此前写进 metadata 后全库无人
+        # 读取——等于"发现了问题，但没有任何人知道"，带病放行和没校验一样。
+        if plan_issues:
+            plan['_plan_dod_issues'] = plan_issues
 
         return {
             'plan': plan,
@@ -964,7 +1240,14 @@ def repair_node(state: AgentState) -> Dict[str, Any]:
 #
 # v1 → v2：click 支持 at 比例坐标 / offset 像素落点；选择器提示纳入
 #          JS 动态生成与 CSS 中定义的类名（req 199）。
-AC_SCRIPT_SCHEMA_VERSION = 2
+# v2 → v3：每条 AC 附 anchor（页面语义区域），脚本定位优先用可见文案而非
+#          代码选择器。老缓存里的脚本是「照着代码选择器出的题」，留着就是
+#          让自证循环继续生效 —— 必须整批作废。
+# v3 → v4：定位材从「anchor 区域描述 + id/class 清单」扩到**确定性提取的可见文案**
+#          （按钮名/标题/placeholder/JS 文本赋值），脚本开始出现 text= / :has-text()。
+#          v3 老缓存里的脚本 100% 是 id/class 定位（实测 0/55）——不递增的话，
+#          这项修复对已跑过的需求毫无作用，又变成"你说修了但结论没变"。
+AC_SCRIPT_SCHEMA_VERSION = 4
 
 
 def _render_signature(code_text: str) -> str:
@@ -1023,19 +1306,258 @@ def _extract_selector_hints(code_text: str):
     return static, dynamic
 
 
+# 用户可见文案的提取来源（每组正则的组 1 即候选文本）。
+# 全部是**确定性**规则 —— 不调用 LLM，因此同一份代码每次给出同一份清单。
+#
+# 为什么必须先把文案捞出来：req 206 实测，翻译器 11/11 次调用都把 anchor
+# 读进了 prompt，却仍然写出 55/55 个 id/class 选择器。原因不是模型不听话，
+# 而是 anchor 描述的是**区域**（"页面中部的添加表单区域：类型选择、金额输入框…"），
+# 里面根本没有能直接当文案用的字 —— 模型想遵守"优先用可见文案定位"也无从下手。
+# 约束不可执行时，加多少遍"必须"都不起作用，所以这里先给它可执行的材料。
+_VISIBLE_TEXT_PATTERNS = (
+    # HTML 标签之间的文本：<button>添加</button> / <h1>记账本</h1>
+    r"<(?:button|a|label|option|legend|summary|th|td|li|h[1-6]|strong|em|title)\b[^>]*>"
+    r"\s*([^<>{}%\n]{1,24}?)\s*</",
+    # 用户可见属性。刻意不含 value=：它多数字符串是 "expense" 这类数据值而非文案
+    r"""\b(?:placeholder|aria-label|title|alt)\s*=\s*["']([^"'<>{}%\n]{1,24})["']""",
+    # JS 文本赋值
+    r"""\.(?:textContent|innerText|innerHTML)\s*=\s*['"]([^'"<>{}%\n]{1,24})['"]""",
+    # JS 建文本节点 / 建 option
+    r"""createTextNode\(\s*['"]([^'"<>{}%\n]{1,24})['"]""",
+    r"""new\s+Option\(\s*['"]([^'"<>{}%\n]{1,24})['"]""",
+    # CSS 伪元素文案：content: "✓"
+    r"""content\s*:\s*['"]([^'"<>{}%\n]{1,24})['"]""",
+)
+
+# 形如标识符而非文案的：全小写 ASCII、无空格、长度 ≤ 12（如 "expense"、"add-btn"）。
+# 它们几乎必然是 id/class/type 的值，混进候选清单只会稀释信号；
+# 中文文案与含空格的英文（"Add item"）不受影响。
+_VISIBLE_TEXT_IDENTIFIER_RE = r"^[a-z][a-z0-9_-]{0,11}$"
+
+
+def _extract_visible_texts(code_text: str, limit: int = 40) -> list[str]:
+    """从产物代码里确定性提取「页面上真正看得见的文字」候选。
+
+    返回去重、保序的短文本列表，供 AC 翻译器用 `text=` / `:has-text()` 定位。
+    Playwright 按可见文案定位不受 id/class 改名影响，这类选择器不会因为实现
+    换个命名就集体落到 compromised。
+
+    与 `_extract_selector_hints` 的分工：那个给的是**兜底**手段（id/class），
+    这个给的是**首选**手段。两者都从代码里提取，但只有文案对应得上
+    "用户看到了什么"——也才对应得上 anchor 想表达的那一层。
+    """
+    import re as _re
+
+    out: list[str] = []
+    for pattern in _VISIBLE_TEXT_PATTERNS:
+        for m in _re.finditer(pattern, code_text, _re.M):
+            text = (m.group(1) or "").strip()
+            if not text or len(text) > 24:
+                continue
+            if _re.fullmatch(_VISIBLE_TEXT_IDENTIFIER_RE, text):
+                continue
+            if not _re.search(r"\w", text):
+                continue
+            if text not in out:
+                out.append(text)
+                if len(out) >= limit:
+                    return out
+    return out
+
+
+def _script_locating_stats(scripts: list) -> tuple[int, int]:
+    """统计脚本里的 `(按可见文案定位的选择器数, 选择器总数)`。
+
+    存在的意义：提示词里"定位优先级：可见文案 > 结构语义 > 兜底选择器"这条约束
+    此前**没有任何验证方式**，模型有没有遵守无从得知。req 206 实测 11 次翻译、
+    55 个选择器全是 id/class —— 直到有人手工去数才发现。约束缺验证方式 = 约束不存在，
+    所以把这件事变成每轮都自动统计、为 0 就报警的量。
+    """
+    located = total = 0
+    for script in scripts or []:
+        if not isinstance(script, dict):
+            continue
+        for step in (script.get("steps") or []):
+            if not isinstance(step, dict):
+                continue
+            selector = step.get("selector")
+            if not selector:
+                continue
+            total += 1
+            if "text=" in selector or ":has-text(" in selector:
+                located += 1
+    return located, total
+
+
+def _resolve_ac_scripts(cached_scripts, cached_hash, ac_hash, translate_fn):
+    """决定本轮用哪份 AC 脚本，返回 `(scripts, source)`。
+
+    `source` 的取值让调用方能把「为什么没脚本」如实说出来：
+
+    - `hit`            缓存命中（hash 一致），直接用，不重译
+    - `fresh`          重新翻译成功
+    - `stale_fallback` 需要重译但翻译失败 → 退回上一次成功翻译的脚本
+    - `none`           需要重译、翻译失败，且没有可回退的脚本
+
+    为什么要单独返回 source：此前"无需翻译"和"翻译失败"都用空列表表示，
+    调用方写的是 `if ac_scripts:`，于是**翻译失败会静默跳过整段 AC 逐条验收**——
+    日志里连 warning 都没有，用户看到的是"验收通过"，实际一条 AC 都没跑
+    （需求 206 实测：翻译器 11 次调用全部被 reasoning 吃光预算，content 为空，
+     5 条 AC 一条也没验）。空列表表示多种含义，是门禁失效的经典成因。
+    """
+    if cached_scripts and cached_hash == ac_hash:
+        return list(cached_scripts), "hit"
+    fresh = translate_fn() or []
+    if fresh:
+        return fresh, "fresh"
+    if cached_scripts:
+        return list(cached_scripts), "stale_fallback"
+    return [], "none"
+
+
+def _ac_translate_timeout() -> int:
+    """AC 脚本翻译的超时预算。
+
+    不能用 `_aux_timeout()`（60s）——那一档的注释写明是给"小输出（500 token 以内）"
+    的调用用的，而这里要求的是多步 JSON 脚本。实测单批（2 条 AC）约 35s、
+    单条最慢 78s，60s 会周期性撞穿并触发无谓重试。
+    """
+    from config import settings
+    return settings.LLM_AC_TRANSLATE_TIMEOUT
+
+
+def _evaluator_timeout(retry: bool = False) -> int:
+    """Evaluator（验收评估）调用的超时预算。
+
+    不能用 `_aux_timeout()`（60s）：评估要读完整产物（含浏览器结果）并开 thinking，
+    实测耗时 54~107s，60s 会误杀。
+
+    retry=True 对应 finish_reason=length 后以 max_tokens 3000→6000 重试的那一档，
+    输出预算翻倍、耗时近似线性，故给更高上限。
+    """
+    from config import settings
+    return (
+        settings.LLM_EVALUATOR_RETRY_TIMEOUT if retry
+        else settings.LLM_EVALUATOR_TIMEOUT
+    )
+
+
+# 单批最多翻几条 AC。
+#
+# 实测（agnes-3.0-flash，需求 206 的 5 条 AC + 26k 字符代码）：
+#   5 条 / max_tokens=2000 → content 空（reasoning 6.1k chars 吃光预算）→ 0 条脚本
+#   5 条 / max_tokens=6000 → 仍然 content 空 → 0 条脚本
+#   2 条 / max_tokens=4000 → 2/2 成功，35s
+#   1 条 / max_tokens=2000 → 1/1 成功，78s
+#
+# 结论：AC 一多，模型就陷进长篇推理直到预算耗尽，"加大预算"救不回来。
+# 分批的第二个好处是**失败被隔离**——某一批挂了，其余批次照常产出脚本，
+# 而不是像原来那样整批作废（空列表还会让调用方静默跳过整段 AC 验收）。
+# 历史注记：8/16~9/28 的日志里 `5 条 AC 翻译完成` 很常见，说明是当前模型/
+# 端点的行为变化让"一次翻 5 条"变得不可行，不是这段逻辑一直都坏。
+_AC_TRANSLATE_BATCH = 2
+
+# 单批最多尝试几次。
+# 实测：同一批用同样的参数重发一次就成功了（端点瞬时拥塞 / 空响应），
+# 而那一次失败会让两整条 AC 无人验收。代价只有"已经失败之后再发一次"，
+# 收益是 AC 覆盖率——按 5 条 AC / 3 批算，一次失败就是 40% 的 AC 没跑。
+_AC_TRANSLATE_ATTEMPTS = 2
+
+
+def _translate_one_ac_batch(
+    batch: list, selector_text: str, render_info: str, visible_text_text: str,
+) -> list[dict]:
+    """翻译一小批 AC。返回结构合法的脚本条目；失败返回空列表（由调用方计数）。"""
+    # 兜底提取 JSON 数组那一步要用 `_re`。本模块只在若干函数里**局部**
+    # `import re as _re`，不做模块级别名，所以这里必须自己导入。
+    # 少了它就会抛 `NameError: name '_re' is not defined`，被上层打成
+    # "[AC Translate] 翻译失败: name '_re' is not defined"，
+    # 把真正的失败原因（超时/截断）盖掉（req 203 实测踩过）。
+    import re as _re
+
+    ac_text = "\n".join(
+        f"- {ac.get('id', '?')}: {ac.get('label', '')}\n  验证方式: {ac.get('how_to_verify', '')}"
+        for ac in batch
+    )
+
+    # anchor 清单：需求阶段写下的「这条验收发生在页面哪一块」，用自然语言描述。
+    # 它是独立于实现的定位参照。只有缺 anchor 的老 plan 才会走进兜底说明，
+    # 那种情况下脚本更容易落到 compromised。
+    anchor_lines = []
+    for ac in batch:
+        if not isinstance(ac, dict):
+            continue
+        anchor = (ac.get("anchor") or "").strip()
+        if anchor:
+            anchor_lines.append(f"- {ac.get('id', '?')}: {anchor}")
+    anchor_text = (
+        "\n".join(anchor_lines)
+        if anchor_lines
+        else "（本批 AC 未提供 anchor，请依据下方的选择器清单与 AC 描述谨慎定位）"
+    )
+
+    from harness.instructions.prompts import load_prompt_template
+    prompt = load_prompt_template(
+        "verify/ac_translator.md",
+        anchor_text=anchor_text,
+        visible_text_text=visible_text_text,
+        selector_text=selector_text,
+        ac_text=ac_text,
+        render_info=render_info,
+    )
+
+    from llm.client import get_client
+    response = get_client().chat(
+        prompt=prompt,
+        system_prompt="你是 Playwright 自动化测试专家。只返回 JSON，不要其他文字。",
+        use_memory=False,
+        # 预算与批大小成比例（实测 2 条 AC 在 4000 下稳定成功）。
+        # 若仍被 reasoning 吃光，llm.client 里有"以更大额度重试一次"的救援。
+        max_tokens=max(2000, 2000 * len(batch)),
+        timeout=_ac_translate_timeout(),
+        thinking='enabled',
+    )
+    if response.is_error or not response.content:
+        return []
+
+    import json as _json
+    content = response.content.strip()
+    try:
+        scripts = _json.loads(content)
+    except _json.JSONDecodeError:
+        match = _re.search(r'\[[\s\S]*\]', content)
+        if not match:
+            return []
+        try:
+            scripts = _json.loads(match.group())
+        except _json.JSONDecodeError:
+            return []
+
+    if not isinstance(scripts, list):
+        return []
+    # 只保留结构合法的条目（LLM 偶尔返回字符串数组导致下游 .get 崩溃）
+    valid = [
+        s for s in scripts
+        if isinstance(s, dict) and isinstance(s.get("steps"), list) and s["steps"]
+    ]
+    if len(valid) < len(scripts):
+        from harness.observability.logger import get_logger
+        get_logger(__name__).info(
+            f"[AC Translate] 本批丢弃 {len(scripts) - len(valid)} 条格式非法条目"
+        )
+    return valid
+
+
 def _translate_acs_to_scripts(acceptance_criteria: list, code_text: str, requirement: str) -> list[dict]:
     """用 LLM 将验收条件翻译为 Playwright 操作序列
 
     每个 AC 的 how_to_verify 字段描述验证方法（如"输入文字点击添加按钮，列表中显示新项目"），
     LLM 需要翻译为具体的 DOM 操作步骤。
+
+    按 `_AC_TRANSLATE_BATCH` 分批调用（原因见该常量的注释）。
     """
     if not acceptance_criteria:
         return []
-
-    ac_text = "\n".join(
-        f"- {ac.get('id', '?')}: {ac.get('label', '')}\n  验证方式: {ac.get('how_to_verify', '')}"
-        for ac in acceptance_criteria
-    )
 
     # 从代码中提取可用的 CSS 选择器（供 LLM 参考，减少 selector 猜测错误）
     # 拆成「静态 + 动态」两段；动态段是 req 199 的修复点：`.cell` 这类由
@@ -1043,11 +1565,20 @@ def _translate_acs_to_scripts(acceptance_criteria: list, code_text: str, require
     # 不补进候选就会让翻译器只能退而写容器选择器（→ 只能点元素中心）。
     selectors_hint, dynamic_hint = _extract_selector_hints(code_text)
 
+    # 用户可见文案候选：这是**首选**定位材，与上面的 id/class 清单（兜底）分节给。
+    # req 206 的根因是"约束不可执行"——anchor 只描述区域、不含可用文案，
+    # 模型想优先用文案定位也无从下手。这里把代码里真实可见的字捞出来喂过去。
+    visible_texts = _extract_visible_texts(code_text)
+    visible_text_text = (
+        "、".join(visible_texts)
+        if visible_texts
+        else "（未能从代码中提取到可见文案；请依据 AC 描述推断页面上的按钮/标签文字）"
+    )
+
     # 渲染方式：由 harness 确定性检测，作为"事实"喂给 LLM。
     # req 147 复盘根因：模板原先写死「游戏类 AC → assert_canvas_change」，
     # 而该游戏是 DOM 实现的，三条 AC 因此永久「不适用」。
-    has_canvas = _render_signature(code_text) == "canvas"
-    if has_canvas:
+    if _render_signature(code_text) == "canvas":
         render_info = (
             "检测到 canvas 用法 → 本实现**基于 canvas 渲染**。\n"
             "画面类断言用 assert_canvas_change。"
@@ -1058,7 +1589,6 @@ def _translate_acs_to_scripts(acceptance_criteria: list, code_text: str, require
             "画面类断言必须用 assert_dom_change，禁止使用 assert_canvas_change。"
         )
 
-    from harness.instructions.prompts import load_prompt_template
     # 保持出现顺序（原实现用 set → 顺序随机，同一输入每轮提示词都可能不同，
     # 不利于"第一版就翻对"）
     _static_sel = ", ".join(list(dict.fromkeys(selectors_hint))[:40])
@@ -1069,60 +1599,64 @@ def _translate_acs_to_scripts(acceptance_criteria: list, code_text: str, require
             "同类元素有多个时须配合 [data-*] 属性选择器或 click 的 at 比例坐标定位）: "
             + ", ".join(dynamic_hint[:40])
         )
-    prompt = load_prompt_template(
-        "verify/ac_translator.md",
-        selector_text=selector_text,
-        ac_text=ac_text,
-        render_info=render_info,
-    )
 
-    try:
-        from llm.client import get_client
-        client = get_client()
-        response = client.chat(
-            prompt=prompt,
-            system_prompt="你是 Playwright 自动化测试专家。只返回 JSON，不要其他文字。",
-            use_memory=False,
-            max_tokens=2000,
-            timeout=_aux_timeout(),
-            thinking='enabled',
-        )
-        if response.is_error or not response.content:
-            return []
+    from harness.observability.logger import get_logger
+    logger = get_logger(__name__)
 
-        import json as _json
-        content = response.content.strip()
-        # 提取 JSON 数组
-        try:
-            scripts = _json.loads(content)
-        except _json.JSONDecodeError:
-            match = _re.search(r'\[[\s\S]*\]', content)
-            if match:
-                try:
-                    scripts = _json.loads(match.group())
-                except _json.JSONDecodeError:
-                    return []
-            else:
-                return []
-
-        if isinstance(scripts, list):
-            # 只保留结构合法的条目（LLM 偶尔返回字符串数组导致下游 .get 崩溃）
-            valid = [
-                s for s in scripts
-                if isinstance(s, dict) and isinstance(s.get("steps"), list) and s["steps"]
-            ]
-            dropped = len(scripts) - len(valid)
-            from harness.observability.logger import get_logger
-            get_logger(__name__).info(
-                f"[AC Translate] {len(valid)} 条 AC 翻译完成"
-                + (f"（丢弃 {dropped} 条格式非法）" if dropped else "")
+    batches = [
+        acceptance_criteria[i:i + _AC_TRANSLATE_BATCH]
+        for i in range(0, len(acceptance_criteria), _AC_TRANSLATE_BATCH)
+    ]
+    collected: list[dict] = []
+    failed_batches = 0
+    for idx, batch in enumerate(batches, 1):
+        scripts: list[dict] = []
+        for attempt in range(1, _AC_TRANSLATE_ATTEMPTS + 1):
+            try:
+                scripts = _translate_one_ac_batch(
+                    batch, selector_text, render_info, visible_text_text,
+                )
+            except Exception as e:
+                scripts = []
+                logger.warning(
+                    f"[AC Translate] 第 {idx}/{len(batches)} 批第 {attempt} 次异常: {e}"
+                )
+            if scripts:
+                break
+            if attempt < _AC_TRANSLATE_ATTEMPTS:
+                logger.warning(
+                    f"[AC Translate] 第 {idx}/{len(batches)} 批首次未产出脚本，重试一次"
+                )
+        if scripts:
+            collected.extend(scripts)
+        else:
+            failed_batches += 1
+            logger.warning(
+                f"[AC Translate] 第 {idx}/{len(batches)} 批未产出脚本"
+                f"（本批 {len(batch)} 条 AC，已尝试 {_AC_TRANSLATE_ATTEMPTS} 次，"
+                f"共 {len(batches)} 批）"
             )
-            return valid
-    except Exception as e:
-        from harness.observability.logger import get_logger
-        get_logger(__name__).warning(f"[AC Translate] 翻译失败: {e}")
 
-    return []
+    logger.info(
+        f"[AC Translate] {len(collected)}/{len(acceptance_criteria)} 条 AC 翻译完成"
+        f"（{len(batches)} 批，失败 {failed_batches} 批）"
+    )
+    # 「定位优先级」这条约束此前没有任何验证方式：模型有没有用可见文案定位，
+    # 只能靠人事后手工去数（req 206：55/55 全是 id/class，翻了才知道）。
+    # 现在每轮自动统计——为 0 就说明提示词里的优先级完全没被遵守，
+    # 脚本绑死 id/class 时，实现改个命名就会让这一整批 AC 集体落到 compromised。
+    if collected:
+        located, total = _script_locating_stats(collected)
+        logger.info(
+            f"[AC Translate] 定位方式：{located}/{total} 个选择器按可见文案定位"
+            f"（候选文案 {len(visible_texts)} 条）"
+        )
+        if total and located == 0:
+            logger.warning(
+                f"[AC Translate] ⚠️ {total} 个选择器无一按可见文案定位——"
+                f"提示词里的定位优先级未被遵守，脚本已绑死 id/class。"
+            )
+    return collected
 
 
 # ==================== Verify 节点（Fresh-Context Evaluator） ====================
@@ -1358,13 +1892,35 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                 "smoke_defects": [], "architectural_defects": [],
                 "metadata": meta}  # 显式返回：不依赖浅拷贝副作用
 
-    # ---- 验证阶段动作级进度（此前完全静默：前端看不到"在验证什么"）----
-    def _verify_progress(percent: int, text: str) -> None:
+    # ---- 验证阶段动作级进度 + 「质量工程师」账本 ----
+    # 百分比与文案统一由 progress_plan 分配（此处不再出现裸数字）；
+    # VerifyTrace 同时喂两条通道：实时卡片 verify_start/verify_step，
+    # 以及验证结束时落库的一条 qa_summary（刷新后仍能看到"它做过什么"）。
+    from harness.observability import progress_plan as _progress_plan
+    from harness.observability.verify_trace import (
+        VerifyTrace, build_summary_message, publish_summary,
+    )
+
+    _verify_sse = None
+    try:
+        _tl_probe = get_tool_loop(state)
+        _verify_sse = _tl_probe.sse if _tl_probe else None
+    except Exception:
+        _verify_sse = None
+    _verify_trace = VerifyTrace(state, sse=_verify_sse)
+
+    def _verify_progress(step: str) -> None:
+        """推送验证子步骤进度（step 取值见 progress_plan.VERIFY_STEPS）。"""
         try:
             _tl = get_tool_loop(state)
             _sse = _tl.sse if _tl else None
             if _sse is not None and state.get("requirement_id"):
-                _sse.progress(state["requirement_id"], percent, text, stage="verifying")
+                _sse.progress(
+                    state["requirement_id"],
+                    _progress_plan.verify_percent(step, _progress_plan.round_index(state)),
+                    _progress_plan.STEP_LABEL[step],
+                    stage="verifying",
+                )
         except Exception as _e:
             logger.debug(f"[Verify] 进度推送失败（不阻断）: {_e}")
 
@@ -1372,7 +1928,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
     browser_result = {"available": False, "errors": [], "warnings": []}
     if any(f.endswith("index.html") for f in code_files):
         try:
-            _verify_progress(80, "正在浏览器里打开页面，检查报错")
+            _verify_progress("preview")
             tl = get_tool_loop(state)
             if tl and tl._preview_handler:
                 preview = tl._preview_handler.run_preview("index.html")
@@ -1381,6 +1937,13 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"[Verify] run_preview 失败: {e}")
             browser_result["errors"].append(f"run_preview 异常: {e}")
+        _verify_trace.done(
+            "preview",
+            "页面打不开（跳过）" if not browser_result.get("available")
+            else f"{len([x for x in browser_result.get('errors') or [] if x.get('message')])} 个运行时错误",
+        )
+    else:
+        _verify_trace.mark("preview", "skipped", "工作区没有 index.html")
 
     # ========== Playwright AC 逐条验收 ==========
     # ⚠️ 这两个变量都必须在**函数作用域**初始化，不能只在下面的
@@ -1447,34 +2010,52 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                 ).encode()
             ).hexdigest()
             ac_scripts = None
+            # 缓存里那份脚本（可能因为 schema / 渲染方式变化而"过期"）。
+            # 重译失败时它是唯一的降级材料——见 _resolve_ac_scripts。
+            stale_scripts = None
+            cached_hash = None
             # _ac_steps_text 已在函数入口初始化（见上方注释），此处不再重复赋值
             if ac_cache_path.exists():
                 try:
                     cached = json.loads(ac_cache_path.read_text())
-                    if (
-                        cached.get("ac_hash") == _ac_hash
-                        and isinstance(cached.get("scripts"), list)
-                        and cached["scripts"]
-                    ):
-                        ac_scripts = cached["scripts"]
-                        logger.info(f"[Verify] AC 脚本命中缓存（{len(ac_scripts)} 条，首轮锁定不重译）")
-                    else:
-                        logger.info(
-                            f"[Verify] AC 脚本缓存失效（渲染方式 {_render_sig} / "
-                            f"脚本 schema v{AC_SCRIPT_SCHEMA_VERSION} 与缓存不符），重新翻译"
-                        )
+                    if isinstance(cached.get("scripts"), list) and cached["scripts"]:
+                        stale_scripts = cached["scripts"]
+                        cached_hash = cached.get("ac_hash")
                 except Exception:
                     pass
-            if ac_scripts is None:
-                ac_scripts = _translate_acs_to_scripts(acceptance_criteria, code_text, requirement)
-                if ac_scripts:
-                    try:
-                        ac_cache_path.parent.mkdir(parents=True, exist_ok=True)
-                        ac_cache_path.write_text(
-                            json.dumps({"ac_hash": _ac_hash, "scripts": ac_scripts}, ensure_ascii=False, indent=2)
-                        )
-                    except Exception:
-                        pass
+            ac_scripts, _ac_source = _resolve_ac_scripts(
+                stale_scripts, cached_hash, _ac_hash,
+                lambda: _translate_acs_to_scripts(acceptance_criteria, code_text, requirement),
+            )
+            if _ac_source == "hit":
+                logger.info(f"[Verify] AC 脚本命中缓存（{len(ac_scripts)} 条，首轮锁定不重译）")
+            elif _ac_source == "fresh":
+                try:
+                    ac_cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    ac_cache_path.write_text(
+                        json.dumps({"ac_hash": _ac_hash, "scripts": ac_scripts}, ensure_ascii=False, indent=2)
+                    )
+                except Exception:
+                    pass
+            elif _ac_source == "stale_fallback":
+                logger.info(
+                    f"[Verify] AC 脚本缓存失效（渲染方式 {_render_sig} / "
+                    f"脚本 schema v{AC_SCRIPT_SCHEMA_VERSION} 与缓存不符），重新翻译失败"
+                )
+                logger.warning(
+                    f"[Verify] ⚠️ AC 脚本重译失败，回退到上一次成功翻译的 "
+                    f"{len(ac_scripts)} 条脚本（schema/渲染方式已变，判定可能偏松或偏紧，"
+                    f"但强于完全不验收）"
+                )
+            else:
+                logger.info(
+                    f"[Verify] AC 脚本缓存失效（渲染方式 {_render_sig} / "
+                    f"脚本 schema v{AC_SCRIPT_SCHEMA_VERSION} 与缓存不符），重新翻译失败"
+                )
+                logger.warning(
+                    "[Verify] ⚠️ AC 脚本翻译失败且无历史脚本可回退"
+                    "→ 本轮跳过 AC 逐条验收，仅靠冒烟 + LLM 评估，判定可信度显著下降"
+                )
             # Step 2: Playwright 执行
             if ac_scripts:
                 from harness.tools.preview_runner import run_ac_checks
@@ -1492,9 +2073,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                         _ac_steps_text[_sid] = " → ".join(_frags)[:400]
                 index_path = workspace.path / "index.html"
                 if index_path.exists():
-                    _verify_progress(
-                        85, f"正在逐条验证 {len(ac_scripts)} 条验收标准"
-                    )
+                    _verify_progress("ac")
                     ac_check_results = run_ac_checks(
                         index_path, ac_scripts, preview_url=preview_url,
                         sse=tl.sse if tl else None,
@@ -1523,6 +2102,11 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                         f"{len(ac_check_results)} 通过（产品断言失败 {_prod_fail} 条，"
                         f"脚本驱动失败 {_harness_fail} 条不计入缺陷）"
                     )
+                    _verify_trace.done(
+                        "ac",
+                        f"{len(ac_check_results) - _prod_fail}/"
+                        f"{len(ac_check_results)} 通过",
+                    )
                     # Step 3: 推送逐条 AC 结果到前端
                     tl = get_tool_loop(state)
                     sse = tl.sse if tl else None
@@ -1548,7 +2132,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             from harness.tools.preview_runner import run_universal_smoke
             index_path = workspace.path / "index.html"
             if index_path.exists():
-                _verify_progress(90, "正在做通用交互冒烟测试")
+                _verify_progress("smoke")
                 smoke_result = run_universal_smoke(index_path, preview_url=preview_url)
                 logger.info(
                     f"[Verify] 通用冒烟: available={smoke_result.get('available')}, "
@@ -1557,6 +2141,21 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"[Verify] 通用冒烟异常（跳过）: {e}")
     smoke_defects = list(smoke_result.get("defects", []))
+
+    # ---- 到这里「打开页面 / AC 验收 / 冒烟」三步都已发生，建卡 ----
+    # 建卡放在 AC 与冒烟**之后**是刻意的：卡片在对话流里的位置必须与落库的
+    # qa_summary 一致（逐条 AC 卡在前、这张总结卡在后），刷新前后顺序才不会变。
+    _smoke_checks = smoke_result.get("checks") or {}
+    if not ac_check_results:
+        _verify_trace.mark("ac", "skipped", "本轮没有可执行的验收标准")
+    if smoke_result.get("available"):
+        _verify_trace.done(
+            "smoke",
+            f"{sum(1 for v in _smoke_checks.values() if v)}/{len(_smoke_checks)} 项通过",
+        )
+    else:
+        _verify_trace.mark("smoke", "skipped", "浏览器会话不可用")
+    _verify_trace.begin()
 
     # 浏览器运行时错误（pageerror）必须进入定向修复清单 —— req 147 复盘的致命缺陷：
     # 当时 repair prompt 里 pageerror 出现 0 次，只有「点击按钮无反应」这一条症状，
@@ -1611,6 +2210,8 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
     # 属于架构类缺陷，经 classify_defects 路由回 coder 携带根因卡片重构
     # （需求 124 事故：app.js 调用 utils.js 未实现的 toast/copyText）
     contract_warnings = []
+    contract_defects = []
+    _verify_progress("contract")
     try:
         js_css_files = {}
         for f in code_files:
@@ -1632,6 +2233,12 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             smoke_defects = smoke_defects + contract_defects
     except Exception as e:
         logger.debug(f"[Verify] 契约检查异常（跳过）: {e}")
+        _verify_trace.mark("contract", "skipped", "契约检查异常")
+    else:
+        _verify_trace.done(
+            "contract",
+            f"{len(contract_defects)} 处断裂 · {len(contract_warnings)} 条警告",
+        )
 
     # ========== AC 断言失败 → 可执行的确定性缺陷（req 148 修复） ==========
     # 事故：AC 逐条验收抓到了 4 条真实产品缺陷（方向键无响应、棋盘无变化），
@@ -1673,13 +2280,27 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"[Verify] 视觉硬伤采集异常（跳过）: {e}")
 
-    # 判断是否可以走快速通道
+    # 判断是否可以走快速通道。
+    # 带病放行的 plan（需求阶段没过 DoD 校验）不允许进 fast_pass：那条通道完全
+    # 跳过 LLM 评估，若让不可操作的 AC 以 passed 收口，等于是给伪结论盖章放行。
+    plan_dod_issues = (plan.get("_plan_dod_issues") or []) if isinstance(plan, dict) else []
     preview_clean = len(browser_result.get("errors", [])) == 0
     ac_all_passed = (
         len(ac_check_results) > 0 and
         all(r["passed"] and not r.get("harness_errors") for r in ac_check_results)
     )
-    fast_pass = preview_clean and ac_all_passed and not smoke_defects
+    fast_pass = preview_clean and ac_all_passed and not smoke_defects and not plan_dod_issues
+    _verify_progress("dod")
+    if plan_dod_issues:
+        logger.warning(
+            f"[Verify] plan 带 DoD 弱项 {len(plan_dod_issues)} 条，"
+            f"禁用快速通道，转深度评估: {plan_dod_issues[:3]}"
+        )
+    _verify_trace.done(
+        "dod",
+        f"{len(plan_dod_issues)} 条弱项（禁快速通道）" if plan_dod_issues
+        else "需求契约完整",
+    )
 
     if fast_pass:
         # 快速通道：preview 零错误 + 所有 AC 通过 → 跳过深度 LLM 评估。
@@ -1730,15 +2351,22 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                 tl.sse.evaluator_result(state.get("requirement_id", 0), evaluator_result)
         except Exception:
             pass
-        state.setdefault("dialogue_history", []).append({
-            "role": "agent", "name": QA_NAME,
-            "content": (
-                f"## 代码评估: ✅ PASS (快速通道)\n\n"
-                f"**浏览器验证**: 无错误\n"
-                f"**验收条件**: {len(ac_check_results)} 条全部通过\n"
-            ),
-            "status": "completed",
-        })
+        # 快速通道不跑 LLM 评估，但**仍然要留下一张可见的验证卡**：
+        # 否则同一份产物走快速通道时用户什么都看不到，走深度评估时又能看到，
+        # 反而更难解释（此前这里落一条 agent 文本，现改为结构化卡片）。
+        _verify_trace.mark("evaluate", "skipped", "快速通道：确定性证据已足够")
+        _qa_card = _verify_trace.to_card(
+            verdict="PASS",
+            score=evaluator_result.get("overall_score"),
+            findings=[],
+            ac_results=ac_check_results,
+            smoke_result=smoke_result,
+            browser_result=browser_result,
+        )
+        _qa_card["fast_pass"] = True
+        _qa_msg = build_summary_message(_qa_card, QA_NAME)
+        state.setdefault("dialogue_history", []).append(_qa_msg)
+        publish_summary(_verify_sse, state.get("requirement_id"), _qa_msg)
         return {"verify_passed": True, "current_step": "verify_done",
                 "smoke_defects": [], "architectural_defects": []}
 
@@ -1816,6 +2444,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
     # 于是 ui_quality 是"读 CSS 代码猜的"—— req 199 的评分 2→5→4→5 无规律波动
     # 就是这么来的，也导致"页面丑"永远进不了修复循环。
     # 按 EVALUATOR_VISION_MODE 决定传什么；默认 dom_css（确定性取值，零外部依赖）。
+    _verify_progress("vision")
     vision_text = ""
     try:
         from config import settings as _vs
@@ -1858,12 +2487,28 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
 
     if vision_text:
         logger.info(f"[Verify] 注入视觉证据（mode={_v_mode}）: {len(vision_text)} chars")
+        _verify_trace.done("vision", f"{_v_mode} · {len(vision_text)} 字符")
+    else:
+        _verify_trace.mark("vision", "skipped", "无可采集的视觉证据")
     if vision_images:
         logger.info(f"[Verify] 附带 {len(vision_images)} 张截图参与评估（mode={_v_mode}）")
     elif _v_mode in ("image_url", "base64"):
         logger.warning(
             f"[Verify] 视觉模式={_v_mode} 当前不可用（无公网 URL / 端点不支持 base64），"
             f"本次评估不含视觉证据"
+        )
+
+    # 需求阶段带病放行时，把弱项清单交给评估器。
+    # 没有这段，evaluator 会把一条本来就不可操作的 AC 当成有效证据，
+    # 对着空气挑产品缺陷，驱动 repair 去改并不存在的问题。
+    _dod_section = ""
+    if plan_dod_issues:
+        _dod_section = (
+            "\n\n## 需求阶段已标记的验收项缺陷（程序化校验得出，不是本次执行结果）\n"
+            "下面这些问题在**生成验收条件时**就存在，说明对应的断言天生不可靠：\n"
+            "它通过了不代表功能可用，它失败了也不代表产品有缺陷。\n"
+            "对这些项请先怀疑断言本身，不要据此判定产品缺陷。\n"
+            + "\n".join(f"- {i}" for i in plan_dod_issues)
         )
 
     evaluator_prompt = load_prompt("verify/evaluator.md")
@@ -1880,11 +2525,15 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
 ```json
 {json.dumps(browser_result, ensure_ascii=False, indent=2)}
 ```
-{ac_results_text}{smoke_text}
+{ac_results_text}{smoke_text}{_dod_section}
 {(chr(10) + chr(10) + vision_text) if vision_text else ""}
 
 请基于以上信息，按照 Evaluator 的评估维度和输出格式，给出结构化评估结果。"""
 
+    # 深度评估是验证阶段最慢的一步（实测单次 45~107s，失败还会重试），
+    # 此前它连同前面的契约/DoD/视觉三步全程零推送 → req 207 实测界面
+    # 停在「正在做通用交互冒烟测试」约 2 分钟不动。
+    _verify_progress("evaluate")
     logger.info(f"[Verify] 启动评估: {len(code_files)} 个文件, prompt 长度={len(user_prompt)}")
 
     def _call_evaluator(focus_instruction: str, max_tokens: int = 3000):
@@ -1898,7 +2547,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             use_memory=False,
             max_tokens=max_tokens,
             # 实测 thinking 评估耗时 54~107s，90s 会误杀；按实测吞吐留足余量
-            timeout=110,
+            timeout=_evaluator_timeout(),
             thinking='enabled',
             images=vision_images or None,
         )
@@ -1919,7 +2568,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                 use_memory=False,
                 max_tokens=6000,
                 # 6000 tokens 按实测吞吐约需 150s（此前 120s 会撞超时）
-                timeout=150,
+                timeout=_evaluator_timeout(retry=True),
                 thinking='enabled',
                 images=vision_images or None,
             )
@@ -2123,6 +2772,11 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
         # 将 verdict 转为 verify_passed
         state["verify_passed"] = (verdict == "PASS")
         state["current_step"] = "verify_done"
+        # 评估步在这里才算完成：确定性证据推翻 LLM 判定（上面那段）会改写
+        # verdict 与分数，提前记录会把用户看到的结论与卡片对不上。
+        _verify_trace.done(
+            "evaluate", f"{overall_score}/10 · {len(findings)} 条待修"
+        )
 
         # 截图留档：确定性证据 + 截图一起构成评估证据链（多模态评估的前置资产）
         screenshot_path = None
@@ -2336,6 +2990,30 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             f"[Verify] 评估完成: verdict={verdict}, "
             f"score={overall_score}, findings={len(findings)}"
         )
+
+        # ---- 落一条**可见**的验证摘要（「质量工程师做了什么」的唯一持久记录）----
+        # 实时通道（progress / verify_step）都是瞬时的：刷新页面就没了，
+        # evaluator_result 事件也不落库。此前用户跑完一轮刷新后完全查不到
+        # 验证结论，只能靠猜。这条消息刻意**不带 hidden**。
+        try:
+            _qa_msg = build_summary_message(
+                _verify_trace.to_card(
+                    verdict=verdict,
+                    score=overall_score,
+                    findings=findings,
+                    ac_results=ac_check_results,
+                    smoke_result=smoke_result,
+                    browser_result=browser_result,
+                ),
+                QA_NAME,
+            )
+            state.setdefault("dialogue_history", []).append(_qa_msg)
+            # 同一条消息推一份实时（专用事件，dialogue 通道会丢结构化字段）
+            publish_summary(_verify_sse, state.get("requirement_id"), _qa_msg)
+            logger.info("[Verify] 已落库验证摘要卡（qa_summary）")
+        except Exception as e:
+            # 摘要卡失败不能影响验证结论与修复流程
+            logger.warning(f"[Verify] 落库验证摘要失败（忽略）: {e}")
 
     except Exception as e:
         logger.warning(f"[Verify] 评估异常: {e}，保守判定为 NEEDS_WORK")

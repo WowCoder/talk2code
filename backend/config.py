@@ -228,12 +228,62 @@ class Settings(BaseSettings):
         default=60, ge=5, le=300,
         description='辅助 LLM 调用超时时间（秒）'
     )
+    # TeamLeader 规划调用（结构化 plan JSON，max_tokens 6000~10000 且开启 thinking）。
+    # 与辅助档分开：辅助调用是小输出（500 token 以内），60s 够；规划调用是**长结构化
+    # 输出**，实测中位 40s 出头，需求多轮澄清后 prompt 变长就会顶到 60s 上限并连续
+    # Read timed out（req 205 实测：同一份 prompt 连撞 3 次 60s，整条链路白等 3 分钟后
+    # 判 TL 失败）。给到 150s，约为实测中位的 3.6 倍。
+    LLM_PLAN_TIMEOUT: int = Field(
+        default=150, ge=30, le=600,
+        description='TeamLeader 规划调用超时时间（秒）'
+    )
+    # AC 脚本翻译调用（把验收条件翻成 Playwright 操作序列）。
+    # 单列一档：它不是"小输出"——输出是多步 JSON 脚本，且开 thinking。
+    # 实测（需求 206，一批 2 条 AC）约 35s，单条最慢 78s，60s 会周期性撞穿
+    # 并触发无谓重试（重试还要再等一轮 thinking，纯浪费）。
+    # 注意：这里只管**超时**；预算吃紧的根因是批大小，见 nodes._AC_TRANSLATE_BATCH。
+    LLM_AC_TRANSLATE_TIMEOUT: int = Field(
+        default=120, ge=15, le=600,
+        description='AC 脚本翻译调用超时时间（秒）'
+    )
+    # Evaluator（验收评估）调用超时。评估要读完整产物并开 thinking，
+    # 实测耗时 54~107s，用辅助档的 60s 会误杀。
+    # 这两个值此前是裸写的 110 / 150：之所以一直没被
+    # `test_llm_aux_timeout.py` 的守卫拦下，是因为那条守卫的正则只匹配
+    # 裸写的 15/20/30（当时要清的债），110/150 从缝里漏过去了。
+    # 现统一由配置控制，并把守卫放宽到「任何裸数字」。
+    LLM_EVALUATOR_TIMEOUT: int = Field(
+        default=110, ge=30, le=600,
+        description='验收评估 LLM 调用超时时间（秒）'
+    )
+    # 截断（finish_reason=length）后以 max_tokens 3000→6000 重试的那一档。
+    # 输出预算翻倍、耗时近似线性，故比首试档更高。
+    LLM_EVALUATOR_RETRY_TIMEOUT: int = Field(
+        default=150, ge=30, le=900,
+        description='验收评估截断重试的 LLM 调用超时时间（秒）'
+    )
     # 极轻量分类/筛选调用（max_tokens ≤ 500，同步阻塞用户输入的意图路由、记忆校验）。
     # 单独一档：这类调用在用户敲下回车的那一刻同步等待，给 60s 会让界面明显卡顿，
     # 但 15s 对 reasoning 模型又不够，折中 30s。
     LLM_CLASSIFY_TIMEOUT: int = Field(
         default=30, ge=5, le=120,
         description='极轻量分类/筛选 LLM 调用超时时间（秒）'
+    )
+    # 单轮 LLM 的**墙钟上限**（秒，含内部重试）—— 与「单次请求超时」解耦。
+    #
+    # 为什么需要它：`timeout` 管的是**一次请求**，而用户感知的是**一轮**。
+    # 此前 `LLM_TIMEOUT=300` × ( `LLM_MAX_RETRIES=2` + 1 ) = 900s/轮，但代码里
+    # 没有任何一处写出过这个 900 —— 它只存在于"两个参数相乘"这个隐式关系里，
+    # 调参时极容易看漏（LLM_TIMEOUT 的注释甚至称它为"绝对天花板"，与实现不符）。
+    # 现在把墙钟显式化：由它反推「单次尝试超时 × 允许的重试次数」。
+    #
+    # 定值依据：`llm_traffic.log` 1450 条请求实测 —— P99 60.6s、最大 172s，
+    # 单次 300s 已是实测峰值的 1.7 倍。所以保留 1 次重试（吸收端点抖动），
+    # 墙钟收敛到 600s；再往上意味着最坏 10 分钟以上任何产出都推不到前端。
+    # 设 0 = 不设墙钟上限，退回 "timeout × (retries+1)" 的隐式行为。
+    LLM_TURN_MAX_WALL_S: int = Field(
+        default=600, ge=0, le=3600,
+        description='单轮 LLM 墙钟上限（秒，含内部重试）；0=不限'
     )
     LLM_MAX_RETRIES: int = Field(default=2, ge=0, le=5, description='LLM 调用最大重试次数')
 
