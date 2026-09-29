@@ -1491,6 +1491,57 @@ def _run_universal_smoke_session(html_path: Path, timeout_ms: int = 15_000, prev
 
                     # 入口被遮挡时已判 interactive=False，跳过 JS 直点观察（避免覆盖判定）
                     if not blocked:
+                        # ---- 先填就近的可见文本输入，再点击主交互入口 ----
+                        # 待办/表单类应用的「添加」按钮在空输入时按设计就该无反应
+                        # （合法防御，不是 bug），不填就 null 点击会判 no_interaction critical，
+                        # 连修多轮都打偏。这里在点击前找页面上离 CTA 最近的可见 text input
+                        # 填「test」—— 模拟真实用户的填表行为。
+                        # search 类型刻意排除：fill 反而触发 list 过滤成空 → 点击后
+                        # 即便添加成功整页变化也少 → 仍可能误判。
+                        try:
+                            filled = doc.evaluate("""
+                                (buttonIdx) => {
+                                    const buttons = [...document.querySelectorAll(
+                                        'button, a, [role="button"], input[type="button"], input[type="submit"]')];
+                                    const btn = buttons[buttonIdx];
+                                    if (!btn) return null;
+                                    const inputs = [...document.querySelectorAll(
+                                        'input[type="text"], input[type="email"], input[type="url"], '
+                                        + 'input[type="tel"], input:not([type])'
+                                    )];
+                                    const visible = inputs.filter(el => {
+                                        const r = el.getBoundingClientRect();
+                                        const s = getComputedStyle(el);
+                                        return r.width > 0 && r.height > 0
+                                            && s.visibility !== 'hidden' && s.display !== 'none'
+                                            && !el.disabled && !el.readOnly;
+                                    });
+                                    if (!visible.length) return null;
+                                    const bRect = btn.getBoundingClientRect();
+                                    let best = null, bestDist = Infinity;
+                                    for (const inp of visible) {
+                                        const r = inp.getBoundingClientRect();
+                                        const dx = (r.left + r.width/2) - (bRect.left + bRect.width/2);
+                                        const dy = (r.top + r.height/2) - (bRect.top + bRect.height/2);
+                                        const d = dx*dx + dy*dy;
+                                        if (d < bestDist) { bestDist = d; best = inp; }
+                                    }
+                                    if (!best) return null;
+                                    // 用原生 setter 绕开框架对 input.value 的劫持，
+                                    // dispatch input+change 让 Vue v-model / React onChange 感知。
+                                    const setter = Object.getOwnPropertyDescriptor(
+                                        window.HTMLInputElement.prototype, 'value').set;
+                                    setter.call(best, 'test');
+                                    best.dispatchEvent(new Event('input', {bubbles: true}));
+                                    best.dispatchEvent(new Event('change', {bubbles: true}));
+                                    return best.outerHTML.slice(0, 200);
+                                }
+                            """, cta["i"])
+                            if filled:
+                                result["logs"].append(f"[smoke] 点击前先填就近文本输入: {filled}")
+                        except Exception as e:
+                            result["logs"].append(f"[smoke] 预填输入异常（继续原点击）: {e}")
+
                         # ---- 不变量 2+3: 点击主交互并观察 ----
                         try:
                             # cta["i"] 是 querySelectorAll 原始列表中的索引，直接按索引点击
