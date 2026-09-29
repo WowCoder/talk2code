@@ -183,6 +183,27 @@ def get_requirement(req_id):
         except Exception:
             pass  # evaluator 数据不存在或无法读取，不影响正常流程
 
+        # 产物文件：需求进行中时 DB 里还没有 code_files（它只在终态落库），
+        # 于是「跑一半刷新页面」会看到代码 TAB 空、任务面板 0/N —— 明明磁盘上
+        # 已经写好了几个文件（req 207 实测：日志显示 5 个文件全部创建成功，
+        # 接口却返回 code_files=0）。这里在进行中的需求上回退读工作区快照，
+        # 让刷新看到的是「到目前为止产出了什么」。
+        code_files = requirement.code_files or []
+        if not code_files and requirement.status in (
+            'pending', 'planning', 'processing', 'interrupted'
+        ):
+            try:
+                from harness.state.workspace import WorkspaceFS
+                ws = WorkspaceFS(requirement.user_id, req_id)
+                # 排除内部工作文件：.task/** 是 Agent 的过程记录（AC 脚本、评估结果、
+                # 任务状态），不是交付物。快照本身已排除 .design/**（模板）。
+                code_files = [
+                    f for f in ws.snapshot()
+                    if not str(f.get('filename', '')).startswith('.task/')
+                ]
+            except Exception:
+                code_files = []
+
         # 推导 plan_status: 从 requirement.status 和 dialogue_history 判断
         plan_status = None
         if requirement.status == 'planning':
@@ -202,7 +223,7 @@ def get_requirement(req_id):
                 'status': requirement.status,
                 'plan_status': plan_status,
                 'dialogue_history': requirement.dialogue_history or [],
-                'code_files': requirement.code_files or [],
+                'code_files': code_files,
                 'create_time': requirement.create_time.isoformat() if requirement.create_time else None,
                 'update_time': requirement.update_time.isoformat() if requirement.update_time else None,
                 'is_deleted': requirement.is_deleted,
@@ -656,14 +677,18 @@ def confirm_plan(req_id):
             confirm_card = {
                 'role': 'user',
                 'name': '用户',
-                'content': '已确认开发计划，开始编码',
+                'content': '已确认需求理解，开始编码',
                 'timestamp': get_current_timestamp(),
                 'preserve': True,
+                # 字段必须与待确认态完全一致：两态共用 PlanSummaryCard，
+                # 少一个字段用户就会看到「确认之后内容变少了」（req 201 教训）。
                 'plan_confirmed': {
+                    'requirement_restated': plan_data.get('requirement_restated', ''),
                     'features': plan_data.get('features', []),
+                    'assumptions': plan_data.get('assumptions', []),
+                    'acceptance_criteria': plan_data.get('acceptance_criteria', []),
                     'tech_stack': plan_data.get('tech_stack', {}),
                     'file_structure': plan_data.get('file_structure', []),
-                    'data_model': plan_data.get('data_model', ''),
                     'complexity': plan_data.get('complexity', 'S'),
                 },
             }
@@ -929,6 +954,13 @@ def sse_stream(req_id):
                     # 60~150 秒且期间无任何业务事件，注释行只维持连接、前端收不到，
                     # 用户只能猜「是不是卡住了」（req 146 实测静默 4 分钟）。
                     # 用命名事件发送：前端的 onmessage 只收无名事件，不会干扰既有逻辑。
+                    #
+                    # 同时必须刷新管理器的存活心跳：cleanup_stale() 只看 send() 刷新的
+                    # last_heartbeat，而心跳是这里直接 yield 的、不经过 SSEClient ——
+                    # 不 touch 的话，一条健康但 5 分钟没收到业务事件的连接会被清理线程
+                    # 摘除，之后所有 broadcast 都静默丢失（req 207：等确认 33 分钟，
+                    # 整个编码与验收阶段一条实时消息都推不出去）。
+                    sse_manager.touch(client_id, client_queue)
                     yield SSEMessage.format_event('heartbeat', {
                         'requirement_id': req_id,
                         'elapsed_s': int(time.time() - sse_started_at),

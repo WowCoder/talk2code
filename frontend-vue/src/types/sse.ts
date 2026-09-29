@@ -1,6 +1,7 @@
 // ===== SSE Event Types =====
 
-import type { RequirementStatus } from './api'
+import type { RequirementStatus, VerifyStep } from './api'
+import type { PlanSpec } from './spec'
 
 export type SSEEventType =
   | 'connected'
@@ -29,6 +30,9 @@ export type SSEEventType =
   | 'qa_step'
   | 'qa_start'
   | 'qa_result'
+  | 'verify_start'
+  | 'verify_step'
+  | 'qa_summary'
 
 // ===== SSE Event Data Shapes =====
 
@@ -155,28 +159,7 @@ export interface SSEPreviewData {
 
 // ===== SDD 新增事件 =====
 
-export interface SSESpecData {
-  title?: string
-  features?: string[]
-  acceptance_criteria?: Array<{
-    id: string
-    label: string
-    how_to_verify?: string
-    passed?: boolean | null
-    reason?: string
-    /** 四态信号: passed / compromised / unverified / not_applicable / fail / pending */
-    state?: string
-  }>
-  file_structure?: string[]
-  tech_stack?: {
-    css?: string
-    storage?: string
-    framework?: string
-  }
-  data_model?: string
-  complexity?: string
-  implementation_notes?: string
-}
+export type SSESpecData = PlanSpec
 
 export interface SSETask {
   file: string
@@ -314,6 +297,19 @@ export interface SSEQAAcData {
   end_ts?: string | null
   summary?: string
 }
+
+// ===== 验证阶段子步骤（冒烟 / 契约 / DoD / 评估） =====
+// 与 coder 的 iteration_start/append/end 同构：verify_start 建卡（带上此前已完成的
+// 步骤），verify_step 逐步实时更新；两者都**不落库**。验证结束时后端落一条
+// role='qa_summary' 的消息（同一份 VerifyCard 形状），前端撤掉这张临时卡，
+// 因此刷新前后位置与内容都一致。
+export interface SSEVerifyStartData {
+  round?: number
+  steps: VerifyStep[]
+  start_ts?: string | null
+}
+
+export type SSEVerifyStepData = VerifyStep
 
 // Task 状态联合类型增加 blocked/failed
 export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'blocked' | 'failed'

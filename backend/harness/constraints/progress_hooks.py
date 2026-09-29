@@ -153,12 +153,18 @@ def track_write_success(ctx: HookContext) -> str | None:
         sse = getattr(tool_loop, "sse", None)
         if sse is not None and ctx.requirement_id:
             sse.task_update(ctx.requirement_id, filename, "completed")
+            # 百分比统一由 progress_plan 分配（编码带 20..75，按轮次右移）；
+            # 此前是 `20 + 75*ratio`，能冲到 95 而验证从 80 重来，进度条会倒退。
+            from harness.observability import progress_plan as _pp
             if total:
-                percent = 20 + int(75 * completed / total)
                 text = f"已完成 {filename}（{completed}/{total}）"
+                percent = _pp.coding_percent(
+                    completed / total, _pp.round_index(ctx.state or {})
+                )
             else:
-                percent = 20
+                # 无总量（contract 缺失）时按"刚开始编码"给带起点，不带虚假比例
                 text = f"已完成 {filename}"
+                percent = _pp.coding_percent(0.0, _pp.round_index(ctx.state or {}))
             sse.progress(ctx.requirement_id, percent, text, stage="coding")
     except Exception as e:
         logger.debug(f"[ProgressHook] SSE 进度推送失败（不阻断）: {e}")

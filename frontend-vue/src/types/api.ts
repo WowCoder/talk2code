@@ -1,4 +1,5 @@
 import type { SSEQuestionFormData } from './sse'
+import type { PlanSpec } from './spec'
 
 // ===== User Types =====
 export interface User {
@@ -27,7 +28,7 @@ export interface CodeFile {
 }
 
 export interface DialogueMessage {
-  role: 'user' | 'agent' | 'assistant' | 'system' | 'tool_call' | 'tool_result' | 'thinking' | 'hook_check' | 'iteration_batch' | 'qa_step' | 'qa_result'
+  role: 'user' | 'agent' | 'assistant' | 'system' | 'tool_call' | 'tool_result' | 'thinking' | 'hook_check' | 'iteration_batch' | 'qa_step' | 'qa_result' | 'qa_summary' | 'verify_steps'
   name?: string
   content: string
   timestamp?: string
@@ -81,15 +82,10 @@ export interface DialogueMessage {
   // clarification
   question_form?: SSEQuestionFormData
   status?: string
-  // plan 确认卡片（用户确认开发计划后的特殊 user 消息）
-  plan_confirmed?: {
-    features?: string[]
-    tech_stack?: { css?: string; storage?: string; framework?: string }
-    file_structure?: string[]
-    // 数据模型描述：确认后卡片与待确认浮层卡保持同样内容
-    data_model?: string
-    complexity?: string
-  }
+  // plan 确认卡片（用户确认后落成的 user 消息）。
+  // 与待确认浮层共用同一份 PlanSpec —— 少一个字段，用户就会看到
+  // 「确认之后内容变少了」，进而怀疑确认这个动作有副作用。
+  plan_confirmed?: PlanSpec
   // hidden: 内部系统提示，不展示在前端
   hidden?: boolean
   // iteration_batch 进行中标记：true 表示本轮工具操作仍在实时累积（SSE iteration_append）
@@ -104,10 +100,40 @@ export interface DialogueMessage {
     detail?: string
     timestamp?: string
   }
+  // 验证阶段「质量工程师做了什么」：实时卡（role=verify_steps, live）与
+  // 落库卡（role=qa_summary）共用同一份 VerifyCard 形状，前端同一个组件渲染，
+  // 保证刷新前后看到的是同一张卡、同一位置。
+  qa_summary?: VerifyCard
+  verify_steps?: VerifyCard
   // grouped tool_calls (virtual message, 前端旧版兼容)
   _grouped?: boolean
   label?: string
   items?: DialogueMessage[]
+}
+
+/** 验证阶段单个子步骤（key 与后端 progress_plan.VERIFY_STEPS 一一对应） */
+export interface VerifyStep {
+  key: string
+  label: string
+  status?: 'pending' | 'running' | 'done' | 'failed' | 'skipped'
+  detail?: string
+  timestamp?: string
+}
+
+/** 验证阶段总结卡（实时与落库共用） */
+export interface VerifyCard {
+  verdict?: string
+  score?: number | null
+  round?: number
+  steps: VerifyStep[]
+  ac?: { passed: number; total: number }
+  smoke?: { available: boolean; checks: Record<string, boolean>; defect_count: number }
+  browser_errors?: number
+  severity?: Record<string, number>
+  defect_count?: number
+  fast_pass?: boolean
+  start_ts?: string | null
+  end_ts?: string | null
 }
 
 export interface Requirement {

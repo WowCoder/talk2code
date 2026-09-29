@@ -5,7 +5,8 @@ import type {
   DialogueMessage,
   CodeFile,
 } from '@/types/api'
-import type { SSEQuestionFormData, SSEEvaluatorResultData, SSESpecData, SSETraceSummaryData, SSETask, SSEIterationStartData, SSEIterationAppendData, SSEQAStepData, SSEQAAcData } from '@/types/sse'
+import type { SSEQuestionFormData, SSEEvaluatorResultData, SSESpecData, SSETraceSummaryData, SSETask, SSEIterationStartData, SSEIterationAppendData, SSEQAStepData, SSEQAAcData, SSEVerifyStartData, SSEVerifyStepData } from '@/types/sse'
+import type { VerifyStep } from '@/types/api'
 import { useApi } from '@/composables/useApi'
 import { normalizeDialogueMessage, normalizeDialogueList, roleOfName, DEV_NAME, QA_NAME } from '@/utils/dialogueRole'
 import { mergeProducedFiles } from '@/utils/publishGate'
@@ -170,7 +171,18 @@ function messageKey(msg: DialogueMessage): string {
 
   async function loadRequirement(id: number): Promise<{ requirement: Requirement; trace?: any; evaluator?: SSEEvaluatorResultData } | null> {
     const seq = ++loadSeq
-    // 先重置所有状态，避免旧需求数据残留
+
+    // ⚠️ 先取数据、成功后再清空旧状态。
+    // 早先这里把「重置全部 state」放在 await 之前，于是**任何一次加载失败**
+    // （401 / 500 / 超时 / 网络抖动）都会把页面留在"刚重置完"的空状态里：
+    // 消息、代码、任务进度全空，而异常只被调用方 catch 成一句 toast。
+    // 用户看到的就是「刷新一下，啥都没了」。
+    const data = await api<{ requirement: Requirement; trace?: any; evaluator?: SSEEvaluatorResultData }>(`/api/requirements/${id}`)
+
+    // 竞态保护：期间又发起了新的 loadRequirement，本次结果作废
+    if (seq !== loadSeq) return null
+
+    // 到这里才确认拿到了新数据，可以安全丢弃旧需求的残留
     dialogueMessages.value = []
     seenMessageKeys.clear()
     Object.keys(codeFiles).forEach((k) => delete codeFiles[k])
@@ -184,11 +196,6 @@ function messageKey(msg: DialogueMessage): string {
     _specInsertIndex.value = null
     planStatus.value = null
     _traceSummary.value = null
-
-    const data = await api<{ requirement: Requirement; trace?: any; evaluator?: SSEEvaluatorResultData }>(`/api/requirements/${id}`)
-
-    // 竞态保护：期间又发起了新的 loadRequirement，本次结果作废
-    if (seq !== loadSeq) return null
 
     currentRequirement.value = data.requirement
 
@@ -227,15 +234,11 @@ function messageKey(msg: DialogueMessage): string {
       for (const msg of data.requirement.dialogue_history) {
         if (!(msg as any).plan) continue
         const plan = (msg as any).plan
+        // 整份带过来，不手工挑字段：挑漏了就又变成"刷新之后卡片少了东西"。
+        // (_specData 是 PlanSpec 类型，字段增删会自动同步到这一处。)
         _specData.value = {
+          ...plan,
           title: data.requirement.title,
-          features: plan.features || [],
-          acceptance_criteria: plan.acceptance_criteria || [],
-          file_structure: plan.file_structure || [],
-          tech_stack: plan.tech_stack || {},
-          data_model: plan.data_model || '',
-          implementation_notes: plan.implementation_notes || '',
-          complexity: plan.complexity || 'S',
         }
         _taskList.value = deriveTaskList(plan, data.requirement)
       }
@@ -286,6 +289,9 @@ function messageKey(msg: DialogueMessage): string {
 
     if (key) seenMessageKeys.add(key)
     dialogueMessages.value.push(msg)
+    // 落库的验证摘要到达 → 撤掉实时临时卡：同一件事不能显示两遍，
+    // 否则用户会看到「一张 live 卡 + 一张同样的落库卡」并排出现。
+    if (msg.role === 'qa_summary') dropLiveVerifyCard()
     // Keep last 100 messages
     if (dialogueMessages.value.length > 200) {
       dialogueMessages.value = dialogueMessages.value.slice(-100)
@@ -560,6 +566,69 @@ function messageKey(msg: DialogueMessage): string {
   }
 
   /**
+   * 验证阶段开始：建一张可实时累积的「质量工程师」卡片。
+   *
+   * 后端 verify_start 会带上此刻**已经完成**的子步骤（打开页面 / AC 验收 / 冒烟），
+   * 所以卡片一出现就有内容，不会先闪一张全 pending 的空卡。
+   * 实时卡只做展示；验证结束时后端会落一条 `qa_summary`，届时这张临时卡被撤掉，
+   * 用户最终看到的是同位置、同形状的持久化卡片（刷新前后一致）。
+   */
+  function startVerifyTrace(data: SSEVerifyStartData) {
+    const steps = data?.steps || []
+    if (!steps.length) return
+    const card = {
+      role: 'verify_steps',
+      name: QA_NAME,
+      content: '正在进行验证',
+      verify_steps: {
+        round: data.round ?? 0,
+        steps: steps.map((s) => ({ ...s })),
+        start_ts: data.start_ts ?? null,
+        end_ts: null,
+      },
+      live: true,
+    } as unknown as DialogueMessage
+    // 重连回放会重复推 verify_start：原地替换，不叠卡
+    const idx = dialogueMessages.value.findIndex(
+      (m) => m.role === 'verify_steps' && (m as any).live === true
+    )
+    if (idx >= 0) dialogueMessages.value.splice(idx, 1, card)
+    else dialogueMessages.value.push(card)
+    qaRunning.value = true
+  }
+
+  /** 验证阶段单个子步骤状态更新（实时）。 */
+  function updateVerifyStep(step: SSEVerifyStepData) {
+    if (!step?.key) return
+    const idx = dialogueMessages.value.findIndex(
+      (m) => m.role === 'verify_steps' && (m as any).live === true
+    )
+    // 没有 live 卡（断线窗口只收到步骤）→ 不凭空造卡，结论由 qa_summary 兜底
+    if (idx < 0) return
+    const steps = (dialogueMessages.value[idx] as any).verify_steps?.steps as
+      | VerifyStep[]
+      | undefined
+    if (!steps) return
+    const merged: VerifyStep = {
+      key: step.key,
+      label: step.label || '',
+      status: step.status || 'done',
+      detail: step.detail || '',
+    }
+    const i = steps.findIndex((s) => s.key === step.key)
+    if (i >= 0) steps[i] = { ...steps[i], ...merged }
+    else steps.push(merged)
+  }
+
+  /** 落库的验证摘要到达 → 撤掉临时 live 卡，避免同一件事显示两遍。 */
+  function dropLiveVerifyCard() {
+    const idx = dialogueMessages.value.findIndex(
+      (m) => m.role === 'verify_steps' && (m as any).live === true
+    )
+    if (idx >= 0) dialogueMessages.value.splice(idx, 1)
+  }
+
+  /**
    * 重连增量补齐：从后端拉取最新 dialogue_history，按 messageKey 幂等合并。
    * SSE 断线重连会回放缓冲（maxlen=200 会滚），但缓冲之外的历史消息（如本轮已结束的
    * 迭代、QA 验收步骤）在断连窗口可能漏掉；用这个接口补齐，避免「刷新页面才看到一堆」。
@@ -764,6 +833,8 @@ function messageKey(msg: DialogueMessage): string {
     appendQaStep,
     startQaAc,
     endQaAc,
+    startVerifyTrace,
+    updateVerifyStep,
     hydrateDialogue,
     qaRunning,
     fetchDialogue,

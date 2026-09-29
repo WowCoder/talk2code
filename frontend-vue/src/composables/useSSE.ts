@@ -3,7 +3,7 @@ import { useRequirementStore, emptyProgress } from '@/stores/requirement'
 import { usePreviewStore } from '@/stores/preview'
 import { useAuthStore } from '@/stores/auth'
 import router from '@/router'
-import type { RequirementStatus } from '@/types/api'
+import type { RequirementStatus, DialogueMessage } from '@/types/api'
 import type {
   SSEDialogueData,
   SSECodeData,
@@ -27,6 +27,8 @@ import type {
   SSEIterationEndData,
   SSEQAStepData,
   SSEQAAcData,
+  SSEVerifyStartData,
+  SSEVerifyStepData,
 } from '@/types/sse'
 
 const INITIAL_RETRY_DELAY = 1000
@@ -126,9 +128,14 @@ export function useSSE(reqId: Ref<number | null>) {
       const st = store.currentRequirement?.status
       if (st !== 'pending' && st !== 'processing') return
       store.isGenerating = true
+      // 进度只增不减：后端在「修复轮次 / coder 重入」时会按**轮内**位置重新
+      // 上报更小的值（这是有意的，见 backend/harness/observability/progress_plan.py），
+      // 这里对同一需求取历史最大值，保证用户看到的进度条不会往回跳。
+      const prevPercent = Number(store.progress.percent) || 0
+      const nextPercent = Math.max(prevPercent, Number(data.progress) || 0)
       store.progress = {
         currentAgent: data.current_agent,
-        percent: data.progress,
+        percent: nextPercent,
         // 阶段缺省时沿用上一阶段：后端部分埋点不带 stage，避免指示器闪回未知
         stage: data.stage || store.progress.stage,
         updatedAt: Date.now(),
@@ -270,6 +277,38 @@ export function useSSE(reqId: Ref<number | null>) {
       }
     })
 
+    // 验证阶段建卡：此刻已完成的子步骤（打开页面 / AC 验收 / 冒烟）随卡一起给，
+    // 之后的契约检查 / DoD / 视觉证据 / 深度评估逐步实时更新。
+    // 此前这四步全程零推送：req 207 实测界面停在「正在做通用交互冒烟测试」约 2 分钟。
+    es.addEventListener('verify_start', (e: MessageEvent) => {
+      try {
+        const data: SSEVerifyStartData = JSON.parse(e.data)
+        store.startVerifyTrace(data)
+      } catch {
+        // ignore parse errors
+      }
+    })
+
+    es.addEventListener('verify_step', (e: MessageEvent) => {
+      try {
+        const data: SSEVerifyStepData = JSON.parse(e.data)
+        store.updateVerifyStep(data)
+      } catch {
+        // ignore parse errors
+      }
+    })
+
+    // 验证摘要卡（落库消息的实时副本）：走通用入列路径，因此与刷新后从
+    // dialogue_history 恢复的同一条消息共用幂等键；入列时撤掉临时 live 卡。
+    es.addEventListener('qa_summary', (e: MessageEvent) => {
+      try {
+        const data: SSEDialogueData = JSON.parse(e.data)
+        store.addDialogueMessage(data as unknown as DialogueMessage)
+      } catch {
+        // ignore parse errors
+      }
+    })
+
     es.addEventListener('hook_check', (e: MessageEvent) => {
       const data: SSEHookCheckData = JSON.parse(e.data)
       // 失败项以 dialogue 消息形式展示（DialogueMessage 的 hook_check 分支渲染），
@@ -335,10 +374,23 @@ export function useSSE(reqId: Ref<number | null>) {
     es.addEventListener('spec', (e: MessageEvent) => {
       const data: SSESpecData = JSON.parse(e.data)
       store._specData = data
+      // 标记紧随其后的那条 TL 分析文本消息：它与计划卡是**同一份内容**
+      // （requirement_restated + features + acceptance_criteria 逐字相同），
+      // 只是卡片的纯文本副本。不标记的话，用户要把同一份计划读两遍
+      // （浮层卡片一遍 + 文本消息一遍），刷新后还会叠加已确认卡片变成三遍。
+      // 标记后由对话流统一只渲染卡片（见 DialoguePanel 的 messages 计算）。
+      //
+      // 只在"首次出计划"时打标：已确认状态下的 spec 重放不该再改动消息属性。
+      // 刷新恢复那条链路的同名消息自带 plan 字段（来自 DB），不依赖这里。
+      const _list = store.dialogueMessages
+      const _last: any = _list[_list.length - 1]
+      if (_last && _last.role === 'agent' && !_last.plan && !_last.plan_confirmed) {
+        _last.has_plan = true
+      }
       // 记录 TL 分析消息的插入位置（spec 事件到达时，TL 消息已通过 dialogue 事件
       // 追加到消息列表末尾，length 即它之后一位 —— 确认卡片落在分析结果之后，
       // 与后端落库位置一致）
-      store._specInsertIndex = store.dialogueMessages.length
+      store._specInsertIndex = _list.length
       // 如果已经确认过，不要覆盖为 needs_confirmation（刷新页面 SSE 重连时可能重放）
       if (store.planStatus !== 'confirmed') {
         store.planStatus = 'needs_confirmation'

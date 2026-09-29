@@ -198,6 +198,13 @@
     </div>
   </div>
 
+  <!-- 验证阶段总结卡：实时（role=verify_steps，live）与落库（role=qa_summary）
+       共用同一个组件与同一份数据形状 —— 刷新前后看到的是同一张卡。
+       它回答的是此前完全不可见的问题：「质量工程师到底做了什么」。 -->
+  <div v-else-if="msg.role === 'qa_summary' || msg.role === 'verify_steps'" class="msg qa-card-msg">
+    <VerifyStepsCard :msg="msg" />
+  </div>
+
   <!-- Default: agent-like -->
   <div v-else class="msg agent">
     <div class="agent-name" :style="{ color: roleColor }">
@@ -217,6 +224,7 @@ import ToolCallCard from './ToolCallCard.vue'
 import HookCheckCard from './HookCheckCard.vue'
 import QaAcCard from './QaAcCard.vue'
 import QaAcGroupCard from './QaAcGroupCard.vue'
+import VerifyStepsCard from './VerifyStepsCard.vue'
 import PlanSummaryCard from './PlanSummaryCard.vue'
 import RichMessage from './RichMessage.vue'
 import CoderTurnCard from './CoderTurnCard.vue'

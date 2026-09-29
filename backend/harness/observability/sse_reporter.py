@@ -156,6 +156,34 @@ class SSEReporter:
             ac["end_ts"] = get_current_timestamp()
         self._send(requirement_id, "qa_result", ac)
 
+    def verify_start(self, requirement_id: int, payload: dict):
+        """验证阶段建卡：前端据此创建可实时累积的「质量工程师」卡片。
+
+        与 coder 的 iteration_start/append/end 同构——实时事件**只做展示、不落库**，
+        落库由验证结束时的一条 `qa_summary` 汇总完成（含同一份 steps），
+        因此刷新前后看到的是同一张卡，位置也一致。
+        """
+        if not isinstance(payload, dict):
+            payload = dict(payload)
+        payload.setdefault("start_ts", get_current_timestamp())
+        payload.setdefault("steps", [])
+        self._send(requirement_id, "verify_start", payload)
+
+    def verify_step(self, requirement_id: int, step: dict):
+        """验证阶段单个子步骤状态更新（实时，不落库）。"""
+        if not isinstance(step, dict):
+            step = dict(step)
+        step.setdefault("timestamp", get_current_timestamp())
+        self._send(requirement_id, "verify_step", step)
+
+    def qa_summary(self, requirement_id: int, message: dict):
+        """验证摘要卡（落库 + 实时同一条）。
+
+        dialogue 通道只透传 role/name/content 等固定字段，结构化卡片会被丢掉，
+        因此摘要有专用事件；前端与刷新后从 DB 恢复的同一条消息共用幂等键。
+        """
+        self._send(requirement_id, "qa_summary", message)
+
     def complete(self, requirement_id: int, status: str = None):
         """完成事件。status 传需求**终态**（finished 等）。
 
