@@ -78,7 +78,10 @@ TEMPLATES: dict[str, list[str]] = {
     ],
     "memory/consolidate_prompt.md": ["memories"],
     "memory/verify_prompt.md": ["query", "candidates"],
-    "verify/ac_translator.md": ["selector_text", "ac_text", "render_info"],
+    "verify/ac_translator.md": [
+        "anchor_text", "visible_text_text", "selector_text", "ac_text",
+        "render_info",
+    ],
 }
 
 

@@ -9,7 +9,7 @@
         ✏️ {{ showFeedback ? '收起' : '修改需求' }}
       </button>
       <button class="btn-confirm" @click="onConfirm" :disabled="confirming || locking">
-        {{ locking ? '重新分析中…' : confirming ? '确认中…' : '✅ 确认，开始编码' }}
+        {{ locking ? '重新分析中…' : confirming ? '确认中…' : '✅ 没问题，开始做' }}
       </button>
     </div>
 
@@ -17,7 +17,7 @@
     <div v-if="showFeedback" class="plan-feedback">
       <textarea
         v-model="feedbackText"
-        placeholder="输入你的修改意见，例如：请使用 React 而不是原生 JS、增加暗黑模式切换功能…"
+        placeholder="例如：整体想要暗色一点／再加一个按月导出的功能／列表默认按时间倒序…"
         rows="3"
         class="feedback-input"
         :disabled="locking"
@@ -56,6 +56,13 @@ watch(
   () => props.specData,
   () => {
     locking.value = false
+    // 必须一并清空上一轮的反馈文字并收起输入框。
+    // 这张卡在「带反馈重分析」期间是**原地不动**的（没有卸载重建），
+    // 不复位的话用户上一轮写的内容会原样留在"新"确认框里 —— 看起来像是
+    // 系统把他刚提的修改意见又当成新需求显示了一遍，也会被误当成待提交内容
+    // 二次提交（req 实测：「我前面改的文字还在新的确认框中出现了」）。
+    feedbackText.value = ''
+    showFeedback.value = false
   }
 )
 

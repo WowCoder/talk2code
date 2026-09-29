@@ -107,9 +107,32 @@ function msgTime(msg: DialogueMessageType): string {
 }
 
 const messages = computed(() => {
-  const raw = store.dialogueMessages.filter(
+  const all = store.dialogueMessages
+
+  /**
+   * 计划卡的「文本副本」不再单独渲染。
+   *
+   * TL 节点产出的分析消息（"我理解你要做的是：…" + 功能清单 + 验收清单 + 默认设置）
+   * 与计划卡是同一份内容，而计划卡有两种形态：待确认时是浮层卡、确认后是消息流里
+   * 的 `plan_confirmed` 卡。三者并存时用户要把同一份计划读三遍（实测 req 207：
+   * 两条 TL 文本 + 一张已确认卡），而且每轮"填修改意见重出计划"都会再叠一份。
+   *
+   * 计划卡才是用户签字、系统判定的那一份，文本版仅在**卡片缺失**时兜底
+   *（老需求 / 异常中断，两者都没落卡），所以这里按"有没有卡"来决定隐藏。
+   *
+   * 识别方式覆盖两条链路：
+   *   - 刷新恢复：消息来自 DB，自带 `plan` 字段；
+   *   - 实时推送：SSE dialogue 事件不带 plan，由 useSSE 在 spec 事件到达时
+   *     给紧随其后的那条标记 `has_plan`。
+   */
+  const hasPlanCard =
+    store.planStatus === 'needs_confirmation' ||
+    all.some((m: DialogueMessageType) => (m as any).plan_confirmed)
+
+  const raw = all.filter(
     (m: DialogueMessageType) =>
       m.content !== '__QUESTION_FORM__' && !(m as any).hidden && !(m as any).plan_feedback &&
+      !(hasPlanCard && ((m as any).plan || (m as any).has_plan)) &&
       // 「0 个操作」幽灵卡片兜底：无论消息从哪条路径进入 store（SSE 实时推送、
       // 历史恢复、chat 响应合并），只要迭代批次没有操作列表就不渲染。
       // useSSE 与后端 sse_reporter 已在源头过滤，这里是最后一条防线。
@@ -334,12 +357,16 @@ watch(
     store.dialogueMessages.splice(planCardInsertIndex(), 0, {
       role: 'user',
       name: '用户',
-      content: '已确认开发计划，开始编码',
+      content: '已确认需求理解，开始编码',
+      // 整份 PlanSpec 原样搬过来：确认是同一张卡的状态切换，不是另做一张摘要。
+      // 此前这里手工挑了 5 个字段，漏掉的一律丢失。
       plan_confirmed: {
+        requirement_restated: spec?.requirement_restated || '',
         features: spec?.features || [],
+        assumptions: spec?.assumptions || [],
+        acceptance_criteria: spec?.acceptance_criteria || [],
         tech_stack: spec?.tech_stack || {},
         file_structure: spec?.file_structure || [],
-        data_model: spec?.data_model || '',
         complexity: spec?.complexity || 'S',
       },
     } as any)

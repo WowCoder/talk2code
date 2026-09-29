@@ -11,6 +11,7 @@
 
 import threading
 import queue
+import uuid
 from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -121,6 +122,7 @@ class TaskQueue:
         requirement_id: int,
         task_func: Callable,
         *args,
+        dedupe: bool = True,
         **kwargs
     ) -> Optional[str]:
         """
@@ -132,6 +134,9 @@ class TaskQueue:
         Args:
             requirement_id: 需求 ID
             task_func: 任务函数
+            dedupe: 是否按需求去重。默认 True（同一需求同时只允许一个任务）。
+                    仅在「任务内部要再给同一需求排一个后续任务」时传 False
+                    —— 此时去重会把自己的后续任务当成重复项挡掉。
             *args: 函数参数
             **kwargs: 函数关键字参数
 
@@ -139,16 +144,24 @@ class TaskQueue:
             task_id 或 None（如果任务已存在）
         """
         # 检查该需求是否已有任务在处理中
-        with self._requirement_tasks_lock:
-            if requirement_id in self._requirement_tasks:
-                existing_task_id = self._requirement_tasks[requirement_id]
-                with self._tasks_lock:
-                    existing_task = self._tasks.get(existing_task_id)
-                    if existing_task and existing_task.status in (TaskStatus.PENDING, TaskStatus.RUNNING):
-                        logger.warning(f"需求 {requirement_id} 已有任务在处理中：{existing_task_id}")
-                        return None
+        if dedupe:
+            with self._requirement_tasks_lock:
+                if requirement_id in self._requirement_tasks:
+                    existing_task_id = self._requirement_tasks[requirement_id]
+                    with self._tasks_lock:
+                        existing_task = self._tasks.get(existing_task_id)
+                        if existing_task and existing_task.status in (TaskStatus.PENDING, TaskStatus.RUNNING):
+                            logger.warning(f"需求 {requirement_id} 已有任务在处理中：{existing_task_id}")
+                            return None
 
-        task_id = f"task_{requirement_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        # 唯一性必须保证：确认计划带反馈时会在同一秒内向同一需求提交两个任务
+        # （外层 confirm 任务 + 内层重跑任务）。此前只用到秒级时间戳，两个任务
+        # 会拿到**同一个 task_id**，后者的 TaskInfo 直接覆盖前者，需求映射也无法
+        # 区分谁是谁（req 204 实测：两个任务都是 task_204_20260929092701）。
+        task_id = (
+            f"task_{requirement_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            f"_{uuid.uuid4().hex[:6]}"
+        )
 
         # 创建任务信息
         task_info = TaskInfo(
@@ -247,9 +260,11 @@ class TaskQueue:
             raise
 
         finally:
-            # 清理需求映射
+            # 清理需求映射。**只删自己登记的那条**：确认计划带反馈时，本任务会在
+            # 运行期间为同一需求登记一个后续任务（dedupe=False）。无条件删除会把
+            # 那条新映射抹掉，之后同一需求的去重就失效了，可能被并发跑多次。
             with self._requirement_tasks_lock:
-                if requirement_id in self._requirement_tasks:
+                if self._requirement_tasks.get(requirement_id) == task_id:
                     del self._requirement_tasks[requirement_id]
 
             # 线程池线程会被复用：不清理会把本需求的 req_id

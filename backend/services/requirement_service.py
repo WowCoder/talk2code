@@ -159,12 +159,9 @@ class RequirementService:
 
     def __init__(self):
         self.workflow = get_workflow()
-        self._progress_map = {
-            'team_leader': 20,
-            'coder': 70,
-            'verify': 90,
-            'repair': 85,
-        }
+        # 进度百分比不再在本地维护一张表：统一走 harness.observability.progress_plan，
+        # 它保证「需求分析 → 编码 → 验证 → 修复」单调不减（此前 repair=85 低于
+        # verify=90，修复轮进度条会往回跳）。
 
     @staticmethod
     def _mark_requirement_failed(requirement, reason: str, final_state: dict = None):
@@ -354,7 +351,10 @@ class RequirementService:
                 trace = tracer.start_trace(requirement_id, requirement.user_id)
                 initial_state['metadata']['trace_id'] = trace.trace_id
     
-                sse.progress(requirement_id, 0, '开始处理需求')
+                from harness.observability import progress_plan as _pp_seq
+                sse.progress(
+                    requirement_id, _pp_seq.START, '开始处理需求', stage='planning'
+                )
     
                 # 将 harness 组件注入 state metadata + 模块级缓存（双路径）
                 # metadata 可能被 LangGraph 节点整体替换，模块级缓存作为兜底
@@ -494,13 +494,17 @@ class RequirementService:
                     logger.info(f"[SSE] 推送 SPEC 和 task_list for requirement {requirement_id}")
                     spec_msg = SSEMessage.format_event('spec', {
                         'title': (final_state.get('requirement_content') or '')[:60],
+                        # 需求契约在前：用户签字的对象必须和验收依据同源。
+                        # acceptance_criteria 此前就推了，但前端卡片没接，
+                        # 导致「用户确认的内容」与「判定的内容」是两份。
+                        'requirement_restated': plan.get('requirement_restated', ''),
                         'features': plan.get('features', []),
+                        'assumptions': plan.get('assumptions', []),
                         'acceptance_criteria': plan.get('acceptance_criteria', []),
-                        'file_structure': plan.get('file_structure', []),
+                        # 工程契约在后：折叠在技术细节区
                         'tech_stack': plan.get('tech_stack', {}),
-                        'data_model': plan.get('data_model', ''),
+                        'file_structure': plan.get('file_structure', []),
                         'complexity': plan.get('complexity', 'S'),
-                        'implementation_notes': plan.get('implementation_notes', ''),
                     })
                     sse_manager.broadcast(str(requirement_id), spec_msg)
                     impl_order = plan.get('implementation_order', [])
@@ -531,9 +535,8 @@ class RequirementService:
                         'acceptance_criteria': [],
                         'file_structure': [],
                         'tech_stack': {},
-                        'data_model': '',
                         'complexity': 'S',
-                        'implementation_notes': f"分析失败: {final_state.get('error', '未知错误')}",
+                        'error': f"分析失败: {final_state.get('error', '未知错误')}",
                     })
                     sse_manager.broadcast(str(requirement_id), error_msg)
 
@@ -550,7 +553,12 @@ class RequirementService:
             # 前端只能显示成"开发工程师工作中…"这类无信息文案。
             node_name = self._detect_node_name(current_step)
             if node_name:
-                progress = self._progress_map.get(node_name, 0)
+                # 百分比与「本轮轮次」统一由 progress_plan 决定，避免修复轮
+                # 退回上一轮的位置（详情见该模块的 docstring）。
+                from harness.observability import progress_plan as _pp
+                progress = _pp.node_percent(
+                    node_name, _pp.round_index(final_state or {})
+                )
                 display_name = {
                     'team_leader': '正在分析需求，拆解实现计划',
                     'coder': '正在编写代码',
@@ -623,22 +631,27 @@ class RequirementService:
                     db.commit()
                     logger.info(f"[ConfirmPlan] 需求 {requirement_id} 有反馈，重置状态重新走完整工作流")
     
-                    # 异步重新执行完整工作流（经由 task_queue 提交：
-                    # 获得全局并发上限与"同需求去重"，且不阻塞进程退出；
-                    # 在新的 RequirementService 实例上执行，避免状态污染）
-                    from services.task_queue import task_queue
-                    new_service = RequirementService()
-                    task_id = task_queue.submit(
-                        requirement_id,
-                        new_service.process_requirement,
-                        requirement_id,
+                # 异步重新执行完整工作流（经由 task_queue 提交：
+                # 获得全局并发上限，且不阻塞进程退出；在新的 RequirementService
+                # 实例上执行，避免状态污染）。
+                # dedupe=False：本函数**自身就跑在需求 X 的任务里**，默认去重会把
+                # 这个后续任务判定成"已在处理中"直接丢弃 —— 结果是状态被置回
+                # pending 但没有任何 worker 接手，需求永久卡住。
+                from services.task_queue import task_queue
+                new_service = RequirementService()
+                task_id = task_queue.submit(
+                    requirement_id,
+                    new_service.process_requirement,
+                    requirement_id,
+                    dedupe=False,
+                )
+                if task_id is None:
+                    logger.error(
+                        f"[ConfirmPlan] 需求 {requirement_id} 的反馈重跑任务提交失败，"
+                        "需求已重置为 pending 但无人接手"
                     )
-                    if task_id is None:
-                        logger.warning(
-                            f"[ConfirmPlan] 需求 {requirement_id} 已有任务在处理中，跳过重复提交"
-                        )
-                        return False
-                    return True
+                    return False
+                return True
     
                 requirement.status = 'processing'
                 db.commit()
@@ -747,7 +760,11 @@ class RequirementService:
             trace = tracer.start_trace(requirement_id, requirement.user_id)
             initial_state['metadata']['trace_id'] = trace.trace_id
     
-            sse.progress(requirement_id, 20, '用户已确认 Plan，开始编码')
+            from harness.observability import progress_plan as _pp_confirm
+            sse.progress(
+                requirement_id, _pp_confirm.PLAN_CONFIRMED,
+                '用户已确认 Plan，开始编码', stage='coding',
+            )
     
             # ---- 执行 Post-Plan 工作流（coder → verify → repair）----
             post_plan_workflow = create_workflow_post_plan()

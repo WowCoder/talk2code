@@ -3,11 +3,46 @@
 <!-- 本模板由 Python str.format 渲染：正文里出现的 JSON 示例必须写成 `{{ }}`
      双花括号转义，否则 load_prompt_template 会抛 KeyError，把整批 AC 翻译打挂。 -->
 
-## 可用 CSS 选择器（从实际代码中提取）
+## 每条 AC 的定位依据（**首选**，来自需求阶段写下的语义描述）
+{anchor_text}
+
+anchor 是需求方用自然语言描述的「这条验收发生在页面的哪一块」。它是**独立于实现**的
+契约：无论代码把按钮命名成 `#add-btn` 还是 `#xyz`，它的可见含义不变。
+
+定位优先级（自上而下，不得跳级）：
+
+1. **可见文案定位**——anchor 里提到的按钮名、标题、标签，直接写成
+   `text=添加` 或对容器用 `:has-text("xxx")`。这类定位不受 id/class 命名影响，
+   也就不会因为代码改个名字就被判 selector 失效（→ compromised）。
+2. **结构语义定位**——anchor 提到「顶部」「侧边」「弹层」「列表某一项」时，用
+   `header >> text=xxx`、`.modal >> ...`、`:nth-match(..., 1)` 这类相对结构表达。
+3. **兜底**：上面两种都走不通时，才用下方「可用 CSS 选择器」清单里的 id/class。
+
+为什么要这么排：清单里的选择器是从**已经写出来的代码**里提取的。只用它们等于让
+验收脚本照着被验收对象的样子出题 —— 代码把 DOM 结构写歪，脚本顺着歪结构也能跑通，
+于是歪的实现自己判自己通过。anchor 是打破这个自证循环的唯一外部参照。
+
+## 页面上真实可见的文案（**首选定位材**）
+{visible_text_text}
+
+上面这些是从**实现代码里确定性提取**出来的、用户真正看得见的字（按钮名、标题、
+标签、placeholder、选项名）。它和下面的 id/class 清单有本质区别：
+**文案对应「用户看到什么」，id/class 只对应「代码怎么命名」。**
+
+因此：**只要某一步要点/要填的元素能在上面找到对应文案，selector 就必须写成
+`text=文案` 或 `:has-text("文案")`**，不得改用它旁边的 id/class。只有当该元素
+确实没有可见文案（canvas、纯图标按钮、动态生成的格子等）时，才允许退回 id/class。
+
+（若上面写着"未能从代码中提取到可见文案"，说明文字是运行时拼接的；此时按 AC
+描述里的字面文案推断，仍然优先用 `text=`。）
+
+## 可用 CSS 选择器（**兜底手段**，从实际代码中提取）
 {selector_text}
 
 （若上面分「静态」与「动态生成」两段：动态段是 JS 运行时 createElement 出来、
 CSS 里定义过的类名，静态 HTML 里看不到但**页面加载后真实存在**，可直接用作选择器。）
+注意：这些选择器只保证「在当前代码里存在」，不保证「就是 anchor 说的那一块」。
+两者冲突时以 anchor 为准，并在 selector 里优先选用与 anchor 描述一致的那个。
 
 ## 验收条件
 {ac_text}
@@ -23,7 +58,12 @@ CSS 里定义过的类名，静态 HTML 里看不到但**页面加载后真实�
 
 ## 翻译规则
 - 每个步骤的 action 必须是: type | click | select | press | wait | assert_exists | assert_visible | assert_text | assert_count | assert_value | assert_canvas_change | assert_dom_change
-- selector 必须从"可用 CSS 选择器"中选择，或从 AC 描述中合理推断
+- selector 的取用顺序（与上方「定位优先级」一致，不得跳级）：
+  1. 页面上真实可见的文案 → 写成 `text=文案` 或 `:has-text("文案")`
+  2. 结构语义 → `header >> text=…`、`.modal >> …`、`:nth-match(…, n)`
+  3. 最后才是「可用 CSS 选择器」清单里的 id/class
+  （本行旧版写的是"必须从可用 CSS 选择器中选择"，与上方优先级自相矛盾 ——
+   模型照这句字面约束执行，整批脚本就都成了 id/class。现已统一。）
 - type 需要 value 字段；只用于 input/textarea，禁止对 canvas/普通元素使用
 - press 需要 key 字段（如 ArrowUp/ArrowDown/Enter/Space）：键盘交互（游戏方向键、快捷键）必须用 press，禁止用 type 模拟
 - 【重要·多点交互必须给落点】对 **canvas / 棋盘 / 网格 / 地图 / 画板 / 任意「同一元素上多点交互」**

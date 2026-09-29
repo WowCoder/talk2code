@@ -7,6 +7,12 @@
       </span>
     </div>
     <div v-if="specData" class="spec-body">
+      <!-- 需求复述 -->
+      <div v-if="specData.requirement_restated" class="spec-section">
+        <div class="section-title">🎯 要做什么</div>
+        <div class="spec-restated">{{ specData.requirement_restated }}</div>
+      </div>
+
       <!-- 核心功能 -->
       <div v-if="specData.features?.length" class="spec-section">
         <div class="section-title">🎯 核心功能</div>
@@ -15,18 +21,12 @@
         </div>
       </div>
 
-      <!-- 技术栈 -->
-      <div v-if="techStackItems.length" class="spec-section">
-        <div class="section-title">⚙️ 技术栈</div>
-        <div class="tech-stack">
-          <span v-for="(item, i) in techStackItems" :key="i" class="tech-badge">{{ item }}</span>
-        </div>
-      </div>
-
-      <!-- 数据模型 -->
-      <div v-if="specData.data_model" class="spec-section">
-        <div class="section-title">🗄️ 数据模型</div>
-        <div class="spec-text">{{ specData.data_model }}</div>
+      <!-- 默认设置 -->
+      <div v-if="specData.assumptions?.length" class="spec-section">
+        <div class="section-title">🔧 默认设置</div>
+        <ul class="assumption-list">
+          <li v-for="(a, i) in specData.assumptions" :key="i">{{ a }}</li>
+        </ul>
       </div>
 
       <!-- 验收条件 -->
@@ -74,10 +74,12 @@
         </div>
       </div>
 
-      <!-- 实现注意事项 -->
-      <div v-if="specData.implementation_notes" class="spec-section">
-        <div class="section-title">💡 实现注意事项</div>
-        <div class="spec-text">{{ specData.implementation_notes }}</div>
+      <!-- 技术栈：工程细节排在最后 -->
+      <div v-if="techStackItems.length" class="spec-section">
+        <div class="section-title">⚙️ 技术栈</div>
+        <div class="tech-stack">
+          <span v-for="(item, i) in techStackItems" :key="i" class="tech-badge">{{ item }}</span>
+        </div>
       </div>
     </div>
     <div v-else class="spec-empty">
@@ -126,27 +128,9 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { SSEEvaluatorResultData } from '@/types/sse'
+import type { PlanSpec, AcceptanceCriterion } from '@/types/spec'
 
-export interface AcceptanceCriterion {
-  id: string
-  label: string
-  how_to_verify?: string
-  passed?: boolean | null
-  reason?: string
-  /** 四态信号: passed / compromised / unverified / not_applicable / fail / pending */
-  state?: string
-}
-
-export interface SpecData {
-  title?: string
-  features?: string[]
-  acceptance_criteria?: AcceptanceCriterion[]
-  file_structure?: string[]
-  tech_stack?: { css?: string; storage?: string; framework?: string }
-  data_model?: string
-  complexity?: string
-  implementation_notes?: string
-}
+export type SpecData = PlanSpec
 
 const props = defineProps<{
   specData?: SpecData | null
@@ -292,12 +276,28 @@ function severityLabel(severity: string): string {
   border: 1px solid oklch(85% 0.04 80);
 }
 
-/* 数据模型 / 实现注意事项 */
+/* 需求复述 / 数据模型 / 实现注意事项 */
 .spec-text {
   padding: 0 14px;
   font-size: 12px;
   color: var(--fg);
   line-height: 1.5;
+}
+
+.spec-restated {
+  padding: 0 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  line-height: 1.5;
+}
+
+.assumption-list {
+  margin: 0;
+  padding: 0 14px 0 30px;
+  font-size: 12px;
+  color: var(--fg);
+  line-height: 1.6;
 }
 
 /* 验收条件 */

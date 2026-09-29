@@ -26,6 +26,17 @@
       </button>
     </div>
 
+    <!-- 详情加载失败：必须显式说出来并给出重试入口。
+         此前失败只弹一句 toast，页面留在被清空的状态里 —— 用户看到的是
+         「消息、代码、任务全都没了」，却不知道是加载失败还是需求真的没了。
+         服务重启会让会话失效（401），这是最容易踩到的触发场景。 -->
+    <div v-if="loadError" class="resume-banner failed">
+      <span class="resume-text">{{ loadError }}</span>
+      <button class="resume-btn" :disabled="loading" @click="retryLoad">
+        {{ loading ? '正在重试…' : '重试' }}
+      </button>
+    </div>
+
     <!-- Split layout -->
     <div class="split">
       <!-- Left: Dialogue -->
@@ -172,12 +183,34 @@ const tokenInfo = computed(() => {
 })
 
 // Load requirement, then decide to connect SSE
-onMounted(async () => {
+const loadError = ref('')
+const loading = ref(false)
+
+/**
+ * 加载失败要给出人话 + 可操作入口。
+ * 最常见的一种是服务重启导致会话失效（401）——此时页面本身是好的，
+ * 用户只需要重新登录/重试，不该看到一片空白。
+ */
+function describeLoadError(err: any): string {
+  const msg = String(err?.message || '')
+  if (/401|未授权|unauthorized|登录/i.test(msg)) {
+    return '登录状态已失效（服务重启会断开登录态），页面内容暂时读不出来。请重新登录后刷新。'
+  }
+  if (/404|不存在/.test(msg)) {
+    return '这个需求不存在，或已被删除。'
+  }
+  if (/timeout|超时|NetworkError|Failed to fetch/i.test(msg)) {
+    return '读取需求详情超时或网络中断，内容暂时读不出来。'
+  }
+  return `读取需求详情失败：${msg || '未知错误'}`
+}
+
+async function load() {
   if (!reqId.value) {
     router.push('/')
     return
   }
-
+  loading.value = true
   try {
     const data = await store.loadRequirement(reqId.value)
     // 竞态保护：本次加载已被更新的请求取代
@@ -185,6 +218,8 @@ onMounted(async () => {
 
     const req = store.currentRequirement
     if (!req) return
+
+    loadError.value = ''
 
     if (req.status === 'finished' || req.status === 'finished_with_issues' || req.status === 'needs_user_input') {
       store.isGenerating = false
@@ -201,9 +236,19 @@ onMounted(async () => {
       connect()
     }
   } catch (err: any) {
+    loadError.value = describeLoadError(err)
     show(err.message || '加载需求失败', 'error')
+  } finally {
+    loading.value = false
   }
-})
+}
+
+function retryLoad() {
+  if (loading.value) return
+  load()
+}
+
+onMounted(load)
 
 // Auto-switch tabs on SSE events
 watch(() => store.planStatus, (status) => {
@@ -262,16 +307,10 @@ watch(connectionError, (msg) => {
 watch(reqId, (newId, oldId) => {
   if (oldId) disconnect()
   if (newId) {
+    // 切换需求是明确的"换一个"：先清干净，再走与首次挂载同一条加载路径
+    // （失败时会落到 loadError 提示条，不再静默留白）
     store.reset()
-    store.loadRequirement(newId)
-      .then((data) => {
-        // 竞态保护：本次加载已被更新的请求取代
-        if (!data) return
-        connect()
-      })
-      .catch((err: any) => {
-        show(err.message || '加载需求失败', 'error')
-      })
+    load()
   }
 })
 

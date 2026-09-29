@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-"""确认「开发计划」之后的落库形态。
+"""确认「需求理解」之后的落库形态。
 
-守两件事：
+守三件事：
 1. 确认卡片内容不缩水 —— 与刚才那张待确认卡片同一份数据（含 file_structure 明细与
-   data_model）。否则「已确认」那条消息会比用户刚看过的计划少东西。
+   每一条验收条件）。否则「已确认」那条消息会比用户刚看过的确认卡少东西。
+2. **验收条件必须在确认卡片上**。它是 verify 判定通过与否的唯一依据；
+   用户签字时也看不到它的话，「确认」这个动作就没有任何约束力。
 2. 插入位置落在「本轮 TL 分析结果」之后。早期实现在之前，实时视图在之后，
    同一条动作在新老需求里会显示成两种顺序；带反馈重出计划时还会贴到上一轮计划后面。
 
@@ -16,11 +18,19 @@ from models import Requirement, SessionLocal
 
 
 PLAN = {
+    'requirement_restated': '一个用方向键控制龙的贪吃龙小游戏',
     'features': ['方向键控制龙移动', '吃到龙珠龙身增长'],
-    'acceptance_criteria': [{'id': 'AC-1', 'label': '点击开始按钮后游戏启动'}],
+    'assumptions': ['速度随时间加快（你没提，默认做成渐进加速）'],
+    'acceptance_criteria': [
+        {'id': 'AC-1', 'label': '点击开始按钮后游戏启动', 'feature': '方向键控制龙移动',
+         'anchor': '开始遮罩层上的开始按钮',
+         'how_to_verify': '点击开始按钮，遮罩消失后棋盘出现'},
+        {'id': 'AC-2', 'label': '吃到龙珠龙身增长', 'feature': '吃到龙珠龙身增长',
+         'anchor': '画面中央的棋盘区域',
+         'how_to_verify': '连续移动吃到龙珠后，分数数值增加'},
+    ],
     'file_structure': ['index.html', 'css/style.css', 'js/game.js', 'js/utils.js'],
     'tech_stack': {'framework': '原生 JS', 'css': '原生 CSS', 'storage': 'localStorage'},
-    'data_model': '游戏状态：{ score, snake[], direction, food }',
     'complexity': 'S',
 }
 
@@ -99,12 +109,12 @@ def test_confirm_card_follows_plan_and_keeps_full_content(app_client, planning_r
     card_msg = dh[card_idx]
     assert card_msg['role'] == 'user'
     card = card_msg['plan_confirmed']
-    # 内容与浮层卡同源：少任何一项都会表现为「确认后计划变简略了」
-    assert card['features'] == PLAN['features']
-    assert card['file_structure'] == PLAN['file_structure']
-    assert card['tech_stack'] == PLAN['tech_stack']
-    assert card['data_model'] == PLAN['data_model']
-    assert card['complexity'] == 'S'
+    # 内容与浮层卡同源：少任何一项都会表现为「确认后计划变简略了」。
+    # 尤其 acceptance_criteria —— 它是判定的依据，若确认卡上没有它，
+    # 用户签字的内容和系统验收的内容就重新分裂成两份。
+    for field in PLAN:
+        assert card.get(field) == PLAN[field], f"{field} 在确认卡片上缺失或不一致"
+    assert card['acceptance_criteria'][0]['anchor'] == PLAN['acceptance_criteria'][0]['anchor']
 
 
 def test_confirm_card_follows_latest_plan_after_feedback_round(app_client, planning_req):
