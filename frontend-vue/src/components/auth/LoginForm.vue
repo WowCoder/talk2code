@@ -1,26 +1,33 @@
 <template>
   <form class="login-form" @submit.prevent="handleSubmit">
     <div class="form-group">
-      <label for="login-username" class="sr-only">用户名</label>
+      <label for="login-username" class="field-label">用户名</label>
       <input
         id="login-username"
         v-model="username"
         type="text"
         class="input-field"
-        placeholder="用户名"
+        placeholder="你的用户名"
         required
         autocomplete="username"
         aria-label="用户名"
       />
     </div>
     <div class="form-group">
-      <label for="login-password" class="sr-only">密码</label>
+      <div class="field-label-row">
+        <label for="login-password" class="field-label">密码</label>
+        <button
+          type="button"
+          class="field-link"
+          @click="showPassword = !showPassword"
+        >{{ showPassword ? '隐藏' : '显示' }}</button>
+      </div>
       <input
         id="login-password"
         v-model="password"
-        type="password"
+        :type="showPassword ? 'text' : 'password'"
         class="input-field"
-        placeholder="密码"
+        placeholder="••••••••"
         required
         autocomplete="current-password"
         aria-label="密码"
@@ -34,6 +41,10 @@
     >
       {{ loading ? '登录中…' : '登录' }}
     </button>
+    <p class="form-foot">
+      还没有账号？
+      <button type="button" class="field-link strong" @click="$emit('switchTab', 'register')">申请内测</button>
+    </p>
     <div class="demo-entry">
       <button
         type="button"
@@ -41,7 +52,7 @@
         :disabled="demoLoading"
         @click="handleDemo"
       >
-        {{ demoLoading ? '进入中…' : '以演示模式进入（只读）' }}
+        {{ demoLoading ? '进入中…' : '以演示身份进入（只读，无需注册）' }}
       </button>
     </div>
   </form>
@@ -54,6 +65,7 @@ import { useRouter } from 'vue-router'
 
 const emit = defineEmits<{
   success: []
+  switchTab: [tab: 'login' | 'register']
 }>()
 
 const authStore = useAuthStore()
@@ -63,6 +75,7 @@ const password = ref('')
 const loading = ref(false)
 const demoLoading = ref(false)
 const errorMsg = ref('')
+const showPassword = ref(false)
 
 async function handleSubmit() {
   if (!username.value.trim() || !password.value.trim()) {
@@ -108,6 +121,39 @@ async function handleDemo() {
 
 .form-group {
   position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field-label {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--fg);
+}
+
+.field-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.field-link {
+  border: none;
+  background: none;
+  padding: 0;
+  font-size: 12px;
+  font-family: var(--font-body);
+  color: var(--accent-strong);
+  cursor: pointer;
+}
+
+.field-link:hover {
+  text-decoration: underline;
+}
+
+.field-link.strong {
+  font-weight: 600;
 }
 
 .login-btn {
@@ -117,9 +163,16 @@ async function handleDemo() {
   font-size: 15px;
 }
 
+.form-foot {
+  text-align: center;
+  font-size: 13px;
+  color: var(--muted);
+  margin: 0;
+}
+
 .form-error {
   font-size: 12px;
-  color: oklch(50% 0.15 20);
+  color: var(--color-danger);
   text-align: center;
   padding: 4px 0;
 }
@@ -144,6 +197,7 @@ async function handleDemo() {
 
 .demo-btn:hover:not(:disabled) {
   border-color: var(--accent);
-  color: var(--accent);
+  color: var(--accent-strong);
+  background: var(--accent-soft);
 }
 </style>

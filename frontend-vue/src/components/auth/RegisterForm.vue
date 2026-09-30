@@ -1,59 +1,63 @@
 <template>
   <form class="register-form" @submit.prevent="handleSubmit">
     <div class="form-group">
-      <label for="reg-username" class="sr-only">用户名</label>
+      <label for="reg-username" class="field-label">用户名</label>
       <input
         id="reg-username"
         v-model="username"
         type="text"
         class="input-field"
-        placeholder="用户名（至少3位）"
+        placeholder="至少 3 位"
         required
         minlength="3"
+        autocomplete="username"
         aria-label="用户名"
       />
     </div>
     <div class="form-group">
-      <label for="reg-password" class="sr-only">密码</label>
+      <label for="reg-password" class="field-label">设置密码</label>
       <input
         id="reg-password"
         v-model="password"
         type="password"
         class="input-field"
-        placeholder="密码（至少6位）"
+        placeholder="至少 6 位"
         required
         minlength="6"
+        autocomplete="new-password"
         aria-label="密码"
       />
     </div>
     <div class="form-group">
-      <label for="reg-confirm" class="sr-only">确认密码</label>
+      <label for="reg-confirm" class="field-label">确认密码</label>
       <input
         id="reg-confirm"
         v-model="confirmPassword"
         type="password"
         class="input-field"
-        placeholder="确认密码"
+        placeholder="再输入一次"
         required
         aria-label="确认密码"
       />
     </div>
     <div class="form-group">
-      <label for="reg-invite" class="sr-only">邀请码</label>
+      <div class="field-label-row">
+        <label for="reg-invite" class="field-label">邀请码</label>
+        <button
+          type="button"
+          class="field-link"
+          @click="showInviteDialog = true"
+        >没有？申请内测</button>
+      </div>
       <input
         id="reg-invite"
         v-model="inviteCode"
         type="text"
         class="input-field invite-input"
-        placeholder="邀请码（必填）"
+        placeholder="例如 T2C-2026-A1B2C3"
         required
         aria-label="邀请码"
       />
-      <button
-        type="button"
-        class="invite-request-link"
-        @click="showInviteDialog = true"
-      >没有邀请码？申请一个</button>
     </div>
     <div v-if="errorMsg" class="form-error">{{ errorMsg }}</div>
     <div v-if="successMsg" class="form-success">{{ successMsg }}</div>
@@ -62,8 +66,12 @@
       class="btn-primary register-btn"
       :disabled="loading"
     >
-      {{ loading ? '注册中…' : '注册' }}
+      {{ loading ? '注册中…' : '注册账号' }}
     </button>
+    <p class="form-foot">
+      已有账号？
+      <button type="button" class="field-link strong" @click="$emit('switchTab', 'login')">返回登录</button>
+    </p>
 
     <InviteRequestDialog
       :show="showInviteDialog"
@@ -79,6 +87,7 @@ import InviteRequestDialog from '@/components/auth/InviteRequestDialog.vue'
 
 const emit = defineEmits<{
   success: []
+  switchTab: [tab: 'login' | 'register']
 }>()
 
 const authStore = useAuthStore()
@@ -148,41 +157,66 @@ async function handleSubmit() {
   font-size: 15px;
 }
 
+.form-foot {
+  text-align: center;
+  font-size: 13px;
+  color: var(--muted);
+  margin: 0;
+}
+
 .form-error {
   font-size: 12px;
-  color: oklch(50% 0.15 20);
+  color: var(--color-danger);
   text-align: center;
   padding: 4px 0;
 }
 
 .form-success {
   font-size: 12px;
-  color: oklch(40% 0.12 155);
+  color: var(--color-success);
   text-align: center;
   padding: 4px 0;
 }
 
 .form-group {
   position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field-label {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--fg);
+}
+
+.field-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.field-link {
+  border: none;
+  background: none;
+  padding: 0;
+  font-size: 12px;
+  font-family: var(--font-body);
+  color: var(--accent-strong);
+  cursor: pointer;
+}
+
+.field-link:hover {
+  text-decoration: underline;
+}
+
+.field-link.strong {
+  font-weight: 600;
 }
 
 .invite-input {
   text-transform: uppercase;
   letter-spacing: 0.04em;
-}
-
-.invite-request-link {
-  margin-top: 6px;
-  padding: 0;
-  border: none;
-  background: transparent;
-  color: var(--accent);
-  font-size: 12px;
-  font-family: var(--font-body);
-  cursor: pointer;
-}
-
-.invite-request-link:hover {
-  text-decoration: underline;
 }
 </style>

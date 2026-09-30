@@ -1,13 +1,13 @@
 <template>
   <div class="login-page">
     <div class="login-card">
-      <!-- Brand -->
+      <!-- Brand（沿用项目现有 Logo） -->
       <div class="brand">
         <img src="@/assets/logo.png" alt="Talk2Code" class="brand-logo" />
         <h1 class="brand-title">
           Talk<span>2</span>Code
         </h1>
-        <p class="brand-subtitle">用自然语言创造应用</p>
+        <p class="brand-subtitle">用自然语言创造应用 · 内测中</p>
       </div>
 
       <!-- Tab Switcher -->
@@ -17,10 +17,12 @@
       <LoginForm
         v-if="activeTab === 'login'"
         @success="onLoginSuccess"
+        @switch-tab="activeTab = $event"
       />
       <RegisterForm
         v-else
         @success="onRegisterSuccess"
+        @switch-tab="activeTab = $event"
       />
     </div>
   </div>
