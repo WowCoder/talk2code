@@ -1,7 +1,6 @@
 <template>
   <div class="section">
     <h3 class="section-title">关于 Talk2Code</h3>
-    <p class="section-sub">版本号、更新日志、条款都放在这，出问题从这里也能找到联系方式</p>
 
     <!-- 版本卡 -->
     <div class="brand-card">
@@ -34,13 +33,13 @@
         <div class="cl-desc">内测开放 · 历史记录 / 创意市集上线 · 主应用改版</div>
       </div>
       <div class="changelog-older">
-        <span>更早的版本没正式记录 · 想看开发过程可以从 GitHub commits 翻起 →</span>
+        <span>觉得 Talk2Code 有用？去 GitHub 点个 Star 支持一下 →</span>
         <a
           class="commits-btn"
-          href="https://github.com/WowCoder/talk2code/commits/main"
+          href="https://github.com/WowCoder/talk2code"
           target="_blank"
           rel="noopener"
-        >看 commits</a>
+        >去 Star</a>
       </div>
     </div>
 
@@ -71,13 +70,14 @@
           <path d="M3 7l9 6 9-6"/>
         </svg>
         <h4 class="info-title">联系我们</h4>
-        <p class="info-desc">Bug / 合作 / 内测邀请都欢迎 · 一般 1 个工作日内回复</p>
-        <a class="info-link" href="mailto:leon@talk2code.app">写信 →</a>
+        <p class="info-desc">Bug / 合作 / 内测邀请都欢迎 · 一般一周内回复</p>
+        <a class="info-link" href="mailto:723181005@qq.com">723181005@qq.com →</a>
       </div>
     </div>
 
     <footer class="about-footer">
-      © 2026 Talk2Code · 由 leon@talk2code.app 维护 · 所有内容采用 CC BY-SA 4.0 · 用 Newsreader + Noto Sans SC 排版
+      © 2026 Talk2Code · 由 <a class="footer-repo" href="https://github.com/WowCoder/talk2code"
+        target="_blank" rel="noopener">WowCoder/talk2code</a> 维护
     </footer>
   </div>
 </template>
@@ -88,13 +88,7 @@
   font-size: 18px;
   font-weight: 600;
   color: var(--fg);
-  margin-bottom: 4px;
-}
-
-.section-sub {
-  font-size: 12.5px;
-  color: var(--muted);
-  margin: 0 0 18px;
+  margin-bottom: 18px;
 }
 
 /* ===== 版本卡 ===== */
@@ -222,8 +216,10 @@
   flex-shrink: 0;
   padding: 6px 14px;
   border-radius: 8px;
+  /* 反色按钮：底用 --fg、字用 --bg，两种主题下都自动成立
+     （深色 = 浅底深字，浅色 = 深底浅字），写死颜色必翻车 */
   background: var(--fg);
-  color: #fffbf6;
+  color: var(--bg);
   font-size: 12px;
   font-weight: 600;
   text-decoration: none;
@@ -288,6 +284,17 @@
   font-size: 11px;
   color: var(--faint);
   padding-top: 6px;
+}
+
+.footer-repo {
+  color: var(--muted);
+  text-decoration: none;
+  border-bottom: 1px solid var(--border);
+}
+
+.footer-repo:hover {
+  color: var(--accent-strong);
+  border-bottom-color: var(--accent-strong);
 }
 
 @media (max-width: 640px) {
