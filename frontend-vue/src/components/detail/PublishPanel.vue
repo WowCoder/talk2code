@@ -50,7 +50,7 @@
         </button>
         <div class="pc-actions">
           <span></span>
-          <button class="pc-link pc-danger" :disabled="unpublishing" @click="onUnpublish">
+          <button class="pc-action-btn danger" :disabled="unpublishing" @click="onUnpublish">
             {{ unpublishing ? '取消中…' : '取消发布' }}
           </button>
         </div>
@@ -80,10 +80,11 @@
         </div>
         <a class="btn-publish" :href="openUrl" target="_blank" rel="noopener">打开站点</a>
 
-        <!-- 创意市集：上架是 opt-in，默认不勾（尊重 unlisted 的既有预期） -->
+        <!-- 创意市集：上架是 opt-in，默认不勾（尊重 unlisted 的既有预期）。
+             所有更改先进暂存区，点「保存并发布」一并生效 —— 不再每动一下就打一次接口。 -->
         <div class="pc-market">
           <label class="pc-switch">
-            <input type="checkbox" v-model="marketListed" @change="syncMarket" />
+            <input type="checkbox" v-model="marketListed" @change="markMarketDirty" />
             <span>同步到创意市集</span>
           </label>
           <p class="pc-market-hint">
@@ -91,15 +92,15 @@
           </p>
           <div v-if="marketListed" class="pc-market-extra">
             <input class="pc-note" type="text" maxlength="120" v-model="authorNote"
-                   placeholder="一句话介绍（选填）" @change="syncMarket" />
-            <select class="pc-note" v-model="category" @change="syncMarket">
+                   placeholder="一句话介绍（选填）" @input="markMarketDirty" />
+            <select class="pc-note" v-model="category" @change="markMarketDirty">
               <option value="">分类（选填）</option>
               <option v-for="c in categoryOptions" :key="c.value" :value="c.value">
                 {{ c.label }}
               </option>
             </select>
             <label class="pc-switch small">
-              <input type="checkbox" v-model="badgeEnabled" @change="syncMarket" />
+              <input type="checkbox" v-model="badgeEnabled" @change="markMarketDirty" />
               <span>站点右下角显示来源入口</span>
             </label>
 
@@ -128,13 +129,23 @@
             </div>
           </div>
           <p v-if="marketError || coverError" class="pc-market-err">{{ marketError || coverError }}</p>
+
+          <!-- 暂存式保存：市集设置改完点这里一并生效 -->
+          <div class="pc-save-row">
+            <button class="btn-publish" :disabled="savingMarket" @click="onSaveMarket">
+              {{ savingMarket ? '保存中…' : '保存并发布' }}
+            </button>
+            <span :class="['pc-save-hint', { dirty: marketDirty }]">
+              {{ marketDirty ? '有未保存的更改，点击后一并生效' : '更改均已保存' }}
+            </span>
+          </div>
         </div>
 
         <div class="pc-actions">
-          <button class="pc-link" :disabled="publishing || unpublishing || !canPublish" @click="onPublish">
-            {{ publishing ? '发布中…' : '重新发布（新版本）' }}
+          <button class="pc-action-btn primary" :disabled="publishing || unpublishing || !canPublish" @click="onPublish">
+            {{ publishing ? '发布中…' : '↻ 重新发布（新版本）' }}
           </button>
-          <button class="pc-link pc-danger" :disabled="unpublishing" @click="onUnpublish">
+          <button class="pc-action-btn danger" :disabled="unpublishing" @click="onUnpublish">
             {{ unpublishing ? '取消中…' : '取消发布' }}
           </button>
         </div>
@@ -290,6 +301,13 @@ const authorNote = ref('')
 const badgeEnabled = ref(true)
 const category = ref('')
 const marketError = ref('')
+// 暂存式编辑：界面上改动先标脏，点「保存并发布」才打接口，不再每次 @change 即时生效
+const marketDirty = ref(false)
+const savingMarket = ref(false)
+
+function markMarketDirty() {
+  marketDirty.value = true
+}
 
 // ===== 封面 =====
 // 预览 = 缩略图端点当前实际会出的那张图（有封面出封面，没有就出首页截图）。
@@ -324,6 +342,7 @@ watch(
     hasCover.value = !!r?.cover
     coverSeq.value += 1
     previewFailed.value = false
+    marketDirty.value = false
   },
   { immediate: true }
 )
@@ -385,6 +404,7 @@ async function syncMarket() {
   // 界面显示成功、后端没保存 —— 这正是「点了同步、市集里却没有」的观感来源。
   // 文本类字段（介绍/分类）保留用户输入，方便他改完重试。
   const prev = { listed: marketListed.value, badge: badgeEnabled.value }
+  savingMarket.value = true
   try {
     await api(`/api/publish/${slug}/market`, {
       method: 'PATCH',
@@ -395,12 +415,21 @@ async function syncMarket() {
         category: category.value,
       }),
     })
+    marketDirty.value = false
     show(marketListed.value ? '已同步到创意市集' : '已从创意市集撤下', 'success')
   } catch (e) {
     marketListed.value = prev.listed
     badgeEnabled.value = prev.badge
     marketError.value = e instanceof Error ? e.message : '保存失败'
+  } finally {
+    savingMarket.value = false
   }
+}
+
+// 「保存并发布」按钮入口：把暂存的市集设置一次性提交
+function onSaveMarket() {
+  if (!marketDirty.value && !savingMarket.value) return
+  syncMarket()
 }
 
 // 「index.html · 共 N 个文件」：按需求实际的代码文件数算。
@@ -1122,13 +1151,72 @@ async function copyUrl() {
   border: 1px solid var(--wb-border);
 }
 
-/* ===== 次操作（重新发布 / 取消发布）===== */
+/* ===== 次操作（重新发布 / 取消发布）：从纯文字链接升级为描边按钮，看得见才点得到 ===== */
 .pc-actions {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 10px;
   margin-top: -2px;
+}
+
+.pc-action-btn {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 9px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--wb-border);
+  background: var(--wb-elevated);
+  color: var(--wb-fg);
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--font-body);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.pc-action-btn.primary {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  color: var(--accent);
+}
+.pc-action-btn.primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border-color: var(--accent);
+}
+
+.pc-action-btn.danger {
+  border-color: color-mix(in srgb, #dc2626 45%, transparent);
+  color: #dc2626;
+}
+.pc-action-btn.danger:hover:not(:disabled) {
+  background: color-mix(in srgb, #dc2626 10%, transparent);
+}
+
+.pc-action-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* ===== 暂存式保存行 ===== */
+.pc-save-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 2px;
+}
+
+.pc-save-row .btn-publish {
+  padding: 8px 18px;
+}
+
+.pc-save-hint {
+  font-size: 11.5px;
+  color: var(--wb-muted);
+}
+
+.pc-save-hint.dirty {
+  color: var(--accent);
+  font-weight: 600;
 }
 .pc-link {
   background: none;
