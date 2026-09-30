@@ -1,58 +1,74 @@
 /* ===== Warm Soft Design System ===== */
+/* 色值与「Talk2Code Studio Redesign」设计稿对齐 */
 :root {
-  /* Light theme */
-  --bg: oklch(97% 0.018 70);
-  --surface: oklch(99% 0.008 70);
-  --fg: oklch(22% 0.02 50);
-  --muted: oklch(50% 0.018 50);
-  --border: oklch(90% 0.014 70);
-  --accent: oklch(64% 0.13 28);
-  --accent-soft: oklch(88% 0.04 38);
+  /* Light theme（暖米底 / 卡片 / 陶土红主色） */
+  --bg: #fdf3e8;
+  --surface: #fffbf6;
+  --fg: #221713;
+  --muted: #6c605a;
+  --faint: #a79a92;
+  --border: #e4dde4;
+  --accent: #cf6a5f;
+  --accent-strong: #a34539;
+  --accent-soft: #f6ebdd;
+  --accent-hover: #c05c51;
 
   /* Typography — loaded via Google Fonts in index.html */
   --font-display: 'Newsreader', 'Iowan Old Style', Georgia, serif;
-  --font-body: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --font-body: 'Noto Sans SC', 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, 'IBM Plex Mono', Menlo, monospace;
 
   /* Semantic color tokens */
-  --color-success: oklch(55% 0.1 155);
-  --color-danger: oklch(50% 0.18 25);
-  --color-warning: oklch(65% 0.12 85);
-  --color-info: oklch(50% 0.1 250);
+  --color-success: #4c8a5a;
+  --color-success-soft: #e4efe4;
+  --color-danger: #c0544a;
+  --color-danger-soft: #f9e3de;
+  --color-warning: #b98a2e;
+  --color-warning-soft: #f7ecd2;
+  --color-info: #5570a8;
   --color-on-accent: #fff;
-  --color-role-user: oklch(55% 0.12 250);
-  --color-role-agent: oklch(55% 0.04 50);
-  --color-role-system: oklch(45% 0.02 60);
+  --color-role-user: #5570a8;
+  --color-role-agent: #8a6a5a;
+  --color-role-system: #6c605a;
 
   /* Focus ring */
-  --focus-ring: 0 0 0 3px oklch(64% 0.13 28 / 25%);
+  --focus-ring: 0 0 0 3px rgba(207, 106, 95, 0.25);
 
-  /* Right panel (detail page) — lighter in light mode, true dark in dark mode */
-  --dark-bg: oklch(95% 0.008 60);
-  --dark-surface: oklch(97% 0.005 60);
-  --dark-border: oklch(88% 0.01 60);
-  --dark-fg: oklch(22% 0.02 50);
-  --dark-muted: oklch(50% 0.018 50);
-  --dark-hover: oklch(91% 0.01 60);
+  /* 右侧工作台（详情页深色面板）—— 设计稿里编码区固定深色 */
+  --wb-bg: #221813;
+  --wb-surface: #2c211d;
+  --wb-elevated: #332621;
+  --wb-border: #3d2f28;
+  --wb-fg: #fdf3e8;
+  --wb-muted: #a8a8b4;
+  --wb-faint: #7a6f66;
+  --wb-hover: #332621;
+
+  /* Right panel (detail page) — 兼容旧变量名，浅色模式下即工作台暖深色 */
+  --dark-bg: var(--wb-bg);
+  --dark-surface: var(--wb-surface);
+  --dark-border: var(--wb-border);
+  --dark-fg: var(--wb-fg);
+  --dark-muted: var(--wb-muted);
+  --dark-hover: var(--wb-hover);
 
   /* Responsive breakpoints (for reference in media queries) */
   /* --bp-sm: 640px; --bp-md: 768px; --bp-lg: 1024px; */
 }
 
-/* Dark mode overrides */
+/* Dark mode overrides（外观设置里深色主题仍为 Coming Soon，token 先备好） */
 html.dark {
-  --bg: oklch(20% 0.015 60);
-  --surface: oklch(22% 0.012 60);
-  --fg: oklch(90% 0.005 70);
-  --muted: oklch(58% 0.01 60);
-  --border: oklch(28% 0.012 60);
-  --accent-soft: oklch(30% 0.04 38);
+  --bg: #1d1512;
+  --surface: #251b16;
+  --fg: #fdf3e8;
+  --muted: #a89a90;
+  --faint: #7a6f66;
+  --border: #3d2f28;
+  --accent-soft: #3d2b24;
 
-  /* Right panel — true dark */
-  --dark-bg: oklch(22% 0.015 60);
-  --dark-surface: oklch(18% 0.012 60);
-  --dark-border: oklch(32% 0.012 60);
-  --dark-fg: oklch(90% 0.005 70);
-  --dark-muted: oklch(58% 0.01 60);
-  --dark-hover: oklch(28% 0.012 60);
+  --wb-bg: #171009;
+  --wb-surface: #20160f;
+  --wb-elevated: #2a1e17;
+  --wb-border: #3d2f28;
+  --wb-hover: #2a1e17;
 }

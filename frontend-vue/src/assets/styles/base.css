@@ -50,7 +50,7 @@ a {
 }
 
 .btn-primary:hover {
-  background: oklch(58% 0.13 28);
+  background: var(--accent-hover);
 }
 
 .btn-primary:disabled {
@@ -78,7 +78,7 @@ a {
   padding: 10px 20px;
   border: none;
   border-radius: 12px;
-  background: oklch(55% 0.15 20);
+  background: var(--color-danger);
   color: #fff;
   font-size: 14px;
   font-weight: 600;
@@ -88,7 +88,7 @@ a {
 }
 
 .btn-danger:hover {
-  background: oklch(48% 0.15 20);
+  background: #ab463d;
 }
 
 /* ===== Form Inputs ===== */
@@ -125,7 +125,7 @@ button:focus-visible,
 }
 
 .input-field::placeholder {
-  color: oklch(65% 0.01 70);
+  color: var(--faint);
 }
 
 /* ===== Scrollbar ===== */
