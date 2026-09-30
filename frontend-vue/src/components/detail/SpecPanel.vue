@@ -254,9 +254,10 @@ function severityLabel(severity: string): string {
   font-size: 12px;
   padding: 2px 8px;
   border-radius: 999px;
-  background: oklch(97% 0.01 250 / 0.5);
+  /* 以文字色为基色做低透明度衬底：浅/深主题下都保持可读 */
+  background: color-mix(in srgb, oklch(50% 0.1 250) 12%, transparent);
   color: oklch(50% 0.1 250);
-  border: 1px solid oklch(85% 0.02 250);
+  border: 1px solid color-mix(in srgb, oklch(50% 0.1 250) 30%, transparent);
 }
 
 /* 技术栈 */
@@ -271,9 +272,9 @@ function severityLabel(severity: string): string {
   font-size: 12px;
   padding: 2px 8px;
   border-radius: 999px;
-  background: oklch(97% 0.01 80 / 0.5);
+  background: color-mix(in srgb, oklch(55% 0.1 80) 12%, transparent);
   color: oklch(55% 0.1 80);
-  border: 1px solid oklch(85% 0.04 80);
+  border: 1px solid color-mix(in srgb, oklch(55% 0.1 80) 30%, transparent);
 }
 
 /* 需求复述 / 数据模型 / 实现注意事项 */
@@ -322,17 +323,17 @@ function severityLabel(severity: string): string {
 
 .ac-item.fail {
   border-left-color: oklch(55% 0.14 20);
-  background: oklch(97% 0.01 20 / 0.4);
+  background: color-mix(in srgb, oklch(55% 0.14 20) 10%, transparent);
 }
 
 .ac-item.compromised {
   border-left-color: oklch(70% 0.14 70);
-  background: oklch(97% 0.01 70 / 0.4);
+  background: color-mix(in srgb, oklch(70% 0.14 70) 12%, transparent);
 }
 
 .ac-item.unverified {
   border-left-color: oklch(60% 0.02 250);
-  background: oklch(97% 0.01 250 / 0.3);
+  background: color-mix(in srgb, oklch(60% 0.02 250) 10%, transparent);
 }
 
 .ac-item.not_applicable {
@@ -342,7 +343,7 @@ function severityLabel(severity: string): string {
 
 .ac-item.pending {
   border-left-color: var(--accent);
-  background: oklch(97% 0.01 50 / 0.3);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
 .ac-status {
@@ -512,17 +513,17 @@ function severityLabel(severity: string): string {
 }
 
 .finding-item.critical {
-  background: oklch(96% 0.02 25 / 0.6);
+  background: color-mix(in srgb, oklch(50% 0.2 25) 10%, transparent);
   border-left: 3px solid oklch(50% 0.2 25);
 }
 
 .finding-item.major {
-  background: oklch(96% 0.02 65 / 0.4);
+  background: color-mix(in srgb, oklch(60% 0.15 60) 12%, transparent);
   border-left: 3px solid oklch(60% 0.15 60);
 }
 
 .finding-item.minor {
-  background: oklch(96% 0.01 50 / 0.3);
+  background: color-mix(in srgb, oklch(70% 0.08 100) 12%, transparent);
   border-left: 3px solid oklch(70% 0.08 100);
 }
 

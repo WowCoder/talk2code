@@ -501,7 +501,7 @@ const qaStepLabel = computed(() => {
   align-items: center;
   gap: 6px;
   padding: 8px 12px;
-  background: oklch(97% 0.01 155 / 0.5);
+  background: color-mix(in srgb, oklch(50% 0.08 155) 10%, transparent);
   border-radius: 8px;
   font-size: 13px;
   color: oklch(50% 0.08 155);

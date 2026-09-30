@@ -652,7 +652,9 @@ function escapeInlineScript(content: string): string {
   padding: 6px 14px;
   border-radius: 999px;
   background: rgba(34, 23, 19, 0.92);
-  color: var(--wb-fg);
+  /* 深色底胶囊在两种主题下都成立，文字色必须固定浅色
+     （--wb-fg 现在浅色模式下是深字，直接用会看不清） */
+  color: #fdf3e8;
   font-size: 12px;
   font-weight: 500;
   box-shadow: 0 2px 10px rgba(0, 0, 0, .25);

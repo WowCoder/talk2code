@@ -34,15 +34,17 @@
   /* Focus ring */
   --focus-ring: 0 0 0 3px rgba(207, 106, 95, 0.25);
 
-  /* 右侧工作台（详情页深色面板）—— 设计稿里编码区固定深色 */
-  --wb-bg: #221813;
-  --wb-surface: #2c211d;
-  --wb-elevated: #332621;
-  --wb-border: #3d2f28;
-  --wb-fg: #fdf3e8;
-  --wb-muted: #a8a8b4;
-  --wb-faint: #7a6f66;
-  --wb-hover: #332621;
+  /* 右侧工作台（详情页右侧面板）—— 跟随主题：浅色模式下用浅色，
+     深色模式（html.dark）下用深色。此前固定深色，导致浅色模式下
+     右侧整块是深色面板、与全站风格割裂。 */
+  --wb-bg: var(--bg);
+  --wb-surface: var(--surface);
+  --wb-elevated: #ffffff;
+  --wb-border: var(--border);
+  --wb-fg: var(--fg);
+  --wb-muted: var(--muted);
+  --wb-faint: var(--faint);
+  --wb-hover: var(--accent-soft);
 
   /* Right panel (detail page) — 兼容旧变量名，浅色模式下即工作台暖深色 */
   --dark-bg: var(--wb-bg);
@@ -66,9 +68,13 @@ html.dark {
   --border: #3d2f28;
   --accent-soft: #3d2b24;
 
+  /* 深色模式下工作台回到深色编码面板 */
   --wb-bg: #171009;
   --wb-surface: #20160f;
   --wb-elevated: #2a1e17;
   --wb-border: #3d2f28;
+  --wb-fg: #fdf3e8;
+  --wb-muted: #a8a8b4;
+  --wb-faint: #7a6f66;
   --wb-hover: #2a1e17;
 }

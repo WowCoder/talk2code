@@ -162,8 +162,10 @@ async function handleLogout() {
 
 <style scoped>
 .nav {
-  background: oklch(99% 0.008 70 / 88%);
-  background: rgba(255, 251, 246, 0.92);
+  /* 跟随主题：浅色模式暖米白、深色模式暗棕（--surface 在 html.dark 下翻转），
+     此前硬编码浅色底 + 深色模式下 --fg 变浅字，导致字看不清 */
+  background: var(--surface);
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
   border-bottom: 1px solid var(--border);
   padding: 0 24px;
   height: 68px;

@@ -222,8 +222,8 @@ function acStateTitle(ac: AcceptanceCriterion): string {
   font-size: 12px;
   line-height: 1.5;
   color: oklch(45% 0.15 25);
-  background: oklch(96% 0.02 25 / 0.6);
-  border: 1px solid oklch(85% 0.05 25);
+  background: color-mix(in srgb, oklch(45% 0.15 25) 10%, transparent);
+  border: 1px solid color-mix(in srgb, oklch(45% 0.15 25) 30%, transparent);
   border-radius: 8px;
   padding: 8px 10px;
   margin-bottom: 12px;
@@ -270,15 +270,15 @@ function acStateTitle(ac: AcceptanceCriterion): string {
 }
 
 .feature-tag {
-  background: oklch(97% 0.01 250 / 0.5);
+  background: color-mix(in srgb, oklch(50% 0.1 250) 12%, transparent);
   color: oklch(50% 0.1 250);
-  border: 1px solid oklch(85% 0.02 250);
+  border: 1px solid color-mix(in srgb, oklch(50% 0.1 250) 30%, transparent);
 }
 
 .tech-tag {
-  background: oklch(97% 0.01 80 / 0.5);
+  background: color-mix(in srgb, oklch(55% 0.1 80) 12%, transparent);
   color: oklch(55% 0.1 80);
-  border: 1px solid oklch(85% 0.04 80);
+  border: 1px solid color-mix(in srgb, oklch(55% 0.1 80) 30%, transparent);
 }
 
 /* ---- 验收清单：让用户签字的对象和系统判定的对象在视觉上就是同一份 ---- */
@@ -302,9 +302,9 @@ function acStateTitle(ac: AcceptanceCriterion): string {
 }
 
 .ac-item.ac-passed { border-left-color: oklch(55% 0.1 155); }
-.ac-item.ac-fail { border-left-color: oklch(55% 0.14 20); background: oklch(97% 0.01 20 / 0.4); }
-.ac-item.ac-compromised { border-left-color: oklch(70% 0.14 70); background: oklch(97% 0.01 70 / 0.4); }
-.ac-item.ac-unverified { border-left-color: oklch(60% 0.02 250); background: oklch(97% 0.01 250 / 0.3); }
+.ac-item.ac-fail { border-left-color: oklch(55% 0.14 20); background: color-mix(in srgb, oklch(55% 0.14 20) 10%, transparent); }
+.ac-item.ac-compromised { border-left-color: oklch(70% 0.14 70); background: color-mix(in srgb, oklch(70% 0.14 70) 12%, transparent); }
+.ac-item.ac-unverified { border-left-color: oklch(60% 0.02 250); background: color-mix(in srgb, oklch(60% 0.02 250) 10%, transparent); }
 .ac-item.ac-not_applicable { border-left-color: var(--border); opacity: 0.7; }
 
 .ac-idx {
