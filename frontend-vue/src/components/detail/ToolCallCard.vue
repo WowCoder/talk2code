@@ -14,13 +14,14 @@
       {{ expanded ? '详情 ▾' : '详情 ▸' }}
     </span>
     <div v-if="expanded && hasArgs" :class="['tc-detail', { open: expanded }]">
-      <pre>{{ JSON.stringify(args, null, 2) }}</pre>
+      {{ describeToolArgs(toolName, args) }}
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, computed } from 'vue'
+import { describeToolArgs } from '@/utils/toolArgs'
 
 const props = withDefaults(defineProps<{
   toolName: string

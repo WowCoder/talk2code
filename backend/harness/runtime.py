@@ -880,7 +880,9 @@ class ToolCallLoop:
     def _tool_display_label(self, tool_name: str, arguments: dict, result) -> str:
         """生成前端展示用的简短工具标签（不暴露大段文件内容）"""
         if result.blocked:
-            return f"⛔ 已跳过 {tool_name}: {result.content[:60]}…" if len(result.content) > 60 else f"⛔ 已跳过 {tool_name}: {result.content}"
+            # 不带 ⛔ 前缀：前端操作列表会按 blocked 状态自带 ⛔ 图标，
+            # 这里再带一个会渲染成「⛔ ⛔ 已跳过 …」
+            return f"已跳过 {tool_name}: {result.content[:60]}…" if len(result.content) > 60 else f"已跳过 {tool_name}: {result.content}"
         filename = arguments.get("filename", "")
         if tool_name == "read_file":
             lines = result.content.count('\n') + 1 if result.success and result.content else 0

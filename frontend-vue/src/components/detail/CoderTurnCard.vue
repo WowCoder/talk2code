@@ -46,25 +46,27 @@
               <div class="round-block-head" @click="toggleThinking(i)">
                 <span>{{ openThinking.has(i) ? '▾' : '▸' }}</span>
                 <span>💭 思考</span>
-                <span class="round-block-preview">{{ r.thinking_preview }}</span>
+                <!-- 展开后正文就在下面，头部不再重复一遍预览 -->
+                <span v-if="!openThinking.has(i)" class="round-block-preview">{{ r.thinking_preview }}</span>
               </div>
               <div v-if="openThinking.has(i)" class="round-thinking">{{ r.thinking_preview }}</div>
             </div>
 
-            <div v-if="r.agent_text" class="round-text">{{ r.agent_text }}</div>
+            <!-- agent_text 与思考内容相同时不再重复渲染（后端常把同一句话同时塞进两个字段） -->
+            <div v-if="showAgentText(r)" class="round-text">{{ r.agent_text }}</div>
 
             <div v-if="(r.tools || []).length" class="round-tools">
               <div v-for="(tool, ti) in r.tools" :key="ti" class="tool-item">
                 <span class="tool-icon">{{ tool.success ? '✅' : tool.blocked ? '⛔' : '❌' }}</span>
-                <span class="tool-label">{{ tool.readable || tool.display_label || tool.name }}</span>
+                <span class="tool-label">{{ toolLabel(tool) }}</span>
                 <span
                   v-if="hasToolArgs(tool)"
                   class="tool-detail"
                   @click.stop="toggleToolArgs(r, ti)"
-                >{{ isToolOpen(r, ti) ? '收起 ▴' : '参数 ▸' }}</span>
+                >{{ isToolOpen(r, ti) ? '收起 ▴' : '详情 ▸' }}</span>
               </div>
               <div v-for="key in openToolsFor(r)" :key="'arg-' + key" class="tool-args">
-                <pre>{{ JSON.stringify((r.tools || [])[key]?.arguments, null, 2) }}</pre>
+                {{ describeToolArgs((r.tools || [])[key]?.name || (r.tools || [])[key]?.tool_name, (r.tools || [])[key]?.arguments) }}
               </div>
             </div>
             <div v-else class="round-empty">本轮无操作记录</div>
@@ -77,8 +79,25 @@
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import { stripStatusEmoji, describeToolArgs } from '@/utils/toolArgs'
 
 const props = defineProps<{ msg: any }>()
+
+/** 历史数据的 readable 可能自带「⛔ 」前缀（旧版后端），与前面的状态图标重复，兜底去掉 */
+function toolLabel(tool: any): string {
+  return stripStatusEmoji(tool.readable || tool.display_label || tool.name || '')
+}
+
+/** agent_text 与思考内容是同一句话时不重复展示 */
+function showAgentText(r: any): boolean {
+  const text = String(r?.agent_text || '').trim()
+  if (!text) return false
+  const rawThink = String(r?.thinking_preview || '').trim()
+  if (!rawThink) return true
+  const thinkCore = rawThink.replace(/…$/, '').trim()
+  if (!thinkCore) return true
+  return !(text === rawThink || text.startsWith(thinkCore))
+}
 
 const ROLE_ICONS: Record<string, string> = {
   'Leon（技术负责人）': '🎯',

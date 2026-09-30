@@ -134,15 +134,15 @@
           <div class="iteration-thinking-header" @click="thinkingDetailExpanded = !thinkingDetailExpanded">
             <span>{{ thinkingDetailExpanded ? '▾' : '▸' }}</span>
             <span>💭 思考中…</span>
-            <span class="iteration-thinking-preview">{{ msg.thinking_preview }}</span>
+            <span v-if="!thinkingDetailExpanded" class="iteration-thinking-preview">{{ msg.thinking_preview }}</span>
           </div>
           <div v-if="thinkingDetailExpanded" class="iteration-thinking-full">
             {{ msg.thinking_preview }}
           </div>
         </div>
 
-        <!-- agent 回复文本 -->
-        <div v-if="msg.agent_text" class="iteration-agent-text">
+        <!-- agent 回复文本：与思考内容相同时不重复展示 -->
+        <div v-if="showAgentText(msg)" class="iteration-agent-text">
           {{ msg.agent_text }}
         </div>
 
@@ -154,16 +154,16 @@
             class="iteration-tool-item"
           >
             <span class="iteration-tool-icon">{{ tool.success ? '✅' : tool.blocked ? '⛔' : '❌' }}</span>
-            <span class="iteration-tool-label">{{ tool.readable }}</span>
+            <span class="iteration-tool-label">{{ toolLabel(tool) }}</span>
             <span
               v-if="hasToolArgs(tool)"
               class="iteration-tool-detail"
               @click="toggleToolDetail(ti)"
-            >{{ expandedTools.has(ti) ? '收起 ▴' : '参数 ▸' }}</span>
+            >{{ expandedTools.has(ti) ? '收起 ▴' : '详情 ▸' }}</span>
           </div>
-          <!-- 展开的工具参数 -->
+          <!-- 展开的工具详情（人话摘要，不再是原始 JSON） -->
           <div v-for="ti in expandedTools" :key="'arg-' + ti" class="iteration-tool-args">
-            <pre>{{ JSON.stringify(toolsList[ti]?.arguments, null, 2) }}</pre>
+            {{ describeToolArgs((toolsList[ti] as any)?.name || (toolsList[ti] as any)?.tool_name, (toolsList[ti] as any)?.arguments) }}
           </div>
         </div>
       </div>
@@ -220,6 +220,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import type { DialogueMessage as DialogueMessageType } from '@/types/api'
+import { stripStatusEmoji, describeToolArgs } from '@/utils/toolArgs'
 import ToolCallCard from './ToolCallCard.vue'
 import HookCheckCard from './HookCheckCard.vue'
 import QaAcCard from './QaAcCard.vue'
@@ -264,6 +265,22 @@ const iterationTimeRange = computed(() => {
 function hasToolArgs(tool: any): boolean {
   const a = tool.arguments
   return a !== undefined && a !== null && Object.keys(a).length > 0
+}
+
+/** 历史数据的 readable 可能自带「⛔ 」前缀（旧版后端），与前面的状态图标重复，兜底去掉 */
+function toolLabel(tool: any): string {
+  return stripStatusEmoji(tool.readable || tool.display_label || tool.name || '')
+}
+
+/** agent_text 与思考内容是同一句话时不重复展示 */
+function showAgentText(m: any): boolean {
+  const text = String(m?.agent_text || '').trim()
+  if (!text) return false
+  const rawThink = String(m?.thinking_preview || '').trim()
+  if (!rawThink) return true
+  const thinkCore = rawThink.replace(/…$/, '').trim()
+  if (!thinkCore) return true
+  return !(text === rawThink || text.startsWith(thinkCore))
 }
 
 function toggleToolDetail(index: number) {
