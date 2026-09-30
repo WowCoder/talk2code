@@ -6,6 +6,7 @@ import { ref } from 'vue'
 
 export const useAuthStore = defineStore('auth', () => {
   const username = ref<string>('用户')
+  const email = ref<string>('')
   const isAuthenticated = ref(false)
   // 演示模式：后端会强制只读（demo JWT claim + before_request 守卫），
   // 前端的 isDemo 只负责 UX —— 置灰按钮、展示引导。
@@ -25,6 +26,7 @@ export const useAuthStore = defineStore('auth', () => {
         const data = await resp.json()
         username.value = data.user?.username || localStorage.getItem('username') || '用户'
         if (data.user?.username) localStorage.setItem('username', username.value)
+        email.value = data.user?.email || ''
         isAuthenticated.value = true
         isDemo.value = Boolean(data.user?.is_demo)
         return
@@ -52,6 +54,7 @@ export const useAuthStore = defineStore('auth', () => {
 
     const data = await response.json()
     username.value = data.user?.username || usernameInput
+    email.value = data.user?.email || ''
     localStorage.setItem('username', username.value)
     isAuthenticated.value = true
     isDemo.value = false
@@ -92,6 +95,7 @@ export const useAuthStore = defineStore('auth', () => {
     isAuthenticated.value = false
     isDemo.value = false
     username.value = '用户'
+    email.value = ''
     localStorage.removeItem('username')
   }
 
@@ -106,6 +110,7 @@ export const useAuthStore = defineStore('auth', () => {
 
   return {
     username,
+    email,
     isAuthenticated,
     isDemo,
     initAuth,
