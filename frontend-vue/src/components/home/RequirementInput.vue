@@ -4,13 +4,13 @@
       <textarea
         v-model="content"
         class="req-textarea"
-        placeholder="描述你想要的应用，例如：创建一个待办事项列表应用，支持添加、完成、删除任务，数据保存在本地…"
+        placeholder="做一个能在浏览器里玩的 HTML5 贪吃蛇小游戏，要求…"
         rows="4"
         @input="onInput"
         @keydown="onKeydown"
       ></textarea>
       <div class="input-actions">
-        <span class="input-hint">Ctrl + Enter 快速提交</span>
+        <span class="input-hint"><kbd>Ctrl</kbd> + <kbd>Enter</kbd> 快速提交</span>
         <button
           class="btn-primary"
           :disabled="!content.trim() || submitting"
@@ -127,7 +127,18 @@ defineExpose({ content })
 }
 
 .req-textarea::placeholder {
-  color: oklch(65% 0.01 70);
+  color: var(--faint);
+}
+
+.input-hint kbd {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--muted);
 }
 
 .input-actions {

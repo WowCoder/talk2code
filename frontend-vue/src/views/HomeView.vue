@@ -7,9 +7,10 @@
         <RequirementInput ref="inputRef" />
         <ExampleChips @select="onSelectExample" />
       </div>
-      <!-- 输入框下方给几条真实作品：一句"你要做什么"之前，先让人看见别人做成了什么 -->
-      <MarketTeaser />
     </main>
+    <!-- 输入框下方给几条真实作品：一句"你要做什么"之前，先让人看见别人做成了什么。
+         全宽背景区，与上方窄栏输入区形成节奏对比。 -->
+    <MarketTeaser />
   </div>
 </template>
 
@@ -35,12 +36,12 @@ function onSelectExample(example: string) {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
-  background: var(--bg);
+  background: var(--surface);
 }
 
 .home-main {
   flex: 1;
-  max-width: 720px;
+  max-width: 760px;
   width: 100%;
   margin: 0 auto;
   padding: 0 24px;
