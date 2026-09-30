@@ -195,3 +195,50 @@ def get_user_info():
                 'is_demo': bool(get_jwt().get('demo')),
             }
         }), 200
+
+
+@app.route('/api/user/password', methods=['POST'])
+@jwt_required()
+@rate_limit_auth
+def change_password():
+    """修改当前用户密码：验证旧密码后写入新哈希。
+
+    挂 rate_limit_auth（和登录同一桶）—— 改密码接口同样适合暴力试旧密码，
+    没有理由比登录更宽松。演示会话的写操作由 demo_guard 在 before_request 拦截。
+    """
+    from models import User
+    from utils.security import hash_password, verify_password
+
+    current_user_id = int(get_jwt_identity())
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': '请求数据为空'}), 400
+
+    old_password = data.get('current_password', '')
+    new_password = data.get('new_password', '')
+
+    if not old_password or not new_password:
+        return jsonify({'error': '当前密码和新密码不能为空'}), 400
+    if len(new_password) < settings.PASSWORD_MIN_LENGTH:
+        return jsonify({'error': f'新密码至少 {settings.PASSWORD_MIN_LENGTH} 个字符'}), 400
+
+    # 校验失败/改密成功都要么走异常回滚、要么走 commit，用事务型上下文
+    with transactional_db() as db:
+        user = db.query(User).filter(User.id == current_user_id).first()
+        # 统一文案不区分「旧密码错」和「用户不存在」，不给枚举探针。
+        # 刻意用 400 而非 401 —— 前端 useApi 把 401 视为登录过期会清登录态跳登录页，
+        # 用户只是输错了旧密码，不该被登出。
+        if not user or not verify_password(old_password, user.password_hash):
+            return jsonify({'error': '当前密码不正确'}), 400
+        if verify_password(new_password, user.password_hash):
+            return jsonify({'error': '新密码不能与当前密码相同'}), 400
+
+        # 只改需要的列，避免整行 update 带动 create_time 等字段
+        db.execute(
+            update(User)
+            .where(User.id == current_user_id)
+            .values(password_hash=hash_password(new_password))
+        )
+
+    logger.info(f"用户修改密码成功：user_id={current_user_id}")
+    return jsonify({'message': '密码已更新'}), 200

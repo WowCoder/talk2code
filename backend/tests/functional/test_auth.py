@@ -147,3 +147,65 @@ class TestUserInfo:
             'Authorization': f'Bearer invalid_token'
         })
         assert response.status_code == 422
+
+
+class TestChangePassword:
+    """修改密码（POST /api/user/password）"""
+
+    def _login(self, client, username: str, password: str):
+        return client.post('/api/login', json={'username': username, 'password': password})
+
+    def test_change_password_success(self, app_client, test_user):
+        """旧密码验证通过 → 改密成功 → 旧密码登录失败、新密码登录成功"""
+        resp = self._login(app_client, test_user['username'], test_user['password'])
+        assert resp.status_code == 200
+
+        new_pwd = test_user['password'] + '-new'
+        resp = app_client.post('/api/user/password', json={
+            'current_password': test_user['password'],
+            'new_password': new_pwd,
+        })
+        assert resp.status_code == 200, resp.get_json()
+
+        # 旧密码登录应失败
+        assert self._login(app_client, test_user['username'], test_user['password']).status_code == 401
+        # 新密码登录应成功
+        assert self._login(app_client, test_user['username'], new_pwd).status_code == 200
+
+    def test_change_password_wrong_current(self, app_client, test_user):
+        """旧密码错误 → 400（刻意不用 401，避免前端 useApi 误判登录过期踢人）"""
+        resp = self._login(app_client, test_user['username'], test_user['password'])
+        assert resp.status_code == 200
+
+        resp = app_client.post('/api/user/password', json={
+            'current_password': 'wrong-password',
+            'new_password': 'newpassword123',
+        })
+        assert resp.status_code == 400
+        assert '当前密码不正确' in resp.get_json()['error']
+
+    def test_change_password_same_as_current(self, app_client, test_user):
+        """新密码与旧密码相同 → 400"""
+        self._login(app_client, test_user['username'], test_user['password'])
+        resp = app_client.post('/api/user/password', json={
+            'current_password': test_user['password'],
+            'new_password': test_user['password'],
+        })
+        assert resp.status_code == 400
+
+    def test_change_password_too_short(self, app_client, test_user):
+        """新密码过短 → 400"""
+        self._login(app_client, test_user['username'], test_user['password'])
+        resp = app_client.post('/api/user/password', json={
+            'current_password': test_user['password'],
+            'new_password': '12345',
+        })
+        assert resp.status_code == 400
+
+    def test_change_password_unauthenticated(self, app_client):
+        """未登录 → 401"""
+        resp = app_client.post('/api/user/password', json={
+            'current_password': 'x',
+            'new_password': 'y123456',
+        })
+        assert resp.status_code == 401
