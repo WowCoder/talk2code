@@ -22,9 +22,12 @@
         </div>
       </div>
 
-      <!-- Tabs -->
+      <!-- 分类 chips（设计稿：红色 pill + 数量） -->
       <div class="tabs">
-        <button :class="['tab-btn', { active: activeTab === 'active' }]" @click="switchTab('active')">运行中</button>
+        <button :class="['tab-btn', { active: activeTab === 'active' }]" @click="switchTab('active')">
+          运行中
+          <span v-if="projects.length" class="tab-badge">{{ projects.length }}</span>
+        </button>
         <button v-if="!isDemo" :class="['tab-btn', { active: activeTab === 'trash' }]" @click="switchTab('trash')">
           回收站
           <span v-if="trashProjects.length" class="tab-badge">{{ trashProjects.length }}</span>
@@ -426,37 +429,31 @@ async function onBatchPermanentDelete() {
   border-color: var(--accent);
 }
 
-/* ===== Tabs ===== */
+/* ===== 分类 chips ===== */
 .tabs {
   display: flex;
-  gap: 4px;
+  gap: 8px;
   margin-bottom: 16px;
-  padding: 4px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 12px;
 }
 
 .tab-btn {
-  flex: 1;
-  padding: 8px 16px;
-  border: none;
-  border-radius: 9px;
-  background: transparent;
+  padding: 7px 16px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
   color: var(--muted);
   font-size: 13px;
   font-weight: 500;
   font-family: var(--font-body);
   cursor: pointer;
   transition: all 0.15s;
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  justify-content: center;
   gap: 6px;
 }
 
-.tab-btn:hover { color: var(--fg); }
-.tab-btn.active { background: var(--accent); color: #fff; }
+.tab-btn:hover { color: var(--fg); border-color: var(--faint); }
+.tab-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
 
 .tab-badge {
   display: inline-flex;
@@ -466,9 +463,14 @@ async function onBatchPermanentDelete() {
   height: 18px;
   padding: 0 5px;
   border-radius: 9px;
-  background: oklch(100% 0 0 / 25%);
+  background: rgba(255, 255, 255, 0.22);
   font-size: 11px;
   font-weight: 600;
+}
+
+.tab-btn:not(.active) .tab-badge {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
 }
 
 /* ===== Select all bar ===== */
@@ -500,26 +502,24 @@ async function onBatchPermanentDelete() {
   cursor: pointer;
 }
 
-/* ===== Floating batch bar ===== */
+/* ===== Floating batch bar（设计稿：深色浮条，锚底部左侧）===== */
 .batch-bar {
   position: fixed;
   bottom: 24px;
-  left: 50%;
-  transform: translateX(-50%);
-  background: var(--surface);
-  border: 1px solid var(--border);
+  left: 24px;
+  background: var(--fg);
   border-radius: 14px;
   padding: 12px 20px;
   display: flex;
   align-items: center;
   gap: 14px;
-  box-shadow: 0 4px 24px oklch(0% 0 0 / 12%);
+  box-shadow: 0 8px 28px rgba(34, 23, 19, 0.28);
   z-index: 100;
 }
 
 .batch-count {
   font-size: 13px;
-  color: var(--muted);
+  color: rgba(255, 251, 246, 0.85);
   white-space: nowrap;
 }
 
@@ -533,32 +533,32 @@ async function onBatchPermanentDelete() {
   border-radius: 9px;
   font-size: 13px;
   font-family: var(--font-body);
-  font-weight: 500;
+  font-weight: 600;
   cursor: pointer;
   transition: all 0.15s;
   white-space: nowrap;
 }
 
 .batch-trash {
-  border: 1px solid oklch(60% 0.15 20);
-  background: oklch(96% 0.01 20);
-  color: oklch(60% 0.15 20);
-}
-.batch-trash:hover { background: oklch(60% 0.15 20); color: #fff; }
-
-.batch-restore {
-  border: 1px solid var(--accent);
-  background: var(--accent-soft);
-  color: var(--accent);
-}
-.batch-restore:hover { background: var(--accent); color: #fff; }
-
-.batch-delete {
-  border: 1px solid oklch(60% 0.15 20);
-  background: oklch(60% 0.15 20);
+  border: none;
+  background: var(--accent);
   color: #fff;
 }
-.batch-delete:hover { background: oklch(50% 0.15 20); border-color: oklch(50% 0.15 20); }
+.batch-trash:hover { background: var(--accent-hover); }
+
+.batch-restore {
+  border: 1px solid rgba(255, 251, 246, 0.3);
+  background: transparent;
+  color: #fffbf6;
+}
+.batch-restore:hover { background: rgba(255, 251, 246, 0.12); }
+
+.batch-delete {
+  border: none;
+  background: var(--color-danger);
+  color: #fff;
+}
+.batch-delete:hover { filter: brightness(1.08); }
 
 /* ===== Transitions ===== */
 .slide-down-enter-active,
