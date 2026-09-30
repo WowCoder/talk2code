@@ -4,7 +4,7 @@
       v-model="message"
       type="text"
       class="chat-input"
-      placeholder="输入消息继续对话…"
+      placeholder="继续给 AI 提要求…"
       :disabled="disabled"
       @keypress="onKeypress"
     />
@@ -13,7 +13,7 @@
       class="btn-stop"
       @click="onStop"
     >
-      ⏹ 停止
+      停止生成
     </button>
     <button
       v-else
@@ -71,7 +71,7 @@ function onStop() {
 .chat-input {
   flex: 1;
   padding: 10px 14px;
-  border: 1px solid var(--border);
+  border: 1px solid rgba(207, 106, 95, 0.35);
   border-radius: 12px;
   font-size: 14px;
   font-family: var(--font-body);
@@ -83,10 +83,11 @@ function onStop() {
 
 .chat-input:focus {
   border-color: var(--accent);
+  box-shadow: var(--focus-ring);
 }
 
 .chat-input::placeholder {
-  color: oklch(65% 0.01 70);
+  color: var(--faint);
 }
 
 .btn-send {
@@ -104,7 +105,7 @@ function onStop() {
 }
 
 .btn-send:hover:not(:disabled) {
-  background: oklch(58% 0.13 28);
+  background: var(--accent-hover);
 }
 
 .btn-send:disabled {
@@ -114,10 +115,10 @@ function onStop() {
 
 .btn-stop {
   padding: 10px 20px;
-  border: 1px solid oklch(55% 0.15 20);
+  border: 1px solid var(--color-danger);
   border-radius: 12px;
   background: transparent;
-  color: oklch(55% 0.15 20);
+  color: var(--color-danger);
   font-size: 14px;
   font-weight: 600;
   font-family: var(--font-body);
@@ -127,7 +128,7 @@ function onStop() {
 }
 
 .btn-stop:hover {
-  background: oklch(55% 0.15 20);
+  background: var(--color-danger);
   color: #fff;
 }
 </style>

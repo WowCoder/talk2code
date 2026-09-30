@@ -1,45 +1,47 @@
 <template>
   <div class="panel-tabbar">
-    <div class="panel-tabs">
+    <div class="panel-tabs" role="tablist" aria-label="工作台视图切换">
       <button
         :class="['panel-tab', { active: activeTab === 'spec' }]"
+        role="tab"
+        :aria-selected="activeTab === 'spec'"
         @click="$emit('update:activeTab', 'spec')"
       >
-        📋 Spec
+        方案 Spec
       </button>
       <button
         :class="['panel-tab', { active: activeTab === 'tasks' }]"
+        role="tab"
+        :aria-selected="activeTab === 'tasks'"
         @click="$emit('update:activeTab', 'tasks')"
       >
-        📝 任务
+        任务
       </button>
       <button
         :class="['panel-tab', { active: activeTab === 'preview' }]"
+        role="tab"
+        :aria-selected="activeTab === 'preview'"
         @click="$emit('update:activeTab', 'preview')"
       >
-        👁 预览
+        预览
       </button>
       <button
         :class="['panel-tab', { active: activeTab === 'code' }]"
+        role="tab"
+        :aria-selected="activeTab === 'code'"
         @click="$emit('update:activeTab', 'code')"
       >
-        📄 代码
+        代码
       </button>
       <button
         :class="['panel-tab', { active: activeTab === 'publish' }]"
+        role="tab"
+        :aria-selected="activeTab === 'publish'"
         @click="$emit('update:activeTab', 'publish')"
       >
-        🚀 发布
+        发布
       </button>
     </div>
-    <button class="btn-download" @click="$emit('download')">
-      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
-        <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
-        <polyline points="7 10 12 15 17 10"/>
-        <line x1="12" y1="15" x2="12" y2="3"/>
-      </svg>
-      代码下载
-    </button>
   </div>
 </template>
 
@@ -50,7 +52,6 @@ defineProps<{
 
 defineEmits<{
   'update:activeTab': [value: string]
-  download: []
 }>()
 </script>
 
@@ -58,58 +59,38 @@ defineEmits<{
 .panel-tabbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 0 16px;
-  background: var(--dark-surface);
-  border-bottom: 1px solid var(--dark-border);
+  padding: 8px 16px 0;
+  background: var(--wb-bg);
+  border-bottom: 1px solid var(--wb-border);
   flex-shrink: 0;
 }
 
 .panel-tabs {
   display: flex;
-  gap: 0;
+  gap: 4px;
 }
 
 .panel-tab {
-  padding: 10px 18px;
-  font-size: 13px;
+  padding: 7px 14px;
+  font-size: 12.5px;
   font-weight: 500;
-  color: var(--dark-muted);
+  color: var(--wb-muted);
   cursor: pointer;
   border: none;
   background: none;
   font-family: var(--font-body);
-  border-bottom: 2px solid transparent;
-  margin-bottom: -1px;
-  transition: color 0.15s;
+  border-radius: 8px 8px 0 0;
+  transition: color 0.15s, background 0.15s;
 }
 
 .panel-tab:hover {
-  color: var(--dark-fg);
+  color: var(--wb-fg);
+  background: var(--wb-hover);
 }
 
 .panel-tab.active {
-  color: var(--accent);
-  border-bottom-color: var(--accent);
-}
-
-.btn-download {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 14px;
-  border-radius: 8px;
-  font-size: 12px;
+  color: var(--wb-fg);
+  background: var(--wb-elevated);
   font-weight: 600;
-  font-family: var(--font-body);
-  color: #fff;
-  cursor: pointer;
-  border: none;
-  background: var(--accent);
-  transition: background 0.2s;
-}
-
-.btn-download:hover {
-  background: oklch(58% 0.13 28);
 }
 </style>

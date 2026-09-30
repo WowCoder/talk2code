@@ -10,7 +10,7 @@
 
     <!-- 中断提示：服务重启会中断在跑的需求，进度已保留在检查点，可一键续跑 -->
     <div v-if="store.currentRequirement?.status === 'interrupted'" class="resume-banner">
-      <span class="resume-text">上次执行被服务重启中断，进度已保留，可从断点继续。</span>
+      <span class="resume-text">上次执行被服务重启中断 · 进度已保留在检查点，可一键续跑</span>
       <button class="resume-btn" :disabled="resuming" @click="onResume">
         {{ resuming ? '正在继续…' : '继续' }}
       </button>
@@ -37,18 +37,26 @@
       </button>
     </div>
 
-    <!-- Split layout -->
+    <!-- Split layout：左对话 / 右工作台，中间可拖拽调宽 -->
     <div class="split">
       <!-- Left: Dialogue -->
-      <DialoguePanel @send-message="onSendMessage" @stop="onStopGeneration" />
+      <div class="left-pane" :style="{ width: leftPaneWidth + '%' }">
+        <DialoguePanel @send-message="onSendMessage" @stop="onStopGeneration" />
+      </div>
+
+      <!-- Splitter：拖拽调整左右分栏比例 -->
+      <div
+        class="splitter"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="拖拽调整对话区宽度"
+        @pointerdown="onSplitterDown"
+      ></div>
 
       <!-- Right: Preview / Code -->
       <div class="right-panel">
         <ProgressBar :percent="store.progress.percent" />
-        <PanelTabs
-          v-model:activeTab="activeTab"
-          @download="onDownload"
-        />
+        <PanelTabs v-model:activeTab="activeTab" />
 
         <!-- Spec view -->
         <div v-show="activeTab === 'spec'" class="view active">
@@ -68,7 +76,7 @@
           <!-- QA 验收中：Catherine 正在浏览器里逐步操作，覆盖提示让用户知道画面在被驱动 -->
           <div v-if="store.qaRunning" class="qa-running-banner">
             <span class="qa-running-dot"></span>
-            <span>🔍 QA 正在验收…</span>
+            <span>QA 正在浏览器里验收</span>
             <span v-if="currentAcLabel" class="qa-running-ac">{{ currentAcLabel }}</span>
             <span v-if="currentAcSteps" class="qa-running-steps">第 {{ currentAcSteps }} 步</span>
           </div>
@@ -77,7 +85,7 @@
 
         <!-- Code view -->
         <div v-show="activeTab === 'code'" class="view active">
-          <CodePanel />
+          <CodePanel @download="onDownload" />
         </div>
 
         <!-- Publish view -->
@@ -120,6 +128,42 @@ const store = useRequirementStore()
 const authStore = useAuthStore()
 const { show } = useToast()
 const activeTab = ref('preview')
+
+// ---- 可拖拽分栏 ----
+// 对话流宽度百分比（25~60 之间拖动），默认 38。宽度只存内存，
+// 刷新回到默认 —— 这是阅读辅助，不是需要持久化的偏好。
+const leftPaneWidth = ref(38)
+let dragging = false
+
+function onSplitterDown(e: PointerEvent) {
+  e.preventDefault()
+  dragging = true
+  document.body.style.cursor = 'col-resize'
+  document.body.style.userSelect = 'none'
+  window.addEventListener('pointermove', onSplitterMove)
+  window.addEventListener('pointerup', onSplitterUp)
+}
+
+function onSplitterMove(e: PointerEvent) {
+  if (!dragging) return
+  const splitEl = document.querySelector('.split') as HTMLElement | null
+  if (!splitEl) return
+  const rect = splitEl.getBoundingClientRect()
+  const pct = ((e.clientX - rect.left) / rect.width) * 100
+  leftPaneWidth.value = Math.min(60, Math.max(25, pct))
+}
+
+function onSplitterUp() {
+  dragging = false
+  document.body.style.cursor = ''
+  document.body.style.userSelect = ''
+  window.removeEventListener('pointermove', onSplitterMove)
+  window.removeEventListener('pointerup', onSplitterUp)
+}
+
+onMounted(() => {
+  window.addEventListener('pointerup', onSplitterUp)
+})
 
 // SSE connection
 const reqId = computed(() => {
@@ -540,15 +584,47 @@ function escapeInlineScript(content: string): string {
   flex: 1;
   display: flex;
   min-height: 0;
-  gap: 1px;
+}
+
+.left-pane {
+  flex-shrink: 0;
+  min-width: 0;
+  display: flex;
+}
+
+/* 拖拽手柄：视觉上是 1px 分隔线，命中区加宽到 9px 方便拖 */
+.splitter {
+  width: 9px;
+  margin: 0 -4px;
+  cursor: col-resize;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 10;
+  touch-action: none;
+}
+
+.splitter::after {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
   background: var(--border);
+  transition: background 0.15s;
+}
+
+.splitter:hover::after,
+.splitter:active::after {
+  background: var(--accent);
+  width: 2px;
 }
 
 .right-panel {
   flex: 1;
   display: flex;
   flex-direction: column;
-  background: var(--dark-bg);
+  background: var(--wb-bg);
   min-width: 0;
 }
 
@@ -566,20 +642,20 @@ function escapeInlineScript(content: string): string {
 
 .qa-running-banner {
   position: absolute;
-  top: 8px;
+  top: 12px;
   left: 50%;
   transform: translateX(-50%);
   z-index: 5;
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 5px 12px;
+  padding: 6px 14px;
   border-radius: 999px;
-  background: rgba(59, 130, 246, .94);
-  color: #fff;
+  background: rgba(34, 23, 19, 0.92);
+  color: var(--wb-fg);
   font-size: 12px;
   font-weight: 500;
-  box-shadow: 0 2px 10px rgba(0, 0, 0, .18);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, .25);
   pointer-events: none;
   white-space: nowrap;
   max-width: 92%;
@@ -606,6 +682,12 @@ function escapeInlineScript(content: string): string {
 @media (max-width: 768px) {
   .split {
     flex-direction: column;
+  }
+  .left-pane {
+    width: 100% !important;
+  }
+  .splitter {
+    display: none;
   }
   .right-panel {
     min-height: 50vh;

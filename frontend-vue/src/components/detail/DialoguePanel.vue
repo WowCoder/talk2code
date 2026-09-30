@@ -1,6 +1,9 @@
 <template>
   <div class="dialogue-panel">
-    <div class="dialogue-header">AI 对话</div>
+    <div class="dialogue-header">
+      <span>AI 对话</span>
+      <span class="dh-count">{{ messages.length }} 条消息</span>
+    </div>
     <div class="dialogue-body" ref="bodyRef">
       <template v-for="(msg, i) in messages" :key="i">
         <!-- wrapper 用 display:contents，不生成盒模型，因此不破坏 .msg 的
@@ -424,11 +427,13 @@ watch(
 </script>
 
 <style scoped>
+/* 宽度由 DetailView 的可拖拽分栏控制，这里填满父容器即可 */
 .dialogue-panel {
-  flex: 0 0 40%;
+  flex: 1 1 auto;
+  width: 100%;
   display: flex;
   flex-direction: column;
-  background: var(--surface);
+  background: var(--bg);
   min-width: 0;
 }
 
@@ -439,6 +444,15 @@ watch(
   font-weight: 600;
   color: var(--fg);
   flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.dh-count {
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--faint);
 }
 
 .dialogue-body {
