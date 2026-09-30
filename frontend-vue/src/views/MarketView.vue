@@ -6,22 +6,24 @@
     <AppNav />
 
     <main class="market-main">
-      <header class="market-header">
-        <div class="header-left">
-          <h1 class="market-title">创意市集</h1>
-          <span class="market-count">{{ total }} 个作品</span>
-        </div>
-        <div class="sort">
-          <button class="sort-btn" :class="{ on: sort === 'hot' && !week }" @click="setSort('hot')">最热</button>
-          <button class="sort-btn" :class="{ on: week }" @click="toggleWeek">本周最热</button>
-          <button class="sort-btn" :class="{ on: sort === 'new' && !week }" @click="setSort('new')">最新</button>
-        </div>
+      <!-- Hero：一句副标题说明「这里的东西怎么来的」，比空喊 slogan 有说服力 -->
+      <header class="market-hero">
+        <span class="hero-eyebrow">CREATIVE MARKET</span>
+        <h1 class="market-title">大家做出来的应用</h1>
+        <p class="hero-sub">每一件都来自一次真实的需求 · 作者说公开才算数</p>
       </header>
 
-      <div v-if="categories.length" class="cats">
-        <button class="cat" :class="{ on: !category }" @click="category = ''">全部</button>
+      <div class="cats">
+        <button class="cat" :class="{ on: !category }" @click="category = ''">
+          全部<template v-if="total"> {{ total }}</template>
+        </button>
         <button v-for="c in categories" :key="c" class="cat" :class="{ on: category === c }"
                 @click="category = c">{{ catLabel(c) }}</button>
+        <span class="sort-group">
+          <button class="cat" :class="{ on: sort === 'hot' && !week }" @click="setSort('hot')">热度 ↓</button>
+          <button class="cat" :class="{ on: sort === 'new' && !week }" @click="setSort('new')">最新</button>
+          <button class="cat" :class="{ on: week }" @click="toggleWeek">本周</button>
+        </span>
       </div>
 
       <p v-if="loadError" class="market-error">{{ loadError }}</p>
@@ -187,74 +189,73 @@ watch([sort, week, category], load)
   padding: 28px 24px 80px;
 }
 
-.market-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 20px;
+/* ===== Hero ===== */
+.market-hero {
+  text-align: center;
+  padding: 36px 0 26px;
 }
 
-.header-left {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
+.hero-eyebrow {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.2em;
+  color: var(--faint);
+  margin-bottom: 8px;
 }
 
 .market-title {
   font-family: var(--font-display);
-  font-size: 24px;
+  font-size: 30px;
   font-weight: 700;
   color: var(--fg);
+  margin: 0 0 10px;
+  letter-spacing: -0.01em;
+}
+
+.hero-sub {
+  font-size: 13.5px;
+  color: var(--muted);
   margin: 0;
 }
 
-.market-count {
-  font-size: 13px;
-  color: var(--muted);
-}
-
-.sort {
-  display: flex;
-  gap: 4px;
-}
-
-.sort-btn {
-  padding: 5px 12px;
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--muted);
-  border-radius: 999px;
-  font-size: 13px;
-  cursor: pointer;
-}
-
-.sort-btn.on {
-  border-color: var(--accent);
-  color: var(--accent);
-  background: var(--accent-soft);
-}
-
+/* ===== 分类 chips（active 红底白字）===== */
 .cats {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  margin-bottom: 18px;
+  gap: 8px;
+  margin-bottom: 20px;
+  align-items: center;
+}
+
+.sort-group {
+  display: inline-flex;
+  gap: 8px;
+  margin-left: auto;
 }
 
 .cat {
-  padding: 4px 12px;
+  padding: 6px 14px;
   border: 1px solid var(--border);
   border-radius: 999px;
-  background: transparent;
+  background: var(--surface);
   color: var(--muted);
-  font-size: 12px;
+  font-size: 12.5px;
+  font-weight: 500;
   cursor: pointer;
+  transition: all 0.15s;
+}
+
+.cat:hover {
+  color: var(--fg);
+  border-color: var(--faint);
 }
 
 .cat.on {
   border-color: var(--accent);
-  color: var(--accent);
-  background: var(--accent-soft);
+  color: #fff;
+  background: var(--accent);
+  font-weight: 600;
 }
 
 .market-grid {

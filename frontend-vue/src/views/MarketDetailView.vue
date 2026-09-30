@@ -6,37 +6,42 @@
       <router-link class="back" to="/market">← 创意市集</router-link>
 
       <header class="head">
-        <div class="head-left">
-          <!-- 头像位复用缩略图：有封面出封面，没有出首页截图，都拿不到才回落首字 -->
-          <span class="thumb" :style="{ background: thumbColor }">
-            <img v-if="site.thumb && !thumbFailed" class="thumb-img" :src="site.thumb"
-                 :alt="site.title" @error="thumbFailed = true" />
-            <template v-else>{{ initial }}</template>
-          </span>
-          <div>
-            <h1 class="title">{{ site.title }}</h1>
-            <p class="author-row">
-              <router-link class="author" :to="`/market/u/${site.author_id}`">
-                {{ site.author || '匿名创作者' }}
-              </router-link>
-              <span class="dot">·</span>
-              <span>{{ site.author_followers }} 粉丝</span>
-              <button v-if="!isMine" class="follow" :class="{ on: site.following_author }"
-                      @click="toggleFollow">
-                {{ site.following_author ? '已关注' : '关注' }}
-              </button>
-            </p>
-          </div>
-        </div>
-        <a v-if="site.url" class="open" :href="site.url" target="_blank" rel="noopener">打开站点 →</a>
+        <h1 class="title">{{ site.title }}</h1>
+        <p class="author-row">
+          <router-link class="author" :to="`/market/u/${site.author_id}`">
+            {{ site.author || '匿名创作者' }}
+          </router-link>
+          <span class="dot">·</span>
+          <span>{{ site.author_followers }} 粉丝</span>
+          <button v-if="!isMine" class="follow" :class="{ on: site.following_author }"
+                  @click="toggleFollow">
+            {{ site.following_author ? '已关注' : '关注' }}
+          </button>
+        </p>
       </header>
 
+      <!-- 大预览横幅：作品的第一印象，点击直接进站点 -->
+      <a v-if="site.url" class="preview" :href="site.url" target="_blank" rel="noopener"
+         :style="{ background: thumbColor }" :aria-label="`打开 ${site.title}`">
+        <img v-if="site.thumb && !thumbFailed" class="preview-img" :src="site.thumb"
+             :alt="site.title" @error="thumbFailed = true" />
+        <span v-else class="preview-initial">{{ initial }}</span>
+      </a>
+      <div v-else class="preview no-link" :style="{ background: thumbColor }">
+        <img v-if="site.thumb && !thumbFailed" class="preview-img" :src="site.thumb"
+             :alt="site.title" @error="thumbFailed = true" />
+        <span v-else class="preview-initial">{{ initial }}</span>
+      </div>
+
       <div class="stats">
-        <HeatBadge :heat="site.heat" />
         <button class="like" :class="{ on: site.liked }" @click="toggleLike">
           <span class="like-icon" :class="{ on: site.liked }"></span>
-          {{ site.like_count }} 赞
+          点赞 · {{ site.like_count }}
         </button>
+        <a v-if="site.url" class="open" :href="site.url" target="_blank" rel="noopener">
+          在新窗口打开 ↗
+        </a>
+        <HeatBadge :heat="site.heat" />
         <span class="stat">{{ site.comment_count }} 条留言</span>
       </div>
 
@@ -154,7 +159,8 @@ const isMine = computed(() => !!site.value && site.value.author === authStore.us
 const thumbColor = computed(() => {
   let h = 0
   for (const ch of slug) h = (h * 31 + ch.charCodeAt(0)) % 360
-  return `hsl(${h} 58% 58%)`
+  const hue = 10 + (h % 50) // 暖色系窄区间，与设计稿一致
+  return `linear-gradient(135deg, hsl(${hue} 72% 78%) 0%, hsl(${hue + 6} 58% 62%) 100%)`
 })
 const initial = computed(() => (site.value?.title || '?').trim().charAt(0).toUpperCase())
 
@@ -293,41 +299,44 @@ onMounted(load)
 }
 
 .head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
+  margin-bottom: 16px;
 }
 
-.head-left {
-  display: flex;
-  gap: 14px;
-}
-
-.thumb {
-  width: 56px;
-  height: 56px;
-  border-radius: 12px;
+/* 大预览横幅：作品第一印象 */
+.preview {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #fff;
-  font-family: var(--font-display);
-  font-size: 24px;
-  font-weight: 700;
+  aspect-ratio: 16 / 9;
+  width: 100%;
+  border-radius: 16px;
   overflow: hidden;
+  text-decoration: none;
+  border: 1px solid var(--border);
+  margin-bottom: 14px;
 }
 
-.thumb-img {
+.preview.no-link {
+  pointer-events: none;
+}
+
+.preview-img {
   width: 100%;
   height: 100%;
   object-fit: cover;
   display: block;
 }
 
+.preview-initial {
+  font-family: var(--font-display);
+  font-size: 64px;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.9);
+}
+
 .title {
   margin: 0 0 4px;
-  font-size: 20px;
+  font-size: 24px;
   font-weight: 700;
   color: var(--fg);
 }

@@ -16,7 +16,7 @@
         {{ site.title }}
       </router-link>
       <router-link class="author" :to="`/market/u/${site.author_id ?? ''}`">
-        by {{ site.author || '匿名创作者' }}
+        @{{ site.author || '匿名创作者' }}
       </router-link>
 
       <div class="card-foot">
@@ -59,12 +59,13 @@ const busy = ref(false)
 const liked = computed(() => props.site.liked)
 const thumbFailed = ref(false)
 
-// 缩略图占位：按 slug 派生稳定色。Ship 1 不接真截图（要起 Chromium + 异步任务），
-// 色块保证同一作品每次进来颜色一致，不会看起来像随机闪烁。
+// 缩略图占位：按 slug 派生稳定色。暖色系柔和渐变（与设计稿一致），
+// 同一作品每次进来颜色一致，不会看起来像随机闪烁。
 const thumbColor = computed(() => {
   let h = 0
   for (const ch of props.site.slug) h = (h * 31 + ch.charCodeAt(0)) % 360
-  return `hsl(${h} 58% 58%)`
+  const hue = 10 + (h % 50) // 陶土红 ~ 玫瑰色的窄区间
+  return `linear-gradient(135deg, hsl(${hue} 72% 78%) 0%, hsl(${hue + 6} 58% 62%) 100%)`
 })
 
 const initial = computed(() => (props.site.title || '?').trim().charAt(0).toUpperCase())
