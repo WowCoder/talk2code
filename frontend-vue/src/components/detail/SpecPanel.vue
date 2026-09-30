@@ -1,7 +1,7 @@
 <template>
   <div class="spec-panel">
     <div class="spec-header">
-      📋 SPEC
+      SPEC
       <span v-if="specData?.complexity" :class="['complexity-badge', specData.complexity.toLowerCase()]">
         {{ specData.complexity }}
       </span>
@@ -9,13 +9,13 @@
     <div v-if="specData" class="spec-body">
       <!-- 需求复述 -->
       <div v-if="specData.requirement_restated" class="spec-section">
-        <div class="section-title">🎯 要做什么</div>
+        <div class="section-title">需求重述</div>
         <div class="spec-restated">{{ specData.requirement_restated }}</div>
       </div>
 
       <!-- 核心功能 -->
       <div v-if="specData.features?.length" class="spec-section">
-        <div class="section-title">🎯 核心功能</div>
+        <div class="section-title">核心功能</div>
         <div class="feature-list">
           <span v-for="(f, i) in specData.features" :key="i" class="feature-tag">{{ f }}</span>
         </div>
@@ -23,7 +23,7 @@
 
       <!-- 默认设置 -->
       <div v-if="specData.assumptions?.length" class="spec-section">
-        <div class="section-title">🔧 默认设置</div>
+        <div class="section-title">默认设置</div>
         <ul class="assumption-list">
           <li v-for="(a, i) in specData.assumptions" :key="i">{{ a }}</li>
         </ul>
@@ -31,7 +31,7 @@
 
       <!-- 验收条件 -->
       <div v-if="specData.acceptance_criteria?.length" class="spec-section">
-        <div class="section-title">✅ 验收条件 ({{ specData.acceptance_criteria.length }})</div>
+        <div class="section-title">验收条件 · {{ specData.acceptance_criteria.length }} 条</div>
         <div class="ac-section">
           <div
             v-for="(item, i) in specData.acceptance_criteria"
@@ -62,21 +62,21 @@
 
       <!-- 文件结构 -->
       <div v-if="specData.file_structure?.length" class="spec-section">
-        <div class="section-title">📁 文件结构 ({{ specData.file_structure.length }})</div>
+        <div class="section-title">文件结构 · {{ specData.file_structure.length }} 个文件</div>
         <div class="file-tree">
           <div
             v-for="(file, i) in specData.file_structure"
             :key="i"
             class="file-tree-file"
           >
-            📄 {{ file }}
+            {{ file }}
           </div>
         </div>
       </div>
 
       <!-- 技术栈：工程细节排在最后 -->
       <div v-if="techStackItems.length" class="spec-section">
-        <div class="section-title">⚙️ 技术栈</div>
+        <div class="section-title">技术栈</div>
         <div class="tech-stack">
           <span v-for="(item, i) in techStackItems" :key="i" class="tech-badge">{{ item }}</span>
         </div>
@@ -186,8 +186,8 @@ function severityLabel(severity: string): string {
 
 <style scoped>
 .spec-panel {
-  background: var(--surface);
-  border: 1px solid var(--border);
+  background: var(--wb-surface);
+  border: 1px solid var(--wb-border);
   border-radius: 10px;
   overflow-y: auto;
 }
@@ -196,8 +196,8 @@ function severityLabel(severity: string): string {
   padding: 10px 14px;
   font-size: 13px;
   font-weight: 600;
-  color: var(--fg);
-  border-bottom: 1px solid var(--border);
+  color: var(--wb-fg);
+  border-bottom: 1px solid var(--wb-border);
   display: flex;
   align-items: center;
   gap: 8px;
@@ -226,7 +226,7 @@ function severityLabel(severity: string): string {
 
 .spec-section {
   padding: 8px 0;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--wb-border);
 }
 
 .spec-section:last-child {
@@ -236,7 +236,7 @@ function severityLabel(severity: string): string {
 .section-title {
   font-size: 11px;
   font-weight: 600;
-  color: var(--muted);
+  color: var(--wb-muted);
   text-transform: uppercase;
   letter-spacing: 0.03em;
   padding: 0 14px 4px;
@@ -280,7 +280,7 @@ function severityLabel(severity: string): string {
 .spec-text {
   padding: 0 14px;
   font-size: 12px;
-  color: var(--fg);
+  color: var(--wb-fg);
   line-height: 1.5;
 }
 
@@ -288,7 +288,7 @@ function severityLabel(severity: string): string {
   padding: 0 14px;
   font-size: 13px;
   font-weight: 600;
-  color: var(--fg);
+  color: var(--wb-fg);
   line-height: 1.5;
 }
 
@@ -296,7 +296,7 @@ function severityLabel(severity: string): string {
   margin: 0;
   padding: 0 14px 0 30px;
   font-size: 12px;
-  color: var(--fg);
+  color: var(--wb-fg);
   line-height: 1.6;
 }
 
@@ -312,7 +312,7 @@ function severityLabel(severity: string): string {
   gap: 6px;
   padding: 6px 14px;
   font-size: 13px;
-  color: var(--fg);
+  color: var(--wb-fg);
   border-left: 3px solid transparent;
 }
 
@@ -336,7 +336,7 @@ function severityLabel(severity: string): string {
 }
 
 .ac-item.not_applicable {
-  border-left-color: var(--border);
+  border-left-color: var(--wb-border);
   opacity: 0.7;
 }
 
@@ -362,7 +362,7 @@ function severityLabel(severity: string): string {
   width: 100%;
   padding: 2px 0 0 30px;
   font-size: 11px;
-  color: var(--muted);
+  color: var(--wb-muted);
   line-height: 1.4;
   font-style: italic;
 }
@@ -371,7 +371,7 @@ function severityLabel(severity: string): string {
   width: 100%;
   padding: 4px 0 0 30px;
   font-size: 12px;
-  color: var(--muted);
+  color: var(--wb-muted);
   line-height: 1.4;
 }
 
@@ -396,13 +396,13 @@ function severityLabel(severity: string): string {
 .file-tree-folder {
   font-size: 13px;
   font-weight: 600;
-  color: var(--fg);
+  color: var(--wb-fg);
   padding: 2px 0;
 }
 
 .file-tree-file {
   font-size: 12px;
-  color: var(--muted);
+  color: var(--wb-muted);
   padding: 1px 0 1px 0;
 }
 
@@ -410,13 +410,13 @@ function severityLabel(severity: string): string {
   padding: 24px 14px;
   text-align: center;
   font-size: 13px;
-  color: var(--muted);
+  color: var(--wb-muted);
 }
 
 /* ---- Evaluator 结果 ---- */
 
 .evaluator-section {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--wb-border);
   margin-top: 8px;
   padding: 8px 0;
 }
@@ -425,13 +425,13 @@ function severityLabel(severity: string): string {
   padding: 8px 14px 4px;
   font-size: 14px;
   font-weight: 600;
-  color: var(--fg);
+  color: var(--wb-fg);
 }
 
 .evaluator-summary {
   padding: 0 14px 8px;
   font-size: 12px;
-  color: var(--muted);
+  color: var(--wb-muted);
   line-height: 1.4;
 }
 
@@ -449,7 +449,7 @@ function severityLabel(severity: string): string {
 
 .score-dim {
   width: 80px;
-  color: var(--muted);
+  color: var(--wb-muted);
   text-transform: capitalize;
   flex-shrink: 0;
 }
@@ -457,7 +457,7 @@ function severityLabel(severity: string): string {
 .score-bar-bg {
   flex: 1;
   height: 6px;
-  background: var(--border);
+  background: var(--wb-border);
   border-radius: 3px;
   overflow: hidden;
 }
@@ -484,7 +484,7 @@ function severityLabel(severity: string): string {
 .score-val {
   width: 32px;
   text-align: right;
-  color: var(--fg);
+  color: var(--wb-fg);
   font-weight: 600;
   flex-shrink: 0;
 }
@@ -496,7 +496,7 @@ function severityLabel(severity: string): string {
 .findings-title {
   font-size: 12px;
   font-weight: 600;
-  color: var(--muted);
+  color: var(--wb-muted);
   margin-bottom: 4px;
 }
 
@@ -534,13 +534,13 @@ function severityLabel(severity: string): string {
 .finding-desc {
   flex: 1;
   min-width: 0;
-  color: var(--fg);
+  color: var(--wb-fg);
 }
 
 .finding-suggestion {
   width: 100%;
   padding-left: 20px;
   font-size: 11px;
-  color: var(--muted);
+  color: var(--wb-muted);
 }
 </style>

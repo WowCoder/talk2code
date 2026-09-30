@@ -144,28 +144,57 @@
       </div>
     </div>
 
-    <!-- 未发布 -->
+    <!-- 未发布：发布前最后一步（设计稿 2.5） -->
     <div v-else class="publish-card">
-      <div class="pc-head">
-        <h3>发布管理</h3>
-        <span class="pc-status">
-          <span class="pc-dot"></span>未发布
-        </span>
+      <div class="pc-pre-head">
+        <h3>发布前最后一步</h3>
+        <p class="pc-pre-sub">
+          点「发布」，就会拿到一个独立网址。链接保持不变，改了再发布也还是同一个。
+        </p>
       </div>
       <div class="pc-body">
-        <p class="pc-intro">
-          把当前生成的静态产物发布为一个可分享的链接。链接与内容解耦——重新发布同一需求，URL 不变、版本号 +1。
-        </p>
-        <div :class="['pc-meta-card', gate.tone]">
-          <span :class="['pc-dot', gate.tone]"></span>
-          <span :class="['pc-meta-label', gate.tone]">{{ gate.label }}</span>
-          <span v-if="assetSummary" class="pc-meta-sub">{{ assetSummary }}</span>
+        <!-- 就绪状态条：QA 结果直接说人话，不再让用户自己拼状态含义 -->
+        <div :class="['pc-gate-bar', gate.tone]">
+          <span class="pc-gate-dot"></span>
+          <span>{{ gate.barText }}</span>
+          <span v-if="assetSummary" class="pc-gate-files">{{ assetSummary }}</span>
         </div>
         <p v-if="gate.hint" :class="['pc-gate-hint', gate.tone]">{{ gate.hint }}</p>
+
+        <!-- 谁能看见：发布即生成链接，链接本来就是给别人的，
+             所以这里只有「先私享再定」和「直接上市集」两档，没有"仅自己" -->
+        <div class="pc-field-label">谁能看见</div>
+        <div class="pc-visibility">
+          <button
+            type="button"
+            :class="['pc-vis-card', { picked: visibilityChoice === 'link' }]"
+            @click="visibilityChoice = 'link'"
+          >
+            <span class="pc-vis-radio"></span>
+            <span class="pc-vis-body">
+              <span class="pc-vis-title">仅链接可访问（不上市集）</span>
+              <span class="pc-vis-desc">推荐 · 分享给别人前自己先用</span>
+            </span>
+          </button>
+          <button
+            type="button"
+            :class="['pc-vis-card', { picked: visibilityChoice === 'market' }]"
+            @click="visibilityChoice = 'market'"
+          >
+            <span class="pc-vis-radio"></span>
+            <span class="pc-vis-body">
+              <span class="pc-vis-title">公开 · 也同步到创意市集</span>
+              <span class="pc-vis-desc">上架后可随时在市集撤回</span>
+            </span>
+          </button>
+        </div>
+
         <button class="btn-publish" :disabled="publishing || !canPublish" @click="onPublish">
-          {{ publishing ? '发布中…' : '发布此需求' }}
+          {{ publishing ? '发布中…' : '发布' }}
         </button>
-        <p class="pc-tip">发布后会得到一个可分享的链接，访问者无需登录即可打开。</p>
+        <p class="pc-tip">
+          发布后会生成一个独立网址，访问者无需登录即可打开；上架市集可以随时撤回。
+        </p>
         <button v-if="gate.retryable" class="pc-link pc-retry" :disabled="store.isGenerating" @click="onRetry">
           {{ store.isGenerating ? '正在重新生成…' : '重新生成代码' }}
         </button>
@@ -247,6 +276,11 @@ const isPublishedButUnavailable = computed(
 )
 
 const warnings = computed(() => result.value?.warnings ?? [])
+
+// ===== 谁能看见（未发布态选择）=====
+// 发布本身就会生成公开链接，没有"仅自己"一档：链接不可访问等于没发布。
+// link = 只把链接给特定的人；market = 发布成功后顺手上架创意市集。
+const visibilityChoice = ref<'link' | 'market'>('link')
 
 // ===== 创意市集 =====
 // 上架一律 opt-in：默认不勾。现状所有站点都是 unlisted，用户预期是"只分享链接"，
@@ -397,6 +431,8 @@ const inProgress = computed(() => IN_PROGRESS_STATUSES.includes(reqStatus.value 
 interface Gate {
   tone: 'ready' | 'wait' | 'block'
   label: string
+  /** 就绪状态条文案（未发布态横条用） */
+  barText: string
   hint: string
   /** 能否就地重试生成（仅失败且无产物时） */
   retryable: boolean
@@ -404,12 +440,19 @@ interface Gate {
 
 const gate = computed<Gate>(() => {
   if (canPublish.value) {
-    return { tone: 'ready', label: '代码已就绪，可发布', hint: '', retryable: false }
+    return {
+      tone: 'ready',
+      label: '代码已就绪，可发布',
+      barText: 'QA 全部通过 · 代码已就绪，可以发布',
+      hint: '',
+      retryable: false,
+    }
   }
   if (inProgress.value) {
     return {
       tone: 'wait',
       label: '代码生成中',
+      barText: '代码生成中，等 QA 验收通过后就能发布',
       hint: '生成完成并通过 QA 验收后即可发布。',
       retryable: false,
     }
@@ -418,6 +461,7 @@ const gate = computed<Gate>(() => {
     return {
       tone: 'block',
       label: '尚未生成代码',
+      barText: '这次生成没有产出任何代码文件，还不能发布',
       hint: '这次生成没有产出任何代码文件，发布需要一次通过 QA 验收的生成结果。',
       retryable: reqStatus.value === 'failed',
     }
@@ -426,6 +470,7 @@ const gate = computed<Gate>(() => {
     return {
       tone: 'block',
       label: '存在未解决的关键缺陷',
+      barText: 'QA 发现关键缺陷并拦截了交付，先在对话里修复吧',
       hint: 'QA 验收发现了关键缺陷并拦截了交付，建议先在对话中修复再通过验收。',
       retryable: false,
     }
@@ -433,6 +478,7 @@ const gate = computed<Gate>(() => {
   return {
     tone: 'block',
     label: '代码已生成，QA 验收未通过',
+    barText: '产物可用，但 QA 验收未全部通过',
     hint: '产物可用，但验收未全部通过；通过验收后再发布能让拿到链接的人获得完整体验。',
     retryable: false,
   }
@@ -498,6 +544,15 @@ async function onPublish() {
     result.value = data
     if (data.url) {
       show('发布成功', 'success')
+      // 发布前选了「公开」：拿到 slug 后立即上架创意市集（listed 是市集侧开关）
+      if (visibilityChoice.value === 'market' && data.slug) {
+        try {
+          marketListed.value = true
+          await syncMarket()
+        } catch {
+          // syncMarket 内部已回滚开关并写 marketError，这里不再叠加错误
+        }
+      }
     } else {
       show('已保存产物，但当前没有可访问的发布域名', 'error')
     }
@@ -542,16 +597,16 @@ async function copyUrl() {
 </script>
 
 <style scoped>
-/* ===== 容器：与 SpecPanel/TaskPanel 同构 —— 卡片铺满右栏，不再 max-width 居中 ===== */
+/* ===== 容器：铺在右侧深色工作台上，全部走 wb token ===== */
 .publish-panel {
   padding: 12px;
-  color: var(--fg);
+  color: var(--wb-fg);
   font-family: var(--font-body);
 }
 
 .publish-card {
-  background: var(--surface);
-  border: 1px solid var(--border);
+  background: var(--wb-surface);
+  border: 1px solid var(--wb-border);
   border-radius: 10px;
   overflow: hidden;
 }
@@ -561,8 +616,8 @@ async function copyUrl() {
   padding: 10px 14px;
   font-size: 13px;
   font-weight: 600;
-  color: var(--fg);
-  border-bottom: 1px solid var(--border);
+  color: var(--wb-fg);
+  border-bottom: 1px solid var(--wb-border);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -572,7 +627,7 @@ async function copyUrl() {
   margin: 0;
   font-size: 13px;
   font-weight: 600;
-  color: var(--fg);
+  color: var(--wb-fg);
 }
 
 /* ===== 状态 pill（标题栏右侧） ===== */
@@ -584,7 +639,7 @@ async function copyUrl() {
   font-weight: 500;
   padding: 3px 10px;
   border-radius: 999px;
-  background: #f5f5f5;
+  background: var(--wb-hover);
   color: #6b6b6b;
 }
 .pc-status.online {
@@ -596,7 +651,7 @@ async function copyUrl() {
   color: #a16207;
 }
 .pc-status.loading {
-  background: #f5f5f5;
+  background: var(--wb-hover);
   color: #6b6b6b;
 }
 .pc-dot {
@@ -628,17 +683,159 @@ async function copyUrl() {
   gap: 14px;
 }
 
+/* ===== 发布前最后一步：标题区 ===== */
+.pc-pre-head {
+  padding: 14px 18px 12px;
+  border-bottom: 1px solid var(--wb-border);
+}
+
+.pc-pre-head h3 {
+  margin: 0 0 4px;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--wb-fg);
+}
+
+.pc-pre-sub {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--wb-muted);
+  line-height: 1.6;
+}
+
+/* ===== 就绪状态条 ===== */
+.pc-gate-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.pc-gate-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: currentColor;
+  flex-shrink: 0;
+}
+
+.pc-gate-files {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  opacity: 0.75;
+}
+
+.pc-gate-bar.ready {
+  background: rgba(76, 138, 90, 0.16);
+  border: 1px solid rgba(76, 138, 90, 0.4);
+  color: #7fbf8c;
+}
+
+.pc-gate-bar.wait {
+  background: rgba(185, 138, 46, 0.14);
+  border: 1px solid rgba(185, 138, 46, 0.4);
+  color: #d8b46a;
+}
+
+.pc-gate-bar.block {
+  background: rgba(192, 84, 74, 0.14);
+  border: 1px solid rgba(192, 84, 74, 0.4);
+  color: #e08a80;
+}
+
+/* ===== 谁能看见 ===== */
+.pc-field-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--wb-fg);
+  margin-top: 2px;
+}
+
+.pc-visibility {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.pc-vis-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--wb-border);
+  background: var(--wb-elevated);
+  cursor: pointer;
+  text-align: left;
+  font-family: var(--font-body);
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.pc-vis-card:hover {
+  border-color: var(--wb-muted);
+}
+
+.pc-vis-card.picked {
+  border-color: var(--accent);
+  background: rgba(207, 106, 95, 0.1);
+}
+
+.pc-vis-radio {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1.5px solid var(--wb-muted);
+  flex-shrink: 0;
+  margin-top: 2px;
+  position: relative;
+}
+
+.pc-vis-card.picked .pc-vis-radio {
+  border-color: var(--accent);
+}
+
+.pc-vis-card.picked .pc-vis-radio::after {
+  content: '';
+  position: absolute;
+  inset: 2.5px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.pc-vis-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.pc-vis-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--wb-fg);
+}
+
+.pc-vis-desc {
+  font-size: 11px;
+  color: var(--wb-muted);
+  line-height: 1.5;
+}
+
 /* 介绍 / 提示段落 */
 .pc-intro,
 .pc-loading-hint,
 .pc-tip {
   margin: 0;
   font-size: 13px;
-  color: var(--fg);
+  color: var(--wb-fg);
   line-height: 1.6;
 }
-.pc-loading-hint { color: var(--muted); }
-.pc-tip { color: var(--muted); }
+.pc-loading-hint { color: var(--wb-muted); }
+.pc-tip { color: var(--wb-muted); }
 
 /* ===== 元信息行（版本 · 时间 · 访问数）===== */
 .pc-meta {
@@ -647,13 +844,13 @@ async function copyUrl() {
   gap: 12px;
   flex-wrap: wrap;
   font-size: 12px;
-  color: var(--muted);
+  color: var(--wb-muted);
 }
 .pc-meta span { white-space: nowrap; }
 .pc-sep {
   width: 1px !important;
   height: 12px;
-  background: var(--border);
+  background: var(--wb-border);
   display: inline-block;
 }
 
@@ -664,12 +861,12 @@ async function copyUrl() {
   gap: 8px;
   padding: 8px 12px;
   border-radius: 6px;
-  background: #fafafa;
-  border: 1px solid var(--border);
+  background: var(--wb-elevated);
+  border: 1px solid var(--wb-border);
   font-size: 12px;
 }
 .pc-meta-sub {
-  color: var(--muted);
+  color: var(--wb-muted);
   margin-left: auto;
   font-family: var(--font-mono);
   font-size: 12px;
@@ -702,7 +899,7 @@ async function copyUrl() {
 .pc-market {
   margin-top: 14px;
   padding-top: 12px;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--wb-border);
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -712,17 +909,17 @@ async function copyUrl() {
   align-items: center;
   gap: 7px;
   font-size: 13px;
-  color: var(--fg);
+  color: var(--wb-fg);
   cursor: pointer;
 }
 .pc-switch.small {
   font-size: 12px;
-  color: var(--muted);
+  color: var(--wb-muted);
 }
 .pc-market-hint {
   margin: 0;
   font-size: 12px;
-  color: var(--muted);
+  color: var(--wb-muted);
   line-height: 1.6;
 }
 .pc-market-extra {
@@ -733,10 +930,10 @@ async function copyUrl() {
 .pc-note {
   width: 100%;
   padding: 7px 10px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--wb-border);
   border-radius: 8px;
-  background: var(--bg);
-  color: var(--fg);
+  background: var(--wb-elevated);
+  color: var(--wb-fg);
   font-size: 13px;
 }
 .pc-note:focus {
@@ -760,8 +957,8 @@ async function copyUrl() {
   height: 68px;
   flex-shrink: 0;
   border-radius: 8px;
-  border: 1px solid var(--border);
-  background: #fafafa;
+  border: 1px solid var(--wb-border);
+  background: var(--wb-elevated);
   overflow: hidden;
   display: flex;
   align-items: center;
@@ -775,7 +972,7 @@ async function copyUrl() {
 }
 .pc-cover-ph {
   font-size: 11px;
-  color: var(--muted);
+  color: var(--wb-muted);
 }
 .pc-cover-ops {
   flex: 1;
@@ -790,10 +987,10 @@ async function copyUrl() {
   display: inline-flex;
   align-items: center;
   padding: 5px 12px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--wb-border);
   border-radius: 8px;
-  background: var(--surface);
-  color: var(--fg);
+  background: var(--wb-surface);
+  color: var(--wb-fg);
   font-size: 12px;
   cursor: pointer;
 }
@@ -809,7 +1006,7 @@ async function copyUrl() {
 .pc-cover-hint {
   margin: 0;
   font-size: 11px;
-  color: var(--muted);
+  color: var(--wb-muted);
   line-height: 1.6;
 }
 
@@ -822,7 +1019,7 @@ async function copyUrl() {
 .pc-url-label {
   font-size: 11px;
   font-weight: 600;
-  color: var(--muted);
+  color: var(--wb-muted);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
@@ -832,11 +1029,11 @@ async function copyUrl() {
   gap: 10px;
   padding: 8px 12px;
   border-radius: 8px;
-  background: #fafafa;
-  border: 1px solid var(--border);
+  background: var(--wb-elevated);
+  border: 1px solid var(--wb-border);
 }
 .pc-url-box.disabled {
-  background: #fafafa;
+  background: var(--wb-elevated);
   border-style: dashed;
 }
 .pc-url {
@@ -852,20 +1049,20 @@ async function copyUrl() {
 }
 .pc-url:hover { text-decoration: underline; }
 .pc-url-text.muted {
-  color: var(--muted);
+  color: var(--wb-muted);
   font-size: 12px;
 }
 .pc-copy {
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--fg);
+  border: 1px solid var(--wb-border);
+  background: var(--wb-surface);
+  color: var(--wb-fg);
   border-radius: 6px;
   padding: 4px 10px;
   font-size: 12px;
   cursor: pointer;
   flex-shrink: 0;
 }
-.pc-copy:hover { background: #fafafa; }
+.pc-copy:hover { background: var(--wb-elevated); }
 .pc-copy:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* ===== 警示框（域名未配置）===== */
@@ -920,9 +1117,9 @@ async function copyUrl() {
 .btn-publish:disabled { opacity: 0.5; cursor: not-allowed; }
 /* 已发布但 url 不可用态：灰底，主操作降级 */
 .btn-publish.btn-secondary {
-  background: #f5f5f5;
-  color: var(--muted);
-  border: 1px solid var(--border);
+  background: var(--wb-hover);
+  color: var(--wb-muted);
+  border: 1px solid var(--wb-border);
 }
 
 /* ===== 次操作（重新发布 / 取消发布）===== */
@@ -939,10 +1136,10 @@ async function copyUrl() {
   padding: 0;
   font-family: var(--font-body);
   font-size: 12px;
-  color: var(--muted);
+  color: var(--wb-muted);
   cursor: pointer;
 }
-.pc-link:hover:not(:disabled) { color: var(--fg); text-decoration: underline; }
+.pc-link:hover:not(:disabled) { color: var(--wb-fg); text-decoration: underline; }
 .pc-link:disabled { opacity: 0.5; cursor: not-allowed; }
 .pc-link.pc-danger { color: #dc2626; }
 .pc-link.pc-danger:hover:not(:disabled) { color: #b91c1c; }
@@ -951,7 +1148,7 @@ async function copyUrl() {
 .pc-skel {
   height: 14px;
   border-radius: 4px;
-  background: #f0f0f0;
+  background: var(--wb-hover);
 }
 .pc-skel.skel-long { width: 100%; }
 .pc-skel.skel-mid { width: 80%; }
@@ -959,7 +1156,7 @@ async function copyUrl() {
 .pc-skel-url {
   height: 38px;
   border-radius: 8px;
-  background: #f5f5f5;
+  background: var(--wb-hover);
   border: 1px solid #eaeaea;
 }
 
