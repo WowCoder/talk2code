@@ -1,24 +1,84 @@
 <template>
   <div class="section">
-    <h3 class="section-title">关于</h3>
-    <div class="about-table">
-      <div class="about-row">
-        <span class="about-key">版本</span>
-        <span class="about-val">v2.0.0</span>
-      </div>
-      <div class="about-row">
-        <span class="about-key">构建日期</span>
-        <span class="about-val">2026.05.20</span>
-      </div>
-      <div class="about-row">
-        <span class="about-key">技术栈</span>
-        <span class="about-val">Vue 3 + Flask + LangGraph + SSE</span>
-      </div>
-      <div class="about-row">
-        <span class="about-key">设计系统</span>
-        <span class="about-val">Warm Soft</span>
+    <h3 class="section-title">关于 Talk2Code</h3>
+    <p class="section-sub">版本号、更新日志、条款都放在这，出问题从这里也能找到联系方式</p>
+
+    <!-- 版本卡 -->
+    <div class="brand-card">
+      <div class="brand-row">
+        <img src="@/assets/logo.png" alt="Talk2Code" class="brand-logo" />
+        <div class="brand-info">
+          <div class="brand-name-row">
+            <span class="brand-name">Talk2Code</span>
+            <span class="version-pill">v0.4</span>
+            <span class="brand-stage">内测开放中</span>
+          </div>
+          <p class="brand-desc">
+            用多智能体协作，把「想做的事」变成可运行的代码。
+            TeamLeader 拆任务、Coder 写代码、QA 在浏览器里实际跑，三角色循环迭代，
+            每一轮都有真人确认。
+          </p>
+        </div>
       </div>
     </div>
+
+    <!-- 更新日志：只记录真实存在的版本，更早的指向 GitHub commits，
+         不在界面上虚构没有发生过的版本号 -->
+    <div class="changelog-card">
+      <div class="changelog-title">更新日志</div>
+      <div class="changelog-current">
+        <div class="cl-row">
+          <span class="cl-version">v0.4</span>
+          <span class="cl-tag">当前版本</span>
+        </div>
+        <div class="cl-desc">内测开放 · 历史记录 / 创意市集上线 · 主应用改版</div>
+      </div>
+      <div class="changelog-older">
+        <span>更早的版本没正式记录 · 想看开发过程可以从 GitHub commits 翻起 →</span>
+        <a
+          class="commits-btn"
+          href="https://github.com/WowCoder/talk2code/commits/main"
+          target="_blank"
+          rel="noopener"
+        >看 commits</a>
+      </div>
+    </div>
+
+    <!-- 条款 / 隐私 / 联系：三列等高卡片 -->
+    <div class="info-grid">
+      <div class="info-card">
+        <svg class="info-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
+             stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4z"/>
+          <path d="M9 12l2 2 4-4"/>
+        </svg>
+        <h4 class="info-title">服务条款</h4>
+        <p class="info-desc">你发布的内容归你 · 我们不扫描 · 保留 30 天后自动归档</p>
+      </div>
+      <div class="info-card">
+        <svg class="info-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
+             stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="9"/>
+          <circle cx="12" cy="12" r="3.5"/>
+        </svg>
+        <h4 class="info-title">隐私政策</h4>
+        <p class="info-desc">只收集用于改进生成效果的反馈 · 不做广告画像 · 可一键导出</p>
+      </div>
+      <div class="info-card">
+        <svg class="info-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
+             stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="5" width="18" height="14" rx="2"/>
+          <path d="M3 7l9 6 9-6"/>
+        </svg>
+        <h4 class="info-title">联系我们</h4>
+        <p class="info-desc">Bug / 合作 / 内测邀请都欢迎 · 一般 1 个工作日内回复</p>
+        <a class="info-link" href="mailto:leon@talk2code.app">写信 →</a>
+      </div>
+    </div>
+
+    <footer class="about-footer">
+      © 2026 Talk2Code · 由 leon@talk2code.app 维护 · 所有内容采用 CC BY-SA 4.0 · 用 Newsreader + Noto Sans SC 排版
+    </footer>
   </div>
 </template>
 
@@ -28,35 +88,211 @@
   font-size: 18px;
   font-weight: 600;
   color: var(--fg);
-  margin-bottom: 20px;
+  margin-bottom: 4px;
 }
 
-.about-table {
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  overflow: hidden;
-}
-
-.about-row {
-  display: flex;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--border);
-}
-
-.about-row:last-child {
-  border-bottom: none;
-}
-
-.about-key {
-  width: 120px;
-  font-size: 13px;
+.section-sub {
+  font-size: 12.5px;
   color: var(--muted);
+  margin: 0 0 18px;
+}
+
+/* ===== 版本卡 ===== */
+.brand-card {
+  background: var(--accent-soft);
+  border: 1px solid rgba(207, 106, 95, 0.2);
+  border-radius: 14px;
+  padding: 20px;
+  margin-bottom: 14px;
+}
+
+.brand-row {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.brand-logo {
+  width: 52px;
+  height: 52px;
+  border-radius: 12px;
   flex-shrink: 0;
 }
 
-.about-val {
-  font-size: 13px;
+.brand-info {
+  min-width: 0;
+}
+
+.brand-name-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.brand-name {
+  font-family: var(--font-display);
+  font-size: 19px;
+  font-weight: 700;
   color: var(--fg);
-  font-weight: 500;
+}
+
+.version-pill {
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.brand-stage {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.brand-desc {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--fg);
+}
+
+/* ===== 更新日志 ===== */
+.changelog-card {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 16px 18px;
+  margin-bottom: 14px;
+  background: var(--surface);
+}
+
+.changelog-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  margin-bottom: 12px;
+}
+
+.changelog-current {
+  background: var(--bg);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+
+.cl-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 3px;
+}
+
+.cl-version {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--accent-strong);
+}
+
+.cl-tag {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent-strong);
+}
+
+.cl-desc {
+  font-size: 12.5px;
+  color: var(--fg);
+}
+
+.changelog-older {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.commits-btn {
+  flex-shrink: 0;
+  padding: 6px 14px;
+  border-radius: 8px;
+  background: var(--fg);
+  color: #fffbf6;
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+  transition: opacity 0.15s;
+}
+
+.commits-btn:hover {
+  opacity: 0.85;
+}
+
+/* ===== 条款三列（layoutGrow + 等高对齐由 grid 保证）===== */
+.info-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.info-card {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 16px;
+  background: var(--surface);
+}
+
+.info-icon {
+  color: var(--accent);
+  margin-bottom: 10px;
+}
+
+.info-title {
+  margin: 0 0 6px;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.info-desc {
+  margin: 0 0 10px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--muted);
+  flex: 1;
+}
+
+.info-link {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-strong);
+  text-decoration: none;
+}
+
+.info-link:hover {
+  text-decoration: underline;
+}
+
+.about-footer {
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--faint);
+  padding-top: 6px;
+}
+
+@media (max-width: 640px) {
+  .info-grid {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

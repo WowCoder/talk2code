@@ -22,9 +22,9 @@ defineEmits<{
 }>()
 
 const sections = [
-  { key: 'profile', label: '个人资料' },
-  { key: 'appearance', label: '外观偏好' },
-  { key: 'account', label: '账户安全' },
+  { key: 'profile', label: '资料' },
+  { key: 'appearance', label: '外观' },
+  { key: 'account', label: '账号' },
   { key: 'about', label: '关于' },
 ]
 </script>

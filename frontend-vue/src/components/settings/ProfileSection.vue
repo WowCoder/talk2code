@@ -1,6 +1,6 @@
 <template>
   <div class="section">
-    <h3 class="section-title">个人资料</h3>
+    <h3 class="section-title">资料</h3>
     <div class="profile-avatar-row">
       <Avatar :username="authStore.username" size="lg" />
       <div>

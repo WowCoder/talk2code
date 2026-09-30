@@ -1,6 +1,6 @@
 <template>
   <div class="section">
-    <h3 class="section-title">账户安全</h3>
+    <h3 class="section-title">账号与安全</h3>
     <div class="form-group">
       <label class="form-label">当前密码</label>
       <input v-model="currentPassword" type="password" class="input-field" placeholder="输入当前密码" />
