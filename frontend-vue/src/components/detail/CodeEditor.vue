@@ -73,6 +73,8 @@ const languageCompartment = new Compartment()
 function buildExtensions(): Extension[] {
   return [
     basicSetup,
+    // 软换行：长行折行显示而不是出横向滚动条（右侧宽度有限，拖分栏也消不掉）
+    EditorView.lineWrapping,
     languageCompartment.of(getLanguageExtension(props.filename)),
     EditorView.updateListener.of((update) => {
       if (update.docChanged) {

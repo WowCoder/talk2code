@@ -1,6 +1,5 @@
 <template>
   <div class="file-tree">
-    <div class="file-tree-header">工作区</div>
     <div class="file-tree-body">
       <div v-if="!files.length" class="file-empty">
         暂无文件
@@ -41,39 +40,18 @@ defineEmits<{
 
 <style scoped>
 .file-tree {
-  width: 220px;
-  flex-shrink: 0;
-  background: var(--dark-surface);
-  border-right: 1px solid var(--dark-border);
+  /* 不再固定 220px：外层 .code-side 是 208px，固定宽会横向溢出，
+     溢出会让侧栏凭空多出一条拖分栏也消不掉的滚动条 */
+  width: 100%;
+  min-width: 0;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
-}
-
-.file-tree-header {
-  padding: 10px 14px;
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.03em;
-  color: var(--dark-muted);
-  text-transform: uppercase;
-  border-bottom: 1px solid var(--dark-border);
-  flex-shrink: 0;
+  /* 不自建滚动容器：滚动统一交给外层 .code-side，避免双滚动条 */
+  overflow: visible;
 }
 
 .file-tree-body {
-  flex: 1;
-  overflow-y: auto;
   padding: 6px 0;
-}
-
-.file-tree-body::-webkit-scrollbar {
-  width: 4px;
-}
-
-.file-tree-body::-webkit-scrollbar-thumb {
-  background: oklch(35% 0.012 60);
-  border-radius: 2px;
 }
 
 .file-empty {

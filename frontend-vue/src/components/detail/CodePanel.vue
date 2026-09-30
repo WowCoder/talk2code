@@ -168,7 +168,22 @@ function onContentChange(content: string) {
   border-right: 1px solid var(--wb-border);
   background: var(--wb-surface);
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 8px 0 16px;
+}
+
+/* 侧栏唯一滚动条：细条 + 跟随主题，文件不多时不会出现 */
+.code-side::-webkit-scrollbar {
+  width: 4px;
+}
+
+.code-side::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--wb-faint) 55%, transparent);
+  border-radius: 2px;
+}
+
+.code-side::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .code-side-label {
@@ -184,6 +199,15 @@ function onContentChange(content: string) {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
+}
+
+/* 编辑器占满顶栏以下的空间并自行滚动；
+   height:100% 会把顶栏高度也撑进去造成 1px 溢出 → 外层出滚动条 */
+.code-main :deep(.code-editor-container) {
+  flex: 1;
+  min-height: 0;
+  height: auto;
 }
 
 /* 编辑器顶栏：当前文件 + 下载 / 复制（设计稿同一栏） */

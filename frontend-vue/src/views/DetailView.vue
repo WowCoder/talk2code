@@ -83,8 +83,8 @@
           <PreviewFrame />
         </div>
 
-        <!-- Code view -->
-        <div v-show="activeTab === 'code'" class="view active">
+        <!-- Code view：编辑器自己管理滚动，外层不再滚动，避免双滚动条 -->
+        <div v-show="activeTab === 'code'" class="view active view-embed">
           <CodePanel @download="onDownload" />
         </div>
 
@@ -633,6 +633,12 @@ function escapeInlineScript(content: string): string {
   overflow-y: auto;
   display: flex;
   flex-direction: column;
+}
+
+/* 代码/预览这类自带滚动的视图：外层锁死溢出，滚动交给内部，
+   否则会出现一条无法通过拖宽分栏消除的多余滚动条 */
+.view-embed {
+  overflow: hidden;
 }
 
 /* QA 验收中提示条：Catherine 正在驱动浏览器，预览画面在被真实操作 */
