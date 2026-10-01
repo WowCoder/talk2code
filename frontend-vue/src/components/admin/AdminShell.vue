@@ -28,6 +28,13 @@
         <span v-if="pending > 0" class="nav-badge">{{ pending > 99 ? '99+' : pending }}</span>
       </RouterLink>
 
+      <RouterLink to="/admin/traces" class="nav-item" active-class="active">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 12h4l2.5-6 4 12L16 12h5" />
+        </svg>
+        <span class="nav-label">需求轨迹</span>
+      </RouterLink>
+
       <p class="nav-group">规划中</p>
 
       <!-- 后端目前只有登录 / 邀请码 / 指标三类接口，未落地的模块按「规划中」置灰，

@@ -81,6 +81,19 @@ const router = createRouter({
       meta: { requiresAuth: false, requiresAdmin: true },
     },
     {
+      path: '/admin/traces',
+      name: 'AdminTraces',
+      component: () => import('@/views/admin/AdminTracesView.vue'),
+      meta: { requiresAuth: false, requiresAdmin: true },
+    },
+    {
+      // 单需求的时间线 / 轮次 / 事件明细
+      path: '/admin/traces/:id',
+      name: 'AdminTraceDetail',
+      component: () => import('@/views/admin/AdminTraceDetailView.vue'),
+      meta: { requiresAuth: false, requiresAdmin: true },
+    },
+    {
       path: '/:pathMatch(.*)*',
       redirect: '/',
     },
