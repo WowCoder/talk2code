@@ -71,3 +71,13 @@ backend/published/
 # SQLite WAL 侧车文件（运行时产物）
 *.db-shm
 *.db-wal
+
+# SQLite 内存库被当成文件路径时的残留
+# （DATABASE_URL 配成 ":memory:" 时，有的代码路径会真的落盘一个名叫 ":memory:" 的库文件）
+backend/:memory:
+backend/:memory:-shm
+backend/:memory:-wal
+
+# 命令行参数被误当作文件名时留下的产物
+# （如 `agent-browser screenshot --full-page <path>` 把 --full-page 当成了输出名）
+/--full-page
