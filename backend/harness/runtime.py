@@ -81,9 +81,53 @@ class ToolCallLoop:
         self._settings = _settings
         self._max_tokens = _settings.LLM_MAX_TOKENS
 
+        # run 级复用的可观测性 writer（见 run/_run_impl）。None 表示未启用，
+        # 此时埋点走每事件一个短 session 的降级路径。
+        self._trace_writer = None
+
     def run(self, state: AgentState) -> AgentState:
+        """整个 run 内复用一个 TraceWriter。
+
+        为什么不在每个事件里单开 session：seq 是「读 MAX + 1」分配，每事件
+        都要多一次 MAX 查询 + 一次 session 创建，一个需求上百个事件就是上百次
+        额外 DB 往返，全压在生成主链路上。这里在入口建一个长 writer，
+        在 finally 关闭；建不出来（DB 不可用 / 无 requirement_id）就退回
+        原来的短 session 路径，埋点不会因此丢失。
+        """
+        req_id = (state.get("metadata", {}).get("requirement_id")
+                  or state.get("requirement_id"))
+        db = None
+        if req_id:
+            try:
+                from models.models import SessionLocal
+                from harness.observability.trace_writer import TraceWriter
+                md = state.get("metadata") or {}
+                db = SessionLocal()
+                self._trace_writer = TraceWriter(
+                    db, requirement_id=req_id,
+                    trace_id=md.get("trace_id") or None,
+                    turn_index=int(md.get("turn_index") or 0),
+                )
+            except Exception as e:
+                logger.debug(f"[TraceWriter] run 级 writer 创建失败（降级为逐事件写入）: {e}")
+                self._trace_writer = None
+                db = None
+        try:
+            return self._run_impl(state)
+        finally:
+            self._trace_writer = None
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
+    def _run_impl(self, state: AgentState) -> AgentState:
         client = get_client()
         trace_id = state.get("metadata", {}).get("trace_id", "")
+        # 对话轮次：初次生成为 0；多轮对话由 chat 路由按「已有最大轮次 + 1」写入。
+        # 不在这里从 dialogue_history 派生 —— 那样既慢又脆弱（见 TraceWriter 注释）。
+        turn_index = int(state.get("metadata", {}).get("turn_index") or 0)
 
         # 每次进入 run() 重置运行时计数器，避免多轮调用（如逐文件编码、修复循环）间状态污染
         state["no_progress_count"] = 0
@@ -220,22 +264,27 @@ class ToolCallLoop:
                     span.metadata["tokens"] = input_tokens + output_tokens
                 self.tracer.end_span(span)
 
-            # 开发排查：记录本轮完整 LLM 请求参数与原始返回（AGENT_EXEC_LOG=1 时生效）
+            # 统一埋点：文件明细（AGENT_EXEC_LOG=1）+ 运营后台索引。
+            # 以前只写文件 —— 运营后台因此查不到任何实时数据，只能靠回填脚本补。
             try:
-                from harness.observability import exec_log
-                exec_log.log_llm_turn(
-                    req_id, iteration + 1, getattr(client, "model", None),
-                    messages,
-                    self.tools.get_schemas() if self.tools else [],
-                    response,
+                from harness.observability.trace_writer import record_llm_turn
+                from harness.observability.event_contract import STAGE_CODING
+                record_llm_turn(
+                    req_id, stage=STAGE_CODING,
+                    iteration=iteration + 1, model=getattr(client, "model", None),
+                    messages=messages,
+                    tools=self.tools.get_schemas() if self.tools else [],
+                    response=response,
                     thinking=thinking_mode,
                     latency_ms=(
                         round((span.end_time - span.start_time) * 1000, 1)
                         if span and span.end_time else None
                     ),
+                    turn_index=turn_index, trace_id=trace_id,
+                    writer=self._trace_writer,
                 )
             except Exception as _e:
-                logger.debug(f"[ExecLog] llm_turn 记录失败（不阻断）: {_e}")
+                logger.debug(f"[TraceWriter] llm_turn 记录失败（不阻断）: {_e}")
 
             # 诊断日志（生产环境可关闭）
             from harness.observability.logger import get_logger
@@ -488,12 +537,17 @@ class ToolCallLoop:
                     result = self._execute_tool(state, tc)
                 logger.info(f"[ToolLoop] 执行 {tc.name}: success={result.success} content={result.content[:100] if result.success else ''} error={result.error[:100] if not result.success else ''}")
 
-                # 开发排查：记录工具调用入参/结果（AGENT_EXEC_LOG=1 时生效）
+                # 统一埋点：文件明细 + 运营后台索引
                 try:
-                    from harness.observability import exec_log
-                    exec_log.log_tool_call(req_id, iteration + 1, tc.name, tc.arguments, result)
+                    from harness.observability.trace_writer import record_tool_call
+                    record_tool_call(
+                        req_id, name=tc.name, arguments=tc.arguments,
+                        result=result, iteration=iteration + 1,
+                        turn_index=turn_index, trace_id=trace_id,
+                        writer=self._trace_writer,
+                    )
                 except Exception as _e:
-                    logger.debug(f"[ExecLog] tool_call 记录失败（不阻断）: {_e}")
+                    logger.debug(f"[TraceWriter] tool_call 记录失败（不阻断）: {_e}")
 
                 # 生成前端展示用简短标签
                 display_readable = self._tool_display_label(tc.name, tc.arguments, result)

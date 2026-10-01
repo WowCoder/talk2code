@@ -52,23 +52,34 @@ class CostTracker:
         # 中转是安全的；trace_id 全局唯一，不会跨 trace 串台。
         self._pending_cache: dict[str, int] = {}
 
+    @classmethod
+    def price_for(cls, model: str) -> dict:
+        """取模型单价（美元 / 百万 token）。
+
+        未登记的模型走前缀回退，不落到任意默认价 —— deepseek 与 qwen 的
+        版本后缀很多，逐个登记不现实，但也不能因此按最贵的算。
+        """
+        model = model or ""
+        pricing = cls.PRICING.get(model)
+        if pricing is not None:
+            return pricing
+        if model.startswith("deepseek-"):
+            return cls.PRICING.get("deepseek-v3", {"input": 0.27, "output": 1.10})
+        if model.startswith("qwen-"):
+            return cls.PRICING.get("qwen-plus", {"input": 0.50, "output": 2.00})
+        if model.startswith("gpt-4o"):
+            return cls.PRICING.get("gpt-4o", {"input": 2.50, "output": 10.00})
+        return {"input": 1.0, "output": 4.0}
+
     def record(self, trace_id: str, input_tokens: int, output_tokens: int,
                model: str = "", cached_tokens: Optional[int] = None):
         # 显式传入优先；未传（None）时取 extract_usage 在本 trace 留下的命中量。
         # 直调 record 的旧代码/测试不传 → 拿不到就归 0，行为与之前完全一致。
         if cached_tokens is None:
             cached_tokens = self._pending_cache.pop(trace_id, 0)
-        pricing = self.PRICING.get(model)
-        if pricing is None:
-            # 前缀回退：deepseek-v4-* 等未知版本按 deepseek-v3 计价，避免落到任意默认价
-            if model.startswith("deepseek-"):
-                pricing = self.PRICING.get("deepseek-v3", {"input": 0.27, "output": 1.10})
-            elif model.startswith("qwen-"):
-                pricing = self.PRICING.get("qwen-plus", {"input": 0.50, "output": 2.00})
-            elif model.startswith("gpt-4o"):
-                pricing = self.PRICING.get("gpt-4o", {"input": 2.50, "output": 10.00})
-            else:
-                pricing = {"input": 1.0, "output": 4.0}
+        # 计价口径统一走 price_for：可观测性后台的单次成本与这里的累计成本
+        # 必须是同一套算法，否则两边数字对不上、谁都不敢信。
+        pricing = self.price_for(model)
         cost = (input_tokens / 1_000_000) * pricing["input"] + \
                (output_tokens / 1_000_000) * pricing["output"]
 
@@ -130,7 +141,8 @@ class CostTracker:
             self._pending_cache[trace_id] = self.extract_cache_hit(response_usage)
         return result
 
-    def extract_cache_hit(self, response_usage: dict) -> int:
+    @staticmethod
+    def extract_cache_hit(response_usage: dict) -> int:
         """从 usage 中提取 KV-cache 命中的输入 token 数
 
         兼容三种供应商格式（实测本项目走第一条）：
@@ -140,6 +152,10 @@ class CostTracker:
 
         取不到时返回 0：命中率会因此被**低估**，但绝不会高估。
         宁可低估，也不要拿一个看起来很漂亮的假数字。
+
+        staticmethod：可观测性后台（trace_writer）要按同一套规则落库，
+        必须是同一个实现 —— 两边各写一份，展示的命中量与累计成本里的
+        命中量迟早会不一致。
         """
         if not response_usage:
             return 0
@@ -158,3 +174,16 @@ class CostTracker:
             return int(read)
 
         return 0
+
+
+def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
+    """单次 LLM 调用的估算成本（美元）。
+
+    CostTracker.record 只给累计值，而可观测性后台要的是「这次调用花多少」，
+    因此把计价单独开放出来 —— 两处共用 price_for，口径不会走偏。
+    """
+    if not model or (not input_tokens and not output_tokens):
+        return 0.0
+    pricing = CostTracker.price_for(model)
+    return ((input_tokens / 1_000_000) * pricing["input"]
+            + (output_tokens / 1_000_000) * pricing["output"])

@@ -205,7 +205,23 @@ class RequirementService:
                     router = IntentRouter()
                     intent_result = router.classify(requirement.content)
                     logger.info(f"需求 {requirement_id} 意图分类: {intent_result.intent.value}")
-    
+
+                    # 里程碑：意图路由结果。时间线的第一条事件 ——
+                    # 「需求根本没进工作流」这种情况在后台要一眼可见，
+                    # 否则排查时会以为任务跑了却什么都没记录。
+                    try:
+                        from harness.observability.trace_writer import record_event
+                        record_event(
+                            requirement_id, "intent",
+                            f"意图识别 · {intent_result.intent.value}",
+                            status="ok",
+                            meta={"intent": intent_result.intent.value,
+                                  "confidence": getattr(intent_result, "confidence", None),
+                                  "skill_name": getattr(intent_result, "skill_name", None)},
+                        )
+                    except Exception:
+                        pass
+
                     if intent_result.intent == IntentType.QUICK:
                         return self._handle_quick_answer(db, requirement, requirement_id, intent_result)
                     elif intent_result.intent == IntentType.SEARCH:
@@ -608,6 +624,20 @@ class RequirementService:
                 if requirement.status != 'planning':
                     logger.warning(f"需求 {requirement_id} 状态为 {requirement.status}，非 planning，跳过")
                     return False
+
+                # 里程碑：用户确认计划。它把时间线切成「规划」与「编码」两段，
+                # 也是排查「用户到底确认的是哪一版计划」的锚点。
+                try:
+                    from harness.observability.trace_writer import record_event
+                    record_event(
+                        requirement_id, "confirm",
+                        "用户确认计划" + ("（附修改意见）" if feedback else ""),
+                        status="ok", meta={"has_feedback": bool(feedback),
+                                           "feedback_len": len(feedback or "")},
+                    )
+                except Exception:
+                    pass
+
     
                 # 如果有用户反馈，追加到需求内容中
                 if feedback:
@@ -938,6 +968,22 @@ class RequirementService:
                     f"交付门禁={'拦截' if gate_blocks else '放行'})"
                 )
                 requirement.error_message = eval_error
+                # 里程碑：交付门禁结论。「为什么这个需求没标成完成」
+                # 在后台上必须一眼可见，而不是只能靠 error_message 猜。
+                try:
+                    from harness.observability.trace_writer import record_event
+                    record_event(
+                        requirement_id, "quality_gate",
+                        ("交付拦截 · critical 未清零"
+                         if gate_blocks else "交付放行 · 仅剩非 critical 问题"),
+                        status="blocked" if gate_blocks else "warning",
+                        meta={"blocked": bool(gate_blocks),
+                              "critical_count": len(critical_findings),
+                              "unmet_acs": len(unmet_acs),
+                              "repair_rounds": repair_count},
+                    )
+                except Exception:
+                    pass
                 if gate_blocks:
                     requirement.status = 'needs_user_input'
                     # 差异报告写入对话历史，前端可见"哪些没做完"
@@ -1023,6 +1069,24 @@ class RequirementService:
 
             requirement.status = 'finished'
             db.commit()
+
+            # 里程碑：交付完成。时间线的最后一条 —— 交付时刻、经过几轮修复、
+            # 门禁口径（strict/loose）都在这里，供后续对比不同时期的交付质量。
+            try:
+                from harness.observability.trace_writer import record_event
+                from config import settings as _dlv_settings
+                _rep = int((final_state.get('metadata') or {}).get(
+                    'defect_repair_count', 0) or 0)
+                record_event(
+                    requirement_id, "deliver", "交付完成",
+                    status="ok",
+                    meta={"repair_rounds": _rep,
+                          "gate": ("strict"
+                                   if getattr(_dlv_settings, "DELIVERY_GATE_STRICT", False)
+                                   else "loose")},
+                )
+            except Exception:
+                pass
 
             # 交付边界折叠（短期记忆 v2 §3.H）：写 .task/DELIVERY.md（handoff）并清空工具轨迹。
             # 不可重建项（需求/计划/决策/反馈）已落地到 requirement 状态 + TASK_STATE.md，
@@ -1119,7 +1183,9 @@ class RequirementService:
                 return
             trace_id = final_state.get('metadata', {}).get('trace_id', '')
             if trace_id:
-                tracer.end_trace(trace_id)
+                # 显式标记 error：start_trace 时已落库 running 占位，
+                # 此处只更新终态，失败任务也能被后台列表检索到。
+                tracer.end_trace(trace_id, status="error")
                 logger.info(f"[Trace] 失败任务 {requirement_id} 的 trace 已保存: {trace_id}")
         except Exception as e:
             logger.warning(f"[Trace] 保存失败任务 trace 异常: {e}")

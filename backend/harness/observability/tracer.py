@@ -2,7 +2,10 @@
 """
 Tracer —— 链路追踪管理器
 
-持久化：注入 db_session 时，end_trace() 把整条 trace（含 spans/tokens/cost）落 agent_traces 表。
+持久化：注入 db_session 时，start_trace() 立刻落一条 running 占位，
+       end_span() 增量刷新，end_trace() 更新为终态。
+       这样崩溃 / 中断 / 进行中的需求也留有可查的痕迹 —— 此前只在
+       end_trace() 一次性写入，中断任务的 trace 全部丢失。
        不注入时退化为内存字典（保持与现有无参构造测试兼容）。
 """
 
@@ -25,6 +28,7 @@ class Span:
     parent_id: Optional[str]
     name: str
     start_time: float
+    trace_id: Optional[str] = None   # 反查所属 Trace，用于增量落库
     end_time: Optional[float] = None
     status: str = "running"
     metadata: dict = field(default_factory=dict)
@@ -35,6 +39,7 @@ class Span:
             "span_id": self.span_id,
             "parent_id": self.parent_id,
             "name": self.name,
+            "trace_id": self.trace_id,
             "start_time": self.start_time,
             "end_time": self.end_time,
             "status": self.status,
@@ -51,6 +56,7 @@ class Trace:
     user_id: int
     start_time: float
     end_time: Optional[float] = None
+    status: str = "running"     # running / finished / error
     spans: list = field(default_factory=list)
     total_tokens: int = 0
     input_tokens: int = 0
@@ -62,6 +68,9 @@ class Trace:
             "trace_id": self.trace_id,
             "requirement_id": self.requirement_id,
             "user_id": self.user_id,
+            "status": self.status,
+            "started_at": self.start_time,
+            "ended_at": self.end_time,
             "total_duration_ms": round((self.end_time - self.start_time) * 1000, 1) if self.end_time else None,
             "span_count": len(self.spans),
             "spans": [s.to_dict() for s in self.spans],
@@ -100,6 +109,11 @@ class Tracer:
         # trace_id 生成后立刻绑定日志上下文 —— 这是「日志 ↔ agent_traces 表」
         # 唯一能互查的钥匙。此前 trace_id 从不落日志，两边永远对不上。
         bind_trace_id(trace.trace_id)
+        # ★ 立刻落库（status=running）：此前只在 end_trace() 一次性写，
+        #   导致崩溃 / 中断 / 进行中的需求完全没有 trace（覆盖率仅约 1/4）。
+        #   先占位，后续 end_span() 增量刷新，异常结束也留下痕迹。
+        if self._persisted:
+            self._persist_trace(trace)
         return trace
 
     def start_span(self, trace_id: str, name: str, parent_id: str = None, metadata: dict = None) -> Span:
@@ -108,6 +122,7 @@ class Tracer:
             parent_id=parent_id,
             name=name,
             start_time=time.time(),
+            trace_id=trace_id,
             metadata=metadata or {},
         )
         trace = self._traces.get(trace_id)
@@ -120,12 +135,27 @@ class Tracer:
         span.status = status
         if error:
             span.error = error
+        # ★ 增量刷新：每个 span 结束时把当前进度写回 DB，
+        #   长任务中途也能看到已完成的阶段。
+        if self._persisted and span.trace_id:
+            trace = self._traces.get(span.trace_id)
+            if trace:
+                self._persist_trace(trace)
 
-    def end_trace(self, trace_id: str):
+    def end_trace(self, trace_id: str, status: str = "finished"):
         trace = self._traces.get(trace_id)
         if not trace:
             return
         trace.end_time = time.time()
+        # 有未正常关闭的 span 说明流程在此处被打断（异常 / kill / 重启）。
+        # 显式标记 interrupted，避免与正常完成混在一起，也留给出问题的定位线索。
+        still_open = [s for s in trace.spans if s.end_time is None]
+        if still_open and status == "finished":
+            status = "interrupted"
+            for s in still_open:
+                s.end_time = time.time()
+                s.status = "interrupted"
+        trace.status = status
         trace.total_tokens = sum(
             s.metadata.get("tokens", 0) for s in trace.spans
         )

@@ -307,6 +307,23 @@ def delete_requirement(req_id):
 
         logger.info(f"需求 {req_id} 已彻底删除")
         return jsonify({'message': '已彻底删除', 'requirement_id': req_id}), 200
+def _next_chat_turn_index(db, req_id: int) -> int:
+    """多轮对话的轮次号 = 已有最大轮次 + 1。
+
+    从 agent_events 读而不是数 dialogue_history：后者混着系统消息与工具结果，
+    既慢又脆弱。初次生成固定写 0，所以这里 +1 后不会与它撞号 ——
+    即便初次生成的事件还没落库（max 为 NULL），第一轮对话也是 1 而不是 0。
+    """
+    try:
+        from models.models import AgentEvent
+        from sqlalchemy import func as _func
+        cur = db.query(_func.max(AgentEvent.turn_index)).filter(
+            AgentEvent.requirement_id == req_id).scalar()
+    except Exception:
+        return 1
+    return int(cur or 0) + 1
+
+
 @app.route('/api/requirements/<int:req_id>/chat', methods=['POST'])
 @rate_limit_chat
 @jwt_required()
@@ -460,7 +477,8 @@ def chat_with_requirement(req_id):
             'current_step': 'tool_coder_ready',
             'code_files': requirement.code_files or [],
             'dialogue_history': dialogue_list,
-            'metadata': {'trace_id': '', 'is_chat': True},
+            'metadata': {'trace_id': '', 'is_chat': True,
+                         'turn_index': _next_chat_turn_index(db, req_id)},
             'tool_call_count': 0,
             'no_progress_count': 0,
             'last_file_list': existing_files,
@@ -521,6 +539,40 @@ def chat_with_requirement(req_id):
                     "已自动恢复为修改前的版本。请换一种描述方式，"
                     "或把改动拆得更小再试。"
                 )
+                # 里程碑：闸门拦截 + 回滚。这两条是「用户说改了但没生效」这类
+                # 疑惑的唯一证据链（后台能看到是谁在什么时候回滚掉了什么）。
+                try:
+                    from harness.observability.trace_writer import record_event
+                    _md = (state.get('metadata') or {})
+                    _tin = int(_md.get('turn_index') or 0)
+                    record_event(
+                        req_id, "quality_gate",
+                        f"轻量质量闸门拦截 · {len(defects)} 个确定性缺陷",
+                        status="blocked", turn_index=_tin,
+                        meta={"blocked": True, "defect_count": len(defects),
+                              "summary": (defect_summary or '')[:300]},
+                    )
+                    record_event(
+                        req_id, "rollback",
+                        f"回滚本次对话修改 · 恢复 {len(pre_chat_files)} 个文件",
+                        status="ok", turn_index=_tin,
+                        meta={"restored_files": sorted(pre_chat_files.keys())[:20],
+                              "removed_files": sorted(
+                                  current_files - set(pre_chat_files.keys()))[:20]},
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    from harness.observability.trace_writer import record_event
+                    record_event(
+                        req_id, "quality_gate", "轻量质量闸门通过",
+                        status="ok",
+                        turn_index=int((state.get('metadata') or {}).get('turn_index') or 0),
+                        meta={"blocked": False, "defect_count": 0},
+                    )
+                except Exception:
+                    pass
 
         # 获取更新后的文件
         updated_files = workspace.snapshot()

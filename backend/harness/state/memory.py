@@ -445,6 +445,20 @@ class MemoryManager:
         if not block or not injected_items:
             return block, []
         hit_ids = self._record_hits(injected_items, user_id, requirement_id, run_id)
+        # 里程碑：记忆注入。此前这条信息只存在于 agent.log 的日志行里，
+        # 后台要靠回填脚本正则解析才看得到；运行时直写之后，
+        # 「这次任务吃了哪些历史经验」在时间线上是第一等公民。
+        if requirement_id:
+            try:
+                from harness.observability.trace_writer import record_event
+                record_event(
+                    requirement_id, "memory",
+                    f"长期记忆注入 · {len(injected_items)} 条",
+                    meta={"injected": len(injected_items),
+                          "hit_ids": list(hit_ids or [])[:20]},
+                )
+            except Exception:
+                pass  # 埋点失败不影响注入
         return block, hit_ids
 
     def before_task(self, requirement: str, system_prompt: str, user_id: int = 0) -> str:

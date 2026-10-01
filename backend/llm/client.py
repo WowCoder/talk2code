@@ -26,7 +26,10 @@ logger = _logging.getLogger(__name__)
 import logging as _logging
 _llm_logger = _logging.getLogger("llm.traffic")
 _llm_logger.setLevel(_logging.DEBUG)
-if not _llm_logger.handlers:
+# LLM_TRAFFIC_LOG=0 可整体关闭这份明文流量日志（传输层明文，含完整 prompt）。
+# 默认开启：它是 KV-cache 命中率等离线指标（harness/observability/metrics_report.py）
+# 唯一的数据源，关掉之后那部分指标就没有数据了 —— 所以只提供开关，不改默认。
+if not _llm_logger.handlers and os.environ.get("LLM_TRAFFIC_LOG", "1") != "0":
     import os as _os
     # 锚定 backend/logs —— 与 setup_logging 的 BACKEND_DIR / LOG_DIR 同一目录。
     # 此前是 backend/../logs（项目根），曾与应用日志分裂在两个目录（P1-1）。
@@ -45,6 +48,15 @@ if not _llm_logger.handlers:
 
 def _log_llm_request(call_id: str, provider: str, model: str, url: str, payload: dict):
     """记录 LLM 请求（结构化 JSON Lines，便于程序化分析）"""
+    # 把 call_id 绑到当前上下文：调用方落可观测性事件时取出，
+    # 于是 agent_events 的每条 llm_turn 都能回查到 llm_traffic.log 的同一次调用。
+    # 放在这里而不是 4 个发请求点：本函数已经收到 call_id，一处绑定全覆盖。
+    # 延迟导入避免 llm ←→ harness 包初始化环。
+    try:
+        from harness.observability.log_context import bind_call_id
+        bind_call_id(call_id)
+    except Exception:
+        pass
     record = {
         "call_id": call_id,
         "dir": "request",

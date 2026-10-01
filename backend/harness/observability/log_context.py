@@ -36,6 +36,11 @@ _req_var: contextvars.ContextVar[str] = contextvars.ContextVar(
 _trace_var: contextvars.ContextVar[str] = contextvars.ContextVar(
     "t2c_trace_id", default=_EMPTY
 )
+# 最近一次 LLM 请求的 call_id：llm/client.py 发出请求时绑定，
+# TraceWriter 落库时取出，是 agent_events ↔ llm_traffic.log 互查的钥匙。
+_call_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "t2c_call_id", default=""
+)
 
 
 def bind_requirement(requirement_id) -> None:
@@ -48,6 +53,15 @@ def bind_trace_id(trace_id) -> None:
     _trace_var.set(str(trace_id) if trace_id else _EMPTY)
 
 
+def bind_call_id(call_id) -> None:
+    """绑定最近一次 LLM 请求的 call_id（由 llm/client.py 发请求时调用）。
+
+    只保留"最近一次"是刻意的：调用方（TraceWriter）在 LLM 调用**立即返回后**
+    落库，此刻上下文里就是这次调用的 call_id；不需要（也不应该）跨调用保序。
+    """
+    _call_var.set(str(call_id) if call_id else "")
+
+
 def clear() -> None:
     """清理上下文。
 
@@ -56,6 +70,7 @@ def clear() -> None:
     """
     _req_var.set(_EMPTY)
     _trace_var.set(_EMPTY)
+    _call_var.set("")
 
 
 def current_requirement_id() -> str:
@@ -64,6 +79,10 @@ def current_requirement_id() -> str:
 
 def current_trace_id() -> str:
     return _trace_var.get()
+
+
+def current_call_id() -> str:
+    return _call_var.get()
 
 
 def install_record_factory() -> None:

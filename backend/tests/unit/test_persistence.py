@@ -199,6 +199,72 @@ class TestTracerPersistence:
         assert loaded is not None
         assert loaded.requirement_id == 1
 
+    def test_start_trace_persists_immediately(self, db):
+        """P0：start_trace 立刻落库 running 占位，不等 end_trace。
+
+        此前只在 end_trace() 一次性写入，导致中断 / 崩溃 / 进行中的需求
+        完全没有 trace 记录。
+        """
+        from harness.observability.tracer import Tracer
+        tracer = Tracer(db_session=db)
+        trace = tracer.start_trace(1, 100)
+
+        # 尚未 end_trace，DB 里应已有记录
+        row = db.query(_AgentTrace).filter_by(trace_id=trace.trace_id).first()
+        assert row is not None
+        assert row.data["status"] == "running"
+        assert row.duration_ms == 0
+
+    def test_interrupted_trace_is_still_queryable(self, db):
+        """P0 验收标准：任务中途被打断（从未调 end_trace）也能被查到。
+
+        模拟崩溃：start_trace + 若干 end_span，然后进程消失。
+        """
+        from harness.observability.tracer import Tracer
+        tracer = Tracer(db_session=db)
+        trace = tracer.start_trace(2, 101)
+        s1 = tracer.start_span(trace.trace_id, "plan", metadata={"tokens": 10})
+        tracer.end_span(s1)
+        s2 = tracer.start_span(trace.trace_id, "coding", metadata={"tokens": 20})
+        tracer.end_span(s2)
+        # 故意不调 end_trace —— 模拟进程被 kill
+
+        db.expire_all()
+        row = db.query(_AgentTrace).filter_by(trace_id=trace.trace_id).first()
+        assert row is not None
+        # 已完成的 span 进度已增量落盘，不因崩溃丢失
+        assert row.data["span_count"] == 2
+        assert row.data["status"] == "running"
+
+    def test_open_spans_mark_trace_interrupted(self, db):
+        """end_trace 时仍有未关闭 span → 标记 interrupted，与正常完成区分。"""
+        from harness.observability.tracer import Tracer
+        tracer = Tracer(db_session=db)
+        trace = tracer.start_trace(3, 102)
+        closed = tracer.start_span(trace.trace_id, "plan")
+        tracer.end_span(closed)
+        tracer.start_span(trace.trace_id, "coding")   # 未关闭 —— 流程在此中断
+
+        tracer.end_trace(trace.trace_id)
+
+        db.expire_all()
+        row = db.query(_AgentTrace).filter_by(trace_id=trace.trace_id).first()
+        assert row.data["status"] == "interrupted"
+        spans = {s["name"]: s["status"] for s in row.data["spans"]}
+        assert spans["plan"] == "success"
+        assert spans["coding"] == "interrupted"
+
+    def test_end_trace_explicit_error_status(self, db):
+        """失败路径显式传 status=error 时不被改写成 interrupted。"""
+        from harness.observability.tracer import Tracer
+        tracer = Tracer(db_session=db)
+        trace = tracer.start_trace(4, 103)
+        tracer.end_trace(trace.trace_id, status="error")
+
+        db.expire_all()
+        row = db.query(_AgentTrace).filter_by(trace_id=trace.trace_id).first()
+        assert row.data["status"] == "error"
+
     def test_recent_traces_still_works_without_db(self):
         """无 db 注入时 recent_traces 走内存（向后兼容）"""
         from harness.observability.tracer import Tracer

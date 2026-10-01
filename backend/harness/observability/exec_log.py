@@ -68,11 +68,17 @@ def _write(requirement_id, record: dict):
 
 
 def log_llm_turn(requirement_id, iteration, model, messages, tools, response,
-                 thinking=None, latency_ms=None):
-    """记录一轮 LLM 调用：完整请求参数 + 原始返回值。"""
+                 thinking=None, latency_ms=None, stage=None):
+    """记录一轮 LLM 调用：完整请求参数 + 原始返回值。
+
+    stage 标明这次调用属于哪个阶段（planning / coding / verifying / repairing）。
+    不加它的话，回填时无法把验收与修复的调用从 coding 里分出来 —— 此前所有
+    记录都被一律标成 coding，运营后台的时间线上看不到验收与修复两段。
+    """
     tool_calls = getattr(response, "tool_calls", None) or []
     _write(requirement_id, {
         "kind": "llm_turn",
+        "stage": stage,
         "iteration": iteration,
         "model": model,
         "thinking": thinking,

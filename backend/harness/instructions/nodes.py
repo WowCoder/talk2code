@@ -21,6 +21,10 @@ from harness.instructions.prompts import load_prompt, load_prompt_template
 from harness.observability.logger import get_logger
 from harness.harness_context import get_tool_loop, get_workspace
 from harness.instructions.ac_verdict_policy import _ac_state, _should_invalidate_ac_cache
+from harness.observability.event_contract import (
+    STAGE_PLANNING, STAGE_CODING, STAGE_VERIFYING, STAGE_REPAIRING,
+    KIND_CLARIFY, KIND_PLAN, KIND_CODING, KIND_VERIFY, KIND_REPAIR,
+)
 
 logger = get_logger(__name__)
 
@@ -54,22 +58,62 @@ def _plan_timeout() -> int:
 
 
 def _log_llm_turn_safe(requirement_id, iteration, client, system_prompt, prompt,
-                       response, thinking=None, latency_ms=None):
-    """exec_log 埋点：记录一轮 LLM 请求 / 原始返回（开发视角执行明细）。
+                       response, thinking=None, latency_ms=None, stage=None,
+                       turn_index=0, trace_id=None):
+    """LLM 调用统一埋点：文件明细（开发排查）+ 运营后台索引。
 
-    coder 阶段的埋点在 ToolCallLoop 内部；verify / defect_repair 走的是独立调用路径，
-    此前完全没被记录（req 146 的 146.jsonl 只到 coder 第 8 轮就断了，修复轮的
-    reasoning 无从查看）。这里补齐整条链路。失败静默，绝不阻断主流程。
+    coder 阶段的埋点在 ToolCallLoop 内部；verify / defect_repair 走独立调用路径，
+    必须显式带 stage —— 否则回填后所有调用一律被标成 coding，运营后台的时间线上
+    看不到验收与修复这两段。
+
+    turn_index / trace_id 同样必须透传（调用方从 state.metadata 取）：多轮对话里
+    不带的话，验收与修复的事件会全部落到「初次生成」（turn 0），轮次切换器
+    把第 N 轮的验收显示在第一轮下面。
+
+    iteration 一律传 None：这些辅助链路（规划 / AC 翻译 / 验收 / 修复）不参与
+    编码迭代，不应有迭代号。**不要用 0 当哨兵** —— 传 0 会让它们顶着「第 0 轮」
+    混进编码子迭代分组，与真正的 1..N 轮混为一谈，界面上看不出哪条属于哪轮
+    （这与 `file_count` 记成 0 是同一类问题：日志在说不真的事）。
+    """
+    if stage is None:
+        from harness.observability.event_contract import STAGE_CODING
+        stage = STAGE_CODING
+    try:
+        from harness.observability.trace_writer import record_llm_turn
+        record_llm_turn(
+            requirement_id, stage=stage, iteration=iteration,
+            model=getattr(client, "model", None),
+            system_prompt=system_prompt, prompt=prompt,
+            tools=[], response=response, thinking=thinking, latency_ms=latency_ms,
+            turn_index=turn_index, trace_id=trace_id,
+        )
+    except Exception:
+        pass
+
+
+def _md(state: AgentState) -> dict:
+    """state.metadata 的安全取值。"""
+    return state.get("metadata") or {}
+
+
+def _record_milestone(state: AgentState, kind: str, label: str, *,
+                      status: str = "ok", meta: dict = None,
+                      duration_ms: int = None):
+    """里程碑事件埋点（意图/记忆/澄清/规划/确认/编码/验收结论/修复/门禁/回滚/交付）。
+
+    时间线只记 llm_turn + tool_call 就是一本流水账，排查时得逐条点开猜
+    「验收为什么没过」。里程碑事件把结论写进 label 与 meta，时间线本身就能回答问题。
+
+    失败静默：可观测性不得阻断主流程（失败计数在 TraceWriter 侧统一记录）。
     """
     try:
-        from harness.observability import exec_log
-        exec_log.log_llm_turn(
-            requirement_id, iteration, getattr(client, "model", None),
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-            [], response, thinking=thinking, latency_ms=latency_ms,
+        from harness.observability.trace_writer import record_event
+        md = _md(state)
+        record_event(
+            state.get("requirement_id") or md.get("requirement_id"),
+            kind, label, status=status, meta=meta, duration_ms=duration_ms,
+            turn_index=int(md.get("turn_index") or 0),
+            trace_id=md.get("trace_id") or None,
         )
     except Exception:
         pass
@@ -694,6 +738,14 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
                 f"({len(questions)} 个问题) 再生成 plan"
             )
             question_form = {'questions': questions}
+            # 里程碑：需求被拦下澄清。运营后台时间线上要能直接看出
+            # 「需求走到哪一步停的、为什么停」，而不是只看到一串 LLM 调用。
+            _record_milestone(
+                state, KIND_CLARIFY,
+                f"需求待澄清 · {len(questions)} 个问题",
+                meta={"reason": clarify_reason,
+                      "question_count": len(questions)},
+            )
             return {
                 'plan': {},
                 'current_step': 'needs_clarification',
@@ -742,11 +794,22 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
 
         def _fetch_and_extract(max_tokens: int, prompt_override: str = None) -> tuple[dict | None, bool, object]:
             """获取响应并提取 JSON，返回 (plan, is_truncated, resp)"""
+            _t0 = time.time()
             resp = client.chat(
                 prompt=prompt_override or user_prompt,
                 system_prompt=system_prompt,
                 use_memory=False, max_tokens=max_tokens, timeout=_plan_timeout(),
                 thinking='enabled',  # 结构化 plan JSON 需要思考模式保证格式正确
+            )
+            # 规划阶段的调用此前完全没被记录 —— 运营后台的时间线一开始就是编码
+            # 阶段，看不出「需求是怎么被翻译成计划的」，规划耗时也无从统计。
+            _log_llm_turn_safe(
+                state.get("requirement_id"), None, client, system_prompt,
+                prompt_override or user_prompt, resp, thinking='enabled',
+                latency_ms=round((time.time() - _t0) * 1000, 1),
+                stage=STAGE_PLANNING,
+                turn_index=int(_md(state).get("turn_index") or 0),
+                trace_id=_md(state).get("trace_id") or None,
             )
             if resp.is_error:
                 return None, False, resp
@@ -862,6 +925,19 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
         if plan_issues:
             plan['_plan_dod_issues'] = plan_issues
 
+        # 里程碑：规划产出。meta 带上 feature / AC 数与复杂度，
+        # 时间线上直接能看出「这一版计划给的是什么量级的活、AC 是否带病放行」。
+        _ac_list = plan.get('acceptance_criteria', []) if isinstance(plan, dict) else []
+        _feat_list = plan.get('features', []) if isinstance(plan, dict) else []
+        _record_milestone(
+            state, KIND_PLAN,
+            f"规划完成 · {len(_feat_list)} 个功能 / {len(_ac_list)} 条验收",
+            status="ok" if plan_ok else "warning",
+            meta={"features": len(_feat_list), "ac_count": len(_ac_list),
+                  "complexity": complexity,
+                  "dod_issues": len(plan_issues or [])},
+        )
+
         return {
             'plan': plan,
             'current_step': 'team_leader_done',
@@ -891,6 +967,10 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
 
     except Exception as e:
         logger.error(f"[TeamLeader] 执行失败：{e}")
+        _record_milestone(
+            state, KIND_PLAN, f"规划失败 · {str(e)[:80]}", status="error",
+            meta={"error": str(e)[:200]},
+        )
         return {
             'plan': {},
             'current_step': 'team_leader_failed',
@@ -1017,6 +1097,8 @@ def _execute_delegated_tasks(state: AgentState) -> Dict[str, Any]:
                     "preserve": True,
                 })
 
+    # 编码结论的里程碑统一由 coder_node 的包装层落（见 _emit_coding_milestone）：
+    # 委派与批量两条路径都从那里返回，集中一处才不会漏、也不会同一轮记两条。
     return {
         "current_step": "coding_done",
         "code_files": all_code_files,
@@ -1045,7 +1127,70 @@ def _review_single_file(workspace, filename: str, state: AgentState) -> str:
         return f"审查异常: {e}"
 
 
+def _emit_coding_milestone(state: AgentState, result) -> None:
+    """把这一次编码的结论落成一条里程碑事件。
+
+    埋在包装层而不是各个 return 前面：coder 有多条返回路径（未注入 ToolCallLoop /
+    委派失败 / 批量抛异常 / 正常收尾），逐条埋必漏一条 —— 而漏掉的恰好是
+    「编码到底产出了几个文件」（实测：第一次端到端跑完，时间线上 13 类事件
+    只缺 coding，就是被漏在这里）。
+
+    文件数**以工作区实际产物为准**，不取 `result["code_files"]`：批量路径下该字段
+    常是空的（实测需求 215：工作区里 4 个交付文件，事件却写 file_count=0）。
+    日志里的数字必须是在磁盘上数出来的，否则排查时会被它带偏。
+    """
+    step = result.get("current_step") if isinstance(result, dict) else None
+    err = result.get("error") if isinstance(result, dict) else None
+    raw = (result.get("code_files") or []) if isinstance(result, dict) else []
+    files = [str(f.get("filename") if isinstance(f, dict) else f) for f in raw]
+    files = _delivered_files(state) or files
+
+    if step == "coding_done" and not err:
+        _record_milestone(state, KIND_CODING,
+                          f"编码完成 · {len(files)} 个文件",
+                          meta={"file_count": len(files), "files": files[:20]})
+    elif err or step in ("coding_error", "llm_error", "error"):
+        _record_milestone(state, KIND_CODING,
+                          f"编码失败 · {str(err or step)[:80]}",
+                          status="error",
+                          meta={"error": str(err or step)[:200],
+                                "file_count": len(files)})
+    else:
+        # 既没宣告完成也没报错（如 max_iterations / no_progress 提前收尾）：
+        # 如实记下状态，不假装成功 —— 这条恰恰是最需要人来看的。
+        # 带上已有文件数：能让「跑了 10 轮一个文件没写」和「写了 4 个但没写完」
+        # 一眼分开，前者是空转事故，后者只是预算不够。
+        _record_milestone(state, KIND_CODING,
+                          f"编码收尾 · {step or '未知状态'} · {len(files)} 个文件",
+                          meta={"file_count": len(files), "files": files[:20]})
+
+
+def _delivered_files(state: AgentState) -> list:
+    """工作区里的实际交付文件（排除 `.task/**`、`.design/**` 这些过程文件）。
+
+    任何异常都返回空列表 —— 埋点辅助函数不得影响主流程。
+    """
+    try:
+        ws = get_workspace(state)
+        if ws is None:
+            return []
+        return [str(f) for f in ws.list()
+                if not str(f).startswith((".task/", ".design/"))]
+    except Exception:
+        return []
+
+
 def coder_node(state: AgentState) -> Dict[str, Any]:
+    """编码节点入口：跑实现体，再把本次编码的结论落成里程碑（见上）。"""
+    result = _coder_node_impl(state)
+    try:
+        _emit_coding_milestone(state, result)
+    except Exception as e:
+        logger.debug(f"[Coder] 编码里程碑写入失败（不阻断）：{e}")
+    return result
+
+
+def _coder_node_impl(state: AgentState) -> Dict[str, Any]:
     """
     统一编码节点：内部根据 complexity 选择策略
 
@@ -1463,11 +1608,20 @@ _AC_TRANSLATE_BATCH = 2
 # 收益是 AC 覆盖率——按 5 条 AC / 3 批算，一次失败就是 40% 的 AC 没跑。
 _AC_TRANSLATE_ATTEMPTS = 2
 
+# AC 翻译的系统提示词 —— 唯一定义处：真实调用与可观测性埋点共用同一份。
+# 分别在两处写同义字面量，改了一处另一处就开始记录假信息。
+_AC_TRANSLATE_SYSTEM_PROMPT = "你是 Playwright 自动化测试专家。只返回 JSON，不要其他文字。"
+
 
 def _translate_one_ac_batch(
     batch: list, selector_text: str, render_info: str, visible_text_text: str,
+    requirement_id: int = None, turn_index: int = 0, trace_id: str = None,
 ) -> list[dict]:
-    """翻译一小批 AC。返回结构合法的脚本条目；失败返回空列表（由调用方计数）。"""
+    """翻译一小批 AC。返回结构合法的脚本条目；失败返回空列表（由调用方计数）。
+
+    requirement_id / turn_index / trace_id 只用于可观测性埋点，不参与翻译逻辑 ——
+    默认值下静默跳过，单测直接调这个函数不受影响。
+    """
     # 兜底提取 JSON 数组那一步要用 `_re`。本模块只在若干函数里**局部**
     # `import re as _re`，不做模块级别名，所以这里必须自己导入。
     # 少了它就会抛 `NameError: name '_re' is not defined`，被上层打成
@@ -1509,7 +1663,7 @@ def _translate_one_ac_batch(
     from llm.client import get_client
     response = get_client().chat(
         prompt=prompt,
-        system_prompt="你是 Playwright 自动化测试专家。只返回 JSON，不要其他文字。",
+        system_prompt=_AC_TRANSLATE_SYSTEM_PROMPT,
         use_memory=False,
         # 预算与批大小成比例（实测 2 条 AC 在 4000 下稳定成功）。
         # 若仍被 reasoning 吃光，llm.client 里有"以更大额度重试一次"的救援。
@@ -1517,6 +1671,17 @@ def _translate_one_ac_batch(
         timeout=_ac_translate_timeout(),
         thinking='enabled',
     )
+    # AC 翻译属于验收阶段：它决定「验收标准怎么变成可执行的检查」，
+    # 之前完全没被记录，验收在后台上只有 Evaluator 那一次调用。
+    # 记录的 system prompt 复用真实发送的那份常量，不另拼字面量 ——
+    # 两处漂移后日志就开始说谎。
+    if requirement_id:
+        _log_llm_turn_safe(
+            requirement_id, None, get_client(),
+            _AC_TRANSLATE_SYSTEM_PROMPT,
+            prompt, response, thinking='enabled', stage=STAGE_VERIFYING,
+            turn_index=turn_index, trace_id=trace_id,
+        )
     if response.is_error or not response.content:
         return []
 
@@ -1548,13 +1713,18 @@ def _translate_one_ac_batch(
     return valid
 
 
-def _translate_acs_to_scripts(acceptance_criteria: list, code_text: str, requirement: str) -> list[dict]:
+def _translate_acs_to_scripts(acceptance_criteria: list, code_text: str,
+                              requirement: str, requirement_id: int = None,
+                              turn_index: int = 0, trace_id: str = None) -> list[dict]:
     """用 LLM 将验收条件翻译为 Playwright 操作序列
 
     每个 AC 的 how_to_verify 字段描述验证方法（如"输入文字点击添加按钮，列表中显示新项目"），
     LLM 需要翻译为具体的 DOM 操作步骤。
 
     按 `_AC_TRANSLATE_BATCH` 分批调用（原因见该常量的注释）。
+
+    requirement_id / turn_index / trace_id 只用于可观测性埋点（AC 翻译属于验收阶段），
+    不参与翻译逻辑。
     """
     if not acceptance_criteria:
         return []
@@ -1613,8 +1783,13 @@ def _translate_acs_to_scripts(acceptance_criteria: list, code_text: str, require
         scripts: list[dict] = []
         for attempt in range(1, _AC_TRANSLATE_ATTEMPTS + 1):
             try:
+                # 按需传：没有 requirement_id 就完全不带这些关键字，保持与既有
+                # 单测替身（四参数 fake_batch）的签名兼容。
+                _extra = ({"requirement_id": requirement_id,
+                           "turn_index": turn_index, "trace_id": trace_id}
+                          if requirement_id else {})
                 scripts = _translate_one_ac_batch(
-                    batch, selector_text, render_info, visible_text_text,
+                    batch, selector_text, render_info, visible_text_text, **_extra,
                 )
             except Exception as e:
                 scripts = []
@@ -1681,8 +1856,72 @@ def _mark_acs_checked(state: AgentState, ac_ids: list) -> None:
 # 完全没有 span——线上质量问题无法归因。用装饰器统一补齐，
 # 不侵入节点函数体。
 
+def _emit_node_milestone(name: str, state: AgentState, result) -> None:
+    """把节点结论落成一条里程碑事件。
+
+    verify 与 defect_repair 各有多个 return 路径（快速通道 / 评估异常 /
+    无缺陷跳过 / 失败），在切面上收口能保证「节点执行一次 = 时间线一条结论」，
+    不必在每个 return 前各写一遍（漏一处就是时间线缺一段）。
+    节点内的富信息（verdict / AC 明细 / 修复轮次）通过 state 上的
+    `verify_verdict` / `repair_verdict` 传出来。
+
+    只处理认识的节点名，且要求 state 是 dict：`@_traced_node("X")` 一旦挂错
+    函数（HEAD 里就发生过一次 —— 它被挂在了 `_build_vision_images` 上，
+    该函数第一个参数是文件名而不是 state），下面这行 `state.pop(...)` 会在
+    每次调用时抛 AttributeError，把被装饰的函数整个打挂。
+    可观测性出问题不该让业务停摆，所以这里先自证输入合法。
+    """
+    if not isinstance(state, dict) or name not in ("verify", "defect_repair"):
+        return
+
+    step = result.get("current_step") if isinstance(result, dict) else None
+
+    if name == "verify":
+        # pop：这两个键只是节点→切面的信息通道，不该被 checkpoint / 状态快照带走
+        v = state.pop("verify_verdict", None) or {}
+        passed = bool(result.get("verify_passed")) if isinstance(result, dict) else False
+        failed = v.get("failed_ac_ids") or []
+        meta = {
+            "verdict": v.get("verdict") or ("PASS" if passed else "NEEDS_WORK"),
+            "score": v.get("score"),
+            "findings": v.get("findings", 0),
+            "critical_count": v.get("critical_count", 0),
+            "failed_ac_ids": failed,
+            "defect_count": v.get("defect_count", 0),
+            "ac_total": v.get("ac_total", 0),
+            "fast_pass": bool(v.get("fast_pass")),
+        }
+        if passed:
+            label = f"验收通过 · {meta['score'] if meta['score'] is not None else '-'} 分"
+        else:
+            label = (f"验收未通过 · 未达成 AC {len(failed)} 条"
+                     if failed else "验收未通过")
+        error = result.get("error") if isinstance(result, dict) else None
+        _record_milestone(state, KIND_VERIFY, label,
+                          status="error" if error else "ok", meta=meta)
+        return
+
+    if name == "defect_repair":
+        v = state.pop("repair_verdict", None) or {}
+        if step == "defect_repair_done":
+            label = (f"第 {v.get('round', '?')} 轮修复完成 · "
+                     f"{len(v.get('written_files') or [])} 个文件")
+            status = "ok"
+        elif step == "defect_repair_skipped":
+            label, status = "无确定性缺陷，跳过修复", "ok"
+        else:
+            label = f"修复失败 · {step or '未知'}"
+            status = "error"
+        _record_milestone(
+            state, KIND_REPAIR, label, status=status,
+            meta={"round": v.get("round"),
+                  "target_defects": v.get("target_defects") or [],
+                  "written_files": v.get("written_files") or []},
+        )
+
+
 def _traced_node(name: str):
-    """给 LangGraph 节点函数包一层 trace span
+    """给 LangGraph 节点函数包一层 trace span + 里程碑事件
 
     成功静默（status=success），失败喧哗（status=error + error 信息）。
     tracer/trace_id 缺失时静默降级为直通。
@@ -1712,6 +1951,7 @@ def _traced_node(name: str):
                     error = result.get("error") if isinstance(result, dict) else None
                     tracer.end_span(span, status="error" if error else "success",
                                     error=str(error) if error else None)
+                _emit_node_milestone(name, state, result)
                 return result
             except Exception as e:
                 if span is not None and tracer is not None:
@@ -1719,6 +1959,9 @@ def _traced_node(name: str):
                         tracer.end_span(span, status="error", error=str(e))
                     except Exception:
                         pass
+                _record_milestone(state, KIND_VERIFY if name == "verify" else KIND_REPAIR,
+                                  f"{name} 异常 · {str(e)[:80]}", status="error",
+                                  meta={"error": str(e)[:200]})
                 raise
         return wrapper
     return decorator
@@ -2025,7 +2268,11 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                     pass
             ac_scripts, _ac_source = _resolve_ac_scripts(
                 stale_scripts, cached_hash, _ac_hash,
-                lambda: _translate_acs_to_scripts(acceptance_criteria, code_text, requirement),
+                lambda: _translate_acs_to_scripts(
+                    acceptance_criteria, code_text, requirement,
+                    requirement_id=state.get("requirement_id"),
+                    turn_index=int(_md(state).get("turn_index") or 0),
+                    trace_id=_md(state).get("trace_id") or None),
             )
             if _ac_source == "hit":
                 logger.info(f"[Verify] AC 脚本命中缓存（{len(ac_scripts)} 条，首轮锁定不重译）")
@@ -2367,6 +2614,17 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
         _qa_msg = build_summary_message(_qa_card, QA_NAME)
         state.setdefault("dialogue_history", []).append(_qa_msg)
         publish_summary(_verify_sse, state.get("requirement_id"), _qa_msg)
+        # 验收结论留给 _traced_node 切面落里程碑事件（覆盖所有 return 路径，
+        # 一处埋点比在 5 个 return 前各写一遍不容易漏）。
+        state["verify_verdict"] = {
+            "verdict": "PASS",
+            "score": evaluator_result.get("overall_score"),
+            "findings": 0,
+            "critical_count": 0,
+            "failed_ac_ids": [r.get("ac_id") for r in (ac_check_results or [])
+                              if r.get("failures")][:20],
+            "fast_pass": True,
+        }
         return {"verify_passed": True, "current_step": "verify_done",
                 "smoke_defects": [], "architectural_defects": []}
 
@@ -2552,9 +2810,12 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             images=vision_images or None,
         )
         _log_llm_turn_safe(
-            state.get("requirement_id"), 0, client, evaluator_prompt, prompt,
+            state.get("requirement_id"), None, client, evaluator_prompt, prompt,
             response, thinking='enabled',
             latency_ms=round((time.time() - _t0) * 1000, 1),
+            stage=STAGE_VERIFYING,
+            turn_index=int(_md(state).get("turn_index") or 0),
+            trace_id=_md(state).get("trace_id") or None,
         )
         # finish_reason=length → 截断，用更大 max_tokens 重试
         if response.finish_reason == "length" and max_tokens < 6000:
@@ -2991,6 +3252,20 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             f"score={overall_score}, findings={len(findings)}"
         )
 
+        # 验收结论留给 _traced_node 切面落里程碑事件。meta 要能直接回答
+        # 「为什么没过」：哪几条 AC 未达成、几条 critical，不必点开 LLM 原文猜。
+        state["verify_verdict"] = {
+            "verdict": verdict,
+            "score": overall_score,
+            "findings": len(findings or []),
+            "critical_count": sum(
+                1 for f in (findings or []) if f.get("severity") == "critical"),
+            "failed_ac_ids": [r.get("ac_id") for r in (ac_check_results or [])
+                              if r.get("failures")][:20],
+            "defect_count": len(list(architectural_defects) + list(local_defects)),
+            "ac_total": len(ac_check_results or []),
+        }
+
         # ---- 落一条**可见**的验证摘要（「质量工程师做了什么」的唯一持久记录）----
         # 实时通道（progress / verify_step）都是瞬时的：刷新页面就没了，
         # evaluator_result 事件也不落库。此前用户跑完一轮刷新后完全查不到
@@ -3324,7 +3599,6 @@ def _collect_defect_repair_context(workspace, defects: list = None) -> tuple[str
     return "\n\n".join(blocks) if blocks else "(无文件)", ordered
 
 
-@_traced_node("defect_repair")
 def _build_vision_images(screenshot_path, mode: str, vendor: str = "agnes") -> list:
     """按 EVALUATOR_VISION_MODE 把截图转成可传给 LLM 的图片内容块。
 
@@ -3505,6 +3779,7 @@ def _apply_diff_edits(workspace, edits: list) -> tuple[list, str]:
     return [{"filename": fn, "content": applied_map[fn]} for fn in order], ""
 
 
+@_traced_node("defect_repair")
 def defect_repair_node(state: AgentState) -> Dict[str, Any]:
     """小上下文定向修复：针对通用冒烟测试发现的确定性缺陷
 
@@ -3617,9 +3892,12 @@ def defect_repair_node(state: AgentState) -> Dict[str, Any]:
         finally:
             client.max_retries = _old_retries
         _log_llm_turn_safe(
-            state.get("requirement_id"), 0, client, system_prompt, user_prompt,
+            state.get("requirement_id"), None, client, system_prompt, user_prompt,
             resp, thinking='enabled',
             latency_ms=round((time.time() - _t0) * 1000, 1),
+            stage=STAGE_REPAIRING,
+            turn_index=int(_md(state).get("turn_index") or 0),
+            trace_id=_md(state).get("trace_id") or None,
         )
         return resp
 
@@ -3766,9 +4044,12 @@ def defect_repair_node(state: AgentState) -> Dict[str, Any]:
                     thinking='enabled',
                 )
                 _log_llm_turn_safe(
-                    state.get("requirement_id"), 0, client, system_prompt, single_prompt,
+                    state.get("requirement_id"), None, client, system_prompt, single_prompt,
                     single_resp, thinking='enabled',
                     latency_ms=round((time.time() - _t0) * 1000, 1),
+                    stage=STAGE_REPAIRING,
+                    turn_index=int(_md(state).get("turn_index") or 0),
+                    trace_id=_md(state).get("trace_id") or None,
                 )
                 if single_resp.content and not single_resp.is_error:
                     s_content = single_resp.content.strip()
@@ -3895,6 +4176,14 @@ def defect_repair_node(state: AgentState) -> Dict[str, Any]:
         ),
         "status": "completed",
     })
+
+    # 修复结论留给 _traced_node 切面落里程碑事件（覆盖本节点的全部 return 路径）。
+    # meta 要能回答「第几轮修的、修了什么、改了哪些文件」。
+    state["repair_verdict"] = {
+        "round": repair_round,
+        "target_defects": [d.get("type") for d in smoke_defects][:10],
+        "written_files": list(written)[:20],
+    }
 
     return {"current_step": "defect_repair_done",
                 "metadata": state.get("metadata") or {}}

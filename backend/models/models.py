@@ -11,6 +11,10 @@ from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.sql import func
 from config import settings
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 # 创建数据库引擎（支持 PostgreSQL + SQLite 自动切换）
 engine = create_engine(
     settings.DATABASE_URI,
@@ -186,6 +190,127 @@ class AgentTrace(Base):
     total_cost = Column(Float, default=0.0)
     duration_ms = Column(Integer, default=0)
     created_at = Column(DateTime, default=func.now())
+
+
+# Agent 可观测性：跨版本 JSON 列类型。
+# PG 上必须是 JSONB（支持 GIN 索引与路径查询）——泛型 JSON 在 PG 会被映射成
+# `json` 类型，两者不等价。
+# with_variant 让同一份模型在两种方言下各自建出正确的类型：SQLite 不支持
+# JSONB，自动降级为 JSON，无需按 settings.IS_POSTGRES 写两套分支
+# （手写分支曾出现过「SQLite 写法在 PG 被吞 → 列没建成」的事故）。
+try:
+    from sqlalchemy.dialects.postgresql import JSONB as _PG_JSONB
+    _JsonCol = JSON().with_variant(_PG_JSONB(), "postgresql")
+except ImportError:  # pragma: no cover - 未安装 psycopg 时
+    _JsonCol = JSON()
+
+
+class TraceMessageBlob(Base):
+    """Message 内容寻址表 —— 跨轮次去重存储 LLM messages 的正文。
+
+    按 (requirement_id, content_hash) 建主键，同一份正文在一个需求内只存一次。
+    为何不做跨需求去重：head content 内嵌需求原文，实测 50 个需求中 49 个互不
+    相同，收益≈0，且跨需求共享会带来数据隔离风险。
+
+    为何用内容寻址而非差分：上下文管线（存量遮蔽 / Compaction / 交付折叠）会
+    **改写** messages[]，add-only 差分无法表达"替换"与"删除"，还原出的 request
+    与实际发给 LLM 的不一致。内容寻址天然支持任意位置改写。
+    """
+    __tablename__ = "trace_message_blobs"
+
+    requirement_id = Column(Integer, primary_key=True, nullable=False)
+    content_hash = Column(String(16), primary_key=True, nullable=False)
+    role = Column(String(16))
+    content = Column(Text, nullable=False)
+    char_len = Column(Integer, default=0)
+    # role/content 之外的整条 message 字段（name / tool_calls / tool_call_id …）。
+    # 只在存在额外字段时才写，绝大多数 message 为 None，不占空间。
+    # 为何不直接把整条塞进 content：content 是去重与展示主体，混进去会破坏
+    # 跨轮次的正文复用（压缩率从 3.2x 掉回 1x）。
+    msg_json = Column(_JsonCol)
+    created_at = Column(DateTime, default=func.now())
+
+    __table_args__ = (
+        Index("ix_tmb_req", "requirement_id"),
+    )
+
+
+class AgentEvent(Base):
+    """Agent 事件索引 —— 一行一事件，支撑列表页聚合与时间线渲染。
+
+    seq 是需求内全局递增序号，直接作为时间线排序依据，避免依赖时间戳精度。
+    turn_index 在**写入时**确定：DB 没有 chat_round 字段，查询时从
+    dialogue_history 派生既脆弱又慢。
+    """
+    __tablename__ = "agent_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    requirement_id = Column(Integer, nullable=False)
+    trace_id = Column(String(32))
+    call_id = Column(String(32))
+    seq = Column(Integer, nullable=False)
+    turn_index = Column(Integer, default=0)
+    iteration = Column(Integer)
+    ts = Column(DateTime, nullable=False)
+    kind = Column(String(32), nullable=False)
+    stage = Column(String(32))
+    label = Column(String(200))
+    status = Column(String(16), default="ok")
+    model = Column(String(64))
+    duration_ms = Column(Integer)
+    tokens_in = Column(Integer, default=0)
+    tokens_out = Column(Integer, default=0)
+    # 命中 KV 缓存的 input token 数 —— **是 tokens_in 的子集，不是并列的第三类**。
+    # 命中率 = cached_tokens / tokens_in，分母是 tokens_in 而不是 tokens_in+tokens_out。
+    #
+    # ⚠️ 三态语义，故意不给默认值：NULL = 这次调用**没上报**缓存信息（未知），
+    # 0 = 上报了、确实没命中，>0 = 命中。把 NULL 落成 0 的话，「供应商不再返回
+    # 这个字段」会表现为「命中率掉到 0」，和「真的没命中」长得一模一样 ——
+    # 这正是本项目反复踩的「没数据 vs 没产生数据」。命中率的分母要按
+    # `cached_tokens IS NOT NULL` 取，见 routes/admin_traces.py::_hit_rate。
+    cached_tokens = Column(Integer, nullable=True)
+    cost = Column(Float, default=0.0)
+
+    # LLM 事件的检索结构：[[content_hash, role], ...] 有序索引，
+    # 按此列表到 trace_message_blobs 取正文即可精确还原 messages[]。
+    message_refs = Column(_JsonCol)
+    tools_ref = Column(String(16))     # tools schema 的 content_hash
+    payload_id = Column(Integer)
+    meta = Column(_JsonCol)
+    created_at = Column(DateTime, default=func.now())
+
+    __table_args__ = (
+        # seq 唯一：时间线排序完全依赖它。分配方式是「读 MAX + 1」，
+        # 并发写（chat 与 resume 竞争、回填与运行并行）会产生重复 seq，
+        # 唯一索引让冲突显式失败并由写入方重排重试，而不是静默乱序。
+        Index("ux_ae_req_seq", "requirement_id", "seq", unique=True),
+        Index("ix_ae_req_turn", "requirement_id", "turn_index", "seq"),
+        Index("ix_ae_kind", "kind"),
+        Index("ix_ae_ts", "ts"),
+    )
+
+
+class AgentPayload(Base):
+    """事件明细 —— 大字段单独存放，PG 的 TOAST 会把它移出主表，
+    不拖慢 agent_events 的扫描。
+
+    只在点开某个事件时才加载，列表页与时间线不碰这张表。
+    """
+    __tablename__ = "agent_payloads"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    requirement_id = Column(Integer, nullable=False)
+    kind = Column(String(32))
+    tools_ref = Column(String(16))
+    response = Column(_JsonCol)
+    tool_content = Column(Text)
+    raw_path = Column(String(500))     # 原始 jsonl 路径，冷回溯用
+    raw_offset = Column(Integer)       # 文件内字节偏移
+    created_at = Column(DateTime, default=func.now())
+
+    __table_args__ = (
+        Index("ix_ap_req", "requirement_id"),
+    )
 
 
 class CheckpointRecord(Base):
@@ -487,5 +612,40 @@ def init_db():
     _backfill_null("published_sites", "category", "''")
     _backfill_null("published_sites", "market_visible", _sql_false())
     _backfill_null("published_sites", "badge_enabled", _sql_true())
+
+    # 迁移：可观测性 —— message 正文之外的字段（name / tool_calls / tool_call_id）。
+    # 不补这列的话，还原出的 message 只有 role/content，用户无法区分
+    # 「真实用户输入」与「系统每轮注入的工作区状态」。
+    _add_column("trace_message_blobs", "msg_json", pg="JSONB", sqlite="JSON")
+
+    # 迁移：可观测性 —— 缓存命中 token。
+    # 供应商确实在返回这个数（实测 414 次响应 100% 带 prompt_tokens_details，
+    # 命中率 62%），但此前只有 CostTracker 在内存里累计，落库时被丢掉，
+    # 于是后台只能显示 Token 总量、看不到「其中多少是缓存命中的」。
+    # ⚠️ 这里**故意不回填 0**：存量行留 NULL 表示「当时没记录」，
+    # 与「记录为 0」区分开（详见 AgentEvent.cached_tokens 的注释）。
+    # NULLABLE 列若加了 DEFAULT，PG 会把存量行也改写成该默认值，语义就没了。
+    _add_column("agent_events", "cached_tokens", pg="INTEGER", sqlite="INTEGER")
+
+    # 迁移：可观测性 —— seq 唯一索引。create_all 不会给已存在的表补索引，
+    # 存量库里 agent_events 只有普通索引，必须显式补上，否则并发写入
+    # 产生的重复 seq 会静默污染时间线排序。
+    # 先删旧的普通索引（PG 与 SQLite 都支持 IF EXISTS）。
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("DROP INDEX IF EXISTS ix_ae_req_seq"))
+            conn.commit()
+    except Exception:
+        pass
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_ae_req_seq "
+                "ON agent_events(requirement_id, seq)"))
+            conn.commit()
+    except Exception as e:
+        # 存量数据已有重复 seq 时建不上：报出来而不是静默跳过。
+        # 重复 seq 只可能来自并发写入，重排后可重建。
+        logger.warning("[init_db] 创建 ux_ae_req_seq 失败（可能存在重复 seq）：%s", e)
 
 
