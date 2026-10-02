@@ -454,8 +454,11 @@ def test_stale_read_masked_before_older_valid_read():
          "content": f"已创建 a.js\n\n--- 文件内容预览 ---\n{big}",
          "arguments": {"filename": "a.js"}},
     ]
-    # 预算只够遮 1 条（5 条 read + 1 条 write ≈ 12000 token，遮 1 条即达标）
-    p = ContextPipeline(budget=11000, single_result_limit=100000)
+    # 预算只够遮 1 条（5 条 read + 1 条 write ≈ 12000 token，遮 1 条即达标）。
+    # history_soft_budget 显式设为 budget：本测试守的是「失效 read 优先于更旧的
+    # 有效 read」这个排序语义，软预算（6000）会额外把 b.js 也遮掉，稀释掉对照。
+    p = ContextPipeline(budget=11000, single_result_limit=100000,
+                        history_soft_budget=11000)
     messages, stats = p.build(head_content="", history=history)
 
     assert stats["masked_read"] == 1

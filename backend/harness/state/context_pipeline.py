@@ -16,6 +16,7 @@ docs/design/context-pipeline-v2.md：
 import json
 import re
 import uuid
+from typing import Optional
 
 from harness.observability.logger import get_logger
 from harness.agent_names import TL_NAME
@@ -28,6 +29,13 @@ SINGLE_RESULT_LIMIT = 2000
 KEEP_RECENT = 3
 # L5 兜底时，保留最近 N 条对话不摘要
 KEEP_TAIL = 6
+# 历史软预算（L2.5）：不等硬预算（24000）撞线，历史超过这个值就开始把最旧的
+# 工具结果遮蔽成占位符。此前只有硬预算一层，实测常规需求全程 4~8K history，
+# 永远差一个数量级触发不了 —— 治理等于不存在，只有贪吃蛇那种极端需求才撞线，
+# 而且一撞就是猛的。软预算让治理从第一轮超线起渐进发生。
+# 口径：history 单独计（不含 head），因为 head（system prompt）是每轮重建的
+# 固定开销，不该挤占历史的治理空间。
+HISTORY_SOFT_BUDGET = 6000
 # 永不遮蔽的工具（write/edit 变更摘要 + 验证结果），对应 Anthropic exclude_tools 白名单
 EXCLUDE_TOOLS = {
     "write_file", "edit_file", "update_task_notes",
@@ -259,7 +267,7 @@ def _slim_iteration_batch(msg: dict) -> dict:
     return {**msg, "tools": slim_tools}
 
 
-def finalize_delivery(state: dict, workspace) -> str:
+def finalize_delivery(state: dict, workspace, handoff_note: bool = True) -> str:
     """交付边界折叠（§3.H）：写 .task/DELIVERY.md（handoff）+ **归档**工具轨迹。
 
     - 非重建项（需求/计划/决策/反馈）已落地到 requirement 状态 + TASK_STATE.md + DELIVERY.md。
@@ -268,6 +276,15 @@ def finalize_delivery(state: dict, workspace) -> str:
     - handoff 起点消息以 **agent（TL）** 身份追加，不用 user：它是系统注入的
       交接说明而非用户发言，落成 user 会在对话流里伪装成用户消息。
     - 返回 handoff 路径；写入失败返回 ""（不阻断交付）。
+
+    Args:
+        handoff_note: 是否在对话末尾追加「上一轮已交付」的交接说明。
+            失败 / 终止态也要做瘦身（否则未完成的需求会带着全部工具轨迹落库，
+            实测可达 20 万字符，用户继续对话时整段进 prompt），但那些终态
+            **不是交付**，追加这句会误导用户。故拆成开关，默认 True 保持原行为。
+
+    幂等性：重复调用时工具轨迹已不在 dialogue_history 中，_archive_tool_trail
+    直接返回不覆写；DELIVERY.md 为整体覆盖写。可安全调用两次。
     """
     handoff = _build_handoff(state, workspace)
     path = ""
@@ -290,7 +307,7 @@ def finalize_delivery(state: dict, workspace) -> str:
             kept.append(m)
         elif role == "iteration_batch":
             kept.append(_slim_iteration_batch(m))
-    if path:
+    if path and handoff_note:
         # ⚠️ 角色必须是 agent（TL），不能是 user。
         # 这条是系统在交付边界注入的交接起点，**不是用户说的话**；早先写成
         # role=user，于是详情页对话流里凭空多出一条「用户消息：上一轮已交付…」
@@ -311,7 +328,8 @@ class ContextPipeline:
 
     def __init__(self, budget: int = 24000, single_result_limit: int = SINGLE_RESULT_LIMIT,
                  keep_recent: int = KEEP_RECENT, keep_tail: int = KEEP_TAIL,
-                 llm_summary=None, ref_store=None):
+                 llm_summary=None, ref_store=None,
+                 history_soft_budget: int = HISTORY_SOFT_BUDGET):
         """
         Args:
             budget: head + history 的总 token 预算（默认 24000，与现状一致）
@@ -320,6 +338,8 @@ class ContextPipeline:
             keep_tail: L5 兜底时保留最近 N 条对话不摘要
             llm_summary: L5 兜底用的摘要函数 text->str（测试注入 stub）
             ref_store: 非文件大结果落盘回调 (filename, content) -> path（测试注入 fake）
+            history_soft_budget: 历史软预算（L2.5，默认 6000）—— history 单独超过
+                即开始渐进遮蔽最旧工具结果，不等硬预算撞线
         """
         self.budget = budget
         self.single_result_limit = single_result_limit
@@ -327,6 +347,9 @@ class ContextPipeline:
         self.keep_tail = keep_tail
         self.llm_summary = llm_summary
         self.ref_store = ref_store
+        # 软预算不能高于硬预算（否则两层目标打架）：小预算场景（单测 / 自定义）
+        # 退化为单层，行为与只有硬预算时一致；生产 24000 下取 6000。
+        self.history_soft_budget = min(history_soft_budget, budget)
 
     # ---------- 对外入口 ----------
 
@@ -340,7 +363,7 @@ class ContextPipeline:
             stats: 可观测性字典
         """
         head_tokens = estimate_tokens(head_content)
-        staged = self._stage_history(history)
+        staged, filtered = self._stage_history(history)
         # L3a 入口闸门：截断单条过大的工具结果
         for s in staged:
             if s["kind"] == "tool":
@@ -357,13 +380,37 @@ class ContextPipeline:
             "dropped": 0,
             "compacted": 0,
             "cache_hit": True,
+            # 日常治理量：thinking / iteration_batch 是**按设计**永不进 prompt 的
+            # （前者是模型内部推理，后者是前端卡片元数据）。此前不计数，于是日志
+            # 上只能看到 masked/dropped/compacted 全 0，看起来像"压缩机制不存在"。
+            # 两者语义必须分开：这里是每轮都发生的常规过滤，那三个是超预算兜底。
+            "filtered_count": filtered["count"],
+            "filtered_tokens": filtered["tokens"],
         }
+
+        # L2.5 软预算渐进治理：history 单独超软预算就开遮，不等硬预算撞线。
+        # 只动工具结果（read 可重读、文件在盘上，是最"不值得原样重发"的部分），
+        # chat 消息（原始需求 / 计划理解 / 验收结论）不在遮蔽候选里 —— 那是
+        # 无法从别处重建的上下文。遮蔽留下的占位符自带「如需请重新读取」指引，
+        # 模型随时可以拿回内容，所以这是有代价标注的省略，不是信息蒸发。
+        if hist_tokens > self.history_soft_budget:
+            messages, soft = self._budget_mask(
+                staged, 0, messages, target_budget=self.history_soft_budget)
+            # masked_* 始终是「实际遮蔽量」的总量（对既有契约兼容）；
+            # soft_masked 单独记软预算触发了几条，日志上与硬预算兜底区分归因。
+            stats["soft_masked"] = sum(soft.values())
+            for k, v in soft.items():
+                stats[k] = stats.get(k, 0) + v
+            stats["history_tokens"] = sum(estimate_tokens(m["content"]) for m in messages)
+            # 硬预算判断必须用治理后的量，否则软遮后会对着旧值再遮一轮，
+            # 把占位符又包一层（实测 6 条 read 全被二次占位）。
+            hist_tokens = stats["history_tokens"]
 
         # L3b + L4：预算内零遮蔽；超预算按时间序从最旧遮蔽
         if head_tokens + hist_tokens > self.budget:
             messages, sub = self._budget_mask(staged, head_tokens, messages)
             for k in sub:
-                stats[k] = sub[k]
+                stats[k] = stats.get(k, 0) + sub[k]
             stats["history_tokens"] = sum(estimate_tokens(m["content"]) for m in messages)
 
         # 注入最近 hook 失败（保留既有行为）
@@ -383,15 +430,27 @@ class ContextPipeline:
 
     # ---------- L0 角色通道 ----------
 
-    def _stage_history(self, history: list) -> list:
-        """把原始 dialogue_history 转成内部 staging 结构（L0 角色通道）。"""
+    def _stage_history(self, history: list) -> tuple:
+        """把原始 dialogue_history 转成内部 staging 结构（L0 角色通道）。
+
+        Returns:
+            (staged, filtered)
+            filtered: {"count": 条数, "tokens": 估算 token} —— 按设计不进 prompt 的
+                thinking / iteration_batch 的量，供统计与日志观测（见 build 的说明）。
+        """
         staged = []
+        filtered = {"count": 0, "tokens": 0}
         for m in history:
             role = m.get("role")
-            if role == "thinking":
-                continue  # 丢弃
-            if role == "iteration_batch":
-                continue  # UI 元数据，不发送
+            if role in ("thinking", "iteration_batch"):
+                # thinking = 模型内部推理；iteration_batch = 前端迭代卡片元数据。
+                # 两者按设计永不进 prompt，但此前不计入任何统计，日志上看不出
+                # 管道做了什么。这里累计下来，让"过滤掉了多少"可被观测。
+                filtered["count"] += 1
+                filtered["tokens"] += estimate_tokens(
+                    str(m.get("content", "")) + str(m.get("thinking_preview", ""))
+                )
+                continue
             preserve = bool(m.get("preserve", False))
             if role == "tool_call":
                 staged.append({
@@ -413,7 +472,7 @@ class ContextPipeline:
                     "role": "user" if role == "user" else "assistant",
                     "content": str(m.get("content", "")), "preserve": preserve,
                 })
-        return staged
+        return staged, filtered
 
     @staticmethod
     def _to_message(s: dict) -> dict:
@@ -482,7 +541,11 @@ class ContextPipeline:
                     break
         return superseded
 
-    def _budget_mask(self, staged: list, head_tokens: int, messages: list) -> tuple:
+    def _budget_mask(self, staged: list, head_tokens: int, messages: list,
+                     target_budget: Optional[int] = None) -> tuple:
+        """预算遮蔽。target_budget 为 None 时用 self.budget（硬预算）；
+        软预算治理（L2.5）传更小的目标值复用同一套保护集与候选排序。"""
+        target = self.budget if target_budget is None else target_budget
         sub = {"masked_read": 0, "masked_nonfile": 0, "offloaded": 0, "dropped": 0, "compacted": 0}
         cur_tokens = sum(estimate_tokens(m["content"]) for m in messages)
 
@@ -507,13 +570,17 @@ class ContextPipeline:
         #（实证 style.css 361→366→245 行变动期间，SEARCH 连续失配）。
         # 其次才按时间序从最旧遮蔽（传统 LRU 语义）。
         superseded = self._superseded_reads(staged)
-        maskable = [i for i in tool_idx if i not in protected]
+        # 已遮蔽过的（软预算阶段留下的占位符）不能再进候选 —— 否则占位符会被
+        # 再包一层占位符，计数也翻倍。
+        maskable = [i for i in tool_idx
+                    if i not in protected and not staged[i].get("masked")]
         maskable.sort(key=lambda i: (0 if i in superseded else 1, i))
 
         for i in maskable:
-            if head_tokens + cur_tokens <= self.budget:
+            if head_tokens + cur_tokens <= target:
                 break
             s = staged[i]
+            s["masked"] = True
             if s["name"] == "read_file":
                 filename, range_info = _parse_read_header(s["content"])
                 if not filename:
@@ -599,3 +666,54 @@ class ContextPipeline:
         keep = [messages[i] for i in range(len(messages)) if i not in set(droppable)]
         sub["dropped"] = len(droppable)
         return keep, sub
+
+
+def condense_chat_background(history: list, first_user_cap: int = 1200,
+                             verdict_cap: int = 600) -> tuple:
+    """第二轮（Chat 修改）对话的**背景瘦身**：只保留对修改有用的上下文。
+
+    问题（req 217 实测）：交付后的 dialogue_history 有 3.2 万字符，第二轮把
+    第一轮的完整对话全量发给 LLM —— 但对"改点东西"真正有用的只有：原始需求、
+    用户确认过的计划理解、验收结论、本轮新诉求。问题表单、编码轮旁白、
+    交付 handoff、评估报告全文都是噪声。
+
+    规则（确定性，无 LLM）：
+      · 最后一条 user 消息**及其之后**的一切原样保留 —— 那是本轮诉求和本轮
+        turns（正在进行的迭代），动它们会破坏本轮的上下文累加；
+      · preserve=True 的保留：用户澄清答案、计划理解（那是二轮的"SPEC"）；
+      · 第一条 user 消息（原始需求）保留，超长截断；
+      · agent 开头的「代码评估」保留结论段（评分 / PASS 与扣分点）；
+      · 其余（问题表单、旁白、handoff、历史评估全文）丢弃。
+
+    丢的消息仍留在 DB 的 dialogue_history 里（UI 照常显示）—— 这里只裁剪
+    **进 prompt 的视图**，由 runtime 在 is_chat 时调用，不落库。
+
+    Returns:
+        (condensed_history, stats)  stats: {"kept": n, "dropped": n, "dropped_tokens": n}
+    """
+    last_user = -1
+    for i, m in enumerate(history):
+        if isinstance(m, dict) and m.get("role") == "user":
+            last_user = i
+
+    kept, dropped, dropped_tokens = [], 0, 0
+    for i, m in enumerate(history):
+        if not isinstance(m, dict):
+            kept.append(m)
+            continue
+        role = m.get("role")
+        if i >= last_user or m.get("preserve"):
+            kept.append(m)
+            continue
+        content = str(m.get("content", ""))
+        if role == "user" and i == 0:
+            if len(content) > first_user_cap:
+                m = {**m, "content": content[:first_user_cap] + "…（历史需求已截断）"}
+            kept.append(m)
+            continue
+        if role == "agent" and content.lstrip().startswith("## 代码评估"):
+            kept.append({**m, "content": content[:verdict_cap] + "…（评估详情略）"})
+            continue
+        dropped += 1
+        dropped_tokens += estimate_tokens(content)
+    return kept, {"kept": len(kept), "dropped": dropped, "dropped_tokens": dropped_tokens}

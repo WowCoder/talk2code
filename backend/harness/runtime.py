@@ -1361,8 +1361,17 @@ class ToolCallLoop:
             llm_summary=_local_summary,
             ref_store=self._make_ref_store(),
         )
+        # 估算口径对齐真实 messages：进 msg[0] 的是 stable_prompt（已剥离可变尾段），
+        # 传完整 system_prompt 会把尾段重复计入 head，预算判断系统性偏高。
+        # Chat 修改（第二轮对话）先做背景瘦身：第一轮的完整对话对"改点东西"是
+        # 噪声 —— 只留原始需求 / 计划理解 / 验收结论 / 本轮诉求（详见
+        # condense_chat_background）。只裁 prompt 视图，不落库。
+        chat_bg = None
+        if (state.get("metadata") or {}).get("is_chat"):
+            from harness.state.context_pipeline import condense_chat_background
+            history, chat_bg = condense_chat_background(history)
         history_msgs, stats = pipeline.build(
-            head_content=system_prompt or "",
+            head_content=stable_prompt or "",
             history=history,
             hook_failures=hook_failures,
             requirement_content=requirement_content,
@@ -1395,10 +1404,17 @@ class ToolCallLoop:
 
         logger.info(
             f"[ContextPipeline] head={stats['head_tokens']} head_sha={head_sha} "
-            f"history={stats['history_tokens']} masked_read={stats['masked_read']} "
+            f"history={stats['history_tokens']} "
+            # filtered = 每轮按设计剥离的 thinking / iteration_batch（日常治理）；
+            # soft_masked = 超历史软预算的渐进遮蔽；后四项 = 超硬预算兜底。
+            f"filtered={stats['filtered_count']}/{stats['filtered_tokens']}tok "
+            f"soft_masked={stats.get('soft_masked', 0)} "
+            f"masked_read={stats['masked_read']} "
             f"masked_nonfile={stats['masked_nonfile']} offloaded={stats['offloaded']} "
             f"dropped={stats['dropped']} compacted={stats['compacted']}"
-            f"{' stale=1' if staleness_reminder else ''}"
+            + (f" chat_bg=-{chat_bg['dropped']}/{chat_bg['dropped_tokens']}tok"
+               if chat_bg else "")
+            + f"{' stale=1' if staleness_reminder else ''}"
         )
         return messages
 

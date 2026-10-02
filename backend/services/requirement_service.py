@@ -942,9 +942,38 @@ class RequirementService:
         }
         return step_to_node.get(current_step, '')
 
+    @staticmethod
+    def _slim_dialogue_on_terminal(final_state: dict, workspace) -> bool:
+        """终态对话历史瘦身：归档工具轨迹后从 dialogue_history 移除。
+
+        所有终态都调用（成功 / 失败 / 终止 / 待确认）。归档而非删除：轨迹原样
+        落盘到 .task/EXECUTION.jsonl，排查能力不损失，只是不再进 prompt。
+
+        handoff_note=False —— 只有真正交付成功才追加「上一轮已交付」的交接说明，
+        失败终态加这句会误导用户。
+
+        Returns:
+            是否成功；失败只记 warning，绝不阻断终态处理。
+        """
+        try:
+            from harness.state.context_pipeline import finalize_delivery
+            finalize_delivery(final_state, workspace, handoff_note=False)
+            return True
+        except Exception as e:
+            logger.warning(f"[Delivery] 终态对话瘦身失败（不阻断）: {e}")
+            return False
+
     def _process_final_state(self, db, requirement, requirement_id, final_state, workspace, git, tracer, sse) -> bool:
         """处理最终状态（三期：兼容多节点工作流）"""
         try:
+            # ---- 终态统一瘦身（放在入口，覆盖全部 return 路径）----
+            # 此前只有「成功交付」分支做折叠；失败 / 待确认需求的 dialogue_history
+            # 里完整保留着全部 read_file / write_file / edit_file 原文（实测
+            # 20 万字符量级，是成功需求的十倍），而 tool_call 类型是会进 prompt 的
+            # —— 用户在这类需求上继续对话时，整段轨迹原样发给了模型。
+            # 放入口而不是各分支内：新增分支时不会漏掉。
+            self._slim_dialogue_on_terminal(final_state, workspace)
+
             current_step = final_state.get('current_step', '')
 
             # 成功状态列表
