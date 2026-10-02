@@ -312,10 +312,28 @@ class TraceWriter:
     def event(self, kind: str, label: str, *, stage=None, status="ok",
               call_id=None, iteration=None, meta=None, duration_ms=None,
               model=None, tokens_in=0, tokens_out=0, cached_tokens=None, cost=0.0,
-              payload_id=None, ts=None) -> int:
-        """写一条事件索引，返回 seq；失败返回 0。"""
+              payload_id=None, ts=None,
+              messages=None, request=None, response=None) -> int:
+        """写一条事件索引，返回 seq；失败返回 0。
+
+        `messages / request / response` 传入时（里程碑事件携带产生该结论的
+        LLM 输入输出，入口见 record_event），与 llm_call 走同一套落库：
+        messages 走内容寻址、response 与请求参数落 payload。不传则维持
+        旧行为 —— 纯结论事件（只有 label + meta）。
+        """
         try:
             from models.models import AgentEvent
+            refs = []
+            if messages:
+                refs = self._write_messages(messages)
+            if payload_id is None and (request is not None or response is not None):
+                request_tail = None
+                if isinstance(request, dict):
+                    request_tail = {k: v for k, v in request.items()
+                                    if k not in ("messages", "tools")}
+                payload_id = self._write_payload(
+                    kind=kind, request_tail=request_tail, response=response)
+
             seq = self._next_seq()
             row = AgentEvent(
                 requirement_id=self.rid,
@@ -336,6 +354,7 @@ class TraceWriter:
                 cached_tokens=cached_tokens,
                 cost=cost,
                 payload_id=payload_id,
+                message_refs=refs or None,
                 meta=meta or {},
             )
             return seq if self._commit_event_row(row, "事件") else 0
@@ -797,13 +816,21 @@ def record_tool_call(requirement_id, *, name, arguments=None, result=None,
 
 def record_event(requirement_id, kind, label, *, stage=None, status="ok",
                  turn_index=0, trace_id=None, meta=None, duration_ms=None,
-                 iteration=None, writer=None):
+                 iteration=None, writer=None,
+                 messages=None, request=None, response=None):
     """里程碑事件的统一埋点（意图 / 记忆 / 澄清 / 规划 / 确认 / 编码 /
     验收结论 / 修复 / 质量门禁 / 回滚 / 交付）。
 
     为什么必须有这一层：只记录 llm_turn 与 tool_call 的时间线是一串流水账，
     排查时得逐条点开猜「为什么没过验收」。里程碑事件把结论写进 `label` 与
     `meta`，时间线本身就能回答问题。
+
+    `messages / request / response` 可选携带：结论背后**确实有 LLM 调用**的
+    事件（意图识别、澄清问题生成等）应把当时的输入输出一并传入，后台点开
+    才能看到「依据什么文本、模型原话是什么」，而不是只有置信度一个数字。
+    传法与 record_llm_turn 相同：messages=[{role, content}, ...]，
+    response={"content": ...}。没有 LLM 调用的事件（记忆注入、用户确认）
+    不要伪造空输入输出，把业务内容写进 meta 即可。
 
     `stage` 不传时取契约里该 kind 的默认阶段（唯一定义处见 event_contract.py）。
     """
@@ -823,7 +850,8 @@ def record_event(requirement_id, kind, label, *, stage=None, status="ok",
             db, w = _open_writer(requirement_id, trace_id, turn_index)
         return w.event(kind, label, stage=stage, status=status,
                        iteration=iteration, meta=meta or {},
-                       duration_ms=duration_ms)
+                       duration_ms=duration_ms,
+                       messages=messages, request=request, response=response)
     except Exception as e:
         logger.warning("[TraceWriter] record_event 失败（不阻断）：%s", e)
         _count_failure()

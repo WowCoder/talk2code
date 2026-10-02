@@ -448,14 +448,28 @@ class MemoryManager:
         # 里程碑：记忆注入。此前这条信息只存在于 agent.log 的日志行里，
         # 后台要靠回填脚本正则解析才看得到；运行时直写之后，
         # 「这次任务吃了哪些历史经验」在时间线上是第一等公民。
+        # 注入的是哪几条记忆（标题/评分/教训）随结论落 meta —— 只有 hit_ids
+        # 这种内部主键，界面上等于没说「注入了什么」。
         if requirement_id:
             try:
                 from harness.observability.trace_writer import record_event
+                _items = [
+                    {
+                        "requirement": str(m.requirement or "")[:80],
+                        "rating": m.rating,
+                        "failure": is_fail,
+                        "lesson": str(m.lesson or "")[:200],
+                    }
+                    for (m, _pos, _tok) in injected_items[:6]
+                    for is_fail in [
+                        "failure" in (m.tags or []) or m.rating < 6.0]
+                ]
                 record_event(
                     requirement_id, "memory",
                     f"长期记忆注入 · {len(injected_items)} 条",
                     meta={"injected": len(injected_items),
-                          "hit_ids": list(hit_ids or [])[:20]},
+                          "hit_ids": list(hit_ids or [])[:20],
+                          "items": _items},
                 )
             except Exception:
                 pass  # 埋点失败不影响注入

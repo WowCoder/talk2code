@@ -249,10 +249,20 @@
               </div>
             </div>
 
-            <!-- 结论要点：里程碑事件写入的 meta（判定 / 得分 / 未达成 AC / 修复轮次…）。
+            <!-- ===== 分页签 =====
+                 单签时不渲染签行 —— 只有一块内容还摆一排 tab 是噪声。
+                 签上带计数：不点进去也知道这块有多大。 -->
+            <div v-if="detailTabs.length > 1" class="d-tabs">
+              <button v-for="t in detailTabs" :key="t.key" class="d-tab"
+                      :class="{ on: activeTab === t.key }" @click="activeTab = t.key">
+                {{ t.label }}<span v-if="t.count != null" class="d-tab-n">{{ t.count }}</span>
+              </button>
+            </div>
+
+            <!-- 要点：里程碑事件写入的 meta（判定 / 得分 / 未达成 AC / 修复轮次…）。
                  不渲染它，这些字段就只躺在库里 —— 界面上「验收为什么没过」没有答案，
                  排查还得回去翻 DB，等于埋点白做。 -->
-            <template v-if="metaRows.length">
+            <template v-if="activeTab === 'overview' && metaRows.length">
               <div class="d-section">要点</div>
               <div class="kf">
                 <div v-for="row in metaRows" :key="row.k" class="kf-row">
@@ -262,79 +272,109 @@
               </div>
             </template>
 
-            <!-- REQUEST -->
-            <template v-if="hasArgs">
-              <div class="d-section">ARGUMENTS</div>
-              <div class="msg">
-                <pre class="msg-body">{{ argsJson }}</pre>
-              </div>
-            </template>
-            <div v-if="detail.messages.length" class="d-section">REQUEST</div>
-            <div v-for="m in pagedMessages" :key="m.index" class="msg">
-              <div class="msg-bar">
-                <span class="role-badge" :style="{ background: roleColor(m.role) }">{{ m.role }}</span>
-                <span v-if="m.name" class="msg-tag">{{ m.name }}</span>
-                <span v-if="m.missing" class="msg-missing">正文缺失</span>
-                <span v-else class="msg-len">{{ fmt(m.char_len) }} chars</span>
-                <button v-if="!m.missing" class="msg-copy" @click.stop="copy(m.content ?? '', 'msg' + m.index)">{{ copyLabel('msg' + m.index, '复制') }}</button>
-              </div>
-              <pre v-if="m.missing" class="msg-body msg-gap">
-这条 message 的正文没有存下来（blob 缺失），不是它本来为空。</pre>
-              <pre v-else class="msg-body" :class="{ clipped: !expanded.has('m' + m.index) }">{{ m.content }}</pre>
-              <button v-if="!m.missing && m.char_len > 700" class="more-btn" @click.stop="toggleMsg(m.index)">
-                {{ expanded.has('m' + m.index) ? '收起' : `展开全部 ${fmt(m.char_len)} 字符` }}
-              </button>
-            </div>
-            <button v-if="detail.messages.length > MSG_PAGE" class="more-btn"
-                    @click="msgLimit = msgLimit > MSG_PAGE ? MSG_PAGE : 999">
-              {{ msgLimit > MSG_PAGE ? '收起' : `显示其余 ${detail.messages.length - MSG_PAGE} 条` }}
-            </button>
-
-            <div v-if="detail.tools" class="msg">
-              <div class="msg-bar">
-                <span class="role-badge tools-b">tools</span>
-                <span class="msg-len">{{ detail.tools.length }} 项工具定义</span>
-              </div>
-              <button class="more-btn" @click.stop="toggleMsg(-1)">
-                {{ expanded.has('m-1') ? '收起' : '查看工具定义' }}
-              </button>
-              <pre v-if="expanded.has('m-1')" class="msg-body clipped">{{ toolsJson }}</pre>
-            </div>
-
-            <!-- RESPONSE -->
-            <template v-if="detail.response">
-              <div class="d-section">RESPONSE</div>
-              <div v-if="detail.response.content" class="msg">
-                <div class="msg-bar">
-                  <span class="role-badge assistant-b">assistant</span>
-                  <span class="msg-len">{{ fmt(String(detail.response.content).length) }} chars</span>
-                  <button class="msg-copy" @click.stop="copy(detail.response.content, 'resp')">{{ copyLabel('resp', '复制') }}</button>
-                </div>
-                <pre class="msg-body" :class="{ clipped: !expanded.has('resp') }">{{ detail.response.content }}</pre>
-                <button v-if="String(detail.response.content).length > 700"
-                        class="more-btn" @click.stop="toggleMsg('resp')">
-                  {{ expanded.has('resp') ? '收起' : '展开全部' }}
+            <!-- ===== REQUEST / 入参 ===== -->
+            <template v-if="activeTab === 'request'">
+              <!-- 工具行：条数 + 批量展开开关。
+                   旧版 MSG_PAGE=3 的分页已删 —— 排查时「默认只出 3 条」等于默认是瞎的；
+                   改为全量渲染，超长的单条仍默认折叠，批量开关一次全开/全收。 -->
+              <div v-if="detail.messages.length || detail.tools" class="req-bar">
+                <span class="req-note">
+                  <template v-if="detail.messages.length">{{ detail.messages.length }} 条 message</template>
+                  <template v-if="detail.messages.length && detail.tools"> · </template>
+                  <template v-if="detail.tools">{{ detail.tools.length }} 项工具定义</template>
+                </span>
+                <button v-if="longKeys.length" class="req-all" @click="toggleAllPrompts">
+                  {{ allLongExpanded
+                    ? '收起全部 prompt'
+                    : `展开全部 prompt（${longKeys.length} 段超长）` }}
                 </button>
               </div>
-              <div v-if="detail.response.tool_calls && detail.response.tool_calls.length" class="msg">
+
+              <div v-for="m in detail.messages" :key="m.index" class="msg">
                 <div class="msg-bar">
-                  <span class="role-badge tools-b">tool_calls</span>
-                  <span class="msg-len">{{ detail.response.tool_calls.length }} 次调用</span>
+                  <span class="role-badge" :style="{ background: roleColor(m.role) }">{{ m.role }}</span>
+                  <span v-if="m.name" class="msg-tag">{{ m.name }}</span>
+                  <span v-if="m.missing" class="msg-missing">正文缺失</span>
+                  <span v-else class="msg-len">{{ fmt(m.char_len) }} chars</span>
+                  <button v-if="!m.missing" class="msg-copy" @click.stop="copy(m.content ?? '', 'msg' + m.index)">{{ copyLabel('msg' + m.index, '复制') }}</button>
                 </div>
-                <div v-for="(tc, i) in detail.response.tool_calls" :key="i" class="tc">
-                  <div class="tc-name">{{ tc.function?.name ?? tc.name ?? 'unknown' }}</div>
-                  <pre class="tc-args">{{ tc.function?.arguments ?? tc.arguments ?? '' }}</pre>
+                <pre v-if="m.missing" class="msg-body msg-gap">
+这条 message 的正文没有存下来（blob 缺失），不是它本来为空。</pre>
+                <pre v-else class="msg-body" :class="{ clipped: !expanded.has('m' + m.index) }">{{ m.content }}</pre>
+                <button v-if="!m.missing && m.char_len > CLIP_LEN" class="more-btn" @click.stop="toggleMsg('m' + m.index)">
+                  {{ expanded.has('m' + m.index) ? '收起' : `展开全部 ${fmt(m.char_len)} 字符` }}
+                </button>
+              </div>
+
+              <!-- 工具入参（tool_call）：结构化渲染，不再整块 JSON。
+                   arguments 超长落库走内容寻址，后端会额外还原出 arguments_full ——
+                   有它才看得到 write_file 写入的完整文件（旧版只显示 2000 字符截断预览）。 -->
+              <template v-if="toolArgs.length">
+                <div v-for="a in toolArgs" :key="a.key" class="ta">
+                  <div class="ta-head">
+                    <span class="kf-k" :title="a.key">{{ a.label }}</span>
+                    <span v-if="a.full" class="ta-flag"
+                          title="参数超过 2000 字符时落库只存预览 + hash，此处是按 hash 还原出的完整原文">完整内容 · 预览已截断</span>
+                  </div>
+                  <pre v-if="a.long" class="msg-body" :class="{ clipped: !expanded.has(a.taKey) }">{{ a.value }}</pre>
+                  <div v-else class="ta-short">{{ a.value }}</div>
+                  <button v-if="a.long" class="more-btn" @click.stop="toggleMsg(a.taKey)">
+                    {{ expanded.has(a.taKey) ? '收起' : `展开全部 ${fmt(a.value.length)} 字符` }}
+                  </button>
                 </div>
+              </template>
+              <div v-else-if="hasArgs" class="msg">
+                <pre class="msg-body">{{ argsJson }}</pre>
+              </div>
+
+              <div v-if="detail.tools" class="msg">
+                <div class="msg-bar">
+                  <span class="role-badge tools-b">tools</span>
+                  <span class="msg-len">{{ detail.tools.length }} 项工具定义</span>
+                </div>
+                <button class="more-btn" @click.stop="toggleMsg('tools')">
+                  {{ expanded.has('tools') ? '收起' : '查看工具定义' }}
+                </button>
+                <!-- 展开后不再 clipped：旧版硬编码 clipped，4k 字符的定义永远只看到开头 -->
+                <pre v-if="expanded.has('tools')" class="msg-body">{{ toolsJson }}</pre>
               </div>
             </template>
 
-            <div v-if="detail.tool_content" class="msg">
-              <div class="d-section">TOOL RESULT</div>
-              <pre class="msg-body clipped">{{ detail.tool_content }}</pre>
-              <button class="more-btn" @click.stop="toggleMsg('tc')">
-                {{ expanded.has('tc') ? '收起' : `展开全部 ${fmt(detail.tool_content.length)} 字符` }}
-              </button>
-            </div>
+            <!-- ===== RESPONSE / 结果 ===== -->
+            <template v-if="activeTab === 'response'">
+              <template v-if="detail.response">
+                <div v-if="detail.response.content" class="msg">
+                  <div class="msg-bar">
+                    <span class="role-badge assistant-b">assistant</span>
+                    <span class="msg-len">{{ fmt(String(detail.response.content).length) }} chars</span>
+                    <button class="msg-copy" @click.stop="copy(detail.response.content, 'resp')">{{ copyLabel('resp', '复制') }}</button>
+                  </div>
+                  <pre class="msg-body" :class="{ clipped: !expanded.has('resp') }">{{ detail.response.content }}</pre>
+                  <button v-if="String(detail.response.content).length > CLIP_LEN"
+                          class="more-btn" @click.stop="toggleMsg('resp')">
+                    {{ expanded.has('resp') ? '收起' : '展开全部' }}
+                  </button>
+                </div>
+                <div v-if="detail.response.tool_calls && detail.response.tool_calls.length" class="msg">
+                  <div class="msg-bar">
+                    <span class="role-badge tools-b">tool_calls</span>
+                    <span class="msg-len">{{ detail.response.tool_calls.length }} 次调用</span>
+                  </div>
+                  <div v-for="(tc, i) in detail.response.tool_calls" :key="i" class="tc">
+                    <div class="tc-name">{{ tc.function?.name ?? tc.name ?? 'unknown' }}</div>
+                    <pre class="tc-args">{{ tc.function?.arguments ?? tc.arguments ?? '' }}</pre>
+                  </div>
+                </div>
+              </template>
+
+              <div v-if="detail.tool_content" class="msg">
+                <div class="d-section">TOOL RESULT</div>
+                <pre class="msg-body" :class="{ clipped: !expanded.has('tc') }">{{ detail.tool_content }}</pre>
+                <button v-if="detail.tool_content.length > CLIP_LEN" class="more-btn" @click.stop="toggleMsg('tc')">
+                  {{ expanded.has('tc') ? '收起' : `展开全部 ${fmt(detail.tool_content.length)} 字符` }}
+                </button>
+              </div>
+            </template>
           </template>
         </div>
       </section>
@@ -413,6 +453,8 @@ interface Detail {
   tool_content: string | null
   // tool_call 事件的工具参数（LLM 事件里则是 messages/tools 之外的请求参数）
   request_params: Record<string, unknown> | null
+  /** true/false：大参数按 hash 还原是否成功；false 时 arguments 是残缺的 */
+  args_resolved?: boolean
   // 里程碑事件的结论字段（判定、得分、未达成 AC、修复轮次…）
   meta: Record<string, unknown> | null
 }
@@ -433,8 +475,33 @@ const activeTurn = ref(0)
 const kindFilter = ref('')
 const selectedId = ref<number | null>(null)
 
-const MSG_PAGE = 3
-const msgLimit = ref(MSG_PAGE)
+// ---- 详情区分页签 ----
+// 旧版 REQUEST / RESPONSE 上下堆在同一栏：长 prompt 展开后 response 被推到
+// 很下面，来回滚动才能对上。分页签把「看输入」和「看输出」分开。
+const activeTab = ref('overview')
+const CLIP_LEN = 700
+
+type DetailTab = { key: string; label: string; count?: number }
+const detailTabs = computed<DetailTab[]>(() => {
+  const d = detail.value
+  if (!d) return []
+  const tabs: DetailTab[] = []
+  if (metaRows.value.length) tabs.push({ key: 'overview', label: '要点' })
+  if (d.kind === 'tool_call') {
+    if (hasArgs.value) tabs.push({ key: 'request', label: '入参' })
+    if (d.tool_content) tabs.push({ key: 'response', label: '结果' })
+  } else {
+    // llm_turn 与里程碑：Request = 喂进去的 prompt（+工具定义），
+    // Response = 模型产出。里程碑事件补埋点后 messages/response 会有内容，
+    // 没补到的事件两个签都不出现，只剩「要点」。
+    if (d.messages.length || d.tools || hasArgs.value) {
+      tabs.push({ key: 'request', label: 'Request', count: d.messages.length || undefined })
+    }
+    if (d.response || d.tool_content) tabs.push({ key: 'response', label: 'Response' })
+  }
+  return tabs
+})
+
 const expanded = ref<Set<string>>(new Set())
 // 折叠状态 = 「用户显式点过的组」+「没点过时的默认值」。
 // 不预填 key：分组的 key 由 rows 生成，页面这边猜不出来（曾想用 `s${i}` 预填，
@@ -625,9 +692,13 @@ const META_LABEL: Record<string, string> = {
   summary: '摘要', injected: '注入条数', hit_ids: '命中记忆', hit: '命中条数',
   error: '错误', message_count: '消息数', content_ref: '内容指纹',
   thinking: '含思考', has_usage: '含用量', source: '来源',
+  // ---- B2 补埋点后新增的明细字段 ----
+  questions: '问题列表', feature_list: '功能清单', ac_list: '验收项明细',
+  plan_issues: '规划问题', items: '注入明细', feedback: '用户反馈',
+  confirmed_features: '确认的功能', confirmed_acs: '确认的验收项',
 }
 const ALERT_KEYS = new Set(['critical_count', 'failed_ac_ids', 'defect_count',
-  'target_defects', 'error', 'dod_issues'])
+  'target_defects', 'error', 'dod_issues', 'plan_issues'])
 // 过程性字段的「默认值」：等于默认值就不显示。全渲染会让「要点」退化成噪声
 // （每个 tool_call 都顶一行「已拦截 否」），排查时反而看不见真正的结论。
 // 反过来说，blocked=true、thinking=false 这类**偏离默认**的值会照常出现。
@@ -642,9 +713,18 @@ const fmtMetaValue = (v: unknown): string => {
   if (typeof v === 'boolean') return v ? '是' : '否'
   if (Array.isArray(v)) {
     if (!v.length) return '无'
-    const head = v.slice(0, 6)
-      .map(x => (typeof x === 'object' && x !== null ? JSON.stringify(x) : String(x)))
-    return v.length > 6 ? `${head.join('、')} 等 ${v.length} 项` : head.join('、')
+    const head = v.slice(0, 6).map(x => {
+      if (typeof x === 'object' && x !== null) {
+        // 对象条目优先念人话字段（澄清问题的 label、记忆条目的 requirement），
+        // JSON 一行展开在要点区没法读
+        const o = x as Record<string, unknown>
+        const text = o.label ?? o.question ?? o.title ?? o.requirement
+        if (text) return `${o.id ? `${o.id} ` : ''}${String(text)}`
+        return JSON.stringify(x)
+      }
+      return String(x)
+    })
+    return v.length > 6 ? `${head.join('；')} 等 ${v.length} 项` : head.join('；')
   }
   if (typeof v === 'object') return JSON.stringify(v)
   return String(v)
@@ -658,13 +738,20 @@ const metaAlert = (k: string, v: unknown): boolean => {
 }
 const metaRows = computed(() => {
   const m = detail.value?.meta
-  if (!m || typeof m !== 'object') return []
-  return Object.entries(m)
+  const rows = !m || typeof m !== 'object' ? [] : Object.entries(m)
     .filter(([k, v]) => !HIDDEN_META.has(k)
       && !(k in NEUTRAL_META && v === NEUTRAL_META[k]))
     .map(([k, v]) => ({
       k, label: META_LABEL[k] ?? k, v: fmtMetaValue(v), alert: metaAlert(k, v),
     }))
+  // 大参数还原失败：此时工具参数是**残缺**的（只显示预览截断），
+  // 不明说的话会被当成完整内容读 —— 这是唯一需要把 content_ref
+  // 的下落讲清楚的场合，单独列一行标红。
+  if (detail.value?.args_resolved === false) {
+    rows.push({ k: 'args_resolved', label: '参数还原',
+                v: '失败（正文缺失，参数只显示截断预览）', alert: true })
+  }
+  return rows
 })
 
 // ---- 时间线的两级分组 ----
@@ -682,7 +769,6 @@ const rows = computed(() => buildTimelineRows<Ev>(filtered.value, {
   color: s => contract.value?.stages[s]?.color ?? 'oklch(60% 0.02 70)',
 }))
 
-const pagedMessages = computed(() => detail.value?.messages.slice(0, msgLimit.value) ?? [])
 const toolsJson = computed(() => JSON.stringify(detail.value?.tools ?? [], null, 2))
 const argsJson = computed(() => {
   const p = detail.value?.request_params
@@ -692,6 +778,77 @@ const hasArgs = computed(() => {
   const p = detail.value?.request_params
   return !!p && Object.keys(p).length > 0
 })
+
+// 详情切换后当前签可能已不存在（如 tool_call 没有「要点」），
+// 归位到第一个可用签，避免渲染出一块空白面板。
+watch(detailTabs, tabs => {
+  if (!tabs.some(t => t.key === activeTab.value)) {
+    activeTab.value = tabs[0]?.key ?? 'overview'
+  }
+}, { immediate: true })
+
+// ---- 工具入参的结构化渲染 ----
+// 旧版把 request_params 整块 JSON.stringify：name / arg_refs 是噪声，content
+// 转义成一行挤在中间；更糟的是 arguments 超 2000 字符时落库只有截断预览，
+// 完整内容在 arguments_full 里，旧版根本没显示 —— write_file 写了什么看不全。
+const ARG_LABEL: Record<string, string> = {
+  section: '写入小节', content: '内容', filename: '文件', path: '路径',
+  old_string: '替换前', new_string: '替换后', command: '命令',
+  query: '查询', url: '地址', code: '代码',
+}
+interface ToolArg {
+  key: string; label: string; value: string
+  /** 非 null = arguments 里是截断预览，value 已换成 arguments_full 的完整原文 */
+  full: string | null
+  long: boolean; taKey: string
+}
+const toolArgs = computed<ToolArg[]>(() => {
+  const p = detail.value?.request_params
+  if (!p) return []
+  const raw = p.arguments
+  if (!raw || typeof raw !== 'object') return []
+  const args = raw as Record<string, unknown>
+  const fullMap = (p.arguments_full ?? {}) as Record<string, unknown>
+  return Object.entries(args).map(([k, v], i) => {
+    const preview = typeof v === 'string' ? v : JSON.stringify(v, null, 2)
+    const resolved = fullMap[k]
+    const truncated = typeof resolved === 'string' && resolved !== preview
+    const value = truncated ? resolved : preview
+    return {
+      key: k,
+      label: ARG_LABEL[k] ?? k,
+      value,
+      full: truncated ? resolved : null,
+      long: value.length > 220 || value.includes('\n'),
+      taKey: `ta${i}`,
+    }
+  })
+})
+
+// ---- 批量展开 / 收起全部超长 prompt ----
+// 长文本默认折叠是为了首屏可读；但排查时经常要看全所有输入 —— 逐条点太磨人。
+// 收起/展开只作用于「超长」的条目（longKeys），短条目本来就没折叠，不受影响。
+const longKeys = computed<string[]>(() => {
+  const ks: string[] = []
+  for (const m of detail.value?.messages ?? []) {
+    if (!m.missing && m.char_len > CLIP_LEN) ks.push('m' + m.index)
+  }
+  if (String(detail.value?.response?.content ?? '').length > CLIP_LEN) ks.push('resp')
+  if ((detail.value?.tool_content ?? '').length > CLIP_LEN) ks.push('tc')
+  for (const a of toolArgs.value) if (a.long) ks.push(a.taKey)
+  return ks
+})
+const allLongExpanded = computed(() =>
+  longKeys.value.length > 0 && longKeys.value.every(k => expanded.value.has(k)))
+
+function toggleAllPrompts() {
+  if (allLongExpanded.value) {
+    const keep = new Set([...expanded.value].filter(k => !longKeys.value.includes(k)))
+    expanded.value = keep
+  } else {
+    expanded.value = new Set([...expanded.value, ...longKeys.value])
+  }
+}
 
 // ---- 格式化 ----
 function pad(n: number) { return String(n).padStart(2, '0') }
@@ -765,8 +922,10 @@ async function openEvent(id: number) {
   if (selectedId.value === id && detail.value) return
   selectedId.value = id
   detailLoading.value = true
+  // 展开状态与当前签都跟着事件重置 —— 上一条事件里点开的 prompt
+  // 不该默默作用于下一条（长文本会以为没折叠，短文本会以为点了没反应）
   expanded.value = new Set()
-  msgLimit.value = MSG_PAGE
+  activeTab.value = 'overview'
   try {
     detail.value = await adminFetch<Detail>(`/api/admin/traces/events/${id}`)
   } catch (e) {
@@ -793,10 +952,11 @@ function toggleGroup(k: string) {
   openState.value = m
 }
 
-function toggleMsg(k: string | number) {
-  const key = String(k).startsWith('m') || typeof k === 'number' ? `m${k}` : String(k)
+function toggleMsg(k: string) {
+  // key 一律显式传入（'m0' / 'resp' / 'tc' / 'tools' / 'ta0'）——
+  // 旧版在这里做数字/字符串的猜测转换，'m-1' 这种 key 就是那么来的
   const s = new Set(expanded.value)
-  s.has(key) ? s.delete(key) : s.add(key)
+  s.has(k) ? s.delete(k) : s.add(k)
   expanded.value = s
 }
 
@@ -1159,6 +1319,58 @@ watch(() => route.params.id, () => { selectedId.value = null; detail.value = nul
   font-size: 10.5px; color: oklch(80% 0.02 70); white-space: pre-wrap;
   word-break: break-word; max-height: 130px; overflow: hidden;
 }
+/* ---- 详情区分页签 ---- */
+/* Request 与 Response 分签：长 prompt 展开后不再把 response 推出视口 */
+.d-tabs {
+  display: flex; gap: 2px; padding: 6px 13px 0;
+  border-bottom: 1px solid oklch(30% 0.015 65);
+}
+.d-tab {
+  padding: 6px 12px 7px; border: none; background: none; cursor: pointer;
+  font-family: inherit; font-size: 11.5px; color: oklch(62% 0.02 70);
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+  display: inline-flex; align-items: center; gap: 5px;
+}
+.d-tab:hover { color: oklch(84% 0.03 75); }
+.d-tab.on {
+  color: oklch(93% 0.01 85); font-weight: 600;
+  border-bottom-color: oklch(70% 0.12 60);
+}
+.d-tab-n {
+  font-size: 9.5px; padding: 0 5px; border-radius: 8px;
+  background: oklch(30% 0.015 65); color: oklch(74% 0.02 75);
+  font-variant-numeric: tabular-nums;
+}
+.d-tab.on .d-tab-n { background: oklch(36% 0.03 55); color: oklch(88% 0.04 70); }
+
+/* Request 签的工具行：条数 + 批量展开开关 */
+.req-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 7px 13px 2px;
+}
+.req-note { font-size: 10px; color: oklch(60% 0.02 70); }
+.req-all {
+  background: none; border: none; padding: 0; cursor: pointer;
+  font-family: inherit; font-size: 10.5px;
+  color: oklch(70% 0.09 60); text-decoration: underline;
+}
+.req-all:hover { color: oklch(82% 0.1 65); }
+
+/* ---- 工具入参的结构化渲染 ---- */
+.ta { padding: 7px 13px 2px; }
+.ta-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 3px; }
+.ta-head .kf-k { min-width: 0; }
+.ta-flag {
+  font-size: 9.5px; padding: 1px 6px; border-radius: 4px;
+  background: oklch(30% 0.04 80); color: oklch(78% 0.08 80);
+  white-space: nowrap;
+}
+.ta-short {
+  font-size: 11.5px; color: oklch(90% 0.01 85); line-height: 1.6;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  word-break: break-word;
+}
+
 .col-body::-webkit-scrollbar { width: 8px; }
 .col-body::-webkit-scrollbar-thumb { background: oklch(86% 0.02 75); border-radius: 4px; }
 .dark-body::-webkit-scrollbar-thumb { background: oklch(38% 0.015 65); }

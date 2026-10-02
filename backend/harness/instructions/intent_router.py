@@ -58,6 +58,10 @@ class IntentResult:
     confidence: float = 0.8  # 置信度 0-1
     quick_answer: str = ""   # QUICK/SEARCH 的预生成答案（可选）
     skill_name: str = ""     # SKILL 意图命中时，匹配到的工作流技能名
+    # 产生该结论的 LLM 输入输出（可观测性）：{"messages": [...], "response": {...}}。
+    # 没走 LLM 的判定（如 SKILL 确定性命中、调用异常兜底）保持 None ——
+    # 没有调用就不要在后台伪造一段空的 prompt。
+    llm_trace: Optional[dict] = None
 
 
 # ==================== 分类 Prompt（从 .md 文件加载）====================
@@ -135,21 +139,36 @@ class IntentRouter:
                 timeout=_classify_timeout(),
             )
 
+            # 可观测性：意图判定的输入输出随结果带回，由调用方（requirement_service）
+            # 写进里程碑事件 —— 此前只落了 intent/confidence 两个数字，
+            # 「模型依据什么文本、原话是什么」在后台查不到。
+            _trace_msgs = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ]
+
             if response.is_error or not response.content:
                 logger.warning(f"[IntentRouter] 分类失败，默认走 TASK: {response.error}")
-                return IntentResult(intent=IntentType.TASK, confidence=0.5)
+                return IntentResult(
+                    intent=IntentType.TASK, confidence=0.5,
+                    llm_trace={"messages": _trace_msgs,
+                               "response": {"content": "",
+                                            "error": str(response.error or "empty")}})
 
             raw = response.content.strip().upper()
             # 归一化分隔符：模型常把 OUT_OF_SCOPE 写成 OUT-OF-SCOPE / OUT OF SCOPE，
             # 不统一就无法命中枚举值，边界声明会被静默跳过。
             raw_norm = raw.replace("-", "_").replace(" ", "_")
+            _llm_trace = {"messages": _trace_msgs,
+                          "response": {"content": raw}}
 
             # 解析分类结果：先精确单标签，再按词边界取最早出现的标签
             # （避免 "这是 TASK，不需要 search" 被先命中 SEARCH）
             for intent_type in IntentType:
                 if raw_norm == intent_type.value.upper():
                     logger.info(f"[IntentRouter] 分类结果: {intent_type.value} (raw={raw})")
-                    return IntentResult(intent=intent_type, confidence=0.95)
+                    return IntentResult(intent=intent_type, confidence=0.95,
+                                        llm_trace=_llm_trace)
 
             import re as _re
             matches = []
@@ -162,11 +181,13 @@ class IntentRouter:
                 matches.sort(key=lambda x: x[0])
                 winner = matches[0][1]
                 logger.info(f"[IntentRouter] 分类结果: {winner.value} (raw={raw})")
-                return IntentResult(intent=winner, confidence=0.7)
+                return IntentResult(intent=winner, confidence=0.7,
+                                    llm_trace=_llm_trace)
 
             # 无法解析，默认 TASK
             logger.warning(f"[IntentRouter] 无法解析分类结果: {raw}，默认 TASK")
-            return IntentResult(intent=IntentType.TASK, confidence=0.5)
+            return IntentResult(intent=IntentType.TASK, confidence=0.5,
+                                llm_trace=_llm_trace)
 
         except Exception as e:
             logger.warning(f"[IntentRouter] 分类异常: {e}，默认 TASK")

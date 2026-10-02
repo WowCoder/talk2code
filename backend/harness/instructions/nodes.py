@@ -98,11 +98,16 @@ def _md(state: AgentState) -> dict:
 
 def _record_milestone(state: AgentState, kind: str, label: str, *,
                       status: str = "ok", meta: dict = None,
-                      duration_ms: int = None):
+                      duration_ms: int = None,
+                      messages: list = None, response: dict = None):
     """里程碑事件埋点（意图/记忆/澄清/规划/确认/编码/验收结论/修复/门禁/回滚/交付）。
 
     时间线只记 llm_turn + tool_call 就是一本流水账，排查时得逐条点开猜
     「验收为什么没过」。里程碑事件把结论写进 label 与 meta，时间线本身就能回答问题。
+
+    `messages / response` 可选：结论背后确实有 LLM 调用时把输入输出一并传入
+    （如澄清问题生成），后台点开能看到依据。没有调用的事件不要传 ——
+    不伪造空的输入输出。
 
     失败静默：可观测性不得阻断主流程（失败计数在 TraceWriter 侧统一记录）。
     """
@@ -114,6 +119,7 @@ def _record_milestone(state: AgentState, kind: str, label: str, *,
             kind, label, status=status, meta=meta, duration_ms=duration_ms,
             turn_index=int(md.get("turn_index") or 0),
             trace_id=md.get("trace_id") or None,
+            messages=messages, response=response,
         )
     except Exception:
         pass
@@ -451,10 +457,13 @@ def _extract_clarify_payload(content: str):
     return None
 
 
-def _generate_clarify_questions_ex(client, requirement: str) -> tuple[list, str]:
+def _generate_clarify_questions_ex(client, requirement: str) -> tuple[list, str, dict]:
     """生成澄清问题，并区分「问了 / 明确不问 / 压根没问成」三种结果。
 
-    返回 (questions, status)，status 取值见上面的常量。
+    返回 (questions, status, llm_trace)，status 取值见上面的常量。
+    `llm_trace` 是产生这些问题的一次 LLM 调用的输入输出（可观测性）：
+    此前只落 question_count，后台「这 2 个问题到底是什么、模型原话是什么」
+    无从查起。调用异常时 trace 带 error；无调用场景不存在（本函数必有调用）。
 
     为什么必须区分：此前三种情况一律返回空列表，调用方只能 `if questions:` 判断，
     于是 LLM 一超时/返回散文，需求确认门禁就**静默全开**，需求和改造前一样直接
@@ -476,9 +485,16 @@ def _generate_clarify_questions_ex(client, requirement: str) -> tuple[list, str]
         detail_hint=detail_hint,
     )
 
+    _system = "你是一位产品经理，帮助澄清用户需求。用户已经说过的信息不要再问。"
+    _trace_msgs = [
+        {"role": "system", "content": _system},
+        {"role": "user", "content": prompt},
+    ]
+    _trace = {"messages": _trace_msgs}
+
     response = client.chat(
         prompt=prompt,
-        system_prompt="你是一位产品经理，帮助澄清用户需求。用户已经说过的信息不要再问。",
+        system_prompt=_system,
         use_memory=False, max_tokens=_CLARIFY_MAX_TOKENS, timeout=_aux_timeout()
     )
     if response.is_error or not response.content:
@@ -486,8 +502,11 @@ def _generate_clarify_questions_ex(client, requirement: str) -> tuple[list, str]
             f"[TeamLeader] 澄清问题调用失败 (is_error={response.is_error}, "
             f"content_len={len(response.content or '')})"
         )
-        return [], CLARIFY_STATUS_FAILED
+        _trace["response"] = {"content": "",
+                              "error": str(response.error or "empty")}
+        return [], CLARIFY_STATUS_FAILED, _trace
 
+    _trace["response"] = {"content": response.content}
     data = _extract_clarify_payload(response.content)
 
     if isinstance(data, dict):
@@ -507,7 +526,7 @@ def _generate_clarify_questions_ex(client, requirement: str) -> tuple[list, str]
         logger.warning(
             f"[TeamLeader] 澄清问题返回不可解析，按调用失败处理: {response.content[:200]!r}"
         )
-        return [], CLARIFY_STATUS_FAILED
+        return [], CLARIFY_STATUS_FAILED, _trace
 
     # 只保留结构合法的条目：残缺条目会让前端渲染出空白选项（比不问更糟）
     questions = [q for q in data if isinstance(q, dict) and (q.get("label") or q.get("question"))]
@@ -515,7 +534,7 @@ def _generate_clarify_questions_ex(client, requirement: str) -> tuple[list, str]
         logger.warning(
             f"[TeamLeader] 澄清问题里有 {len(data) - len(questions)} 条结构不合法，已丢弃"
         )
-    return questions, (CLARIFY_STATUS_ASKED if questions else CLARIFY_STATUS_NONE)
+    return questions, (CLARIFY_STATUS_ASKED if questions else CLARIFY_STATUS_NONE), _trace
 
 
 def _generate_clarify_questions(client, requirement: str) -> list:
@@ -523,7 +542,7 @@ def _generate_clarify_questions(client, requirement: str) -> list:
 
     需要区分失败的新调用方请用 _generate_clarify_questions_ex。
     """
-    questions, _ = _generate_clarify_questions_ex(client, requirement)
+    questions, _, _ = _generate_clarify_questions_ex(client, requirement)
     return questions
 
 
@@ -700,10 +719,11 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
         MIN_REQUIREMENT_CHARS = 8
         try:
             client = get_client()
-            questions, clarify_status = _generate_clarify_questions_ex(client, requirement)
+            questions, clarify_status, clarify_trace = \
+                _generate_clarify_questions_ex(client, requirement)
         except Exception as e:
             logger.warning(f"[TeamLeader] 生成澄清问题失败: {e}")
-            questions, clarify_status = [], CLARIFY_STATUS_FAILED
+            questions, clarify_status, clarify_trace = [], CLARIFY_STATUS_FAILED, {}
 
         if clarify_status == CLARIFY_STATUS_FAILED:
             # 调用失败 ≠ 需求明确。失败时用兜底问题守住门禁——宁可多问一句，
@@ -740,11 +760,17 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
             question_form = {'questions': questions}
             # 里程碑：需求被拦下澄清。运营后台时间线上要能直接看出
             # 「需求走到哪一步停的、为什么停」，而不是只看到一串 LLM 调用。
+            # questions 完整列表落 meta（此前只有 question_count，问题正文
+            # 查不到）；llm_trace 是生成这些问题的一次 LLM 调用，输入输出
+            # 一并落库 —— 是 LLM 问的还是兜底罐头问题，点开即见。
             _record_milestone(
                 state, KIND_CLARIFY,
                 f"需求待澄清 · {len(questions)} 个问题",
                 meta={"reason": clarify_reason,
-                      "question_count": len(questions)},
+                      "question_count": len(questions),
+                      "questions": questions[:6]},
+                messages=clarify_trace.get("messages"),
+                response=clarify_trace.get("response"),
             )
             return {
                 'plan': {},
@@ -929,13 +955,25 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
         # 时间线上直接能看出「这一版计划给的是什么量级的活、AC 是否带病放行」。
         _ac_list = plan.get('acceptance_criteria', []) if isinstance(plan, dict) else []
         _feat_list = plan.get('features', []) if isinstance(plan, dict) else []
+        # 明细随结论落 meta：只有「5 个功能 / 5 条验收」两个计数，排查时
+        # 「这一版计划到底规划了什么、AC 写了什么」还得去翻对话流。
+        _ac_detail = [
+            f"{a.get('id', '?')} {a.get('label', '')}"
+            + (f"（{a.get('how_to_verify', '')}）" if a.get('how_to_verify') else "")
+            for a in (_ac_list if isinstance(_ac_list, list) else [])
+            if isinstance(a, dict)
+        ]
         _record_milestone(
             state, KIND_PLAN,
             f"规划完成 · {len(_feat_list)} 个功能 / {len(_ac_list)} 条验收",
             status="ok" if plan_ok else "warning",
             meta={"features": len(_feat_list), "ac_count": len(_ac_list),
                   "complexity": complexity,
-                  "dod_issues": len(plan_issues or [])},
+                  "dod_issues": len(plan_issues or []),
+                  "feature_list": [str(f) for f in
+                                   (_feat_list if isinstance(_feat_list, list) else [])][:10],
+                  "ac_list": _ac_detail[:10],
+                  "plan_issues": [str(x) for x in (plan_issues or [])][:10]},
         )
 
         return {

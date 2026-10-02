@@ -209,8 +209,13 @@ class RequirementService:
                     # 里程碑：意图路由结果。时间线的第一条事件 ——
                     # 「需求根本没进工作流」这种情况在后台要一眼可见，
                     # 否则排查时会以为任务跑了却什么都没记录。
+                    # llm_trace：意图判定背后是一次真实 LLM 调用，输入输出
+                    # 一并落库，后台点开能看到「依据什么文本、模型原话是什么」，
+                    # 而不是只有 confidence 一个数字。SKILL 确定性命中无调用，
+                    # trace 为 None，落库走纯结论事件。
                     try:
                         from harness.observability.trace_writer import record_event
+                        _trace = getattr(intent_result, "llm_trace", None) or {}
                         record_event(
                             requirement_id, "intent",
                             f"意图识别 · {intent_result.intent.value}",
@@ -218,6 +223,8 @@ class RequirementService:
                             meta={"intent": intent_result.intent.value,
                                   "confidence": getattr(intent_result, "confidence", None),
                                   "skill_name": getattr(intent_result, "skill_name", None)},
+                            messages=_trace.get("messages"),
+                            response=_trace.get("response"),
                         )
                     except Exception:
                         pass
@@ -626,14 +633,32 @@ class RequirementService:
                     return False
 
                 # 里程碑：用户确认计划。它把时间线切成「规划」与「编码」两段，
-                # 也是排查「用户到底确认的是哪一版计划」的锚点。
+                # 也是排查「用户到底确认的是哪一版计划」的锚点 —— 所以被确认的
+                # 计划内容（功能清单 / 验收项）与用户反馈全文必须随事件落库，
+                # 只记 feedback_len 等于没回答「确认的是哪一版」。
                 try:
                     from harness.observability.trace_writer import record_event
+                    _plan = {}
+                    for _msg in reversed(list(requirement.dialogue_history or [])):
+                        _p = _msg.get('plan') if isinstance(_msg, dict) else None
+                        if isinstance(_p, dict) and _p:
+                            _plan = _p
+                            break
+                    _feats = _plan.get('features') or []
+                    _acs = [
+                        f"{a.get('id', '?')} {a.get('label', '')}"
+                        for a in (_plan.get('acceptance_criteria') or [])
+                        if isinstance(a, dict)
+                    ]
                     record_event(
                         requirement_id, "confirm",
                         "用户确认计划" + ("（附修改意见）" if feedback else ""),
                         status="ok", meta={"has_feedback": bool(feedback),
-                                           "feedback_len": len(feedback or "")},
+                                           "feedback_len": len(feedback or ""),
+                                           "feedback": (feedback or "")[:500] or None,
+                                           "confirmed_features":
+                                               [str(f) for f in _feats][:10],
+                                           "confirmed_acs": _acs[:10]},
                     )
                 except Exception:
                     pass
