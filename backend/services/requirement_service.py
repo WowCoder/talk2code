@@ -4,8 +4,10 @@
 封装 AI 多智能体协同处理需求的业务逻辑
 """
 
+import hashlib
 import json
 import threading
+from collections import OrderedDict
 from typing import Optional
 
 from models import Requirement
@@ -87,6 +89,30 @@ def _get_memory_manager() -> MemoryManager:
     return _memory_manager
 
 
+# 记忆注入结果缓存：{(requirement_id, 需求内容摘要): (block, hit_ids)}
+#
+# 为什么需要它：一条需求会被重复入队处理 —— 首次提交、澄清回答后重跑、计划确认后
+# 再跑一遍，其中计划确认还会经过 process_requirement 与 _continue_from_plan_checkpoint
+# 两个入口（实测相隔约 130ms 各注入一次）。每次入队都重新检索一次、并且**新写一批
+# 记账行**，于是同一对记忆在同一需求下被记成 4 次命中，命中率统计被凭空抬高。
+#
+# 缓存失效的后果只是「多检索一次」（回到改造前的行为），不引入新的失败模式，
+# 因此用进程内缓存即可，不做落库 —— 落库要处理跨任务一致性，收益不抵复杂度。
+_MEMORY_INJECT_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_MEMORY_INJECT_CACHE_MAX = 256
+_memory_inject_lock = threading.Lock()
+
+
+def _memory_cache_key(requirement_id: Optional[int], requirement_content: str) -> tuple:
+    """缓存键：需求 id + 需求内容摘要。
+
+    内容摘要参与 key，是为了让「用户补充说明后重新提交」这种情况自然穿透缓存
+    （内容变了就要重新检索），而不是命中旧结果。
+    """
+    digest = hashlib.sha1((requirement_content or "").encode("utf-8")).hexdigest()[:12]
+    return (requirement_id, digest)
+
+
 def _build_injected_memory_block(requirement_content: str, user_id: int,
                                  requirement_id: Optional[int] = None):
     """检索并渲染待注入的历史经验文本块 + 记账行 id。
@@ -96,6 +122,9 @@ def _build_injected_memory_block(requirement_content: str, user_id: int,
     抽成独立函数是因为生成阶段与定向补全阶段都要用，且必须与"每任务算一次、
     结果缓存复用"的策略配合 —— 放进 _build_system_prompt 里会导致每个
     LLM turn 重新检索。
+
+    同一需求 + 同一份需求内容只检索一次并复用（见 _MEMORY_INJECT_CACHE），
+    重复入队不会再产生第二份记账行。
 
     返回的 hit_ids 是本次注入写下的记账行主键，任务到**终态**时用 resolve_hits()
     回填结果。
@@ -109,12 +138,77 @@ def _build_injected_memory_block(requirement_content: str, user_id: int,
     在生产侧第一次有数据可答（此前 139 条生产命中全是 pending，只能靠 eval 的
     小样本外推）。
     """
+    key = _memory_cache_key(requirement_id, requirement_content)
+    with _memory_inject_lock:
+        cached = _MEMORY_INJECT_CACHE.get(key)
+        if cached is not None:
+            _MEMORY_INJECT_CACHE.move_to_end(key)
+            return cached
     try:
-        return _get_memory_manager().inject_with_receipt(
+        result = _get_memory_manager().inject_with_receipt(
             requirement_content, user_id, requirement_id=requirement_id)
     except Exception as e:
         logger.warning(f"记忆检索失败（不阻断，降级为无记忆注入）：{e}")
         return "", []
+    with _memory_inject_lock:
+        _MEMORY_INJECT_CACHE[key] = result
+        _MEMORY_INJECT_CACHE.move_to_end(key)
+        while len(_MEMORY_INJECT_CACHE) > _MEMORY_INJECT_CACHE_MAX:
+            _MEMORY_INJECT_CACHE.popitem(last=False)
+    return result
+
+
+def _attach_lazy_memory(tool_loop, requirement_content: str, user_id: int,
+                        requirement_id: Optional[int] = None) -> dict:
+    """把记忆注入挂到 tool_loop 上，**惰性执行**：第一个真正编码的 turn 才检索。
+
+    为什么不能在入队时就 eagerly 算好：一次需求会被多次入队，其中相当一部分
+    根本走不到编码阶段 ——
+      · 首次提交：TeamLeader 进节点的第一件事是澄清门禁
+        （harness/instructions/nodes.py:698），需求未经用户确认就直接返回问题
+        表单，这一次入队一个 turn 都没进 Coder；
+      · 计划确认：process_requirement 跑 130ms 就转
+        _continue_from_plan_checkpoint，也只是路过。
+    在这两种入队上检索并记账，等于把一批**从未参与过任何一次生成**的记忆写成
+    「命中」，它们既不会被调用也不会在终态之外被结算，只把归因分母灌水，还在
+    界面的规划阶段插一条与本次生成无关的记忆事件。
+
+    惰性化的判据不是「猜这次会不会被门禁拦下」（猜不准，门禁放不放行由 LLM 定），
+    而是「有没有人真的要读它」：只有 Coder 的 system prompt 与定向补全阶段会读
+    （file_coder.py），读的那一刻才算。被门禁拦下的入队自然一次都不触发，
+    LLM 判定无需澄清、直接开跑的需求也不会少拿记忆。
+
+    副作用：记忆事件的时间点从「规划阶段」后移到「编码首个 turn」——这是修正，
+    不是退化：注入本就只作用于编码。
+
+    返回一个可变 dict（{"loaded", "block", "hit_ids"}）供调用方观测，
+    语义保证：同一 tool_loop 只算一次；检索失败降级为空串，绝不阻断编码。
+    """
+    cache = {"loaded": False, "block": "", "hit_ids": []}
+
+    def _ensure() -> str:
+        if not cache["loaded"]:
+            block, hit_ids = _build_injected_memory_block(
+                requirement_content, user_id, requirement_id=requirement_id)
+            cache["block"] = block or ""
+            cache["hit_ids"] = list(hit_ids or [])
+            cache["loaded"] = True
+            # 定向补全阶段整体替换 _build_system_prompt，拿不到这个闭包，
+            # 走 provider 取（file_coder.py 优先读 _memory_provider）。
+            tool_loop._memory_block = cache["block"]
+        return cache["block"]
+
+    original_builder = tool_loop._build_system_prompt
+    # 未触发前保持空串：下游读到空只代表「还没取」，不代表「没检索到」
+    tool_loop._memory_block = ""
+    tool_loop._memory_provider = _ensure
+    def _memory_aware_prompt(state):
+        base = original_builder(state)
+        block = _ensure()
+        return base + block if block else base
+
+    tool_loop._build_system_prompt = _memory_aware_prompt
+    return cache
 
 
 class RequirementService:
@@ -290,28 +384,16 @@ class RequirementService:
     
                 # 记忆注入：将历史经验作为 few-shot 示例追加到 System Prompt
                 #
-                # 注入内容在一个任务内不会变化，所以必须在任务开始时算一次并缓存。
-                # 若像以前那样放在 _build_system_prompt 内部计算，由于 system prompt
-                # 是每个 LLM turn 重建一次的，检索开销会被放大到每个 turn
+                # 惰性执行（_attach_lazy_memory）：第一个真正进 Coder 的 turn 才检索。
+                # 澄清门禁会直接返回问题表单、计划确认也只是路过，这两种入队一个
+                # turn 都不会用到它 —— 提前检索等于给从未参与生成的记忆记一笔命中。
+                #
+                # 注入内容在一个任务内不会变化，所以只算一次并缓存（进程内 LRU）。放回到 _build_system_prompt 内部逐 turn 计算是被
+                # 禁止的：system prompt 每轮重建，检索开销会被放大到每个 turn
                 # （全表查询 + 索引一致性检查 + LLM 校验）。
-                _original_builder = tool_loop._build_system_prompt
-                _req_content = requirement.content
-                _req_user_id = requirement.user_id
-                # 记账行 id，任务终态回填 outcome。先置空，避免检索分支未走到时
-                # 终态回填抛 NameError。
-                _memory_hit_ids = []
-                _memory_block, _memory_hit_ids = _build_injected_memory_block(
-                    _req_content, _req_user_id, requirement_id=requirement_id)
-
-                # 挂到 loop 上供 file_coder 的逐文件编码阶段复用：
-                # 该阶段会整体替换 _build_system_prompt，拿不到这里的包装结果。
-                tool_loop._memory_block = _memory_block
-
-                def _memory_aware_prompt(state):
-                    base = _original_builder(state)
-                    return base + _memory_block if _memory_block else base
-
-                tool_loop._build_system_prompt = _memory_aware_prompt
+                _attach_lazy_memory(
+                    tool_loop, requirement.content, requirement.user_id,
+                    requirement_id=requirement_id)
     
                 # 构建初始状态
                 initial_state: AgentState = {
@@ -772,19 +854,13 @@ class RequirementService:
                 checkpoint=checkpoint, on_iteration=_persist_dialogue,
             )
     
-            # 记忆注入（每任务算一次并缓存，不要放进 builder 内部逐 turn 计算）
-            _original_builder = tool_loop._build_system_prompt
-            _req_content = requirement.content
-            _req_user_id = requirement.user_id
-            _memory_block, _memory_hit_ids = _build_injected_memory_block(
-                _req_content, _req_user_id, requirement_id=requirement_id)
-            tool_loop._memory_block = _memory_block
-
-            def _memory_aware_prompt(state):
-                base = _original_builder(state)
-                return base + _memory_block if _memory_block else base
-
-            tool_loop._build_system_prompt = _memory_aware_prompt
+            # 记忆注入（惰性，理由同上：每任务只算一次，且不再放进 builder 内部
+            # 逐 turn 计算）。这里的 tool_loop 是新实例，检索结果不与上游
+            # process_requirement 那一份共享 —— 但两者都是惰性的，谁也没提前触发，
+            # 实际只会由第一个真正编码的 loop 触发一次。
+            _attach_lazy_memory(
+                tool_loop, requirement.content, requirement.user_id,
+                requirement_id=requirement_id)
     
             # ---- 从检查点恢复 TL 后的状态 ----
             resumed_state = checkpoint.resume(requirement_id)
@@ -1082,11 +1158,15 @@ class RequirementService:
                 except Exception as e:
                     logger.warning(f"经验学习失败（不阻断）：{e}")
 
-                # 记账回填（失败结局）：此前生产侧只记账不回填，139 条命中记录
+                # 记账回填（失败结局）：此前生产侧只记账不回填，命中记录
                 # 永远是 pending，于是"注入的记忆到底有没有用"这个问题在数据上
                 # 根本无法回答（eval 侧 33% 的通过率没有生产对照）。
+                #
+                # 按需求号回填而不是传 id 列表：后者是注入点的局部变量，
+                # 在这里引用必抛 NameError 被 except 吞掉 —— 回填从未真正生效。
                 try:
-                    _get_memory_manager().resolve_hits(_memory_hit_ids, passed=False)
+                    _get_memory_manager().resolve_hits_for_requirement(
+                        requirement_id, passed=False)
                 except Exception as e:
                     logger.warning(f"记忆记账回填失败（不阻断）：{e}")
 
@@ -1178,7 +1258,8 @@ class RequirementService:
                 # 注意这是相关性不是因果性 —— 要证明因果得靠 A/B（eval --with-memory）。
                 try:
                     _passed = bool(qa_data.get("passed")) if isinstance(qa_data, dict) else True
-                    _get_memory_manager().resolve_hits(_memory_hit_ids, passed=_passed)
+                    _get_memory_manager().resolve_hits_for_requirement(
+                        requirement_id, passed=_passed)
                 except Exception as e:
                     logger.warning(f"记忆记账回填失败（不阻断）：{e}")
 

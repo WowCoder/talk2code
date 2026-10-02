@@ -984,6 +984,55 @@ class MemoryManager:
                 except Exception:
                     pass
 
+    def resolve_hits_for_requirement(self, requirement_id: int, passed: bool) -> int:
+        """按需求回填：把该需求下所有 pending 命中行一次性结算。
+
+        为什么不继续用 resolve_hits(hit_ids)：那个接口的实参是注入点里的局部变量，
+        而终态处理在另一个方法里 —— 生产上每次调用都抛 NameError 被 except 吞掉，
+        数百条命中行永远停在 pending，「注入的记忆有没有用」在数据上无法回答。
+
+        改按 requirement_id 结算后，调用方不再需要跨作用域搬运 id 列表：
+        记账行本身就带 requirement_id，终态只需拿到需求号。跨进程（Celery worker）
+        同样成立，这是按 id 列表传递做不到的。
+
+        Returns:
+            实际更新的行数；无待结算行或失败时返回 0。
+        """
+        if not requirement_id:
+            return 0
+        outcome = "pass" if passed else "fail"
+        db = None
+        try:
+            db = SessionLocal()
+            rows = db.query(MemoryHit).filter(
+                MemoryHit.requirement_id == requirement_id,
+                MemoryHit.outcome == "pending",
+            ).update(
+                {MemoryHit.outcome: outcome,
+                 MemoryHit.resolved_at: func.now()},
+                synchronize_session=False,
+            )
+            db.commit()
+            if rows:
+                logger.info(
+                    f"[MemoryManager] 需求 {requirement_id} 记账回填 {rows} 条 → {outcome}"
+                )
+            return int(rows or 0)
+        except Exception as e:
+            logger.warning(f"[MemoryManager] 按需求记账回填失败: {e}")
+            if db is not None:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+            return 0
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
     def effectiveness_report(self, min_hits: int = 3) -> dict:
         """记忆有效性报表：回答"注入的记忆到底有没有用"。
 

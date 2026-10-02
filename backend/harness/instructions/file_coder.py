@@ -125,9 +125,16 @@ def _inject_coding_context(tool_loop, context: dict):
     的记忆注入被静默丢弃：不报错、不告警，只是悄悄不生效。
     """
     original_builder = tool_loop._build_system_prompt
-    # requirement_service 在任务开始时就已算好并挂上，这里直接复用即可，
-    # 不重新检索（注入内容在一个任务内不会变化）
-    memory_block = getattr(tool_loop, "_memory_block", "") or ""
+    # requirement_service 用 _attach_lazy_memory 挂了惰性 provider：只有真的要拼
+    # prompt 时才检索。这里必须走 provider 触发一次，否则这一阶段的记忆注入会被
+    # 静默丢弃（不报错、不告警，只是悄悄不生效）。
+    # _memory_block 是 provider 触发后回写的兜底值：eval 等直 call 路径会自己挂
+    # 一个静态块，没有 provider 时退化读它，行为不变。
+    _provider = getattr(tool_loop, "_memory_provider", None)
+    if callable(_provider):
+        memory_block = _provider() or ""
+    else:
+        memory_block = getattr(tool_loop, "_memory_block", "") or ""
 
     def _file_aware_prompt(state):
         plan_section = ""
