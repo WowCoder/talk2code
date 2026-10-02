@@ -57,3 +57,8 @@ jobs:
 
       - name: Type-check & build
         run: npm run build
+
+      # 守卫必须挂在 CI 上：脚本进了仓库但没人跑，等于没有守卫。
+      # 断言只编译本仓源码、读本仓用例数据，不需要浏览器也不发网络请求。
+      - name: Frontend guards
+        run: npm run check

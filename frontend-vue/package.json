@@ -8,8 +8,9 @@
     "build": "vue-tsc -b && vite build",
     "preview": "vite preview",
     "check:role": "node scripts/role-check.mjs",
+    "check:timeline": "node scripts/timeline-rows-check.mjs",
     "check:gate": "node scripts/gate-check.mjs",
-    "check": "node scripts/role-check.mjs && node scripts/gate-check.mjs",
+    "check": "node scripts/role-check.mjs && node scripts/timeline-rows-check.mjs && node scripts/gate-check.mjs",
     "replay:role": "node scripts/role-replay.mjs"
   },
   "dependencies": {
