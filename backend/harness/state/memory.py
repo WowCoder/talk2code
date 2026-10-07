@@ -1158,11 +1158,21 @@ class MemoryManager:
                 prompt=prompt,
                 system_prompt=REFLECTION_SYSTEM,
                 use_memory=False,
-                max_tokens=400,
+                # 400 → 1600（需求 220 实证）：max_tokens 是 reasoning + content 的
+                # **共享额度且 reasoning 先扣**，400 会被 3 问自答的思考过程吃光
+                # → content 恒空 → 教训一条都存不下来（实测连续两次全部失败，
+                # 只能降级到规则化 lesson）。反思确实需要推理，故关掉 thinking
+                # 不合适，改为把额度给够。
+                max_tokens=1600,
                 timeout=_aux_timeout(),
                 thinking='enabled',
             )
             if response.is_error or not response.content:
+                logger.warning(
+                    f"[MemoryManager] 反思 LLM 未产出内容 "
+                    f"(error={getattr(response, 'error', None)}, "
+                    f"finish_reason={getattr(response, 'finish_reason', None)})，本次不记教训"
+                )
                 return {}
 
             content = response.content.strip()
@@ -1197,11 +1207,23 @@ class MemoryManager:
                 prompt=prompt,
                 system_prompt=VERIFY_SYSTEM,
                 use_memory=False,
-                max_tokens=100,
+                # thinking: enabled → disabled（需求 220 实证）：输出只是一个索引
+                # 列表（形如 `[0, 2, 5]`），不需要推理；而 100 的额度在开启推理时
+                # 会被 reasoning 吃光（实测 content 空），于是**无声**降级到
+                # 向量 top-2 —— 记忆筛选等于没做，且日志里完全没有痕迹。
+                # 额度给到 300：即使换到关不掉推理的端点（glm）也够正文落地。
+                max_tokens=300,
                 timeout=_classify_timeout(),
-                thinking='enabled',
+                thinking='disabled',
             )
             if response.is_error or not response.content:
+                # 此前这里是静默 fallback：筛选失败与「筛选后确实只该留 2 条」
+                # 在日志里长得一模一样，排查时无从下手。
+                logger.warning(
+                    f"[MemoryManager] 记忆筛选 LLM 未产出内容，降级到向量 top-2 "
+                    f"(候选 {len(candidates)} 条, error={getattr(response, 'error', None)}, "
+                    f"finish_reason={getattr(response, 'finish_reason', None)})"
+                )
                 return candidates[:2]
 
             import re

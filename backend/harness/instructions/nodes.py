@@ -45,6 +45,16 @@ def _classify_timeout() -> int:
     return settings.LLM_CLASSIFY_TIMEOUT
 
 
+# TeamLeader 规划的 max_tokens 额度序列（首轮 + 2 次截断重试）。
+#
+# deepseek-v4-flash 的 max_tokens 是 **reasoning 与 content 的共享额度、
+# reasoning 先扣**（需求 220 实证：6000 时 reasoning 吃光、正文 0 字，
+# finish_reason=length；抬到 8000 才出完整 JSON，每次规划白等 +29s）。
+# 故首轮直接给够，而不是指望重试兜底 —— 重试要多付一遍完整的 input token。
+_PLAN_TOKENS = 10_000
+_PLAN_RETRY_TOKENS = (12_000, 16_000)
+
+
 def _plan_timeout() -> int:
     """TeamLeader 规划调用的超时预算。
 
@@ -591,6 +601,31 @@ def _format_plan_summary(plan: dict) -> str:
     return "\n".join(lines) if lines else "已完成需求分析"
 
 
+def _derive_implementation_order(plan: dict) -> list:
+    """plan 没给 implementation_order 时，从 file_structure 推一份确定性的实现顺序。
+
+    为什么必须补（2026-10-05/07 评测实测）：implementation_order 是下游四件事的
+    **唯一依据** ——
+
+      ① 迭代预算（文件数 + ITERATION_SLACK）
+      ② 每轮「进度检查：还差哪些文件」提醒
+      ③ CompletionContract 的 Default-FAIL 清单
+      ④ 批量编码后的 Phase 2 定向补全
+
+    缺了它，这四件事全部静默失效 —— 表现是「预算恒为最小值、提醒一条不发、
+    漏建的文件没人补」，而没有任何一条日志会说「因为你没给实现顺序」。
+
+    顺序约定与 tl_analysis.md 的示例一致：被依赖的 css/js 在前，入口 html 最后。
+    """
+    files = [f for f in (plan.get("file_structure") or [])
+             if isinstance(f, str) and f]
+    if not files:
+        return []
+    entries = [f for f in files if f.lower().endswith((".html", ".htm"))]
+    others = [f for f in files if f not in entries]
+    return others + entries
+
+
 def _extract_plan_metadata(plan: dict) -> dict:
     """从 plan 中提取关键元数据（供程序使用，前端可选渲染）。
 
@@ -844,12 +879,17 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
             return plan, is_truncated, resp
 
         # 第1次请求
-        plan, is_truncated, response = _fetch_and_extract(6000)
+        #
+        # 额度 6000 → 10000（需求 220 实证）：deepseek-v4-flash 的 max_tokens 是
+        # **reasoning + content 的共享额度且 reasoning 先扣**，6000 必然被 plan JSON
+        # 的思考过程吃光 → 每次规划固定多花一次重试（+29s）。实测 reasoning 实测
+        # 消耗 + 输出量需要 ~10k 才够一轮出全。
+        plan, is_truncated, response = _fetch_and_extract(_PLAN_TOKENS)
 
         # L1: 优先重试（最多2次）
         retry_count = 0
         max_retries = 2
-        retry_tokens = [8000, 10000]
+        retry_tokens = _PLAN_RETRY_TOKENS
         while (response.finish_reason == "length" or is_truncated) and retry_count < max_retries:
             current_tokens = retry_tokens[retry_count]
             logger.warning(
@@ -873,11 +913,26 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
 
         # L3: 完整性校验
         if plan is not None:
-            required_fields = ['features', 'file_structure', 'tasks']
+            # `tasks` 与 features / file_structure **不同级**：它在下游本来就是可选的
+            # （plan_validator._validate_tasks 的注释写着「simple 复杂度允许省略」；
+            #   file_coder 与批量编码也只在 tasks 非空时才用它）。
+            # 此前把它并列成硬必需，导致「模型合理省略 tasks」= 整份计划判失败。
+            # 2026-10-07 评测实测：agnes-3.0-flash 对「个人名片页」返回
+            # `tasks: []`（file_structure / implementation_order / features 全都齐全），
+            # plan JSON 完全合法却被丢弃 → TL 直接失败 → 整条链路退回**没有计划**的
+            # 裸编码（提示词里文件结构、缺文件提醒、迭代预算全部失效）。
+            # 判据收紧为：features 与 file_structure 缺一不可；tasks 允许为空，留痕即可。
+            required_fields = ['features', 'file_structure']
             missing_fields = [f for f in required_fields if not plan.get(f)]
             if missing_fields:
                 logger.error(f"[TeamLeader] 数据完整性校验失败，缺失字段: {missing_fields}")
                 plan = None
+            elif not plan.get('tasks'):
+                logger.warning(
+                    "[TeamLeader] plan 未给出 tasks（file_structure 有 %d 个文件）。"
+                    "tasks 在下游可选，按无任务清单继续 —— 文件清单与实现顺序才是硬依据。",
+                    len(plan.get('file_structure') or []),
+                )
 
         if plan is None:
             # 诊断信息
@@ -909,7 +964,14 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
                 + "\n\n---\n\n"
                 + build_plan_retry_feedback(plan_issues)
             )
-            retry_plan, _, retry_resp = _fetch_and_extract(8000, prompt_override=retry_prompt)
+            # 额度必须 ≥ 首轮：DoD 打回要求的是「完整重出一份 plan」，输出体量与首轮
+            # 相同（只是 user prompt 多了一段反馈），给得比首轮少等于把「格式问题」
+            # 换成「截断问题」—— 首轮 10000 就不够的话，8000 只会更不够，而截断的
+            # 结果是 plan=None，静默保留那份没通过校验的旧计划。取重试档首档（12000）
+            # 留出余量；max_tokens 是按实际用量计费的，额度给大不花钱。
+            retry_plan, _, retry_resp = _fetch_and_extract(
+                max(_PLAN_TOKENS, _PLAN_RETRY_TOKENS[0]), prompt_override=retry_prompt
+            )
             if retry_plan is not None:
                 ok2, issues2 = validate_plan(retry_plan)
                 if ok2 or len(issues2) < len(plan_issues):
@@ -931,6 +993,17 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
         tasks = plan.get('tasks', []) if isinstance(plan, dict) else []
         interfaces = plan.get('interfaces', {}) if isinstance(plan, dict) else {}
         impl_order = plan.get('implementation_order', []) if isinstance(plan, dict) else []
+        # implementation_order 缺失时从 file_structure 推一份（见该函数注释）：
+        # 它是下游「迭代预算 / 每轮缺文件提醒 / CompletionContract / Phase 2 定向补全」
+        # 的唯一依据，缺了会让这四件事全部静默失效。
+        if isinstance(plan, dict) and not impl_order:
+            impl_order = _derive_implementation_order(plan)
+            if impl_order:
+                plan['implementation_order'] = impl_order
+                logger.info(
+                    f"[TeamLeader] plan 未给 implementation_order，"
+                    f"按 file_structure 推导: {impl_order}"
+                )
 
         # 把 plan 数据编码到 dialogue 消息中（持久化到 DB，页面刷新后可用）
         tl_plan_data = {
@@ -1646,9 +1719,26 @@ _AC_TRANSLATE_BATCH = 2
 # 收益是 AC 覆盖率——按 5 条 AC / 3 批算，一次失败就是 40% 的 AC 没跑。
 _AC_TRANSLATE_ATTEMPTS = 2
 
-# AC 翻译的系统提示词 —— 唯一定义处：真实调用与可观测性埋点共用同一份。
-# 分别在两处写同义字面量，改了一处另一处就开始记录假信息。
-_AC_TRANSLATE_SYSTEM_PROMPT = "你是 Playwright 自动化测试专家。只返回 JSON，不要其他文字。"
+def _ac_translate_system_prompt() -> str:
+    """AC 翻译的系统提示词 —— 唯一定义处（prompts/verify/ac_translator_system.md）。
+
+    真实调用与可观测性埋点共用同一份，两处写同义字面量的话，改了一处另一处
+    就开始记录假信息。
+
+    放在 system 而不是 user：AC 按批连续调用多次，这段 7.3k 的**恒定规则**
+    此前和每批都不同的 anchor 一起塞在 user 里、且 anchor 排在最前 ——
+    于是多次调用的公共前缀只有 197 字符，prefix cache 几乎完全不命中，
+    同样的指令按全价付了 N 遍（需求 220 实测 4 次全价）。
+    移进 system 后它成为所有批次共享的恒定前缀，可被缓存命中。
+
+    走 load_prompt_template（而非 load_prompt）：模板里的 JSON 示例按约定写成
+    `{{ }}`，只有 .format() 才会还原成单花括号。直接 load_prompt 会把 `{{`
+    原样发给模型。
+
+    延迟加载：模块导入时 prompts 包未必就绪，且这里只需在真正翻译前取一次。
+    """
+    from harness.instructions.prompts import load_prompt_template
+    return load_prompt_template("verify/ac_translator_system.md")
 
 
 def _translate_one_ac_batch(
@@ -1698,10 +1788,11 @@ def _translate_one_ac_batch(
         render_info=render_info,
     )
 
+    _system_prompt = _ac_translate_system_prompt()
     from llm.client import get_client
     response = get_client().chat(
         prompt=prompt,
-        system_prompt=_AC_TRANSLATE_SYSTEM_PROMPT,
+        system_prompt=_system_prompt,
         use_memory=False,
         # 预算与批大小成比例（实测 2 条 AC 在 4000 下稳定成功）。
         # 若仍被 reasoning 吃光，llm.client 里有"以更大额度重试一次"的救援。
@@ -1716,7 +1807,7 @@ def _translate_one_ac_batch(
     if requirement_id:
         _log_llm_turn_safe(
             requirement_id, None, get_client(),
-            _AC_TRANSLATE_SYSTEM_PROMPT,
+            _system_prompt,
             prompt, response, thinking='enabled', stage=STAGE_VERIFYING,
             turn_index=turn_index, trace_id=trace_id,
         )
@@ -2891,6 +2982,91 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                     pass
         return {}
 
+    def _reformat_evaluator_output(raw: str):
+        """把「上一次评估的原始输出」交给 LLM 重新排成合法 JSON —— **小请求**。
+
+        只发「system + 上次原文 + 格式指令」，不带那 51k 的代码与浏览器结果：
+        解析失败时缺的从来不是上下文（材料它刚看过一遍），而是输出没按格式落地。
+        原文已经带着它的结论，重排一遍即可。
+        thinking 关掉：这是纯格式转换，开推理只会把额度吃在"重新思考一遍"上。
+        """
+        if not (raw or "").strip():
+            return None
+        _fmt_system = (
+            "你是 JSON 格式化器。把用户给出的文本改写成一个**合法 JSON 对象**，"
+            "必须包含 verdict / summary / score / overall_score / findings 五个字段，"
+            "语义与原文一致。只返回 JSON 本身，不要解释、不要 markdown 代码块。"
+        )
+        client = get_client()
+        _t0 = time.time()
+        prompt = (
+            "下面是上一次评估输出的原文，请把它改写为合法 JSON：\n\n"
+            f"{raw[:12000]}"
+        )
+        resp = client.chat(
+            prompt=prompt,
+            system_prompt=_fmt_system,
+            use_memory=False,
+            max_tokens=4000,
+            timeout=_evaluator_timeout(),
+            thinking='disabled',
+        )
+        _log_llm_turn_safe(
+            state.get("requirement_id"), None, client, _fmt_system, prompt,
+            resp, thinking='disabled',
+            latency_ms=round((time.time() - _t0) * 1000, 1),
+            stage=STAGE_VERIFYING,
+            turn_index=int(_md(state).get("turn_index") or 0),
+            trace_id=_md(state).get("trace_id") or None,
+        )
+        return resp
+
+    def _eval_signature() -> str:
+        """本次评估的**全部**输入指纹（代码 + 浏览器结果 + AC 结果 + SPEC）。
+
+        只有这些输入**逐字节相同**时，重跑评估才可能得到相同结论 ——
+        需求 220 实测 4 次评估调用里有 3 次（首轮的解析失败重试 + 修复未产出
+        任何改动后的两轮复验）输入完全相同，却把 51k 的 prompt 原样重发了，
+        约 2/3 的验收 token 是这么烧掉的。
+        """
+        try:
+            import hashlib as _hashlib
+            raw = "\n".join([
+                code_text or "",
+                json.dumps(browser_result, ensure_ascii=False, sort_keys=True),
+                json.dumps(ac_check_results, ensure_ascii=False, sort_keys=True),
+                spec_content or "",
+                json.dumps(smoke_defects, ensure_ascii=False, sort_keys=True),
+            ])
+            return _hashlib.md5(raw.encode("utf-8", "ignore")).hexdigest()
+        except Exception:
+            # 指纹算不出来就当作每次都不同（退化为重跑），绝不因此跳过评估。
+            return ""
+
+    def _reuse_previous_eval(sig: str):
+        """输入完全未变时复用上轮评估结论；否则返回 None。"""
+        if not sig:
+            return None
+        # metadata 可能是 None（不是 dict）—— setdefault 不会替换 None，
+        # 于是后面 .get 会抛 AttributeError，把整轮验收带崩。
+        meta = state.get("metadata")
+        if not isinstance(meta, dict):
+            meta = {}
+            state["metadata"] = meta
+        prev = meta.get("_last_eval_signature")
+        cached = meta.get("_last_eval_result")
+        if prev != sig or not isinstance(cached, dict) or not cached:
+            return None
+        # 降级结论（LLM 不可用时的兜底）不复用：那不是评估出来的结论，
+        # 缓存它会让"LLM 曾经不可用"这件事被永久记住。
+        if cached.get("degraded"):
+            return None
+        logger.info(
+            "[Verify] 评估输入指纹未变（代码/浏览器结果/AC 结果/SPEC 全部相同），"
+            "复用上一轮评估结论，跳过本次 LLM 调用"
+        )
+        return cached
+
     # ---- 单次全维度评估（原先 Correctness+Quality 双视角 = 2 次 LLM 调用，合并为 1 次减半耗时）----
     try:
         from llm.client import CircuitBreakerOpenError
@@ -2902,28 +3078,54 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
             "必须覆盖 functionality / runtime / acceptance / ui_quality / code_quality 五个维度，"
             "并给出 verdict、overall_score、findings（只返回 JSON）。"
         )
-        try:
-            eval_response = _call_evaluator(eval_focus, max_tokens=4000)
-            combined = _parse_evaluator_response(eval_response)
-        except CircuitBreakerOpenError as e:
-            logger.warning(f"[Verify] 熔断器打开，跳过评估: {e}")
-            combined = {}
-            _circuit_breaker_hit = True
-
-        # ---- 解析失败（非熔断）：用更强约束重试一次 ----
-        if not combined and not _circuit_breaker_hit:
-            logger.warning("[Verify] 单次评估解析失败，以更强约束重试")
-            retry_focus = (
-                eval_focus + "\n\n⚠️ 必须只返回一个合法 JSON 对象，"
-                "包含 verdict/summary/score/overall_score/findings 字段。"
-            )
+        _sig = _eval_signature()
+        _reused = _reuse_previous_eval(_sig)
+        if _reused is not None:
+            combined = _reused
+        else:
             try:
-                retry_response = _call_evaluator(retry_focus, max_tokens=4000)
-                combined = _parse_evaluator_response(retry_response)
+                eval_response = _call_evaluator(eval_focus, max_tokens=4000)
+                combined = _parse_evaluator_response(eval_response)
+                _last_raw = getattr(eval_response, "content", "") or ""
             except CircuitBreakerOpenError as e:
-                logger.warning(f"[Verify] 重试评估熔断: {e}")
+                logger.warning(f"[Verify] 熔断器打开，跳过评估: {e}")
                 combined = {}
+                _last_raw = ""
                 _circuit_breaker_hit = True
+
+            # ---- 解析失败（非熔断）：先用「小请求」重格式化一次 ----
+            # 此前这里把 51k 的完整 prompt 原样重发，只为多一句格式约束
+            # （需求 220 实测：第 2~4 次评估调用看的都是同一份代码）。
+            # 便宜的做法是先只发「上轮原始输出 + 格式指令」让它重排成 JSON；
+            # 若仍失败，再退回原来那次全量重发 —— 不省这点钱，但不能为了省钱
+            # 把评估质量赔进去。
+            if not combined and not _circuit_breaker_hit:
+                logger.warning("[Verify] 单次评估解析失败，先以最小请求要求重新格式化")
+                _refmt = _reformat_evaluator_output(_last_raw)
+                combined = _parse_evaluator_response(_refmt) if _refmt else {}
+
+            if not combined and not _circuit_breaker_hit:
+                logger.warning("[Verify] 小请求重格式化仍失败，以全量上下文 + 更强约束重试")
+                retry_focus = (
+                    eval_focus + "\n\n⚠️ 必须只返回一个合法 JSON 对象，"
+                    "包含 verdict/summary/score/overall_score/findings 字段。"
+                )
+                try:
+                    retry_response = _call_evaluator(retry_focus, max_tokens=4000)
+                    combined = _parse_evaluator_response(retry_response)
+                except CircuitBreakerOpenError as e:
+                    logger.warning(f"[Verify] 重试评估熔断: {e}")
+                    combined = {}
+                    _circuit_breaker_hit = True
+
+            # 只在**真的做了一次完整评估**时缓存：指纹相同的下一轮可直接复用。
+            if combined and not combined.get("degraded") and _sig:
+                meta = state.get("metadata")
+                if not isinstance(meta, dict):
+                    meta = {}
+                    state["metadata"] = meta
+                meta["_last_eval_signature"] = _sig
+                meta["_last_eval_result"] = combined
 
         # ---- 熔断/解析失败降级：仅基于 preview + AC 结果判定 ----
         if not combined:
@@ -3355,6 +3557,12 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
 _DEFECT_REPAIR_MAX_FILES = 6
 _DEFECT_REPAIR_FILE_CHAR_CAP = 8_000
 
+# 最多把几个文件判定为「根因文件」（= 完整给出、不截断）。
+# 与 `tasks/defect_repair*.md` 里「最多修改 2 个文件」的约束对齐 ——
+# 此前词袋匹配会把所有命中的文件都标成根因（需求 220 实测 6 个文件全标），
+# 于是「一律不截断」等于「全量下发」，与该约束直接打架。
+_DEFECT_REPAIR_ROOT_FILE_MAX = 2
+
 # Evaluator 上下文预算（req 147 修正：原先无条件 content[:6000] 且无截断标记，
 # 导致 game.js 的 move() 整个方法体被切掉，评估 LLM 直接幻觉出「move 未定义」）
 _EVALUATOR_TOTAL_CHAR_BUDGET = 40_000   # 全额完整装载的总预算
@@ -3545,6 +3753,15 @@ def _extract_root_cause_files(workspace, files: list, defects: list) -> set:
     断点正好落在 move() 中间。修复 LLM 于是「认为文件被截断」，自作主张补全了
     后半段——改动落在完全不需要动的地方，真正的 prototype 挂载一行没碰。
     结论：**被指向为根因的文件一律不截断**，宁可少带几个别的文件的全文。
+
+    ⚠️ 为什么必须裁剪（需求 220 实证）：
+    旧实现是「任一 token 命中即判为根因文件」，而缺陷证据里必然含 `click`
+    `assert` `button` 这类**每个文件都有**的泛化词 —— 结果 6 个文件被**全部**
+    标成根因文件、一字不截地全量下发（42.7k prompt 里缺陷清单只占 1.7%），
+    同时又与 system 提示词里「最多修改 2 个文件」自相矛盾。
+    故这里改成两道工序：
+      ① **去掉无区分度的 token**（在半数以上文件里都出现的词）；
+      ② 按**命中的不同标识符个数**排序，只取前 `_DEFECT_REPAIR_ROOT_FILE_MAX` 个。
     """
     import re as _re
 
@@ -3565,19 +3782,38 @@ def _extract_root_cause_files(workspace, files: list, defects: list) -> set:
     if not tokens:
         return set()
 
-    root_files = set()
+    # 先把文件内容取出来：既要算区分度（token 在多少文件里出现），也要算命中数。
+    contents = {}
     for fname in files:
         try:
-            content = workspace.read(fname)
+            contents[fname] = workspace.read(fname)
         except Exception:
             continue
-        hits = sum(content.count(t) for t in tokens)
+    if not contents:
+        return set()
+
+    n_files = len(contents)
+    # ① 文档频率过滤：在 ≥半数文件里都出现的 token 没有定位价值（泛化词）。
+    doc_freq = {t: sum(1 for c in contents.values() if t in c) for t in tokens}
+    discriminating = {t for t, n in doc_freq.items() if n <= max(1, n_files // 2)}
+    if not discriminating:
+        # 所有 token 都不具备区分度（证据本身很泛）→ 退化为「全部命中数」排序，
+        # 仍然只取前 N 个，绝不回到「全标根因」。
+        discriminating = set(tokens)
+
+    # ② 按命中的不同标识符数排序，取前 N 个。
+    scored = []
+    for fname, content in contents.items():
+        hits = sum(1 for t in discriminating if t in content)
         if hits:
-            root_files.add(fname)
-        elif len(tokens) <= 3:
-            # 证据很少时退化为「报错里出现的标识符」强匹配
-            if any(t in content for t in tokens):
-                root_files.add(fname)
+            scored.append((hits, fname))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    root_files = {fname for _, fname in scored[:_DEFECT_REPAIR_ROOT_FILE_MAX]}
+    if root_files:
+        logger.info(
+            f"[DefectRepair] 根因文件裁剪: {sorted(root_files)} "
+            f"（候选 {len(scored)} 个，区分度 token {len(discriminating)}/{len(tokens)} 个）"
+        )
     return root_files
 
 
@@ -3588,8 +3824,14 @@ def _collect_defect_repair_context(workspace, defects: list = None) -> tuple[str
     - 根因文件（证据里提到的标识符所在文件）**完整给出**，绝不截断
     - 其余文件仍受字符上限保护，且截断标记放在代码块**外面**并明确说明后果
     """
-    files = [f for f in workspace.list()
-             if not f.startswith("docs/") and not f.startswith(".task/")]
+    # 口径必须与 _delivered_files / runtime._deliverable_files 一致：只算真正交付的文件。
+    # 此前漏排 `.design/**`（成品样式模板，只在编码期作参考、交付的 index.html 并不引用它），
+    # 于是 preset-*.css 被当成交付文件塞进修复 prompt —— 需求 223 实测：入选 6 个文件里
+    # 有 4 个是这类无关噪音，占修复上下文 68%，而缺陷其实只指向 index.html 与 js/app.js。
+    files = [
+        f for f in workspace.list()
+        if not str(f).startswith((".task/", ".design/", "docs/"))
+    ]
     html = [f for f in files if f.endswith(".html")]
     js = [f for f in files if f.endswith(".js")]
     css = [f for f in files if f.endswith(".css")]
@@ -3715,6 +3957,23 @@ def _build_vision_images(screenshot_path, mode: str, vendor: str = "agnes") -> l
         return []
 
     return []
+
+
+# 定向修复路径的思考模式：**关闭**。
+#
+# 依据（需求 223 实测，deepseek-v4-flash，多轮对照）：
+#   thinking=on（或省略字段）→ 修复调用 6/6 全部 `finish_reason=length`、
+#     reasoning 吃满 12000~20000 额度、content 恒为空；且**输入砍 57%、
+#     换输出格式（锚点 vs SEARCH/REPLACE）、放松「SEARCH 必须唯一」都改不动**
+#     —— 每次 reasoning 都停在 47~50k 字符处被额度截断，额度给多少吃多少。
+#   thinking=off → 3/3 全部 `finish_reason=stop`、reasoning=0、产出有效补丁 JSON
+#     且逐条真实命中目标文件，单轮耗时 57s → 2.4s。
+# 根因：修复是**机械定位替换**（缺陷证据里已写明「哪个文件引用了什么、该改成
+#   什么」），不需要推演；开着思考等于让它永远轮不到输出环节。
+# 注：DeepSeek 不支持 `thinking.budget_tokens`（实测传 2000 仍吃满 12000），
+#   故只能整体关闭、无法限流。
+# 作用域：仅「定向修复」。编码 / 评估 / 规划等真正需要推演的路径不受影响。
+_DEFECT_REPAIR_THINKING = "disabled"
 
 
 def _defect_repair_timeout(max_tokens: int) -> int:
@@ -3906,7 +4165,10 @@ def defect_repair_node(state: AgentState) -> Dict[str, Any]:
 
     if _dr_mode == "diff":
         system_prompt = load_prompt("tasks/defect_repair_edit.md")
-        _budgets = (8_000, 16_000)
+        # 8k → 12k（需求 220 实证）：reasoning 与 content 共享额度且 reasoning 先扣，
+        # 42.7k 输入下 reasoning 实测吃掉 ~31.5k 字符（≈8k token），8k 额度
+        # 必然「content 空 + finish_reason=length」，第二档 16k 从未被用到。
+        _budgets = (12_000, 20_000)
     else:
         system_prompt = load_prompt("tasks/defect_repair.md")
         _budgets = (16_000, 32_000)
@@ -3925,13 +4187,13 @@ def defect_repair_node(state: AgentState) -> Dict[str, Any]:
                 use_memory=False,
                 max_tokens=max_tokens,
                 timeout=_defect_repair_timeout(max_tokens),
-                thinking='enabled',  # 补丁 JSON 需要思考模式保证格式正确
+                thinking=_DEFECT_REPAIR_THINKING,
             )
         finally:
             client.max_retries = _old_retries
         _log_llm_turn_safe(
             state.get("requirement_id"), None, client, system_prompt, user_prompt,
-            resp, thinking='enabled',
+            resp, thinking=_DEFECT_REPAIR_THINKING,
             latency_ms=round((time.time() - _t0) * 1000, 1),
             stage=STAGE_REPAIRING,
             turn_index=int(_md(state).get("turn_index") or 0),
@@ -3941,6 +4203,9 @@ def defect_repair_node(state: AgentState) -> Dict[str, Any]:
 
     response = None
     llm_down = False
+    # 记录「所有档位都只是被 reasoning 吃光」——它的处置与端点故障完全不同
+    # （端点故障该等/该跳过；额度不足该加额度或改提示词），日志不能被混为一谈。
+    truncated_out = False
     for max_tokens in _budgets:
         try:
             resp = _call(max_tokens)
@@ -3949,7 +4214,25 @@ def defect_repair_node(state: AgentState) -> Dict[str, Any]:
             llm_down = True
             logger.warning(f"[DefectRepair] LLM 调用失败 (max_tokens={max_tokens}): {e}")
             break
-        if resp.is_error or not resp.content:
+        if resp.is_error:
+            # ⚠️ 分诊顺序（2026-10-05 req 222 实证，deepseek-v4-flash 实测踩点）：
+            # client 层会把「content 为空」的响应统一标成 is_error=True
+            # （error="LLM 返回空响应"）。所以**先判 is_error 再判 finish_reason**
+            # 会让下面 4144 那段 finish_reason 分诊永远不可达 —— 明明拿到了
+            # finish_reason='length'（额度被 reasoning 吃光、可恢复），却被当成
+            # 端点故障 break，第二档 20000 从未被尝试，与需求 220 的死法一模一样。
+            # 实测证据：req 222 修复调用 in=6724 out=12000 finish_reason=length
+            # content_len=0 → status=error → 本分支 break → 日志「定向修复 LLM
+            # 连续 2 次不可用，跳过该路径」。
+            # 故：空内容 + 截断 = 可恢复，先升档；其余才按端点故障处理。
+            if not resp.content and getattr(resp, "finish_reason", None) == "length":
+                logger.warning(
+                    f"[DefectRepair] 响应被额度截断（reasoning 吃光，content 空）"
+                    f" (max_tokens={max_tokens})，升档重试"
+                )
+                response = resp
+                truncated_out = True
+                continue
             # 端点故障/超时：再换更大的 max_tokens 重试毫无意义 —— 同样的 prompt
             # 必然同样失败。此前这里仅在「异常」时 break，而 resp.is_error 会
             # 静默 continue 到下一个额度，于是每次烧满 2 轮 × 3 次内部重试 ≈ 550s
@@ -3958,6 +4241,27 @@ def defect_repair_node(state: AgentState) -> Dict[str, Any]:
             logger.warning(
                 f"[DefectRepair] LLM 返回错误 (max_tokens={max_tokens}): "
                 f"{getattr(resp, 'error', None)}"
+            )
+            break
+        if not resp.content:
+            # ⚠️ 空内容必须先按 finish_reason 分诊，不能一律当端点故障（需求 220 实证）：
+            #   · finish_reason == "length" → 额度被 reasoning 吃光，是**可恢复**的，
+            #     升到下一档额度重试就完事。此前这里直接 break，16000 第二档从未
+            #     被尝试，两轮修复都死在 8000 上、4 万 input token 产出 0。
+            #   · 其余（stop / 端点异常）→ 换额度重试无意义，判定端点不可用。
+            # 判据依赖 client 层如实回传 finish_reason（见 llm/client.py 的 _LLMMeta）。
+            if getattr(resp, "finish_reason", None) == "length":
+                logger.warning(
+                    f"[DefectRepair] 响应被额度截断（reasoning 吃光，content 空） "
+                    f"(max_tokens={max_tokens})，升档重试"
+                )
+                response = resp
+                continue
+            llm_down = True
+            logger.warning(
+                f"[DefectRepair] LLM 返回空内容且非截断 "
+                f"(max_tokens={max_tokens}, finish_reason="
+                f"{getattr(resp, 'finish_reason', None)})，判定端点不可用"
             )
             break
         response = resp
@@ -3970,12 +4274,35 @@ def defect_repair_node(state: AgentState) -> Dict[str, Any]:
         break
 
     if llm_down or (not response) or response.is_error or not response.content:
-        logger.error("[DefectRepair] LLM 未返回有效内容，本轮不计入修复轮数")
+        if truncated_out and not llm_down:
+            # 走到这里说明**每一档额度都被 reasoning 吃光**。这是额度配置问题
+            # （LLM_MAX_TOKENS 偏低或该端点思考过长），不是端点不可用 —— 必须说清，
+            # 否则下一个人会照着「端点故障」去查网络和 Key。
+            logger.error(
+                "[DefectRepair] 全部额度档位都被 reasoning 吃光（非端点故障）："
+                f"已试 max_tokens={list(_budgets)}。"
+                f"修复路径的 thinking 应为 {_DEFECT_REPAIR_THINKING!r} —— 先确认它没被"
+                "打开；实测抬高额度、精简提示词、更换输出格式**都无效**，"
+                "唯一有效手段是关闭思考。不是排查端点。"
+            )
+        else:
+            logger.error("[DefectRepair] LLM 未返回有效内容，本轮不计入修复轮数")
         meta = dict(state.get("metadata") or {})
         meta["defect_repair_count"] = prev_count  # 回滚：预算留给下一次真正的修复
         meta["defect_repair_llm_failures"] = prev_llm_fail + 1
         state["metadata"] = meta
         if meta["defect_repair_llm_failures"] >= 2:
+            # 措辞必须与死因一致：把「额度被思考吃光」写成「端点不可用」会把下一个人
+            # 引向网络/Key 排查（req 223 实测日志就是这么误导的）。
+            if truncated_out and not llm_down:
+                logger.error(
+                    f"[DefectRepair] 连续 {meta['defect_repair_llm_failures']} 次"
+                    "全部额度被 reasoning 吃光，放弃定向修复（非端点故障；"
+                    "处置方向：抬高额度档位或精简修复提示词）"
+                )
+                return {"current_step": "defect_repair_failed",
+                        "error": "修复额度被思考吃光",
+                        "metadata": meta}
             logger.error(
                 f"[DefectRepair] LLM 端点连续 {meta['defect_repair_llm_failures']} 次不可用，放弃定向修复"
             )
@@ -4034,7 +4361,7 @@ def defect_repair_node(state: AgentState) -> Dict[str, Any]:
                         use_memory=False,
                         max_tokens=16_000,
                         timeout=_defect_repair_timeout(16_000),
-                        thinking='enabled',
+                        thinking=_DEFECT_REPAIR_THINKING,
                     )
                 finally:
                     client.max_retries = _old_retries
@@ -4054,8 +4381,10 @@ def defect_repair_node(state: AgentState) -> Dict[str, Any]:
         logger.warning(
             "[DefectRepair] 整包补丁解析失败，降级为单文件修复（压缩输出预算）"
         )
+        # 口径同 _collect_defect_repair_context：.design/** 是模板不是交付文件，
+        # 不能被选成「待修复文件」。
         all_files = [f for f in workspace.list()
-                     if not f.startswith("docs/") and not f.startswith(".task/")]
+                     if not str(f).startswith((".task/", ".design/", "docs/"))]
         js_files = sorted(
             [f for f in all_files if f.endswith(".js")],
             key=lambda n: -len(workspace.read(n)),
@@ -4079,11 +4408,11 @@ def defect_repair_node(state: AgentState) -> Dict[str, Any]:
                     use_memory=False,
                     max_tokens=16_000,
                     timeout=_defect_repair_timeout(16_000),
-                    thinking='enabled',
+                    thinking=_DEFECT_REPAIR_THINKING,
                 )
                 _log_llm_turn_safe(
                     state.get("requirement_id"), None, client, system_prompt, single_prompt,
-                    single_resp, thinking='enabled',
+                    single_resp, thinking=_DEFECT_REPAIR_THINKING,
                     latency_ms=round((time.time() - _t0) * 1000, 1),
                     stage=STAGE_REPAIRING,
                     turn_index=int(_md(state).get("turn_index") or 0),

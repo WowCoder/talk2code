@@ -11,7 +11,13 @@
 import pytest
 
 from harness.constraints import environment_contract as env
-from harness.constraints.plan_validator import validate_plan, build_plan_retry_feedback
+from harness.constraints.plan_validator import (
+    ACTIONABLE_VERBS,
+    DEFAULT_STATE_TRIGGERS,
+    OBSERVABLE_PATTERNS,
+    validate_plan,
+    build_plan_retry_feedback,
+)
 
 
 class TestRenderContract:
@@ -151,6 +157,26 @@ class TestPlanValidator:
             ],
         }
 
+    def _plan_with_js_edge(self):
+        """带一条 **js→js 调用边** 的计划。
+
+        exports 契约只在 js↔js 之间成立（index.html 的 dependencies 表达的是"引入
+        脚本"而不是"调用方法"），所以测这条规则必须真的造一条 js 调 js 的边。
+        """
+        plan = self._base_plan()
+        plan["file_structure"] = ["index.html", "js/utils.js", "js/game.js", "css/style.css"]
+        plan["tasks"] = [
+            {"file": "js/utils.js", "purpose": "通用工具函数库：选择器与事件绑定快捷方法",
+             "dependencies": [], "exports": {"Utils": ["$", "on"]}},
+            {"file": "js/game.js", "purpose": "游戏核心循环与碰撞检测逻辑实现",
+             "dependencies": ["js/utils.js"],
+             "exports": {"SnakeGame": ["start", "pause", "reset"]}},
+            {"file": "index.html", "purpose": "页面入口与布局结构定义",
+             "dependencies": ["js/game.js"]},
+        ]
+        plan["implementation_order"] = ["js/utils.js", "js/game.js", "index.html"]
+        return plan
+
     def test_valid_plan_passes(self):
         ok, issues = validate_plan(self._base_plan())
         assert ok, issues
@@ -199,6 +225,80 @@ class TestPlanValidator:
         assert not ok
         assert any("观察点" in i for i in issues)
 
+    def test_vague_promise_still_rejected_after_widening(self):
+        """放宽"观察点"词表后，真正的假验收措辞仍必须被拦下（防止放宽变成放水）"""
+        plan = self._base_plan()
+        plan["acceptance_criteria"][0]["how_to_verify"] = "点击开始按钮，整个流程顺畅自然"
+        ok, issues = validate_plan(plan)
+        assert not ok
+        assert any("观察点" in i for i in issues)
+
+    @pytest.mark.parametrize("verify", [
+        # 2026-10-07 评测 t01 真实原文：观察点是"颜色/渐变"，能用 computed style 断言
+        "打开页面，body 背景非单一纯色，视觉可从左上角颜色平滑过渡到右下角颜色",
+        # t05 真实原文：观察点是"尺寸的相对比较"，能用 boundingBox 断言
+        "鼠标悬停在某张图片上，该图片尺寸明显大于相邻未悬停图片",
+        # t04 真实原文：观察点是"元素可见 + 文本内容"，却因词表只收"出现/显示"被误判
+        "打开页面，主体区域可见三张并排卡片，卡片标题依次为「基础」「专业」「企业」",
+        # 其它常见的视觉属性观察点
+        "点击切换按钮后，卡片背景颜色变为深色",
+        "滚动到页面底部，导航栏高度变小且透明度降低",
+    ])
+    def test_visual_property_is_a_valid_observable(self, verify):
+        """视觉属性/相对比较同样是可断言的观察点
+
+        词表此前只收「出现/消失/文本/数量」这一类变化，视觉属性（颜色/尺寸/
+        透明度…）一个词都不占，导致这类完全合格的 AC 被误判、白赔一轮重规划。
+        """
+        assert any(p in verify for p in OBSERVABLE_PATTERNS), verify
+
+    @pytest.mark.parametrize("verify", [
+        # 2026-10-07 评测（颜色转换器）真实原文：三条 AC 全被判"不含可操作动词"，
+        # 因为词表收了「拖动/拖拽」却没收回一个动作的「拖到」。
+        "将R滑块从默认最右端拖到最左端，R右侧数值标签由255变为0",
+        "将B滑块从默认最右端拖到最左端，预览色块背景色由白色变为红色",
+    ])
+    def test_action_verb_stem_matches_its_variants(self, verify):
+        """动作词表要收**词干**：判定是子串包含，只收完整词形会漏同义说法"""
+        assert any(v.lower() in verify.lower() for v in ACTIONABLE_VERBS), verify
+
+    @pytest.mark.parametrize("verify", [
+        # 2026-10-07 全量重跑真实原文：8 条打回里这两条是词表缺口
+        "将R、G、B滑块分别设为255、0、0，十六进制文本显示#FF0000",
+        "让蛇撞墙，出现「游戏结束」文字遮罩",
+    ])
+    def test_action_verb_covers_control_and_in_game_words(self, verify):
+        """控制件取值（设为/调整）与游戏内动作（撞墙）也是用户操作
+
+        词表此前只有「设置/调整」没有「设为」，游戏类只收了「方向键」而没收
+        「撞」这类动作 —— 两条 AC 完全可操作（改滑块数值 / 按方向键撞墙后断言
+        遮罩出现），却各白赔一轮 TL 重规划。
+        """
+        assert any(v.lower() in verify.lower() for v in ACTIONABLE_VERBS), verify
+
+    @pytest.mark.parametrize("verify", [
+        # t16 真实原文：明确的观察点（出现 + 数量 + 间隙），但"没人点"→ 曾被拦
+        "页面加载完成后，柱状图区域出现20根等宽蓝色竖条，相邻竖条间隙一致",
+        "打开页面后，初始状态列出全部待办项，已完成项显示删除线",
+    ])
+    def test_default_state_ac_is_valid(self, verify):
+        """「打开页面即成立」的默认态同样是可执行的验收
+
+        校验器原本把「必须由用户操作触发」当成必要条件，但初始状态用 Playwright
+        打开页面即可断言，完全可落地。豁免只在**未命中操作动词**时生效，且后面
+        还有「可断言观察点」这道独立关卡兜底。
+        """
+        assert any(t in verify for t in DEFAULT_STATE_TRIGGERS), verify
+
+    def test_default_state_exemption_does_not_leak(self):
+        """豁免不能把真正空洞的 AC 放进来
+
+        「排行榜存在新纪录」既没有操作、也没有默认态触发词，必须继续被拦
+        —— 放宽判定时最容易出的事就是顺手把判据放没了。
+        """
+        assert not any(t in "排行榜存在新纪录" for t in DEFAULT_STATE_TRIGGERS)
+        assert not any(v in "排行榜存在新纪录" for v in ACTIONABLE_VERBS)
+
     def test_uncovered_feature_rejected(self):
         """承诺了功能却没有对应验收项，该功能等于从没被验证过"""
         plan = self._base_plan()
@@ -220,16 +320,16 @@ class TestPlanValidator:
         assert any("语义重复" in i for i in issues)
 
     def test_missing_exports_rejected(self):
-        """被依赖的 js 未声明 exports → 打回（需求 124 跨文件 API 断层）"""
-        plan = self._base_plan()
-        plan["tasks"][0].pop("exports")
+        """被另一个 js 调用的 js 未声明 exports → 打回（需求 124 跨文件 API 断层）"""
+        plan = self._plan_with_js_edge()
+        plan["tasks"][0].pop("exports")           # js/utils.js，被 js/game.js 调用
         ok, issues = validate_plan(plan)
         assert not ok
-        assert any("exports" in i for i in issues)
+        assert any("exports" in i and "utils.js" in i for i in issues)
 
     def test_exports_bad_structure_rejected(self):
-        plan = self._base_plan()
-        plan["tasks"][0]["exports"] = ["SnakeGame"]  # 应为 dict
+        plan = self._plan_with_js_edge()
+        plan["tasks"][0]["exports"] = ["Utils"]   # 应为 dict[str, list[str]]
         ok, issues = validate_plan(plan)
         assert not ok
         assert any("exports" in i for i in issues)
@@ -273,12 +373,79 @@ class TestPlanValidator:
         assert not ok2
         assert any("orphan" not in i and "extra" in i for i in issues2) or any("未在 file_structure" in i for i in issues2)
 
-    def test_simple_with_many_files_flagged(self):
+    def test_simple_with_many_files_coerced_not_rejected(self):
+        """simple 但文件数超限 = 标错档，就地纠正为 standard，不打回重出。
+
+        complexity 是路由标签（决定迭代预算 / CompletionContract / Phase 2 补全），
+        自洽性由文件数唯一确定 —— 可确定性判定的缺陷不值得花一整轮 LLM 让模型改口。
+        2026-10-07 评测实测：8 题里 5 题命中「simple 但 3 个文件」。
+        """
         plan = self._base_plan()
         plan["complexity"] = "simple"
         ok, issues = validate_plan(plan)
+        assert ok, issues
+        assert plan["complexity"] == "standard", "纠正必须真的写回 plan，否则下游仍按 simple 走"
+
+    def test_simple_within_file_limit_untouched(self):
+        """1~2 个文件的 simple 是正牌 simple，不许被纠正（这是单文件快速通道）"""
+        plan = self._base_plan()
+        plan["complexity"] = "simple"
+        plan["file_structure"] = ["index.html", "css/style.css"]
+        plan["implementation_order"] = ["index.html"]
+        plan["tasks"] = [
+            {"file": "index.html", "purpose": "页面入口与布局结构定义，内含样式引用"},
+        ]
+        ok, issues = validate_plan(plan)
+        assert ok, issues
+        assert plan["complexity"] == "simple"
+
+    def test_standard_over_capacity_still_rejected(self):
+        """standard 装不下 12 个以上文件是真的做不完，必须打回让模型拆小"""
+        plan = self._base_plan()
+        plan["file_structure"] = [f"js/m{i}.js" for i in range(13)]
+        ok, issues = validate_plan(plan)
         assert not ok
-        assert any("simple" in i for i in issues)
+        assert any("超出单次交付能力" in i for i in issues)
+
+    def test_plan_without_tasks_accepted(self):
+        """tasks 是可选的：下游有 implementation_order / _derive_implementation_order 兜底。
+
+        曾经的规则是「非 simple 就必须有 tasks」，但 complexity 恰恰会被
+        coerce_complexity 改写 —— 3 文件 + 无 tasks 的计划刚被纠正成 standard，
+        立刻又因缺 tasks 被打回，纠正是白做的。
+        """
+        plan = self._base_plan()
+        del plan["tasks"]
+        ok, issues = validate_plan(plan)
+        assert ok, issues
+
+    def test_js_depending_on_css_needs_no_exports(self):
+        """js 依赖 css（要按类名操作 DOM）不是跨文件调用，不该被要求声明 exports。
+
+        2026-10-07 评测 t07 实测：js/app.js 写 dependencies:["css/style.css"]、
+        exports:{}，而它是个自执行 IIFE，「无需暴露全局对象」的自我判断是对的。
+        """
+        plan = self._base_plan()
+        plan["file_structure"] = ["index.html", "css/style.css", "js/app.js"]
+        plan["implementation_order"] = ["css/style.css", "js/app.js", "index.html"]
+        plan["tasks"] = [
+            {"file": "css/style.css", "purpose": "计数器页面全部样式与按钮交互态",
+             "dependencies": [], "exports": {}},
+            {"file": "js/app.js", "purpose": "计数器全部交互逻辑，自执行无需对外暴露",
+             "dependencies": ["css/style.css"], "exports": {}},
+            {"file": "index.html", "purpose": "唯一入口页面，引入样式与脚本",
+             "dependencies": ["css/style.css", "js/app.js"], "exports": {}},
+        ]
+        ok, issues = validate_plan(plan)
+        assert ok, issues
+
+    def test_js_depending_on_js_still_needs_exports(self):
+        """js→js 的调用边仍然要求声明 exports（需求 124 事故的护栏不能松掉）"""
+        plan = self._plan_with_js_edge()
+        plan["tasks"][1]["exports"] = {}      # js/game.js 调 js/utils.js，但自己不声明
+        ok, issues = validate_plan(plan)
+        assert not ok
+        assert any("exports" in i and "game.js" in i for i in issues)
 
     def test_retry_feedback_lists_issues(self):
         text = build_plan_retry_feedback(["问题A", "问题B"])

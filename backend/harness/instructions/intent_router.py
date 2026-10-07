@@ -135,8 +135,14 @@ class IntentRouter:
                 prompt=prompt,
                 system_prompt=system_prompt,
                 use_memory=False,
-                max_tokens=100,
+                # 输出是 1 个枚举单词，不需要推理 —— 但**必须显式关 thinking**：
+                # 需求 220 实测该端点省略 thinking 字段时服务端仍默认推理，
+                # 42 个 completion token 里 39 个是 reasoning，正文只剩 3 个；
+                # 额度再小一点就会被 reasoning 吃光、分类整个失效。
+                # 额度给 200（而非 100）：留一倍余量，换到关不掉推理的端点也够用。
+                max_tokens=200,
                 timeout=_classify_timeout(),
+                thinking='disabled',
             )
 
             # 可观测性：意图判定的输入输出随结果带回，由调用方（requirement_service）
