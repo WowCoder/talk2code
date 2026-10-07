@@ -127,6 +127,11 @@ export function useSSE(reqId: Ref<number | null>) {
       // 「一边让你确认计划、一边亮着编码阶段灯」的。
       const st = store.currentRequirement?.status
       if (st !== 'pending' && st !== 'processing') return
+      // 桌面上摆着一张没提交的表单 = 流程停在等用户回答，此刻没有任务在跑。
+      // SSE 重连会整段回放 progress，把界面拉回"生成中"，于是出现
+      // 「一边等你选视觉风格、一边显示需求分析已等待 9 分钟」（req 221 实测，
+      // question-form 事件被上面的去重条件挡掉，清不回来，只能在这里拦）。
+      if (store.questionForm) return
       store.isGenerating = true
       // 进度只增不减：后端在「修复轮次 / coder 重入」时会按**轮内**位置重新
       // 上报更小的值（这是有意的，见 backend/harness/observability/progress_plan.py），
@@ -150,6 +155,13 @@ export function useSSE(reqId: Ref<number | null>) {
       if (store.dialogueMessages.some((m: any) => m.question_form?.submitted === true)) return
       // 避免重复设置（loadRequirement 已恢复时跳过）
       if (store.questionForm) return
+      // 出现待填写的表单 = 流程停在等用户回答，此刻没有任务在跑。
+      // 不清进度态会一边弹表单、一边显示「需求分析 · 已等待 9 分钟」，
+      // 用户在等模型，模型在等他（req 221 实测，刷新页面才恢复正常）。
+      // 与 spec 事件的处理同一口径：停在选择点时绝不显示"生成中"。
+      store.isGenerating = false
+      store.progress = emptyProgress()
+      store.serverElapsedS = 0
       store.addDialogueMessage({
         role: 'system',
         name: 'System',
