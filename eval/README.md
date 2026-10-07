@@ -12,7 +12,30 @@ PYTHONPATH=. python ../eval/run_eval.py --no-preview        # 快跑（跳过浏
 PYTHONPATH=. python ../eval/run_eval.py --tasks t01 t06     # 只跑指定任务
 PYTHONPATH=. python ../eval/run_eval.py --compare ../eval/results/baseline_xxx.json  # 对比历史
 PYTHONPATH=. python ../eval/run_eval.py --with-memory --memory-user 200     # 开记忆（A/B 的 B 组）
+PYTHONPATH=. python ../eval/run_eval.py --no-plan           # 退回裸 ToolCallLoop（历史口径 A/B）
 ```
+
+### 口径：默认走真实规划（2026-10-07 修）
+
+本脚本此前**直连 `ToolCallLoop`**，`state["plan"]` 恒为 None，于是三件防线静默失效：
+
+| 失效项 | 后果 |
+|---|---|
+| 提示词里的 `## 推荐文件结构 / 实现计划` 整段消失 | 模型不知道要建哪些文件 |
+| `_pending_plan_files()` 恒返回 `[]` | 每轮「进度检查：还差 N 个文件」一条都没发出（21 题的提示词里出现 **0 次**） |
+| 迭代预算退化成 `max(0,3)+3 = 6` 轮 | 与真实工作量脱钩，起步就烧完了 |
+
+实测代价：**8/21 个任务连 `index.html` 都没创建**就被预算耗尽，断言第一条即判死。
+
+现在默认跑**真实生产管线**：`team_leader_node` → `coder_node`。它同时带回三样东西：
+
+1. 真实计划（文件结构 / 实现顺序 / CompletionContract）
+2. `metadata["tool_thinking"] = "disabled"`（裸跑会带着思考模式烧完额度）
+3. Phase 2 定向补全：批量编码漏建的文件会被逐个补齐
+
+要复现历史口径请显式加 `--no-plan`。报告 JSON 每条结果带
+`plan_used` / `plan_files` / `plan_error` / `rounds` / `tool_sequence`，
+MD 摘要另有「失败归因」小节，逐轮列出工具序列 —— 失败不需要再翻日志猜。
 
 ### 记忆 A/B 对照
 
@@ -33,8 +56,10 @@ PYTHONPATH=. python ../eval/run_eval.py --with-memory --memory-user 200     # �
 
 ## 评估什么
 
-驱动**真实的 `ToolCallLoop`** 生成代码（不是 mock），因此评估的是端到端真实质量：
-Planner → Coder（write_file/edit_file）→ 验证闭环（run_preview）→ 修复。
+驱动**真实的生产节点**生成代码（不是 mock），因此评估的是端到端真实质量：
+`team_leader_node`（规划）→ `coder_node`（write_file/edit_file + 契约 + 定向补全）。
+断言由本脚本在产物上跑，不经过 verify / defect_repair —— 也就是说
+本集测的是**交付物本身的正确性**，不是「自评打分」。
 
 ## 断言类型
 
@@ -43,9 +68,22 @@ Planner → Coder（write_file/edit_file）→ 验证闭环（run_preview）→ 
 | `file_exists` | 指定文件存在 |
 | `content_contains` | 文件包含某字符串 |
 | `content_not_contains` | 文件不含某字符串（反模式：innerHTML/eval） |
-| `html_has_element` | index.html 含某选择器对应元素 |
+| `html_has_element` | index.html 含某选择器对应元素（支持标签名 / `.class` / `#id` / `[class*=x]` / **逗号并集**） |
 | `preview_no_error` | Playwright 运行无 pageerror/console.error |
 | `file_min_lines` | 文件行数 ≥ N（防空文件偷懒） |
+
+### 断言必须容得下「同等合法的另一种写法」
+
+断言写得太字面，测的就不是产物质量，而是**模型有没有猜中我们心里的那个写法**。
+2026-10-07 全量跑实测到三处同类假阴性，全部按「放宽到合法写法的并集」修：
+
+| 断言 | 被误杀的写法 | 修法 |
+|---|---|---|
+| `html_has_element: button`（t02 着陆页 CTA） | `<a class="btn" href="#cta">` —— 着陆页 CTA 更常见、语义也更对（跳转不是提交） | 选择器改为并集 `button, [class*=btn], [class*=button]`，匹配器支持逗号并集与 `[class*=x]` |
+| `content_contains: style.css`（t01 名片页） | 单文件方案把样式写在 inline `<style>` 里 | 查 `.css` 时把 HTML 的 `<style>` 块一并纳入；`content_not_contains` 同样覆盖 |
+| `file_min_lines min: 20`（t01） | 「标题 + 职位 + 简介」的写实名片页只有 17 行 | 降到 12（仍远高于任何真实空壳的 < 5 行） |
+
+判断标准：**一个正常的前端工程师会写出这种写法吗？** 会，就是断言的问题，不是产物的问题。
 
 ## 何时跑
 
@@ -61,10 +99,10 @@ Planner → Coder（write_file/edit_file）→ 验证闭环（run_preview）→ 
 
 ## 任务集
 
-20 个需求，4 个难度：
+21 个需求，4 个难度：
 - **L1**（5）：单页静态展示 —— 名片/着陆页/文章/定价表/画廊
 - **L2**（7）：交互 + localStorage —— 待办/计数器/计算器/颜色选择器/留言板/标签页/番茄钟
-- **L3**（5）：复杂多状态 —— 购物车/天气卡/表单验证/排序可视化/搜索过滤
+- **L3**（6）：复杂多状态 + 回归专项 —— 购物车/天气卡/表单验证/排序可视化/搜索过滤/贪吃蛇
 - **L4**（3）：综合 —— 仪表盘/笔记应用/看板
 
 新增任务：编辑 `tasks/tasks.yaml`，每条配 `assertions` 即可，无需改代码。

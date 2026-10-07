@@ -11,6 +11,22 @@ Eval Runner —— 生成质量基线评估
     cd backend && PYTHONPATH=. python ../eval/run_eval.py --no-preview       # 跳过浏览器验证（CI 快跑）
     cd backend && PYTHONPATH=. python ../eval/run_eval.py --resume eval/results/baseline_xxx.json  # 断点续跑（只重跑失败项）
     cd backend && PYTHONPATH=. python ../eval/run_eval.py --with-memory      # 开启记忆注入（A/B 对照）
+    cd backend && PYTHONPATH=. python ../eval/run_eval.py --no-plan          # 关掉规划，退回裸 ToolCallLoop（老口径 A/B）
+
+规划口径说明（2026-10-07 修）：
+    本脚本此前**直连 ToolCallLoop**，state["plan"] 恒为 None。后果是三件事静默失效，
+    而它们恰好是「缺文件」类失败的全部防线：
+
+      ① 编码提示词里的「## 推荐文件结构 / 实现计划」整段消失；
+      ② `_pending_plan_files()` 恒返回 []→ 每轮「进度检查：还差 N 个文件」一条都没发出过
+         （21 个任务的提示词里该字样出现 0 次）；
+      ③ 迭代预算退化成 max(0,3)+3 = 6 轮（与真实工作量脱钩）。
+
+    实测代价：8/21 个任务连 index.html 都没创建就被预算耗尽，断言第一条就挂。
+    现在默认走**真实生产管线** team_leader_node → coder_node，
+    它同时带来三样评测此前没有的东西：真实计划、`tool_thinking=disabled`、
+    Phase 2 定向补全（批量编码漏建的文件会被逐个补齐）。
+    要复现历史口径请显式加 --no-plan。
 
 记忆 A/B 说明：
     默认不开记忆 —— 与历史基线一致（eval 从未走过 requirement_service 的
@@ -75,6 +91,13 @@ class TaskResult:
     files: list = field(default_factory=list)
     memory_enabled: bool = False      # 生成该结果时是否开启记忆注入
     memory_block_chars: int = 0       # 实际注入的记忆块长度（0 = 没检索到东西）
+    # ---- 规划口径诊断（2026-10-07）----
+    plan_used: bool = False           # 是否跑通了真实 TeamLeader 规划
+    plan_files: list = field(default_factory=list)   # 计划声明的文件清单
+    plan_error: str = ""              # 规划失败原因（空 = 成功）
+    rounds: int = 0                   # 实际消耗的编码轮数（LLM 迭代次数）
+    tool_sequence: list = field(default_factory=list)  # 每轮工具名，如 "read_file+write_file"
+    workspace: str = ""               # 失败时保留的产物目录（成功/关闭保留时为空）
 
 
 # ---------- 断言检查器 ----------
@@ -101,6 +124,11 @@ class AssertionChecker:
           ``style.css`` → 所有 ``*.css``，``script.js`` → 所有 ``*.js``。
           这样断言「样式表含 gradient / JS 含 localStorage」不再因路径
           （``css/style.css``、``js/main.js``）或文件名差异而假阴性。
+        - 查 ``.css`` 时还要算上**内联样式**：HTML 里 ``<style>`` 块的内容一并纳入。
+          单文件方案（index.html + inline style）是合法交付，页面照样有样式。
+          2026-10-07 实测 t01：plan 选了单文件，页面用 ``--grad-cool`` 实现了渐变背景、
+          预览零错误，却因为工作区里没有 ``.css`` 文件被判 ``content_contains`` 失败。
+          这与上面「同扩展名回退」是同一类假阴性 —— **文件布局不该决定断言成败**。
         """
         if self.ws.exists(filename):
             try:
@@ -115,6 +143,17 @@ class AssertionChecker:
                     parts.append(self.ws.read(f))
                 except Exception:
                     continue
+        if ext == ".css":
+            for f in self.ws.list():
+                if not f.lower().endswith((".html", ".htm")):
+                    continue
+                try:
+                    html = self.ws.read(f)
+                except Exception:
+                    continue
+                parts.extend(re.findall(
+                    r"<style[^>]*>(.*?)</style>", html, re.IGNORECASE | re.DOTALL
+                ))
         return "\n".join(parts), False
 
     def check(self, assertion: dict) -> AssertionResult:
@@ -200,12 +239,29 @@ class AssertionChecker:
 
     @staticmethod
     def _selector_match(html: str, selector: str) -> bool:
+        """轻量选择器匹配（不引浏览器，覆盖 eval 用例）。
+
+        支持：标签名 / `.class` / `#id` / `[class*=x]` / **逗号并集**。
+
+        并集是为「同一个语义有多种合法写法」准备的 —— 例如「CTA 按钮」既可以
+        是 `<button>`，也可以是 `<a class="btn" href="#cta">`（着陆页更常见的
+        写法，语义上也没错）。此前只认标签名 `button`，把后者判成"未匹配"，
+        是一条与产物质量无关的假阴性（2026-10-07 评测 t02 实测：整页 4 条断言
+        里 3 条通过，唯独卡在字面 `<button>`）。
+        """
         import re
         sel = selector.strip()
-        if sel.startswith(".") :
+        if "," in sel:
+            return any(AssertionChecker._selector_match(html, part)
+                       for part in sel.split(","))
+        if sel.startswith("."):
             return bool(re.search(rf'class\s*=\s*"[^"]*\b{re.escape(sel[1:])}\b', html))
         if sel.startswith("#"):
             return bool(re.search(rf'id\s*=\s*"{re.escape(sel[1:])}"', html))
+        m = re.match(r"\[class\*=\s*['\"]?([\w-]+)['\"]?\]$", sel)
+        if m:
+            # class 属性里出现过该子串即可（btn--sm / cta-btn / button 都算「像按钮」）
+            return bool(re.search(rf'class\s*=\s*"[^"]*{re.escape(m.group(1))}', html))
         # 标签名
         return bool(re.search(rf"<{re.escape(sel)}[\s>]", html, re.IGNORECASE))
 
@@ -270,6 +326,47 @@ def _inject_memory(loop: ToolCallLoop, requirement_content: str, user_id: int,
     return block, hit_ids
 
 
+# ---------- 规划（真实 TeamLeader） ----------
+
+def plan_for_task(task: dict) -> tuple[dict, str]:
+    """跑真实 TeamLeader 规划，返回 (节点返回值, 失败原因)。
+
+    为什么值得多花一次 LLM 往返：没有 plan，编码阶段的「推荐文件结构」
+    「进度检查（还差 N 个文件）」「CompletionContract（Default-FAIL）」
+    三件事全部静默失效（见本文件顶部说明）。评测要测的是**产品链路**，
+    而产品链路的 Coder 一定有计划。
+
+    澄清门禁的绕法：评测题库只有一句话需求，没有任何「视觉风格」补充，
+    TL 的需求确认门禁会拦下来问问题（返回 needs_clarification），
+    评测就永远拿不到计划。这里用生产里真实存在的 `[用户补充说明]` 标记放行
+    —— 那正是用户填完澄清表单后需求里会带的东西，不是为测试造的旁路。
+    """
+    from harness.instructions.nodes import team_leader_node
+
+    scratch: AgentState = {
+        "requirement_id": int(task["id"].lstrip("t")),
+        "user_id": 0,
+        "requirement_content": (
+            task["requirement"]
+            + "\n\n[用户补充说明]\n评测运行：无需澄清，请直接给出实现计划。"
+        ),
+        "dialogue_history": [],
+        "metadata": {},
+    }
+    try:
+        res = team_leader_node(scratch) or {}
+    except Exception as e:
+        return {}, f"规划异常: {type(e).__name__}: {str(e)[:160]}"
+
+    if res.get("current_step") == "needs_clarification":
+        return {}, "TL 要求澄清（放行标记未生效）"
+    plan = res.get("plan") or {}
+    if not plan or not (plan.get("file_structure") or res.get("implementation_order")):
+        return {}, (f"规划未产出可用计划: step={res.get('current_step')} "
+                    f"err={str(res.get('error'))[:120]}")
+    return res, ""
+
+
 # ---------- 单任务执行 ----------
 
 def run_one_task(task: dict, args) -> TaskResult:
@@ -311,7 +408,12 @@ def run_one_task(task: dict, args) -> TaskResult:
         "retry_count": 0,
         "error": None,
         "dialogue_history": [],
-        "metadata": {},
+        "metadata": {
+            # 生产里由 harness_context 注入（metadata 双路径）；eval 是独立进程，
+            # 不注入的话 coder_node 找不到 ToolCallLoop / Workspace。
+            "_tool_loop": loop,
+            "_workspace": ws,
+        },
         "tool_call_count": 0,
         "no_progress_count": 0,
         "last_file_list": [],
@@ -319,13 +421,63 @@ def run_one_task(task: dict, args) -> TaskResult:
         "visual_style": None,
     }
 
+    # ---- 阶段 1：规划（真实 TeamLeader）----
+    # 规划失败不把整个任务判死：退回旧的「裸 ToolCallLoop」口径继续跑，
+    # 但把失败原因记进结果，避免下一次又靠翻日志才发现计划整段是空的。
+    if getattr(args, "with_plan", True):
+        pres, plan_err = plan_for_task(task)
+        if pres.get("plan"):
+            state["plan"] = pres["plan"]
+            for key in ("tasks", "interfaces", "implementation_order"):
+                if pres.get(key) is not None:
+                    state[key] = pres[key]
+            pm = dict(pres.get("metadata") or {})
+            pm.pop("_tool_loop", None)
+            pm.pop("_workspace", None)
+            state["metadata"].update(pm)
+            state["dialogue_history"] = list(pres.get("dialogue_history") or [])
+            result.plan_used = True
+            result.plan_files = list(
+                pres.get("implementation_order")
+                or (pres["plan"].get("file_structure") or [])
+            )
+        else:
+            result.plan_error = plan_err
+            print(f"    ⚠️ 规划失败，退回裸编码口径: {plan_err}", flush=True)
+
+    # ---- 阶段 2：编码（计划到位时走真实 coder_node）----
+    # coder_node 与裸 loop.run 的差别不是「多一层包装」，而是三件实测有效的事：
+    #   ① metadata["tool_thinking"]="disabled"（裸跑会带着思考模式烧完额度）
+    #   ② CompletionContract 按 implementation_order 初始化（Default-FAIL 硬约束）
+    #   ③ Phase 2 定向补全：批量编码漏建的文件会被逐个补齐
     try:
-        final_state = loop.run(state)
-        if final_state.get("error"):
-            result.error = str(final_state["error"])
+        if result.plan_used:
+            from harness.instructions.nodes import coder_node
+            # coder_node 返回的是**局部增量**（LangGraph 语义），不是完整 state：
+            # 错误必须从返回值读，读 state 会拿到 None 而把失败静默成成功。
+            coder_out = coder_node(state) or {}
+            final_state = state
+            if coder_out.get("error"):
+                result.error = str(coder_out["error"])
+        else:
+            final_state = loop.run(state)
+            if final_state.get("error"):
+                result.error = str(final_state["error"])
     except Exception as e:
         import traceback
         result.error = f"生成异常: {e}\n{traceback.format_exc()}"
+
+    # ---- 诊断：实际用了多少轮、每轮都干了什么 ----
+    # 失败归因全靠它：没有这两个字段，「预算被记账吃光」这种结论只能靠翻日志猜。
+    _iter_msgs = [
+        m for m in (final_state.get("dialogue_history") or [])
+        if isinstance(m, dict) and m.get("role") == "iteration_batch"
+    ]
+    result.rounds = len(_iter_msgs)
+    result.tool_sequence = [
+        "+".join(str(t.get("name", "?")) for t in (m.get("tools") or []))
+        for m in _iter_msgs
+    ]
 
     result.files = ws.list()
     result.duration_s = round(time.time() - t0, 1)
@@ -345,11 +497,20 @@ def run_one_task(task: dict, args) -> TaskResult:
         except Exception as e:
             print(f"[memory] 记账回填失败（不影响结果）: {e}", flush=True)
 
-    # 清理临时工作区
-    try:
-        shutil.rmtree(ws.path)
-    except Exception:
-        pass
+    # 清理临时工作区。
+    # 失败时默认保留一份（--no-keep-failed 可关掉）：报告里的 detail 只有一行，
+    # 而「为什么挂」常常要看产物本身（几行、差哪个词、引用了什么）。
+    # 此外 llm_traffic.log 的 body 超 8000 字符会截断，被截断的那次写入离线重放不出来，
+    # 只有留在磁盘上的产物是完整的真相。
+    result.workspace = str(ws.path)
+    if result.passed or getattr(args, "keep_failed", True) is False:
+        try:
+            shutil.rmtree(ws.path)
+        except Exception:
+            pass
+        result.workspace = ""
+    else:
+        print(f"    （失败产物保留在 {ws.path}）", flush=True)
     return result
 
 
@@ -400,11 +561,39 @@ def write_reports(results: list[TaskResult], tasks_run: int):
     ]
     for lv in sorted(by_level):
         lines.append(f"| L{lv} | {by_level[lv]['pass']} | {by_level[lv]['total']} |")
-    lines += ["", "## 明细", "", "| ID | 名称 | 通过 | 耗时 | 失败项 |", "|---|---|---|---|---|"]
+    lines += ["", "## 明细", "",
+              "| ID | 名称 | 通过 | 耗时 | 计划 | 轮次 | 失败项 |",
+              "|---|---|---|---|---|---|---|"]
     for r in results:
         fails = [a["type"] for a in r.assertions if not a["passed"]]
         mark = "✅" if r.passed else "❌"
-        lines.append(f"| {r.id} | {r.name} | {mark} | {r.duration_s}s | {', '.join(fails) or '-'} |")
+        plan_cell = f"{len(r.plan_files)}文件" if r.plan_used else "无"
+        lines.append(
+            f"| {r.id} | {r.name} | {mark} | {r.duration_s}s | "
+            f"{plan_cell} | {r.rounds} | {', '.join(fails) or '-'} |"
+        )
+
+    # 失败归因：每轮的工具序列。没有它，「预算被记账吃光 / 入口从未被创建」
+    # 这类结论只能靠事后翻 llm_traffic.log 猜（且日志截断，未必看得出）。
+    fails = [r for r in results if not r.passed]
+    if fails:
+        lines += ["", "## 失败归因（每轮工具序列）", ""]
+        for r in fails:
+            lines.append(f"### {r.id} {r.name}")
+            if r.plan_error:
+                lines.append(f"- ⚠️ 规划失败：{r.plan_error}")
+            if r.plan_used:
+                lines.append(f"- 计划文件：{', '.join(r.plan_files) or '-'}")
+            lines.append(f"- 共 {r.rounds} 轮，产物 {len(r.files)} 个：{', '.join(r.files) or '-'}")
+            for i, seq in enumerate(r.tool_sequence, 1):
+                lines.append(f"  {i}. {seq}")
+            for a in r.assertions:
+                if not a["passed"]:
+                    lines.append(f"- ❌ {a['type']}: {a['detail'][:160]}")
+            if r.workspace:
+                lines.append(f"- 产物目录（可直接复看）：`{r.workspace}`")
+            lines.append("")
+
     md_path.write_text("\n".join(lines))
 
     # latest 软链（覆盖）
@@ -503,6 +692,13 @@ def main():
                              "429/401 造成的失败会被误读成代码问题")
     parser.add_argument("--no-preflight", action="store_true",
                         help="跳过开跑前的 LLM 连通性/鉴权自检（默认会自检一次）")
+    parser.add_argument("--no-keep-failed", dest="keep_failed", action="store_false",
+                        default=True,
+                        help="失败任务的工作区照旧删掉（默认保留，便于离线复看产物）")
+    parser.add_argument("--with-plan", dest="with_plan", action="store_true", default=True,
+                        help="走真实 TeamLeader 规划 + coder_node（默认，见文件顶部说明）")
+    parser.add_argument("--no-plan", dest="with_plan", action="store_false",
+                        help="关掉规划，退回裸 ToolCallLoop（历史口径 A/B）")
     args = parser.parse_args()
 
     # 工作区隔离：每次 run 用唯一目录（时间戳+PID），避免并发/重跑互相覆盖
@@ -527,7 +723,9 @@ def main():
             print(f"resume 读取失败，忽略: {e}")
 
     mem_status = f"on(user={args.memory_user})" if args.with_memory else "off"
-    print(f"Eval: {len(tasks)} 个任务 (preview={'off' if args.no_preview else 'on'}, memory={mem_status})\n")
+    plan_status = "on(team_leader+coder_node)" if args.with_plan else "off(裸 ToolCallLoop)"
+    print(f"Eval: {len(tasks)} 个任务 (preview={'off' if args.no_preview else 'on'}, "
+          f"memory={mem_status}, plan={plan_status})\n")
 
     # 开跑前自检：Key 失效/套餐被禁/额度打满时，21 个任务会全部"失败"，
     # 而失败原因跟被测代码毫无关系——必须在花掉 20 分钟之前就拦住。
@@ -553,6 +751,12 @@ def main():
                 assertions=old.get("assertions", []),
                 memory_enabled=old.get("memory_enabled", False),
                 memory_block_chars=old.get("memory_block_chars", 0),
+                plan_used=old.get("plan_used", False),
+                plan_files=old.get("plan_files", []),
+                plan_error=old.get("plan_error", ""),
+                rounds=old.get("rounds", 0),
+                tool_sequence=old.get("tool_sequence", []),
+                workspace=old.get("workspace", ""),
             )
             print(f"[{i}/{len(tasks)}] {rid} {task['name']} ... ⏭️ (resume PASS)")
             results.append(r)

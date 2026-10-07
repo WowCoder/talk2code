@@ -19,7 +19,11 @@ tasks:
     requirement: "做一个个人名片页面，显示姓名、职位、一句话简介，背景用渐变色"
     assertions:
       - {type: file_exists, filename: index.html}
-      - {type: file_min_lines, filename: index.html, min: 20}
+      # min 原为 20：一个「标题 + 职位 + 一句话简介」的完整名片页，写实了就是
+      # 17 行（doctype/head/link/body/卡片/h1/p/p），20 会把它当成偷懒空文件误杀。
+      # 12 行仍远高于任何真实空壳（空壳 < 5 行），保留「防空文件」的本意。
+      # 2026-10-07 实测：页面完整、preview 零错误、渐变命中，唯一失败项就是这条。
+      - {type: file_min_lines, filename: index.html, min: 12}
       - {type: content_contains, filename: style.css, text: "gradient"}
       - {type: preview_no_error}
 
@@ -29,7 +33,10 @@ tasks:
     requirement: "做一个 SaaS 产品着陆页，包含 hero 区、三个特性卡片、底部 CTA 按钮"
     assertions:
       - {type: file_exists, filename: index.html}
-      - {type: html_has_element, selector: "button"}
+      # 「CTA 按钮」在着陆页里更常见的写法是 `<a class="btn" href="#cta">`（语义
+      # 上比 <button> 更对：它是跳转不是提交）。只认字面 <button> 会误杀合格产物，
+      # 所以这里用并集：真按钮 / 类名含 btn / 类名含 button 任一命中即可。
+      - {type: html_has_element, selector: "button, [class*=btn], [class*=button]"}
       - {type: content_not_contains, filename: index.html, text: "lorem ipsum"}
       - {type: preview_no_error}
 
