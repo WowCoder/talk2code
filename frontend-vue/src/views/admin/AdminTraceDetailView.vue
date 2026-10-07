@@ -267,7 +267,8 @@
               <div class="kf">
                 <div v-for="row in metaRows" :key="row.k" class="kf-row">
                   <span class="kf-k" :title="row.k">{{ row.label }}</span>
-                  <span class="kf-v" :class="{ alert: row.alert }">{{ row.v }}</span>
+                  <!-- title 挂完整值：一行里被 clip 过的明细，悬停仍能看到全文 -->
+                  <span class="kf-v" :class="{ alert: row.alert }" :title="row.v">{{ row.v }}</span>
                 </div>
               </div>
             </template>
@@ -708,6 +709,12 @@ const NEUTRAL_META: Record<string, unknown> = {
 // 纯内部标识，对排查没有信息量（正文本身就在下面）
 const HIDDEN_META = new Set(['content_ref', 'message_count'])
 
+// 单条明细在一行里最多显示多少字。记忆教训后端存 200 字，不截会把「要点」
+// 撑成一大坨，反而看不见判定/得分这些真正要一眼看到的结论。
+const ITEM_TEXT_CAP = 100
+const clip = (s: string, n = ITEM_TEXT_CAP) =>
+  s.length > n ? `${s.slice(0, n)}…` : s
+
 const fmtMetaValue = (v: unknown): string => {
   if (v === null || v === undefined || v === '') return '—'
   if (typeof v === 'boolean') return v ? '是' : '否'
@@ -715,14 +722,24 @@ const fmtMetaValue = (v: unknown): string => {
     if (!v.length) return '无'
     const head = v.slice(0, 6).map(x => {
       if (typeof x === 'object' && x !== null) {
-        // 对象条目优先念人话字段（澄清问题的 label、记忆条目的 requirement），
-        // JSON 一行展开在要点区没法读
+        // 对象条目优先念人话字段（澄清问题的 label、记忆条目的 lesson），
+        // JSON 一行展开在要点区没法读。
+        //
+        // ⚠️ 记忆条目必须念 `lesson`（教训正文）而不是 `requirement`（来源需求）：
+        // 只念来源需求时，时间线上看到的是一条和自己毫无关系的旧需求标题，
+        // 看起来就像注入了噪音 —— 而真正被注入的那句教训一个字都没露出来。
+        // 来源需求保留为「来源：…」后缀：它是判断这条教训是否适用的依据。
         const o = x as Record<string, unknown>
+        const prefix = o.id ? `${o.id} ` : ''
+        if (o.lesson) {
+          const src = o.requirement ? `（来源：${clip(String(o.requirement), 40)}）` : ''
+          return `${prefix}教训：${clip(String(o.lesson))}${src}`
+        }
         const text = o.label ?? o.question ?? o.title ?? o.requirement
-        if (text) return `${o.id ? `${o.id} ` : ''}${String(text)}`
-        return JSON.stringify(x)
+        if (text) return `${prefix}${clip(String(text))}`
+        return clip(JSON.stringify(x))
       }
-      return String(x)
+      return clip(String(x))
     })
     return v.length > 6 ? `${head.join('；')} 等 ${v.length} 项` : head.join('；')
   }
