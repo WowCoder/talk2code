@@ -3,10 +3,16 @@
 CostTracker —— Token 用量和成本统计
 """
 
+import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
 from harness.observability.log_context import current_trace_id
+
+logger = logging.getLogger(__name__)
+
+# 已经为「未登记模型」告过警的名字，避免每次调用刷屏（见 price_for）。
+_WARNED_MODELS: set = set()
 
 
 @dataclass
@@ -29,8 +35,20 @@ class CostReport:
 
 
 class CostTracker:
-    """Token 用量和成本统计"""
+    """Token 用量和成本统计
 
+    计价口径（三处必须一致，否则「谁的数字都不敢信」）：
+      本文件的 record()、estimate_cost_usd()，以及可观测性后台的展示。
+    """
+
+    # 缓存命中部分的输入单价 = 普通输入价的 10%。
+    # DeepSeek 与 Agnes 的官方计费规则相同（缓存命中/未命中是两个价目），
+    # 这不是估算系数而是厂商公布的比例。个别模型若公布别的比例，
+    # 在 PRICING 里给它单独写 "cached" 覆盖即可。
+    CACHED_INPUT_RATIO = 0.1
+
+    # 单价单位：美元 / 百万 token。键 "cached" 可省略，省略即按
+    # CACHED_INPUT_RATIO × input 计。
     PRICING = {
         "gpt-4o": {"input": 2.50, "output": 10.00},
         "gpt-4o-mini": {"input": 0.15, "output": 0.60},
@@ -39,7 +57,13 @@ class CostTracker:
         "claude-opus-4-5": {"input": 15.00, "output": 75.00},
         "deepseek-v3": {"input": 0.27, "output": 1.10},
         "deepseek-r1": {"input": 0.55, "output": 2.19},
-        # 注意：deepseek 系列按模型名前缀匹配（下方 record 中做前缀回退）
+        # agnes 系列（本项目当前主力模型）。**必须显式登记**：此前缺这一项，
+        # 前缀回退三个分支全不匹配 → 落到最末的兜底价 $1/$4，比官方刊例
+        # （输入 $0.05 / 输出 $0.15）整整贵 21 倍，后台报 $2.48 而实际花费 $0。
+        "agnes-3.0-flash": {"input": 0.05, "output": 0.15, "cached": 0.005},
+        "agnes-3.0-pro": {"input": 0.30, "output": 0.90, "cached": 0.03},
+        # 注意：deepseek / qwen / agnes / claude 系列按模型名前缀匹配
+        #（见 price_for 的前缀回退），版本后缀换名不必逐个登记。
     }
 
     def __init__(self):
@@ -52,24 +76,68 @@ class CostTracker:
         # 中转是安全的；trace_id 全局唯一，不会跨 trace 串台。
         self._pending_cache: dict[str, int] = {}
 
+    # 未登记模型的兜底价。宁可偏高也不要偏低（低估成本会让人以为优化有效），
+    # 但每次命中都要打警告 —— 「按兜底价算出来的成本」和「真实成本」是两回事，
+    # 静默兜底会让后台的数字看起来精确、实际没有依据。
+    FALLBACK_PRICING = {"input": 1.0, "output": 4.0}
+
     @classmethod
     def price_for(cls, model: str) -> dict:
         """取模型单价（美元 / 百万 token）。
 
-        未登记的模型走前缀回退，不落到任意默认价 —— deepseek 与 qwen 的
+        未登记的模型走前缀回退，不落到任意默认价 —— 各家模型的
         版本后缀很多，逐个登记不现实，但也不能因此按最贵的算。
+
+        返回值一定是含 input / output / cached 三个键的完整价目：cached 由
+        CACHED_INPUT_RATIO 补齐，调用方不必各自判断缺键。
         """
         model = model or ""
         pricing = cls.PRICING.get(model)
-        if pricing is not None:
-            return pricing
-        if model.startswith("deepseek-"):
-            return cls.PRICING.get("deepseek-v3", {"input": 0.27, "output": 1.10})
-        if model.startswith("qwen-"):
-            return cls.PRICING.get("qwen-plus", {"input": 0.50, "output": 2.00})
-        if model.startswith("gpt-4o"):
-            return cls.PRICING.get("gpt-4o", {"input": 2.50, "output": 10.00})
-        return {"input": 1.0, "output": 4.0}
+        if pricing is None:
+            for prefix, key in (
+                ("deepseek-", "deepseek-v3"),
+                ("qwen-", "qwen-plus"),
+                ("gpt-4o", "gpt-4o"),
+                ("agnes-", "agnes-3.0-flash"),
+                ("claude-", "claude-opus-4-5"),
+            ):
+                if model.startswith(prefix):
+                    pricing = cls.PRICING.get(key)
+                    break
+        if pricing is None:
+            # 每个模型名只警告一次：price_for 是每次 LLM 调用的必经之路，
+            # 不去重会变成刷屏，反而没人看。
+            if model and model not in _WARNED_MODELS:
+                _WARNED_MODELS.add(model)
+                logger.warning(
+                    "[CostTracker] 未登记模型 %r，按兜底价 %s 计 —— 该模型的实际"
+                    "单价请补进 PRICING，否则后台成本只是量级参考",
+                    model, cls.FALLBACK_PRICING,
+                )
+            pricing = cls.FALLBACK_PRICING
+        if "cached" not in pricing:
+            pricing = dict(pricing)
+            pricing["cached"] = pricing["input"] * cls.CACHED_INPUT_RATIO
+        return pricing
+
+    @staticmethod
+    def _cost_of(pricing: dict, input_tokens: int, output_tokens: int,
+                 cached_tokens: int = 0) -> float:
+        """按价目算一次调用的美元成本（缓存命中部分单独折价）。
+
+        ⚠️ `input_tokens` 是**含**命中量的总量（供应商口径就是 prompt_tokens），
+        所以命中部分必须先从全价里扣出来、再按缓存价计。此前直接
+        `input × 价 + output × 价`，把已经命中的部分也按全价收了一遍 ——
+        实测命中率 46% 时，输入成本因此高估约 41%。
+        """
+        cached = max(0, min(int(cached_tokens or 0), int(input_tokens or 0)))
+        fresh = max(0, int(input_tokens or 0) - cached)
+        cached_price = pricing.get("cached")
+        if cached_price is None:  # 价目没写 cached → 按统一比例，与 price_for 一致
+            cached_price = pricing["input"] * CostTracker.CACHED_INPUT_RATIO
+        return ((fresh / 1_000_000) * pricing["input"]
+                + (cached / 1_000_000) * cached_price
+                + (int(output_tokens or 0) / 1_000_000) * pricing["output"])
 
     def record(self, trace_id: str, input_tokens: int, output_tokens: int,
                model: str = "", cached_tokens: Optional[int] = None):
@@ -77,11 +145,13 @@ class CostTracker:
         # 直调 record 的旧代码/测试不传 → 拿不到就归 0，行为与之前完全一致。
         if cached_tokens is None:
             cached_tokens = self._pending_cache.pop(trace_id, 0)
+        # 命中量是 input 的子集：供应商若上报了该字段但数值异常（> input），
+        # 按 input 封顶，否则计价里会出现负的"未命中部分"，成本被算成负数。
+        cached_tokens = max(0, min(int(cached_tokens or 0), int(input_tokens or 0)))
         # 计价口径统一走 price_for：可观测性后台的单次成本与这里的累计成本
         # 必须是同一套算法，否则两边数字对不上、谁都不敢信。
         pricing = self.price_for(model)
-        cost = (input_tokens / 1_000_000) * pricing["input"] + \
-               (output_tokens / 1_000_000) * pricing["output"]
+        cost = self._cost_of(pricing, input_tokens, output_tokens, cached_tokens)
 
         if trace_id not in self._usage:
             self._usage[trace_id] = CostReport()
@@ -176,14 +246,34 @@ class CostTracker:
         return 0
 
 
-def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
+def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int,
+                      cached_tokens: int = 0) -> float:
     """单次 LLM 调用的估算成本（美元）。
 
     CostTracker.record 只给累计值，而可观测性后台要的是「这次调用花多少」，
-    因此把计价单独开放出来 —— 两处共用 price_for，口径不会走偏。
+    因此把计价单独开放出来 —— 两处共用 price_for 与 _cost_of，口径不会走偏。
+    `cached_tokens` 必须透传：不传的话后台的单次成本会把缓存命中部分按全价算，
+    与累计成本（record）对不上。
     """
     if not model or (not input_tokens and not output_tokens):
         return 0.0
     pricing = CostTracker.price_for(model)
-    return ((input_tokens / 1_000_000) * pricing["input"]
-            + (output_tokens / 1_000_000) * pricing["output"])
+    return CostTracker._cost_of(pricing, input_tokens, output_tokens, cached_tokens)
+
+
+# 进程级共享实例。
+#
+# 为什么需要它：成本要在**所有** LLM 调用上累计（编码 / 规划 / 验收 / 修复 /
+# AC 翻译），而记账的唯一收口点是 `trace_writer.record_llm_turn`（每条调用都
+# 经过它）。它在调用栈深处，拿不到「某个需求自己 new 出来的」CostTracker 实例。
+# 于是改为按 trace_id 键共享一个实例：trace_id 全局唯一，不会串台，
+# 每个 trace 结束时由 tracer.end_trace 调 clear(trace_id) 回收。
+_SHARED: Optional[CostTracker] = None
+
+
+def shared_cost_tracker() -> CostTracker:
+    """取进程级共享的 CostTracker（懒加载）。"""
+    global _SHARED
+    if _SHARED is None:
+        _SHARED = CostTracker()
+    return _SHARED

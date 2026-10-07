@@ -48,7 +48,7 @@ def create_harness(requirement_id: int, user_id: int, db_session=None):
     from harness.tools.registry import create_tool_registry
     from harness.constraints.hooks import create_default_hook_manager
     from harness.observability.tracer import Tracer
-    from harness.observability.cost import CostTracker
+    from harness.observability.cost import shared_cost_tracker
     from llm.client import get_client
 
     workspace = WorkspaceFS(user_id, requirement_id)
@@ -57,7 +57,9 @@ def create_harness(requirement_id: int, user_id: int, db_session=None):
     hooks = create_default_hook_manager()
     checkpoint = CheckpointManager(db_session=db_session)
     memory_manager = MemoryManager(llm_client=get_client())
-    cost_tracker = CostTracker()
+    # 共享实例：记账收口在 trace_writer.record_llm_turn（拿不到这里的局部变量），
+    # 必须与它读同一个实例，否则 trace 级汇总读不到非编码阶段的用量。
+    cost_tracker = shared_cost_tracker()
     tracer = Tracer(db_session=db_session, cost_tracker=cost_tracker)
 
     return {

@@ -162,7 +162,9 @@ def backfill_requirement(db, rid: int, jsonl_path: str,
                 cached_tokens=cached,
                 # jsonl 里只有部分调用带 usage（实测 15%），没有的那些就是 0 ——
                 # 那是"没记录"而不是"没花钱"，meta.has_usage 会如实标出来。
-                cost=estimate_cost_usd(rec.get("model"), tin, tout),
+                # 与实时路径同口径：命中部分按缓存价算（不传 cached 会把
+                # 命中量按全价收一遍，回填出来的成本会系统性偏高）
+                cost=estimate_cost_usd(rec.get("model"), tin, tout, cached or 0),
                 stage=stage,
                 ts=ts,
                 meta={"thinking": bool(rec.get("thinking")),

@@ -288,14 +288,17 @@ class ToolCallLoop:
                 state["error"] = f"LLM 调用失败: {response.error or response.content[:200]}"
                 break
 
-            # 记录 token 用量 + 结束 span（真实耗时 = start_span 到此刻）
+            # 记录本轮 token 用量 + 结束 span（真实耗时 = start_span 到此刻）
+            # ⚠️ 这里**不再**调 cost_tracker.record：编码调用的记账已收口到
+            #    紧随其后的 record_llm_turn（所有 LLM 调用的唯一记账点），
+            #    两处都记会让同一轮被计两次、成本翻倍。
+            #    这里只把「本轮用了多少 token」写进 span 元数据，供进度展示。
             if span:
                 if response.usage and self.cost_tracker:
-                    input_tokens, output_tokens = self.cost_tracker.extract_usage(
+                    _tin, _tout = self.cost_tracker.extract_usage(
                         response.usage, client.provider
                     )
-                    self.cost_tracker.record(trace_id, input_tokens, output_tokens, client.model)
-                    span.metadata["tokens"] = input_tokens + output_tokens
+                    span.metadata["tokens"] = _tin + _tout
                 self.tracer.end_span(span)
 
             # 统一埋点：文件明细（AGENT_EXEC_LOG=1）+ 运营后台索引。

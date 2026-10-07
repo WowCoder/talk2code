@@ -336,7 +336,7 @@ def chat_with_requirement(req_id):
     from harness.constraints.hooks import create_default_hook_manager
     from harness.observability.sse_reporter import SSEReporter
     from harness.observability.tracer import Tracer
-    from harness.observability.cost import CostTracker
+    from harness.observability.cost import shared_cost_tracker
     from harness.runtime import ToolCallLoop
     from harness.instructions.intent_router import IntentRouter, IntentType
 
@@ -392,8 +392,10 @@ def chat_with_requirement(req_id):
         tools = create_tool_registry()
         hooks = create_default_hook_manager()
         sse = SSEReporter(sse_manager)
-        tracer = Tracer(db_session=db)
-        cost_tracker = CostTracker()
+        # 第二轮对话此前只建了 tracer、**没挂 cost_tracker** —— 这条路径上的
+        # token 与成本从来没进过 trace 汇总。共享实例一并接上。
+        cost_tracker = shared_cost_tracker()
+        tracer = Tracer(db_session=db, cost_tracker=cost_tracker)
 
         # 保存用户消息到数据库（立即持久化，防止崩溃丢失）
         from sqlalchemy.orm.attributes import flag_modified

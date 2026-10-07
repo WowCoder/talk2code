@@ -27,7 +27,7 @@ from harness.tools.code_tools import CodeToolHandler
 from harness.constraints.hooks import create_default_hook_manager
 
 from harness.observability.tracer import Tracer
-from harness.observability.cost import CostTracker
+from harness.observability.cost import shared_cost_tracker
 from harness.observability.sse_reporter import SSEReporter
 from harness.runtime import ToolCallLoop
 from harness.agent_names import TL_NAME, DEV_NAME, QA_NAME
@@ -347,7 +347,8 @@ class RequirementService:
                 hooks = create_default_hook_manager()
                 # 注入 db_session：记忆/检查点/追踪跨重启持久化
                 checkpoint = CheckpointManager(db_session=db)
-                cost_tracker = CostTracker()
+                # 共享实例（与 trace_writer 的记账收口读同一个）：见 cost.py 注释
+                cost_tracker = shared_cost_tracker()
                 tracer = Tracer(db_session=db, cost_tracker=cost_tracker)
     
                 # SSE reporter
@@ -700,7 +701,7 @@ class RequirementService:
         from harness.tools.registry import create_tool_registry
         from harness.constraints.hooks import create_default_hook_manager
         from harness.observability.tracer import Tracer
-        from harness.observability.cost import CostTracker
+        from harness.observability.cost import shared_cost_tracker
         from sqlalchemy.orm.attributes import flag_modified
 
         with get_db() as db:
@@ -822,7 +823,7 @@ class RequirementService:
         from harness.tools.registry import create_tool_registry
         from harness.constraints.hooks import create_default_hook_manager
         from harness.observability.tracer import Tracer
-        from harness.observability.cost import CostTracker
+        from harness.observability.cost import shared_cost_tracker
         from sqlalchemy.orm.attributes import flag_modified
 
         try:
@@ -834,7 +835,8 @@ class RequirementService:
             tools = create_tool_registry()
             hooks = create_default_hook_manager()
             checkpoint = CheckpointManager(db_session=db)
-            cost_tracker = CostTracker()
+            # 共享实例（与 trace_writer 的记账收口读同一个）
+            cost_tracker = shared_cost_tracker()
             tracer = Tracer(db_session=db, cost_tracker=cost_tracker)
             sse = SSEReporter(sse_manager)
     

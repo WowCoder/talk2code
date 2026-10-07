@@ -691,6 +691,21 @@ def _call_id_or_none() -> str:
         return None
 
 
+def _current_trace_or_none() -> str:
+    """取当前线程绑定的 trace_id；未绑定（哨兵 "-"）时返回 None。
+
+    与 `_call_id_or_none` 同一套路。返回 None 而不是 "-"：调用方要用它当
+    dict 键做成本累计，"-" 会变成一个真实的键、把所有无 trace 的调用混在
+    一起，看着像某个 trace 花了很多钱。
+    """
+    try:
+        from harness.observability.log_context import current_trace_id
+        tid = current_trace_id()
+        return tid if tid and tid != "-" else None
+    except Exception:
+        return None
+
+
 def record_llm_turn(requirement_id, *, stage, iteration=None, model=None,
                     system_prompt=None, prompt=None, messages=None,
                     tools=None, response=None, thinking=None, latency_ms=None,
@@ -721,6 +736,30 @@ def record_llm_turn(requirement_id, *, stage, iteration=None, model=None,
     except Exception:
         pass  # 文件明细失败无所谓，库里的索引才是后台的数据源
 
+    # ---- 成本累计：所有 LLM 调用的唯一记账点 ----
+    # 刻意放在 `requirement_id` 判空**之前**：CostTracker 是按 **trace_id** 键的，
+    # 而「有 trace 但没需求号」是存在的（评测链路就是），放在判空之后会被静默漏掉。
+    usage = _usage_dict(getattr(response, "usage", None))
+    tin, tout = _tokens_from_usage(usage)
+    cached = _cached_from_usage(usage)
+    try:
+        from harness.observability.cost import (
+            estimate_cost_usd, shared_cost_tracker,
+        )
+        # cached 为 None 时按 0 计（= 全部按全价）—— 供应商没上报命中量时
+        # 保守地按未命中算，宁可略高也不虚报节省。
+        cost = estimate_cost_usd(model, tin, tout, cached or 0)
+        # 此前只有 ToolCallLoop 里的编码调用调 cost_tracker.record，
+        # 规划 / 验收 / 修复 / AC 翻译的 token 只存在于单条事件里，
+        # trace 级汇总（详情页 TokenBar、后台 cost_7d）看不到它们 ——
+        # 于是同一个「本次成本」在不同页面是两个数。
+        eff_trace = trace_id or _current_trace_or_none()
+        if (tin or tout) and eff_trace:
+            shared_cost_tracker().record(eff_trace, tin, tout, model, cached or 0)
+    except Exception as e:
+        logger.debug("[TraceWriter] 成本累计失败（不阻断）：%s", e)
+        cost = 0.0
+
     if not requirement_id:
         return None
 
@@ -729,9 +768,6 @@ def record_llm_turn(requirement_id, *, stage, iteration=None, model=None,
         w = writer
         if w is None:
             db, w = _open_writer(requirement_id, trace_id, turn_index)
-        usage = _usage_dict(getattr(response, "usage", None))
-        tin, tout = _tokens_from_usage(usage)
-        cached = _cached_from_usage(usage)
         resp = None
         if response is not None:
             resp = {
@@ -744,12 +780,10 @@ def record_llm_turn(requirement_id, *, stage, iteration=None, model=None,
                 "usage": usage or None,
                 "is_error": getattr(response, "is_error", None),
                 "error": getattr(response, "error", None),
+                # finish_reason 是「被额度截断(length)」与「端点故障(error)」
+                # 唯一可靠的分诊依据，必须能事后回查（需求 220 根因 A）。
+                "finish_reason": getattr(response, "finish_reason", None),
             }
-        try:
-            from harness.observability.cost import estimate_cost_usd
-            cost = estimate_cost_usd(model, tin, tout)
-        except Exception:
-            cost = 0.0
         return w.llm_call(
             # call_id 从上下文取：与 llm_traffic.log 里同一次请求的 call_id 一致，
             # 于是后台点开某个 llm_turn 能直接查到当时的传输层原文。
