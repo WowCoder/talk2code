@@ -1,7 +1,7 @@
 <template>
   <div class="token-bar">
     <span>tokens <b class="tb-val">{{ tokens ? tokens.toLocaleString() : '-' }}</b></span>
-    <span>cost <b class="tb-val">{{ cost != null ? '$' + Number(cost).toFixed(2) : '-' }}</b></span>
+    <span>cost <b class="tb-val">{{ cost != null ? formatCost(cost, 2) : '-' }}</b></span>
     <span>elapsed <b class="tb-val">{{ elapsedText }}</b></span>
     <span class="tb-right">由 LangGraph 驱动</span>
   </div>
@@ -9,6 +9,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
+import { formatCost } from '@/utils/cost'
 
 const props = defineProps<{
   tokens?: number

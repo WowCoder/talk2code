@@ -1562,7 +1562,7 @@ class CostTracker:
 **数据来源**：LLM API 响应中的 `usage` 字段（OpenAI: `response.usage.total_tokens`，Anthropic: `response.usage.input_tokens/output_tokens`）。
 
 **展示位置**：
-- 需求详情页底部状态栏：本次生成消耗 XXX tokens / $0.XXX
+- 需求详情页底部状态栏：本次生成消耗 XXX tokens / ¥0.XXX
 - 设置页新增"用量统计"：按天/周/月的 Token 和费用汇总
 
 #### 7.2.3 SSE 事件体系统一
@@ -1650,7 +1650,7 @@ Claude Code 行为                    Talk2Code 对等实现
 │   └ execute_code   2.8s    ✓            │
 │ Hook 检查           0.4s    ✓ (5/5 通过) │
 ├─────────────────────────────────────────┤
-│ Token: 12,450  │  Cost: $0.042          │
+│ Token: 12,450  │  Cost: ¥0.042          │
 │ Model: gpt-4o   │  Retries: 1           │
 └─────────────────────────────────────────┘
 ```

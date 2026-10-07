@@ -65,7 +65,7 @@
 
         <div class="sum-card">
           <span class="sum-label">总成本</span>
-          <span class="sum-value">{{ summary.cost > 0 ? `¥${summary.cost.toFixed(4)}` : '—' }}</span>
+          <span class="sum-value">{{ summary.cost > 0 ? formatCost(summary.cost) : '—' }}</span>
           <span class="sum-sub">{{ modelSummary }}</span>
         </div>
 
@@ -391,6 +391,8 @@ import { adminFetch } from '@/composables/useAdmin'
 import { buildTimelineRows } from './timelineRows'
 // 状态的中文名与语义档位与首页列表共用一份（见 ./statusMeta）
 import { statusLabel, statusTone } from './statusMeta'
+// 成本展示口径与首页列表共用一份（见 @/utils/cost）
+import { formatCost } from '@/utils/cost'
 
 interface Turn { turn_index: number; mode: string; event_count: number; llm_calls: number; started_at: string | null; ended_at: string | null; duration_ms: number }
 // 阶段时间线的一段 —— 按阶段聚合（不是按连续段），一段回答「这个阶段共花了多久」

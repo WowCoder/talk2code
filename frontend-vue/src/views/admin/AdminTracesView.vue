@@ -94,7 +94,7 @@
           </span>
         </div>
         <span class="kpi-label">今日累计成本</span>
-        <span class="kpi-value">{{ fmtCost(stats.today.cost) }}</span>
+        <span class="kpi-value">{{ formatCost(stats.today.cost) }}</span>
         <span class="kpi-sub">今日 {{ fmt(stats.today.llm_calls) }} 次 LLM 调用</span>
       </div>
 
@@ -256,7 +256,7 @@
               <span v-else class="muted" title="该需求的调用未记录 usage">—</span>
             </td>
             <td class="r mono">
-              <template v-if="r.cost > 0">{{ fmtCost(r.cost) }}</template>
+              <template v-if="r.cost > 0">{{ formatCost(r.cost) }}</template>
               <span v-else class="muted">—</span>
             </td>
             <td class="mono dim">{{ relTime(r.last_event_at) }}</td>
@@ -284,6 +284,8 @@ import AdminShell from '@/components/admin/AdminShell.vue'
 import { adminFetch } from '@/composables/useAdmin'
 // 状态的中文名与配色与详情页共用一份（见 ./statusMeta）
 import { statusColor, statusLabel } from './statusMeta'
+// 成本展示口径（¥ 符号 + 精度）与其余页面共用一份（见 @/utils/cost）
+import { formatCost } from '@/utils/cost'
 
 interface TraceRow {
   requirement_id: number
@@ -422,12 +424,6 @@ function fmt(n: number): string {
   return n >= 10000 ? `${(n / 1000).toFixed(1)}k` : String(n)
 }
 
-function fmtCost(v: number): string {
-  if (!v) return '¥0'
-  // 单次生成的成本量级很小（分/厘），固定 4 位小数免得全显示成 ¥0.00
-  return `¥${v.toFixed(4)}`
-}
-
 function fmtDuration(ms: number): string {
   if (!ms) return '—'
   const s = Math.round(ms / 1000)
@@ -557,6 +553,7 @@ async function exportCsv() {
       if (!d.items.length || all.length >= d.total) break
     }
 
+    // 成本列在表头声明单位、单元格保持纯数值：带上 ¥ 前缀 Excel 会当文本，就没法求和了
     const header = ['需求编号', '标题', '创建人', '状态', '对话轮次', '事件数',
       'LLM 调用', '工具调用', 'Token', '成本(元)', '耗时(秒)',
       '开始时间', '最近活跃']

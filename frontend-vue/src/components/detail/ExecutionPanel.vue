@@ -4,7 +4,7 @@
       📊 执行详情
       <span>
         {{ spanCount }} 步 · {{ (totalDuration / 1000).toFixed(1) }}s ·
-        {{ totalTokens }} tokens · ${{ totalCost.toFixed(4) }}
+        {{ totalTokens }} tokens · {{ formatCost(totalCost, 4) }}
         {{ expanded ? '▾' : '▸' }}
       </span>
     </div>
@@ -21,7 +21,7 @@
         </span>
       </div>
       <div v-if="totalTokens" class="exec-row" style="font-weight:600;border-top:1px solid var(--dark-border);padding-top:4px;margin-top:4px">
-        Total: {{ totalTokens }} tokens · Cost: ${{ totalCost.toFixed(4) }}
+        Total: {{ totalTokens }} tokens · Cost: {{ formatCost(totalCost, 4) }}
       </div>
     </div>
   </div>
@@ -29,6 +29,7 @@
 
 <script setup lang="ts">
 import { ref, computed } from 'vue'
+import { formatCost } from '@/utils/cost'
 import type { SSETraceSummaryData } from '@/types/sse'
 
 const props = defineProps<{

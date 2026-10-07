@@ -129,7 +129,7 @@
             </div>
             <span class="v-divider"></span>
             <div class="stat">
-              <span class="stat-value">¥{{ m.observability.cost_7d.toFixed(2) }}</span>
+              <span class="stat-value">{{ formatCost(m.observability.cost_7d, 2) }}</span>
               <span class="stat-label">7 日成本</span>
             </div>
           </div>
@@ -263,6 +263,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import AdminShell from '@/components/admin/AdminShell.vue'
 import { adminFetch } from '@/composables/useAdmin'
+import { formatCost } from '@/utils/cost'
 
 interface Metrics {
   users: { total: number; new_today: number; new_7d: number; active_7d: number }
