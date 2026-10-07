@@ -41,6 +41,11 @@
           </div>
           <span class="pc-action">{{ activityText }}</span>
         </div>
+        <!-- 等待期轮换文案：说清楚在做什么之外，也给这段等待一点人味。
+             用 :key 强制换元素，配合 out-in 过渡做淡出淡入，避免硬切 -->
+        <Transition name="wl" mode="out-in">
+          <div :key="waitingLine" class="pc-line">{{ waitingLine }}</div>
+        </Transition>
         <div class="pc-stages">
           <span
             v-for="(s, i) in STAGES"
@@ -71,6 +76,7 @@ import DialogueInput from './DialogueInput.vue'
 import QuestionForm from './QuestionForm.vue'
 import ExecutionPanel from './ExecutionPanel.vue'
 import PlanConfirmation from './PlanConfirmation.vue'
+import { useWaitingLine } from '@/composables/useWaitingLine'
 import type { DialogueMessage as DialogueMessageType } from '@/types/api'
 import type { SSEQuestionFormData, SSETraceSummaryData } from '@/types/sse'
 
@@ -288,6 +294,9 @@ const currentStageIndex = computed(() =>
 // 后端推送的是动作描述（"正在创建 js/app.js"）；无动作时退化到中性文案，
 // 不再显示没有信息量的"AI 正在处理…"。
 const activityText = computed(() => store.progress.currentAgent || '正在处理')
+
+// 等待期轮换文案：按当前阶段取句，每 10 秒换一条，阶段一变立刻换。
+const { line: waitingLine } = useWaitingLine(isLoading, computed(() => store.progress.stage))
 
 // 静默期计时：LLM 挂起时后端可能数十秒无任何事件，这里用本地秒级心跳
 // 把"这一步已经跑了多久"显式说出来，避免用户只能面对一个不动的界面。
@@ -514,6 +523,25 @@ watch(
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 等待期文案：比动作描述弱一级（不抢注意力），但要在"还在动"这件事上够明显 */
+.pc-line {
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.5;
+  padding-left: 2px;
+}
+
+/* 文案切换：淡出淡入，避免硬切带来的闪烁感 */
+.wl-enter-active,
+.wl-leave-active {
+  transition: opacity 0.28s ease;
+}
+
+.wl-enter-from,
+.wl-leave-to {
+  opacity: 0;
 }
 
 .pc-stages {
