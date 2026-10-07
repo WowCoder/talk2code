@@ -96,6 +96,29 @@ class TestReasoningFallbackBound:
         assert out == 'hello'
         assert mp.call_count == 1
 
+    def test_rescue_fires_when_req_equals_global_default(self):
+        """req 恰好等于全局 LLM_MAX_TOKENS 时，救援仍必须发起。
+
+        主路径（coder / 评估 / 修复）取的额度就是全局默认值，所以这条路径才是
+        救援的**主战场**。旧公式把 LLM_MAX_TOKENS 也塞进 min()，于是
+        req == 全局默认 ⇒ fallback == req ⇒ 直接走「放弃重试」，
+        救援在主战场上从未生效过。
+
+        实测代价（2026-10-05 req 222，deepseek-v4-flash + LLM_MAX_TOKENS=12000）：
+        修复调用 out=12000 / finish_reason=length / content 为空 → 未救援 →
+        第二档 20000 从未尝试 → 「定向修复连续 2 次不可用」整条跳过。
+        """
+        # deepseek-v4-flash 的线上配置：全局 12000 + 天花板 16000
+        client = _make_client(fallback_cap=16000)
+        client.max_tokens = 12000
+        with patch('llm.client.requests.post',
+                   side_effect=[_resp('', 'think' * 500), _resp('ok')]) as mp:
+            out = ''.join(client._request_openai([{'role': 'user', 'content': 'hi'}],
+                                                 stream=False, max_tokens=12000))
+        assert out == 'ok', "救援没有发起 —— 主路径的空响应将无人兜底"
+        budgets = [c.kwargs['json']['max_tokens'] for c in mp.call_args_list]
+        assert budgets == [12000, 16000]
+
 
 class TestReasoningFallbackConfig:
     """配置项本身可被调优"""

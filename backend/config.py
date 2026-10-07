@@ -171,8 +171,21 @@ class Settings(BaseSettings):
     # 而流水线里大量按需写死的小额度调用（500/1000/2000/3000），一旦失败就把
     # 重试额度抬到全局 LLM_MAX_TOKENS（32000）——单轮随即可达 ~680s，必然撞穿
     # LLM_TIMEOUT，整节点表现为「假挂死」。故这里给一个**绝对天花板**。
+    # ⚠️ 天花板只对「大额度调用」起作用（需求 220 实证）：client 里的取值是
+    # min(max(req*2, req+4000), 本值)，小额度调用（500/1000/2000）
+    # 由 max(req*2, req+4000) 兜住抬不高，所以把本值从 8000 提到 16000 只影响
+    # 本就很大的调用，不会让小调用变慢。
+    # 定 8000 时的实证缺陷：修复调用 req=8000 → fallback ≤ 8000
+    # → 走「放弃重试」分支，救援**从未生效**，两轮修复都死在 8000。
+    # ⚠️ 本值必须**大于主路径的 LLM_MAX_TOKENS**，救援才可能生效（否则
+    # fallback ≤ req 一律放弃）。配对关系（2026-10-05 实测）：
+    #   deepseek-v4-flash：LLM_MAX_TOKENS=12000 + 本值 16000 → 救援可用（已验证）；
+    #   agnes-3.0-flash  ：LLM_MAX_TOKENS=32000 → coder 的 req 就是 32000，
+    #                      本值需 >32000 才救得动，而 48000 一档单轮要 ~680s、
+    #                      必然撞穿 LLM_TIMEOUT，故对 Agnes 大额度调用「不救援」
+    #                      是有意为之 —— 别为了让它"看起来生效"而调高本值。
     LLM_REASONING_FALLBACK_TOKENS: int = Field(
-        default=8000, ge=500, le=65500,
+        default=16000, ge=500, le=65500,
         description='推理模型 token 耗尽时的重试额度上限'
     )
     LLM_TIMEOUT: int = Field(default=60, ge=10, le=300, description='LLM 调用超时时间（秒）')

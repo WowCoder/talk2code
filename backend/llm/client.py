@@ -443,6 +443,23 @@ class LLMResponse:
         return self.error is not None
 
 
+@dataclass
+class _LLMMeta:
+    """一次 LLM 调用的元数据回写容器（usage / finish_reason）。
+
+    `_request_openai` / `_request_anthropic` 是**生成器**（与流式路径同构），
+    生成器没有 return 值，元数据没法随 content 一起带出来 —— 于是历史上
+    `chat()` 只能写死 `usage=None, finish_reason=None`（client.py:1156），
+    planning/verifying/repairing 三阶段的 token 与成本在后台恒为 0，
+    「截断 / 空响应 / 端点故障」三态也无法分诊。
+
+    故改由调用方传入本容器，请求层解析完响应后回写。线程安全：容器由调用方
+    自己创建，不共享。
+    """
+    usage: Optional[dict] = None
+    finish_reason: Optional[str] = None
+
+
 class CircuitBreakerOpenError(Exception):
     """熔断器打开时抛出，调用方应捕获并做降级处理"""
     pass
@@ -561,7 +578,18 @@ class LLMClient:
         self.vendor = settings.LLM_VENDOR
         self.thinking_format = settings.LLM_THINKING_FORMAT
         self.thinking_budget_tokens = settings.LLM_THINKING_BUDGET_TOKENS
-        self.echo_reasoning = settings.LLM_THINKING_ECHO_REASONING
+        # DeepSeek 硬性要求：带 tools 的请求里，历史 assistant 消息的 reasoning_content
+        # 必须原样回传，否则 API 直接 400；Agnes 不要求。
+        # 这里做成「显式开启 OR 厂商推断」：只要厂商是 deepseek 就强制回传 ——
+        # echo=False + deepseek + tools 这个组合**必然 400**，不存在能跑通的场景，
+        # 所以自动打开只可能消掉故障，不可能改变正常行为。
+        # 2026-10-05 实测踩点：切换厂商时 .env 里**后面**那行
+        # `LLM_THINKING_ECHO_REASONING=false` 会覆盖掉本厂商段里的 true
+        # （dotenv 后者胜），于是「只改 base_url + model」的切换会在第一次
+        # 带工具的调用上报 400。这类静默失效不该由使用者记住，交给代码兜。
+        self.echo_reasoning = (
+            settings.LLM_THINKING_ECHO_REASONING or self._resolve_vendor() == 'deepseek'
+        )
         self.strip_invalid_params = settings.LLM_STRIP_INVALID_PARAMS
 
         # 熔断器：防止 LLM API 不可用时持续无效重试
@@ -683,12 +711,14 @@ class LLMClient:
         max_tokens: Optional[int] = None,
         thinking: Optional[str] = None,
         timeout: Optional[int] = None,
-        endpoint: Optional[_Endpoint] = None
+        endpoint: Optional[_Endpoint] = None,
+        meta: Optional[_LLMMeta] = None
     ) -> Generator[str, None, None]:
         """发送 OpenAI 兼容 API 请求（带重试）
 
         endpoint: 目标端点参数；None 时使用主模型配置。
         timeout: 本次调用超时秒数；None 时使用实例默认。
+        meta: 元数据回写容器（usage / finish_reason）；见 _LLMMeta 的说明。
         """
         ep = endpoint or self._primary_endpoint()
         effective_timeout = timeout if timeout is not None else self.timeout
@@ -706,15 +736,18 @@ class LLMClient:
             'temperature': self.temperature,
             'max_tokens': max_tokens if max_tokens is not None else self.max_tokens
         }
-        # 思考模式开关：不同厂商参数格式完全不同，统一由 _build_thinking_params 决定。
-        # - enabled ：按厂商 + LLM_THINKING_FORMAT 组装（Agnes 默认 anthropic 格式以启用
-        #   budget_tokens 限流；DeepSeek 为 openai 格式 + 顶层 reasoning_effort）
-        # - disabled：**省略字段**。各端点对关闭的语义不一致（实测矩阵）：
+        # 思考模式开关：不同厂商参数格式完全不同，统一由 _build_thinking_params /
+        # _build_thinking_disable_params 决定。**"关思考"绝不能靠省略字段**——
+        # 省略在各端点语义不一致（实测矩阵，deepseek-v4-flash 于 2026-10-04 实测）：
+        #   · deepseek-v4-flash：省略 = 服务端**默认开启**推理（实测 completion 89 token
+        #     里 86 是 reasoning，正文只剩 3 token）；显式 {"type":"disabled"} = 真正
+        #     关闭（reasoning 0，completion 2）。`chat_template_kwargs.enable_thinking
+        #     =False` **无效**（仍 241 字符推理）。
         #   · agnes-3.0-flash：省略 = 思考 OFF；携带 thinking 字段（哪怕
-        #     {"type":"disabled"}）反而触发思考；
+        #     {"type":"disabled"}）反而**触发**思考 —— 与 DeepSeek 完全相反。
         #   · glm-5.3-flash（lkeap）：省略 = 服务端默认自动思考（关不掉），
         #     且 disabled 值直接 HTTP 400。
-        #   因此省略是唯一安全选项；glm 下如需真正关思考只能换模型/端点。
+        # 故关闭动作必须按厂商分发，只有确认「显式关闭被正确接受」的厂商才发字段。
         if _thinking == 'enabled':
             data.update(self._build_thinking_params())
             # DeepSeek 思考模式下 temperature / presence_penalty / frequency_penalty
@@ -722,6 +755,8 @@ class LLMClient:
             # 剔除掉，避免"以为调了参其实没生效"的误判。
             if self.strip_invalid_params and self._resolve_vendor() == 'deepseek':
                 data.pop('temperature', None)
+        else:
+            data.update(self._build_thinking_disable_params())
 
         url = f'{ep.base_url}/chat/completions'
 
@@ -768,9 +803,15 @@ class LLMClient:
                     _log_and_raise(response, call_id, t0)
                     result = response.json()
                     _log_llm_response(call_id, response.status_code, result, (time.time() - t0) * 1000)
-                    msg = result.get('choices', [{}])[0].get('message', {})
+                    choice = result.get('choices', [{}])[0]
+                    msg = choice.get('message', {})
                     content = msg.get('content', '')
                     reasoning = msg.get('reasoning_content', '')
+                    # usage / finish_reason 必须带回上层：这是「截断=length」与
+                    # 「真端点故障」唯一可靠的分诊依据，也是成本统计的唯一数据源。
+                    if meta is not None:
+                        meta.usage = result.get('usage') or meta.usage
+                        meta.finish_reason = choice.get('finish_reason') or meta.finish_reason
                     # content 为空但有 reasoning_content：max_tokens 被 thinking 吃光了。
                     # 重试一次，但额度必须「够用且不过量」——
                     #   ① 必须显著大于原额度，否则同样被 thinking 再次吃光，重试无意义；
@@ -781,10 +822,21 @@ class LLMClient:
                     #      LLM_TIMEOUT，整节点表现为「假挂死」。
                     if not content and reasoning:
                         req_tokens = data.get('max_tokens', 0) or 0
+                        # ⚠️ 这里**不能**再夹一个 `self.max_tokens`（全局默认额度）：
+                        # 主路径（coder / 评估 / 修复）取的正是全局默认值，于是
+                        # 「req >= 全局默认」时 min() 必然回到 req 本身，
+                        # `fallback_tokens <= req_tokens` 成立 → 救援被静默放弃。
+                        # 实测代价（2026-10-05 req 222，deepseek-v4-flash +
+                        # LLM_MAX_TOKENS=12000）：修复调用 max_tokens=12000 全被
+                        # reasoning 吃光、content 为空、finish_reason=length，
+                        # 救援本可抬到 16000 却直接放弃，最终整条定向修复被判
+                        # 「端点连续 2 次不可用」而跳过。
+                        # 绝对天花板由 LLM_REASONING_FALLBACK_TOKENS 单独承担
+                        # —— 这正是它存在的意义（见上面 ② 的注释）。
+                        # 已探测：deepseek-v4-flash 接受 16000 / 20000 不报错。
                         fallback_tokens = min(
                             max(req_tokens * 2, req_tokens + 4000),
                             self.reasoning_fallback_tokens,
-                            self.max_tokens,
                         )
                         if fallback_tokens <= req_tokens:
                             # 天花板已经压不住：再抬只会把一次超长调用变成必然超时。
@@ -805,14 +857,25 @@ class LLMClient:
                         )
                         retry_data = dict(data)
                         retry_data['max_tokens'] = fallback_tokens
+                        # 救援重试此前完全不记 traffic log，也不记响应 ——
+                        # 全链路看不到「曾经升档重试过」，排查时只能靠猜。
+                        # 复用同一 call_id：与原始请求在日志里天然成对。
+                        _log_llm_request(call_id, ep.provider, ep.model, url, retry_data)
                         retry_response = requests.post(
                             url, headers=headers, json=retry_data,
                             timeout=effective_timeout
                         )
                         _log_and_raise(retry_response, call_id, t0)
                         retry_result = retry_response.json()
-                        retry_msg = retry_result.get('choices', [{}])[0].get('message', {})
+                        _log_llm_response(call_id, retry_response.status_code,
+                                          retry_result, (time.time() - t0) * 1000)
+                        retry_choice = retry_result.get('choices', [{}])[0]
+                        retry_msg = retry_choice.get('message', {})
                         content = retry_msg.get('content', '')
+                        if meta is not None:
+                            meta.usage = retry_result.get('usage') or meta.usage
+                            meta.finish_reason = (
+                                retry_choice.get('finish_reason') or meta.finish_reason)
                         if not content:
                             logger.error(
                                 f"[LLM] 以 max_tokens={fallback_tokens} 重试后 content 仍为空 "
@@ -845,11 +908,12 @@ class LLMClient:
         max_tokens: Optional[int] = None,
         thinking: Optional[str] = None,
         timeout: Optional[int] = None,
-        endpoint: Optional[_Endpoint] = None
+        endpoint: Optional[_Endpoint] = None,
+        meta: Optional[_LLMMeta] = None
     ) -> Generator[str, None, None]:
         """发送 Anthropic 兼容 API 请求（带重试）
 
-        endpoint/timeout 语义同 _request_openai。
+        endpoint/timeout/meta 语义同 _request_openai。
         """
         ep = endpoint or self._primary_endpoint()
         effective_timeout = timeout if timeout is not None else self.timeout
@@ -928,6 +992,11 @@ class LLMClient:
                         for block in content_blocks
                         if block.get('type') == 'text'
                     )
+                    if meta is not None:
+                        meta.usage = result.get('usage') or meta.usage
+                        # Anthropic 的停止原因字段名是 stop_reason，语义等价于
+                        # OpenAI 的 finish_reason（length 同样表示被额度截断）。
+                        meta.finish_reason = result.get('stop_reason') or meta.finish_reason
                     yield text
                 return
 
@@ -954,27 +1023,33 @@ class LLMClient:
         max_tokens: Optional[int] = None,
         thinking: Optional[str] = None,
         timeout: Optional[int] = None,
-        endpoint: Optional[_Endpoint] = None
+        endpoint: Optional[_Endpoint] = None,
+        meta: Optional[_LLMMeta] = None
     ) -> Generator[str, None, None]:
         """根据端点 provider 分发到对应的请求方法"""
         ep = endpoint or self._primary_endpoint()
         if ep.provider == 'anthropic_compatible':
             yield from self._request_anthropic(messages, stream, max_tokens=max_tokens,
-                                               thinking=thinking, timeout=timeout, endpoint=ep)
+                                               thinking=thinking, timeout=timeout,
+                                               endpoint=ep, meta=meta)
         else:
             yield from self._request_openai(messages, stream, max_tokens=max_tokens,
-                                            thinking=thinking, timeout=timeout, endpoint=ep)
+                                            thinking=thinking, timeout=timeout,
+                                            endpoint=ep, meta=meta)
 
     def _chat_request_loop(
         self, messages: list, effective_max_tokens: int, effective_timeout: int,
         thinking: Optional[str] = None,
-        endpoint: Optional[_Endpoint] = None
+        endpoint: Optional[_Endpoint] = None,
+        meta: Optional[_LLMMeta] = None
     ) -> tuple:
         """单次请求（不在此层重试）。
 
         重试由 _request_openai/_request_anthropic 内层负责（带指数退避）。
         之前这里再加一层循环会导致 (max_retries+1)² 次请求放大。
         超时保护由底层 requests.post(timeout=...) 提供，支持主线程和工作线程。
+
+        meta 传入时由底层回写 usage / finish_reason（见 _LLMMeta）。
 
         Returns:
             (content: str, error: str | None, failed: bool)
@@ -989,6 +1064,7 @@ class LLMClient:
                 thinking=thinking,
                 timeout=effective_timeout,
                 endpoint=endpoint,
+                meta=meta,
             ):
                 content = chunk
 
@@ -1061,6 +1137,24 @@ class LLMClient:
                 params['reasoning_effort'] = self.reasoning_effort
         return params
 
+    def _build_thinking_disable_params(self) -> dict:
+        """组装「关闭思考」的请求参数（仅 thinking != enabled 时调用）。
+
+        默认返回空 dict（= 省略字段），因为多数端点省略即关闭。只有**实证确认
+        省略关不掉、且显式关闭字段被正确接受**的厂商才返回非空：
+
+        · deepseek：省略时服务端默认推理（实测 86/89 token 是 reasoning），
+          显式 `{"thinking": {"type": "disabled"}}` 后 reasoning 归零。
+          （`reasoning_effort: "none"` 实测同样有效，但 thinking 字段是 OpenAI
+            兼容端点的正统写法，优先用它。）
+        · agnes：省略即关闭，发字段反而触发思考 → 必须保持省略。
+        · glm/lkeap：省略关不掉，但 disabled 值直接 HTTP 400 → 只能保持省略
+          （换模型/端点才是解法）。
+        """
+        if self._resolve_vendor() != 'deepseek':
+            return {}
+        return {'thinking': {'type': 'disabled'}}
+
     def chat(
         self,
         prompt: str,
@@ -1103,6 +1197,10 @@ class LLMClient:
         error = None
         tried_backup = False
 
+        # usage / finish_reason 由底层请求层回写（生成器带不出 return 值），
+        # 主备两次尝试共用一个容器：备用成功时以备用为准覆盖。
+        meta = _LLMMeta()
+
         # ---- 主模型尝试 ----
         primary_available = True
         try:
@@ -1114,7 +1212,7 @@ class LLMClient:
         if primary_available:
             content, error, failed = self._chat_request_loop(
                 messages, effective_max_tokens, effective_timeout, thinking,
-                endpoint=self._primary_endpoint()
+                endpoint=self._primary_endpoint(), meta=meta
             )
             if failed and (not content or content.startswith('[错误]')):
                 self._circuit_breaker.record_failure()
@@ -1136,7 +1234,7 @@ class LLMClient:
                 # 端点经参数传递，不改写实例状态（多线程共享单例下安全）
                 content, error, failed = self._chat_request_loop(
                     messages, effective_max_tokens, effective_timeout, thinking,
-                    endpoint=backup_ep
+                    endpoint=backup_ep, meta=meta
                 )
                 if failed and (not content or content.startswith('[错误]')):
                     self._backup_circuit_breaker.record_failure()
@@ -1150,11 +1248,11 @@ class LLMClient:
             self._messages.append(Message(role='user', content=prompt))
             self._messages.append(Message(role='assistant', content=content))
 
-        # 获取用量信息（如果有）
-        usage = None
-        finish_reason = None
-
-        return LLMResponse(content=content, usage=usage, finish_reason=finish_reason, error=error)
+        # 用量与停止原因：此前这里硬编码 None，导致 planning / verifying / repairing
+        # 三个只走 chat() 的阶段在后台 token 与成本恒为 0（成本数据不可信），且
+        # 「被额度截断」与「端点故障」无法区分。现在如实带回底层观测到的事实。
+        return LLMResponse(content=content, usage=meta.usage,
+                           finish_reason=meta.finish_reason, error=error)
 
     def chat_stream(
         self,
@@ -1239,6 +1337,7 @@ class LLMClient:
         timeout: Optional[int] = None,
         endpoint: Optional[_Endpoint] = None,
         max_retries: Optional[int] = None,
+        meta: Optional[_LLMMeta] = None,
     ) -> tuple:
         """chat_with_tools 核心请求+重试循环
 
@@ -1248,6 +1347,7 @@ class LLMClient:
             max_retries: 覆盖实例级重试次数。调用方做长尾熔断时传 0——
                 超时预算是给"这一次尝试"的，若内部再重试 N 次，
                 实际墙钟时间会变成 N+1 倍预算，熔断就失去了意义。
+            meta: 元数据回写容器（usage / finish_reason）；见 _LLMMeta。
 
         Returns:
             (content, reasoning_content, tool_calls, usage, failed)
@@ -1266,11 +1366,12 @@ class LLMClient:
                 if ep.provider == 'anthropic_compatible':
                     content, reasoning_content, tool_calls, usage = self._request_anthropic_with_tools(
                         messages, tools, max_tokens=effective_max_tokens, thinking=thinking,
-                        tool_choice=tool_choice, timeout=effective_timeout, endpoint=ep)
+                        tool_choice=tool_choice, timeout=effective_timeout, endpoint=ep,
+                        meta=meta)
                 else:
                     content, reasoning_content, tool_calls, usage = self._request_openai_with_tools(
                         messages, tools, tool_choice, max_tokens=effective_max_tokens, thinking=thinking,
-                        timeout=effective_timeout, endpoint=ep)
+                        timeout=effective_timeout, endpoint=ep, meta=meta)
                 break
             except requests.exceptions.HTTPError as e:
                 status = _status_of(e)
@@ -1390,6 +1491,10 @@ class LLMClient:
         finish_reason = None
         error = None
 
+        # 与 chat() 同构：finish_reason 由底层回写（此前恒为 None，
+        # 「内容被截断」与「正常结束」在编码阶段同样无法区分）。
+        meta = _LLMMeta()
+
         # ---- 主模型尝试 ----
         primary_available = True
         try:
@@ -1403,7 +1508,7 @@ class LLMClient:
                 self._chat_with_tools_request_loop(
                     messages, tools, tool_choice, effective_max_tokens, thinking,
                     timeout=timeout, endpoint=self._primary_endpoint(),
-                    max_retries=max_retries,
+                    max_retries=max_retries, meta=meta,
                 )
             if failed and (not content or content.startswith('[错误]')):
                 self._circuit_breaker.record_failure()
@@ -1427,6 +1532,7 @@ class LLMClient:
                 self._chat_with_tools_request_loop(
                     messages, tools, tool_choice, effective_max_tokens, thinking,
                     timeout=timeout, endpoint=backup_ep, max_retries=max_retries,
+                    meta=meta,
                 )
                 if failed and (not content or content.startswith('[错误]')):
                     self._backup_circuit_breaker.record_failure()
@@ -1445,15 +1551,16 @@ class LLMClient:
                 error = "LLM 返回空响应"
 
         return LLMResponse(content=content, reasoning_content=reasoning_content,
-                           usage=usage, finish_reason=finish_reason,
+                           usage=usage, finish_reason=meta.finish_reason,
                            error=error, tool_calls=tool_calls)
 
     def _request_openai_with_tools(self, messages: list, tools: list, tool_choice: str,
                                     max_tokens: Optional[int] = None,
                                     thinking: Optional[str] = None,
                                     timeout: Optional[int] = None,
-                                    endpoint: Optional[_Endpoint] = None):
-        """OpenAI function calling 协议"""
+                                    endpoint: Optional[_Endpoint] = None,
+                                    meta: Optional[_LLMMeta] = None):
+        """OpenAI function calling 协议（meta 语义同 _request_openai）"""
         import uuid
         ep = endpoint or self._primary_endpoint()
         effective_timeout = timeout if timeout is not None else self.timeout
@@ -1471,11 +1578,14 @@ class LLMClient:
             'tools': tools,
             'tool_choice': tool_choice,
         }
-        # 思考模式开关（OpenAI 格式，DeepSeek 扩展字段）：语义同 _request_openai，
-        # disabled 通过省略字段实现（各端点语义矩阵见 _request_openai 注释）
+        # 思考模式开关（OpenAI 格式，DeepSeek 扩展字段）：语义同 _request_openai。
+        # 关闭必须走 _build_thinking_disable_params —— 省略字段在 DeepSeek 上
+        # 关不掉（服务端默认推理），各端点语义矩阵见 _request_openai 的注释。
         if _thinking == 'enabled':
             data['thinking'] = {'type': _thinking}
             data['reasoning_effort'] = self.reasoning_effort
+        else:
+            data.update(self._build_thinking_disable_params())
         url = f'{ep.base_url}/chat/completions'
 
         call_id = uuid.uuid4().hex[:8]
@@ -1493,6 +1603,9 @@ class LLMClient:
         content = msg.get('content', '') or ''
         reasoning_content = msg.get('reasoning_content', '') or None
         usage_data = result.get('usage')
+        if meta is not None:
+            meta.usage = usage_data or meta.usage
+            meta.finish_reason = choice.get('finish_reason') or meta.finish_reason
 
         # 如果 content 和 tool_calls 都为空但有 reasoning_content，
         # 说明 max_tokens 不足，所有 token 被 reasoning 消耗。
@@ -1523,6 +1636,10 @@ class LLMClient:
                 content = retry_msg.get('content', '') or ''
                 reasoning_content = retry_msg.get('reasoning_content', '') or None
                 usage_data = retry_result.get('usage')
+                if meta is not None:
+                    meta.usage = usage_data or meta.usage
+                    meta.finish_reason = (
+                        retry_choice.get('finish_reason') or meta.finish_reason)
                 raw_tool_calls = retry_msg.get('tool_calls', [])
                 if content or raw_tool_calls:
                     break
@@ -1557,8 +1674,9 @@ class LLMClient:
                                        thinking: Optional[str] = None,
                                        tool_choice: str = 'auto',
                                        timeout: Optional[int] = None,
-                                       endpoint: Optional[_Endpoint] = None):
-        """Anthropic tool use 协议"""
+                                       endpoint: Optional[_Endpoint] = None,
+                                       meta: Optional[_LLMMeta] = None):
+        """Anthropic tool use 协议（meta 语义同 _request_anthropic）"""
         ep = endpoint or self._primary_endpoint()
         effective_timeout = timeout if timeout is not None else self.timeout
         headers = {
@@ -1629,6 +1747,10 @@ class LLMClient:
                     name=block.get('name', ''),
                     arguments=block.get('input', {})
                 ))
+
+        if meta is not None:
+            meta.usage = usage_data or meta.usage
+            meta.finish_reason = result.get('stop_reason') or meta.finish_reason
 
         return content, None, (tool_calls or None), usage_data
 
