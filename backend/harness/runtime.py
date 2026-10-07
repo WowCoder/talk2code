@@ -28,8 +28,24 @@ class ToolCallLoop:
 
     MAX_ITERATIONS = 15
     NO_PROGRESS_LIMIT = 5  # 连续无进展轮次限制
+
+    # ---- 迭代预算（文件数 + SLACK，见 _run_impl）----
+    # 有计划：按计划文件数给预算，上限 PLANNED_ITERATION_CAP。
+    ITERATION_SLACK = 3
+    PLANNED_ITERATION_CAP = 10
+    # simple 复杂度走固定轮数的快速通道
+    SIMPLE_ITERATIONS = 5
+    # 无计划兜底（评测直连 ToolCallLoop / TL 规划失败）：见 _run_impl 注释
+    UNPLANNED_ITERATIONS = 8
+    # 「纯记账轮」不计入预算的退款次数上限（见主循环 update_task_notes 分支）
+    NOTES_ONLY_REFUND_MAX = 3
+    # 入口文件：平台硬约束（SKILL / 环境契约都要求 index.html 作为唯一入口），
+    # 预览、断言、发布全都以它为锚点。见 _maybe_remind_entry_file。
+    ENTRY_FILE = "index.html"
+
     # 读写比检测：窗口轮数 / 触发几次干预后强制终止。
-    # 窗口必须明显小于迭代预算（min(文件数+3, 10) ≤ 10），否则终止分支永远跑不到。
+    # 窗口必须明显小于迭代预算（计划模式 ≤ PLANNED_ITERATION_CAP），
+    # 否则终止分支永远跑不到。
     READ_HEAVY_WINDOW = 6
     READ_HEAVY_ABORT = 3
     # 同一文件被读取多少轮、且连续多少轮没有写入 → 判定反复回读
@@ -154,25 +170,43 @@ class ToolCallLoop:
         state["_known_content_files"] = {}
         state["_missing_reminder_key"] = ""
         state["_missing_reminder_count"] = 0
+        # 新增的三类运行时计数器同样必须随阶段重置（理由同上）：
+        # 入口优先提醒 / 语法硬伤提醒 / 纯记账轮退款
+        state["_entry_reminder_key"] = ""
+        state["_entry_reminder_count"] = 0
+        state["_any_write_done"] = False
+        state["_syntax_reminder_key"] = ""
+        state["_syntax_reminder_count"] = 0
+        state["_notes_only_rounds"] = 0
 
         # 可配置的角色名称（多角色协作用，默认兼容旧行为）
         meta = state.get("metadata", {})
         coder_name = meta.get("coder_name", DEV_NAME)
         thinking_name = meta.get("thinking_name", DEV_NAME)
 
-        # 根据文件数动态计算迭代上限：文件数 + 3，上限 10
+        # 根据文件数动态计算迭代上限：文件数 + SLACK，上限 PLANNED_ITERATION_CAP
         # （原先文件数×2+3 过于宽松，贪吃蛇这类 6 文件项目可跑到 15 轮；
         #   收紧后 6 文件 → 9 轮，配合思考模式关闭，单轮成本已大幅下降）
-        # simple 复杂度（单文件）使用固定 5 轮快速通道
+        # simple 复杂度（单文件）使用固定轮数快速通道
         complexity = state.get("metadata", {}).get("complexity", "standard")
         plan_files = (state.get("implementation_order") or
                       (state.get("plan") or {}).get("file_structure", []) or
                       [])
         if complexity == "simple":
-            effective_max_iterations = 5
+            effective_max_iterations = self.SIMPLE_ITERATIONS
+        elif plan_files:
+            effective_max_iterations = min(
+                len(plan_files) + self.ITERATION_SLACK, self.PLANNED_ITERATION_CAP
+            )
         else:
-            file_count = max(len(plan_files), 3)  # 至少按 3 个文件计算
-            effective_max_iterations = min(file_count + 3, 10)
+            # ---- 无计划兜底（评测直连 ToolCallLoop / TL 规划失败） ----
+            # 此前与「有计划」共用 max(len(plan_files), 3) + 3 = 6 轮。2026-10-05
+            # 评测实测（21 题，Agnes）：一个 standard 项目光起步就要吃掉
+            # 「读 .design 模板 → 记账 → 写 css → 写 js」4~6 轮，
+            # 于是 8/21 个任务连 index.html 都没机会创建，断言直接判死。
+            # 无计划意味着没有文件清单可依据，只能按「通用前端项目最小规模」给足：
+            # 入口 + 样式 + 逻辑 + 验证 + 纠错余量。
+            effective_max_iterations = self.UNPLANNED_ITERATIONS
 
         # 实例级上限：chat/逐文件编码会覆盖 MAX_ITERATIONS 以收紧轮数
         effective_max_iterations = min(effective_max_iterations, self.MAX_ITERATIONS)
@@ -705,6 +739,50 @@ class ToolCallLoop:
             # 此前"还缺 X 文件"只挂在"本轮零 tool_calls"分支上，模型只要在空转中
             # 顺手发一个 read_file，就永远收不到这条指令（需求 182 空转 18 轮根因）。
             self._maybe_remind_missing_files(state, iteration)
+
+            # ===== 悬空引用提醒：每轮投递（与缺文件提醒同款纪律） =====
+            # 悬空引用此前只在**迭代耗尽**那一刻由交付门禁兜一次（扩容 3 轮）。
+            # 2026-10-05 评测集实测：t02/t05/t17/t18/t21 五个任务全挂在
+            # 「index.html 引用了从未创建的 js 资源」，而门禁把这条事实告诉模型时
+            # 已经是第 7 轮，模型只剩 3 轮去补 —— 补得上（t03/t09/t13 扩容后自愈）
+            # 还是补不上（t02/t05/t17）纯看不稳定的运气。
+            # 检查本身是确定性的、机器可判定的，没有理由拖到最后一刻才说。
+            self._maybe_remind_broken_references(state, iteration)
+
+            # ===== 入口文件优先提醒：写过了却没入口 → 每轮催 =====
+            # 三条提醒各管一件事，不可互相替代：
+            #   缺文件提醒   = 「计划里的文件还差哪几个」（清单）
+            #   悬空引用提醒 = 「你交付的产物自相矛盾」（闭合）
+            #   入口优先提醒 = 「一个能打开的页面都没有」（顺序）
+            if written_files:
+                state["_any_write_done"] = True
+            self._maybe_remind_entry_file(state, iteration)
+
+            # ===== 语法硬伤当轮提醒 =====
+            # 交付门禁只在预算将尽时兜一次，那时往往只剩 1-3 轮。首写即被截断的
+            # 文件（没有上一版可回滚）必须当轮就说，否则后面每一步都建在坏文件上。
+            self._maybe_remind_syntax_errors(state, iteration, bool(written_files))
+
+            # ---- 纯记账轮不占迭代预算 ----
+            # update_task_notes 是「维护状态」而非「推进交付」。需求 220 与
+            # 2026-10-05 评测都实测到整整一轮只用来记账（t12 一轮发 5 条 notes、
+            # t16/t18 一轮各 3 条），预算被维护性动作吃掉，该写的文件没轮次写。
+            # 只对「本轮除记账外没有任何成功写入」生效，且退款有次数上限，
+            # 不会被退化成「无限预算」。
+            if (
+                batch_tools
+                and not written_files
+                and all(t.name == "update_task_notes" for t in batch_tools)
+            ):
+                _refunds = state.get("_notes_only_rounds", 0)
+                if _refunds < self.NOTES_ONLY_REFUND_MAX:
+                    state["_notes_only_rounds"] = _refunds + 1
+                    effective_max_iterations += 1
+                    logger.info(
+                        f"[ToolLoop] 第 {iteration + 1} 轮仅记账（零写入），"
+                        f"不计入迭代预算 "
+                        f"({_refunds + 1}/{self.NOTES_ONLY_REFUND_MAX})"
+                    )
 
             # ===== 增强死循环检测：核心操作签名累积 + 读写比 =====
             # 提取当前轮的核心操作签名（tool_name:filename，忽略行范围等参数差异）
@@ -1431,6 +1509,47 @@ class ToolCallLoop:
         except Exception:
             return ""
 
+    def _task_state_injection(self) -> str:
+        """本轮要注入的 TASK_STATE 内容（**只留实内容**，空壳返回 ""）。
+
+        需求 220 实测：`_ensure_task_state_seed` 播种的骨架里有「决策与理由 /
+        文件状态 / 未决问题 / 下一步」四个**空小节**，而实测 agent 一次
+        `update_task_notes` 都没调用 —— 于是这个空壳每轮都被原样重发一遍，
+        既占 token 又挤掉了尾段里真正有价值的前缀（尾段是从文件索引开始变的，
+        空壳夹在中间只会把可变区域拉长）。
+
+        处理：按 `##` 切小节，丢掉没有正文的小节；全部为空则返回 ""（整段不下发）。
+        """
+        text = self._read_task_state()
+        if not text or not text.strip():
+            return ""
+        try:
+            lines = text.split("\n")
+            blocks: list[list[str]] = []
+            current: list[str] = []
+            for ln in lines:
+                if ln.lstrip().startswith("## "):
+                    if current:
+                        blocks.append(current)
+                    current = [ln]
+                else:
+                    current.append(ln)
+            if current:
+                blocks.append(current)
+
+            kept = []
+            for b in blocks:
+                body = "\n".join(b[1:]).strip()
+                # 小节体里常见的两个占位写法也算空
+                if body and body not in ("(无)", "（无）", "-", "(未提供)", "（未提供）"):
+                    kept.extend(b)
+            if not kept:
+                return ""
+            return "\n".join(kept).strip()
+        except Exception:
+            # 解析失败就退回原文：宁可多发几百字符，也不要把 agent 记的进度弄丢。
+            return text
+
     def _ensure_task_state_seed(self, state: dict):
         """run 开始播种 TASK_STATE.md（若缺失）：从需求 + spec 写入「目标/决策/文件状态」种子。
 
@@ -1517,7 +1636,8 @@ class ToolCallLoop:
         existing_text = self._build_file_summaries(existing_files)
         # L2 任务状态：把 .task/TASK_STATE.md 注入 head（可变尾段首段，每轮变）。
         # 它不在稳定前缀内，不破坏前缀缓存；agent 通过 update_task_notes 维护它。
-        task_state = self._read_task_state()
+        # 只注入实内容：空骨架每轮重发纯属浪费（见 _task_state_injection）。
+        task_state = self._task_state_injection()
 
         plan_section = ""
         first_round_section = ""
@@ -1883,6 +2003,15 @@ class ToolCallLoop:
                 ]
         impl_order = [f for f in impl_order if f]
         if not impl_order:
+            # ---- 无计划兜底（评测直连 / TL 规划失败）----
+            # 没有这一条，本函数恒返回 []，`_maybe_remind_missing_files` 就永久静音。
+            # 2026-10-05 评测实测：21 个任务的编码提示词里「进度检查」出现 0 次，
+            # 模型把 6~9 轮预算全烧在 .design 模板与记账上，index.html 从未被创建。
+            # 无计划时退回「最小交付」判据：至少要有一个入口 HTML。
+            # 引用闭合由 `_maybe_remind_broken_references` 独立负责，不在这里重复。
+            existing = set(self.workspace.list())
+            if not any(e.endswith(".html") for e in existing):
+                return [self.ENTRY_FILE]
             return []
 
         existing = set(self.workspace.list())
@@ -1929,6 +2058,172 @@ class ToolCallLoop:
         })
         logger.info(
             f"[ToolLoop] 第 {iteration + 1} 轮投递缺文件提醒: {missing}"
+        )
+
+    def _maybe_remind_entry_file(self, state: AgentState, iteration: int):
+        """已经写过文件、但入口 HTML 还不存在 → 每轮催一次「先落入口」。
+
+        为什么这是一条**独立**的提醒，而不是并进缺文件清单：
+
+        - 缺文件提醒讲的是「计划里的文件还差几个」，是清单式的；而实现顺序
+          （implementation_order）按依赖拓扑排序，index.html 通常排在最后
+          （它依赖 css/js）。清单给的信号是「先写 css/js」——**恰好是错的**。
+        - 但预算耗尽时，没有入口的交付物是一个「断言必挂、预览打不开」的散件集
+          合。2026-10-05 评测里 8/21 个任务正是这个形态（只有 css/js，没有 index.html），
+          而它们的断言第一条就是 `index.html 不存在`。
+        - 所以顺序约束必须单独说：**第一个 write_file 必须是入口文件**（先写骨架，
+          把 js/css 的 `<script>/<link>` 引用先摆上），之后再用 write_file 补 css/js。
+
+        纪律与其它两条提醒一致：没有写入过就不催（给探索留空间），
+        同一状态连续提醒 2 轮后改隔轮。
+        """
+        if state.get("metadata", {}).get("is_chat", False):
+            return
+        if not state.get("_any_write_done"):
+            return  # 一个文件都还没写 → 先不催，模型可能还在读模板 / 定方案
+        try:
+            existing = set(self.workspace.list())
+        except Exception:
+            return
+        if any(e.endswith(".html") for e in existing):
+            state["_entry_reminder_key"] = ""
+            state["_entry_reminder_count"] = 0
+            return
+
+        if state.get("_entry_reminder_key") == self.ENTRY_FILE:
+            state["_entry_reminder_count"] = state.get("_entry_reminder_count", 0) + 1
+        else:
+            state["_entry_reminder_key"] = self.ENTRY_FILE
+            state["_entry_reminder_count"] = 1
+        count = state["_entry_reminder_count"]
+        if count > 2 and count % 2 == 0:
+            return
+
+        state["dialogue_history"].append({
+            "role": "system", "name": "System",
+            "content": (
+                f"⚠️ 你已经写了文件，但入口文件 {self.ENTRY_FILE} 还不存在。\n"
+                f"**本轮必须先创建 {self.ENTRY_FILE}**（哪怕先写成能打开的骨架："
+                f"结构 + 对 css/js 的 <link>/<script> 引用），再用 write_file 补其它文件。\n"
+                f"原因：一切验收（预览、断言、发布）都以 {self.ENTRY_FILE} 为入口 —— "
+                f"没有它，你写的 css/js 再完整也不构成一个可运行的交付物。"
+                f"不要再读文件确认，直接 write_file。"
+            ),
+            "hidden": True,
+            "preserve": True,
+        })
+        logger.info(
+            f"[ToolLoop] 第 {iteration + 1} 轮投递入口优先提醒（{self.ENTRY_FILE} 缺失）"
+        )
+
+    def _maybe_remind_syntax_errors(self, state: AgentState, iteration: int,
+                                    wrote_this_round: bool):
+        """本轮写过文件、且交付物有语法硬伤 → 当轮要求重写（不等交付门禁）。
+
+        与 `task_complete` 路径上的「语法硬门禁」是互补而非重复：
+        那道门只在模型**主动声明完成**时生效；而实测失败大多发生在
+        「迭代耗尽」或「被防回读熔断」这两条路上 —— 那时门禁根本不执行。
+
+        为什么首写截断必须当轮说：`file_tools` 的写入保护只在前一版完好时回滚，
+        **文件首次写入被截断时没有上一版可回滚**，半句话直接落盘，
+        此后每一轮都建立在一个跑不起来的文件上（实测 `js/app.js: Unexpected
+        end of input`，t19 反复重试同一处都修不掉）。
+
+        纪律：同清单连续 2 轮后改隔轮；检查自身异常一律视为「无问题」，
+        门禁故障绝不阻断交付。
+        """
+        if not wrote_this_round:
+            return
+        try:
+            problems = self._check_deliverable_syntax_only()
+        except Exception:
+            return
+        if not problems:
+            state["_syntax_reminder_key"] = ""
+            state["_syntax_reminder_count"] = 0
+            return
+
+        key = "|".join(sorted(problems))
+        if key == state.get("_syntax_reminder_key"):
+            state["_syntax_reminder_count"] = state.get("_syntax_reminder_count", 0) + 1
+        else:
+            state["_syntax_reminder_key"] = key
+            state["_syntax_reminder_count"] = 1
+        count = state["_syntax_reminder_count"]
+        if count > 2 and count % 2 == 0:
+            return
+
+        state["dialogue_history"].append({
+            "role": "system", "name": "System",
+            "content": (
+                "⚠️ 语法检查不通过（机器判定，不是建议）：\n"
+                + "\n".join(f"- {p}" for p in problems[:4])
+                + "\n请**本轮立刻修好**：`Unexpected end of input` / 括号未闭合一类"
+                  "通常说明上一次写入被截断 —— 用 write_file 重写该文件"
+                  "（一轮只写一个），或把它拆成更小的文件分轮写。"
+                  "不要在坏文件之上继续加功能。"
+            ),
+            "hidden": True,
+            "preserve": True,
+        })
+        logger.info(
+            f"[ToolLoop] 第 {iteration + 1} 轮投递语法硬伤提醒: {problems[:3]}"
+        )
+
+    def _maybe_remind_broken_references(self, state: AgentState, iteration: int):
+        """每轮投递"引用了不存在的资源"的提醒（同清单降频）。
+
+        与 `_maybe_remind_missing_files` 是两个**不可互相替代**的信号：
+
+        - 缺文件提醒说的是「计划里有、你还没建」（实现进度）；
+        - 悬空引用说的是「你已经交付的产物自相矛盾」（交付完整性）。
+
+        两者会重合（引用的正是还没建的那个文件），但只有后者能在**引用写错名字**
+        时报警 —— 比如 index.html 写 `js/main.js` 而计划里叫 `js/app.js`，
+        此时缺文件提醒永远显示"该建的都建了"，只有引用闭合检查能发现问题。
+        2026-10-05 评测集 t02 正是这个形态：唯一失败断言是
+        `index.html 引用了不存在的资源：js/main.js`，而实现计划里根本没有 main.js。
+
+        纪律与缺文件提醒一致：同清单连续 2 轮后改隔轮，避免重复句淹没上下文。
+        """
+        if state.get("metadata", {}).get("is_chat", False):
+            return
+        try:
+            problems = self._check_broken_references()
+        except Exception:
+            # 门禁自身故障绝不阻断编码循环（与交付门禁同一纪律）
+            return
+        if not problems:
+            state["_refs_reminder_key"] = ""
+            state["_refs_reminder_count"] = 0
+            return
+
+        key = "|".join(sorted(problems))
+        if key == state.get("_refs_reminder_key"):
+            state["_refs_reminder_count"] = state.get("_refs_reminder_count", 0) + 1
+        else:
+            state["_refs_reminder_key"] = key
+            state["_refs_reminder_count"] = 1
+
+        count = state["_refs_reminder_count"]
+        if count > 2 and count % 2 == 0:
+            return
+
+        state["dialogue_history"].append({
+            "role": "system", "name": "System",
+            "content": (
+                "引用闭合检查：你已交付的文件里引用了工作区中不存在的资源 ——\n"
+                + "\n".join(f"- {p}" for p in problems[:5])
+                + "\n预览会因为这些文件不存在而白屏（ERR_FILE_NOT_FOUND），这是硬伤。\n"
+                "请立刻用 write_file 把缺少的文件补上；如果引用名写错了，"
+                "就用 edit_file 把引用改成你实际创建的那个文件名。"
+                "不要留到最后一轮再来处理。"
+            ),
+            "hidden": True,
+            "preserve": True,
+        })
+        logger.info(
+            f"[ToolLoop] 第 {iteration + 1} 轮投递悬空引用提醒: {problems[:3]}"
         )
 
     def _check_missing_files(self, state: AgentState) -> list[str]:
@@ -2201,7 +2496,8 @@ class ToolCallLoop:
             return
         note = (
             f"[提示] {fname} 是你在第 {write_round} 轮亲自写入的文件，此后没有被修改过，"
-            f"内容与你写入时完全一致（write_file 的返回值已包含首尾预览）。"
+            f"内容与你写入时完全一致（write_file 的返回值已包含正文：小文件是全文，"
+            f"大文件是首尾回执 + 「中间部分与你写入的逐字一致」的说明）。"
             f"不要再为确认 class/id 反复读取它，直接以你写入的版本为准继续写其它文件。\n\n"
         )
         result.content = note + (result.content or "")
@@ -2332,8 +2628,23 @@ class ToolCallLoop:
         「创建后免回读」被绕过只有一种合理情况：文件在写入之后又被改过
         （被 edit_file / 被其它工具），此时模型需要重新拿正文。既然新正文已经
         通过这次 read_file 进入上下文，创建时那份就变成纯冗余 —— 替换成一行占位说明。
+
+        ⚠️ 覆盖度校验（需求 220 根因 B，必守）：
+        「创建后免回读」与「同内容去重」两道防线都只对**整文件读取**生效，
+        带 start_line/end_line 的分页读取会绕过它们。而本函数此前是「read 成功
+        即卸载」、完全不校验这次读覆盖了多少 —— 于是模型一次分页读只读到
+        26%~63%，系统却把创建时的完整正文删掉了，模型手上副本归零，只能继续
+        分页往下读，19 次 read 后熔断（模型原话：*"their bodies were dropped
+        from context"*）。
+        故：**分页读取一律不卸载**。宁可留一份冗余，也不能制造"内容凭空消失"。
         """
-        fname = tc.arguments.get("filename", "") if isinstance(tc.arguments, dict) else ""
+        args = tc.arguments if isinstance(tc.arguments, dict) else {}
+        if args.get("start_line") or args.get("end_line"):
+            logger.info(
+                "[ToolLoop] 分页读取不卸载创建时正文（覆盖不完整，卸载会让模型无正文可用）"
+            )
+            return
+        fname = args.get("filename", "")
         if not fname:
             return
         known = state.get("_known_content_files") or {}
@@ -2354,18 +2665,12 @@ class ToolCallLoop:
             logger.info(f"[ToolLoop] 卸载创建时正文: {fname}")
             return
 
-    def _check_deliverable_syntax(self) -> list[str]:
-        """检查交付文件的**确定性硬伤**，返回问题列表（空列表 = 无问题）。
+    def _check_deliverable_syntax_only(self) -> list[str]:
+        """只查**语法**硬伤（不含引用闭合），空列表 = 无问题。
 
-        两类判据（都是机器可判定、不依赖模型审美判断）：
-        1. 语法：与 lint_js / lint_css / _syntax_problem 对齐 ——
-           .js → node --check、.css → 花括号平衡、.html → </html> 收尾、.json → 可解析
-        2. 引用闭合：HTML 的 src/href、CSS 的 url()/@import 指向的本地文件必须存在
-           （语法全对但引用了没创建的文件，预览会直接白屏）
-
-        设计要点：
-        - 只查交付文件（排除 .task/、.design/ 等元数据与模板目录）
-        - 任一步异常一律视为"无问题"——**门禁自身故障绝不能阻断交付**
+        拆出来是为了让「每轮语法提醒」（`_maybe_remind_syntax_errors`）能只说语法 ——
+        引用闭合有它自己的每轮提醒（`_maybe_remind_broken_references`），
+        两者同时命中同一个缺失文件时，合成一条会让模型以为有两处问题。
         """
         try:
             from harness.tools.file_tools import _syntax_problem
@@ -2390,7 +2695,22 @@ class ToolCallLoop:
                 continue
             if problem:
                 problems.append(f"{fname}: {problem}")
+        return problems
 
+    def _check_deliverable_syntax(self) -> list[str]:
+        """检查交付文件的**确定性硬伤**，返回问题列表（空列表 = 无问题）。
+
+        两类判据（都是机器可判定、不依赖模型审美判断）：
+        1. 语法：与 lint_js / lint_css / _syntax_problem 对齐 ——
+           .js → node --check、.css → 花括号平衡、.html → </html> 收尾、.json → 可解析
+        2. 引用闭合：HTML 的 src/href、CSS 的 url()/@import 指向的本地文件必须存在
+           （语法全对但引用了没创建的文件，预览会直接白屏）
+
+        设计要点：
+        - 只查交付文件（排除 .task/、.design/ 等元数据与模板目录）
+        - 任一步异常一律视为"无问题"——**门禁自身故障绝不能阻断交付**
+        """
+        problems = list(self._check_deliverable_syntax_only())
         # 引用闭合：语法正确但引用了不存在的文件，同样是确定性缺陷。
         # 单独 try 兜底：引用检查崩了也不能让语法检查的结果一起丢掉。
         try:

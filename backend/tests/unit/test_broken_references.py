@@ -31,6 +31,9 @@ class _Gate:
     _is_deliverable = staticmethod(ToolCallLoop._is_deliverable)
     _REF_SKIP_PREFIX = ToolCallLoop._REF_SKIP_PREFIX
     _check_broken_references = ToolCallLoop._check_broken_references
+    # 语法检查自 2026-10-07 拆成两半：`_only` 不含引用闭合，供「每轮语法提醒」使用；
+    # `_check_deliverable_syntax` 是两者的合成（交付门禁用）。两个都要带上。
+    _check_deliverable_syntax_only = ToolCallLoop._check_deliverable_syntax_only
     _check_deliverable_syntax = ToolCallLoop._check_deliverable_syntax
 
     def __init__(self, workspace):

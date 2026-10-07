@@ -72,6 +72,17 @@ def _syntax_problem(filename: str, content: str) -> str:
 
 # ==================== ToolHandler 子类 ====================
 
+# write_file 回显完整正文的字符上限。
+#
+# 需求 220 根因 B 的三方契约之一：write_file 的**返回内容**必须与 prompt 对它的
+# 承诺一致。此前无论文件大小一律只回「前 80 行 + 后 10 行」再被 `preview[:3000]`
+# 硬截，而 prompt 却写着「返回结果含完整正文，这就是权威副本，禁止回读」。
+# 阈值内的文件直接回全文（承诺即事实）；超阈值的如实标注为「首尾回执」。
+# 定 6000：实测交付文件多在此量级内，且相对旧行为（≤3000 预览）只多 ~3k 字符，
+# 换来的是「模型不再回读」——一次回读往返的成本远高于这 3k。
+WRITE_FULL_ECHO_CHAR_CAP = 6000
+
+
 class ReadFileHandler(ToolHandler):
     """读取工作区文件内容"""
 
@@ -98,10 +109,22 @@ class ReadFileHandler(ToolHandler):
                 if end >= total_lines:
                     tail_note = "已到文件末尾"
                 else:
-                    tail_note = (
-                        f"第 {end + 1}-{total_lines} 行未包含在本段，"
-                        f"需要时用 start_line={end + 1} 继续读取"
-                    )
+                    # ⚠️ 分页邀请必须按文件来源区分（需求 220 根因 B 的第 ⑥ 环）：
+                    # 对**本任务自己创建**的文件，这句「需要时用 start_line=N 继续读取」
+                    # 是回读空转循环的直接推手 —— 模型刚写入、正文就被系统从上下文
+                    # 卸掉，于是沿着提示一页页往下读，19 次后触发熔断。
+                    # 对既有文件（模型从未见过其内容）分页提示仍然是必要信息。
+                    if self._is_self_created(filename, state):
+                        tail_note = (
+                            f"第 {end + 1}-{total_lines} 行未包含在本段，"
+                            f"但该文件是你本次任务写入的，未包含部分与你写入时逐字一致，"
+                            f"**无需继续读取**"
+                        )
+                    else:
+                        tail_note = (
+                            f"第 {end + 1}-{total_lines} 行未包含在本段，"
+                            f"需要时用 start_line={end + 1} 继续读取"
+                        )
                 range_info = f"共 {total_lines} 行；本次返回第 {start + 1}-{end} 行，{tail_note}"
             else:
                 range_info = f"全文共 {total_lines} 行，未截断"
@@ -119,6 +142,24 @@ class ReadFileHandler(ToolHandler):
             )
         except Exception as e:
             return ToolResult(error=str(e))
+
+    @staticmethod
+    def _is_self_created(filename: str, state) -> bool:
+        """该文件是否由本次任务自己写入且此后未被改动。
+
+        判据复用 ToolCallLoop 的「已知正文」登记表（`_known_content_files`）：
+        它由 write_file 成功时登记、edit_file 成功时撤销（内容已被局部改动，
+        模型手上的副本过期），语义正是「本次任务创建 + 内容未变」。
+        取不到 state（兼容路径直接调 handler）时返回 False —— 保守回到旧行为，
+        不会误伤既有文件的分页提示。
+        """
+        if not state or not filename:
+            return False
+        try:
+            known = state.get("_known_content_files") or {}
+        except Exception:
+            return False
+        return filename in known
 
     # 保留旧方法名以兼容现有调用
     def read_file(self, filename: str, start_line: int = None, end_line: int = None) -> ToolResult:
@@ -190,19 +231,47 @@ class WriteFileHandler(ToolHandler):
                               "lines": prev_lines, "chars": len(prev)},
                 )
 
-            # 返回内容预览（前80行+后10行），让 Agent 不读文件就知道自己写了什么
-            all_lines = content.split('\n')
-            head_lines = all_lines[:80]
-            tail_lines = all_lines[-10:] if len(all_lines) > 80 else []
-            preview = '\n'.join(head_lines)
-            if tail_lines:
-                preview += f"\n\n... (中间省略 {len(all_lines) - 90} 行) ...\n\n" + '\n'.join(tail_lines)
-            preview_note = f"已创建 {filename} ({lines} 行, {char_count} 字符)\n\n--- 文件内容预览 ---\n{preview[:3000]}"
+            # 返回内容预览。⚠️ 这里的措辞必须与 prompt 里的承诺**逐字一致**
+            # （需求 220 根因 B）：主 prompt 此前宣称「write_file 返回完整正文，
+            # 这就是权威副本，禁止回读」，而实际只给 ≤3000 字符的头尾片段 ——
+            # 模型按承诺省掉回读，随后发现中段缺失（14607 字符的 particles.js
+            # 只见到 20%），于是**理性地**开始分页回读，19 次后被熔断。
+            # 系统先撒谎、再惩罚说真话的模型，这个循环必须断在这里。
+            if char_count <= WRITE_FULL_ECHO_CHAR_CAP:
+                # 够小 → 直接回完整正文，承诺即为事实，模型再无任何回读理由。
+                preview_note = (
+                    f"已创建 {filename} ({lines} 行, {char_count} 字符)\n\n"
+                    f"--- 以下是你写入的**完整正文**（与磁盘逐字一致，权威副本，无需回读）---\n"
+                    f"{content}"
+                )
+            else:
+                # 太大 → 如实说明「你拿到的是首尾回执，不是全文」，并明确中段
+                # 与你写入的逐字相同。**绝不能**再写「中间省略 N 行」——那句话
+                # 在模型看来等于「这里有内容缺失」，是触发分页回读的直接诱因。
+                all_lines = content.split('\n')
+                head_lines = all_lines[:80]
+                tail_lines = all_lines[-10:] if len(all_lines) > 80 else []
+                preview = '\n'.join(head_lines)
+                if tail_lines:
+                    preview += "\n\n... (首尾之间的内容与你写入的逐字相同，"
+                    preview += "已确认写入成功，无需回读核对) ...\n\n" + '\n'.join(tail_lines)
+                preview_note = (
+                    f"已创建 {filename} ({lines} 行, {char_count} 字符)\n\n"
+                    f"--- 首尾回执（文件共 {char_count} 字符，超过 "
+                    f"{WRITE_FULL_ECHO_CHAR_CAP} 字符故不回显全文）---\n"
+                    f"{preview[:3000]}\n\n"
+                    f"文件已完整写入磁盘，未回显的中间部分与你提交的 content 逐字一致。"
+                    f"**不要为确认内容而回读它。**"
+                )
 
             if problem:
+                # 不再教「用 start_line/end_line 分段重写」（需求 220 根因 B 第 ③ 环）：
+                # 那条建议会把模型引导到分页读/分页写的循环里，而分页读又会绕过
+                # 防回读的两道防线，最终撞上 read 次数上限被熔断。
                 preview_note += (
                     f"\n\n⚠️ 完整性告警：{problem}。内容疑似被截断，"
-                    f"请立即用 edit_file 补齐或用 start_line/end_line 分段重写，不要留给下一轮。"
+                    f"请立即用 edit_file 补齐（SEARCH/REPLACE 只传改动片段），"
+                    f"或把文件拆成两个更小的文件分轮写入，不要留给下一轮。"
                 )
             if prev is not None and prev.strip():
                 prev_lines = prev.count('\n') + 1
@@ -300,7 +369,8 @@ def register_file_tools(registry):
         description=(
             "读取工作区中的文件内容。对于大文件（>300行），请使用 start_line/end_line 分页读取，"
             "避免一次性读取整个文件。返回头部会给出文件总行数与本次返回的行范围。\n"
-            "重要：你自己刚写入的文件，内容已由 write_file 返回（含首尾预览），"
+            "重要：你自己刚写入的文件，内容已由 write_file 返回（≤6000 字符返回完整正文，"
+            "更大的文件返回首尾回执并说明中间部分与你写入的逐字一致），"
             "不要为了确认 class/id 反复读取同一个文件；同一文件在一次任务中最多读 1-2 次，"
             "把时间用在创建尚未生成的文件上。"
         ),

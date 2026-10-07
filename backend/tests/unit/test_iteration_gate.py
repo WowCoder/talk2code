@@ -124,7 +124,9 @@ def test_gate_extends_when_hard_problems_at_exhaustion():
         counter = {"n": 0}
         client = _client_that_never_finishes(counter)
 
-        base_max = 6  # plan 为空 → file_count=max(0,3)=3 → 3+3=6
+        # 无计划 → UNPLANNED_ITERATIONS（此前是 max(0,3)+3=6，实测连 index.html
+        # 都写不出来，2026-10-07 起改为 8；不写字面量，随常量走）
+        base_max = ToolCallLoop.UNPLANNED_ITERATIONS
         with patch("harness.runtime.get_client", return_value=client):
             final = loop.run(_state())
 
@@ -163,7 +165,9 @@ def test_gate_does_not_extend_when_clean():
             final = loop.run(_state())
 
         assert final.get("_gate_extended") in (None, False)
-        assert counter["n"] == 6, f"无硬伤却扩容了：{counter['n']} 次调用"
+        assert counter["n"] == ToolCallLoop.UNPLANNED_ITERATIONS, (
+            f"无硬伤却扩容了：{counter['n']} 次调用"
+        )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -180,8 +184,9 @@ def test_gate_extends_only_once():
         with patch("harness.runtime.get_client", return_value=client):
             final = loop.run(_state())
 
-        # 6 + 3 = 9，而不是 6 + 3 + 3
-        assert counter["n"] == 9, f"扩容发生了多次：{counter['n']} 次调用"
+        # 8 + 3 = 11，而不是 8 + 3 + 3
+        expected = ToolCallLoop.UNPLANNED_ITERATIONS + ToolCallLoop.SELF_REPAIR_EXTRA_ITERATIONS
+        assert counter["n"] == expected, f"扩容发生了多次：{counter['n']} 次调用"
         assert final["current_step"] == "max_iterations"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

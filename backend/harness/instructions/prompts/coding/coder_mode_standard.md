@@ -1,5 +1,9 @@
 ## 实现策略（standard 完整流程）
-1. 先创建入口文件 index.html（按依赖顺序以普通 `<script src>` 引入所有本地 js/css）
+1. **第一个 write_file 必须是 index.html**。既然后面要按依赖顺序引入，
+   就先把它落成一个能打开的骨架（结构与 `<link href="css/...">` /
+   `<script src="js/..."></script>` 引用先摆上，具体样式与逻辑稍后补）。
+   理由：一切验收都以 index.html 为入口 —— 预算万一不够，
+   「有入口但样式待补」是能打开的半成品，「有 css/js 但没有入口」是零分交付物。
 2. 按模块逐层组织（使用子目录如 css/、js/），每个模块单一职责
 3. 一次创建 2-3 个相关模块文件（如 CSS + JS），每个文件必须完整
 4. 全部文件创建完成后一次性验证（validate_html / lint_css / lint_js）

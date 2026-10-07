@@ -111,6 +111,110 @@ class TestMissingReminderDelivery:
         assert state["dialogue_history"] == []
 
 
+class TestBrokenReferenceReminder:
+    """悬空引用提醒必须每轮投递（此前只在迭代耗尽时由门禁兜一次、扩容 3 轮）
+
+    2026-10-05 评测集实测：t02/t05/t17/t18/t21 五个任务全挂在
+    「index.html 引用了从未创建的 js 资源」，门禁把这条事实告诉模型时已经第 7 轮。
+    """
+
+    @staticmethod
+    def _loop(files: dict):
+        workspace = Mock()
+        workspace.path = None
+        workspace.list.return_value = list(files)
+        workspace.read.side_effect = lambda name: files[name]
+        return ToolCallLoop(workspace=workspace, git=None, tools=None)
+
+    def test_reminder_reports_dangling_ref(self):
+        loop = self._loop({
+            "index.html": '<link href="css/style.css" rel="stylesheet">'
+                          '<script src="js/main.js"></script>',
+            "css/style.css": "body{}",
+        })
+        state = {"metadata": {}, "dialogue_history": []}
+        loop._maybe_remind_broken_references(state, 2)
+        assert len(state["dialogue_history"]) == 1
+        content = state["dialogue_history"][0]["content"]
+        assert "js/main.js" in content
+        assert "引用闭合检查" in content
+
+    def test_no_reminder_when_references_closed(self):
+        loop = self._loop({
+            "index.html": '<script src="js/app.js"></script>',
+            "js/app.js": "var a=1;",
+        })
+        state = {"metadata": {}, "dialogue_history": []}
+        loop._maybe_remind_broken_references(state, 2)
+        assert state["dialogue_history"] == []
+
+    def test_skips_external_and_anchor_refs(self):
+        """CDN / data: / #锚点 不算悬空引用"""
+        loop = self._loop({
+            "index.html": (
+                '<script src="https://cdn.example.com/x.js"></script>'
+                '<a href="#top">top</a><img src="data:image/png;base64,AAA">'
+            ),
+        })
+        state = {"metadata": {}, "dialogue_history": []}
+        loop._maybe_remind_broken_references(state, 2)
+        assert state["dialogue_history"] == []
+
+    def test_catches_wrong_name_even_when_plan_complete(self):
+        """引用名写错时只有这条线索能报警：
+
+        HTML 里写 js/main.js，而实现计划里叫 js/app.js 且**已创建** ——
+        缺文件提醒此时完全静默（"计划里的文件都建了"），只有引用闭合检查
+        能发现交付物自相矛盾。t02 实测就是这个形态。
+        """
+        loop = self._loop({
+            "index.html": '<script src="js/main.js"></script>',
+            "css/style.css": "body{}",
+            "js/app.js": "var a=1;",
+        })
+        state = {
+            "implementation_order": ["index.html", "css/style.css", "js/app.js"],
+            "metadata": {},
+            "dialogue_history": [],
+        }
+        loop._maybe_remind_missing_files(state, 3)
+        assert state["dialogue_history"] == [], "计划文件已齐，缺文件提醒本应静默"
+        loop._maybe_remind_broken_references(state, 3)
+        assert "js/main.js" in state["dialogue_history"][0]["content"]
+
+    def test_silent_in_chat_mode(self):
+        loop = self._loop({"index.html": '<script src="js/main.js"></script>'})
+        state = {"metadata": {"is_chat": True}, "dialogue_history": []}
+        loop._maybe_remind_broken_references(state, 2)
+        assert state["dialogue_history"] == []
+
+    def test_same_list_throttled_after_two_rounds(self):
+        """同清单连续 2 轮后改隔轮，避免重复句淹没上下文"""
+        loop = self._loop({
+            "index.html": '<script src="js/main.js"></script>',
+        })
+        state = {"metadata": {}, "dialogue_history": []}
+        for i in range(6):
+            loop._maybe_remind_broken_references(state, i)
+        # 计数 1..6：前 2 轮每轮投递（1、2），之后隔轮（3、5），偶数轮静音（4、6）
+        # → 6 轮共投递 4 次。与缺文件提醒同一套降频纪律。
+        assert len(state["dialogue_history"]) == 4
+
+    def test_gate_failure_never_breaks_loop(self):
+        """门禁自身故障（读文件抛异常）必须静默降级，不得打断编码循环"""
+        loop = self._loop({"index.html": '<script src="js/main.js"></script>'})
+        loop.workspace.read.side_effect = RuntimeError("boom")
+        state = {"metadata": {}, "dialogue_history": []}
+        loop._maybe_remind_broken_references(state, 2)
+        assert state["dialogue_history"] == []
+
+    def test_wired_into_loop_body(self):
+        """方法写好了还必须真的接线：漏了调用点等于没修"""
+        import inspect
+        src = inspect.getsource(ToolCallLoop._run_impl)
+        assert "_maybe_remind_broken_references(state, iteration)" in src
+
+
 class TestReadbackGuard:
     """写入后回读同一文件必须收到"内容未变"提示"""
 
