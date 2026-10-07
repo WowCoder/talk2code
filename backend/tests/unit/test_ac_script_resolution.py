@@ -414,7 +414,13 @@ class TestVisibleTextIsWiredToTranslator:
         """
         from harness.instructions.prompts import load_prompt
 
-        template = load_prompt("verify/ac_translator.md")
-        assert "- selector 必须从" not in template, (
-            "又出现了强制单一选择器来源的措辞，会压过上面的定位优先级"
-        )
+        # 规则段已迁到 system 模板，两份都要查 —— 只查 user 那份的话，
+        # 恒定规则里偷偷加回互斥措辞就没人拦了。
+        for rel in ("verify/ac_translator.md", "verify/ac_translator_system.md"):
+            template = load_prompt(rel)
+            assert "- selector 必须从" not in template, (
+                f"{rel} 又出现了强制单一选择器来源的措辞，会压过上面的定位优先级"
+            )
+            assert "selector 必须从可用 CSS 选择器中选择" not in template, (
+                f"{rel} 又出现了强制单一选择器来源的措辞，会压过上面的定位优先级"
+            )

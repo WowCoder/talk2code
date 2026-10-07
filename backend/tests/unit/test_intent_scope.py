@@ -30,9 +30,20 @@ PROMPTS_DIR = (
 
 # ==================== 1. 能力边界 ====================
 
+def _rendered(rel: str) -> str:
+    """读**渲染后**的提示词，而不是 .md 原文。
+
+    能力边界段已抽到共享片段（intent/_platform_boundary.md）由两处引用，
+    直接读原文的话，引用标记还没展开 —— 断言会变成在考文件里有没有某行字，
+    而不是在考「模型真正收到的提示词里有没有这条判据」。
+    """
+    from harness.instructions.prompts import load_prompt
+    return load_prompt(rel)
+
+
 def test_classify_prompt_declares_out_of_scope():
     """分类器必须知道「超出能力范围」这一类，否则边界永远到不了用户面前。"""
-    text = (PROMPTS_DIR / "intent" / "classify.md").read_text(encoding="utf-8")
+    text = _rendered("intent/classify.md")
     assert "OUT_OF_SCOPE" in text
     # 只加枚举不够：必须同时写清"做不到什么"的判据，否则模型无从判断
     assert "数据库" in text
@@ -41,7 +52,7 @@ def test_classify_prompt_declares_out_of_scope():
 
 def test_clarify_prompt_offers_data_scope_choice():
     """澄清环节必须给出「要后端」的可行替代方案，而不是默默降级。"""
-    text = (PROMPTS_DIR / "intent" / "clarify_generate.md").read_text(encoding="utf-8")
+    text = _rendered("intent/clarify_generate.md")
     assert "data_scope" in text
     assert "本地存储" in text
     # 边界声明本身也要在：用户得先知道为什么被问这个问题

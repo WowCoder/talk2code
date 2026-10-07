@@ -21,6 +21,7 @@
 - 缓存按文件 mtime 失效：修改 .md 后下一次读取自动生效，无需重启进程
 """
 
+import re as _re_mod
 import string
 from pathlib import Path
 
@@ -30,12 +31,22 @@ _PROMPTS_DIR = Path(__file__).parent
 # 单条目原子替换，读旧值最多一次 IO，无需加锁。
 _cache: dict[str, tuple[float, str]] = {}
 
+# 片段复用：`<!-- @include <rel_path> -->` 会被替换成该文件的正文。
+#
+# 为什么需要它：同一段规则（如「平台能力边界」）在多个提示词里重复维护，
+# 改了一处另一处就漂移 —— 漂移后的两份提示词会给出互相矛盾的判断，
+# 而这种矛盾只在真实需求上才会暴露，很难在单测里发现。
+_INCLUDE_RE = _re_mod.compile(r"<!--\s*@include\s+([^\s>]+)\s*-->")
+_INCLUDE_MAX_DEPTH = 4
 
-def load_prompt(rel_path: str) -> str:
+
+def load_prompt(rel_path: str, _seen: frozenset = frozenset()) -> str:
     """加载 .md 文件中的 Prompt 文本（按 mtime 缓存，改动即失效）。
 
     Args:
         rel_path: 相对于 prompts/ 目录的路径，如 "verify/evaluator.md"
+        _seen: **内部参数**，展开 @include 时已经加载过的路径集合（防环）。
+               调用方不要传。
 
     Returns:
         str: Prompt 文本内容（已去除首尾空白）
@@ -48,8 +59,48 @@ def load_prompt(rel_path: str) -> str:
     if cached and cached[0] == mtime:
         return cached[1]
     text = file_path.read_text(encoding="utf-8").strip()
-    _cache[rel_path] = (mtime, text)
+    text = _resolve_includes(text, _seen | {rel_path})
+    # 被 include 的片段不写缓存：它这次的结果已经内联进调用方了，
+    # 缓存下来会让后续「单独加载该片段」拿到一份没展开的版本。
+    if not _seen:
+        _cache[rel_path] = (mtime, text)
     return text
+
+
+def _resolve_includes(text: str, _seen: frozenset = frozenset()) -> str:
+    """展开 `<!-- @include rel_path -->` 标记（在 .format() 之前）。
+
+    在 format 之前展开，是为了让被包含片段里的 `{{ }}` 转义 JSON 也能被正确
+    还原 —— 否则片段会带着双花括号原样发给模型。
+
+    `_seen` 是防环的关键：**片段里如果出现自己的 include 标记字面量**（写注释时
+    顺手把标记抄进去就会这样），展开会无限递归直到撑爆栈 —— 实测踩过一次。
+    按路径集合判重，重复引用直接跳过。
+    解析不到的 include 保留原标记并记 warning —— 静默吞掉会让提示词缺一大段
+    却看不出原因。
+    """
+    if not _INCLUDE_RE.search(text):
+        return text
+    missing = []
+
+    def _sub(m):
+        rel = m.group(1)
+        if rel in _seen:
+            missing.append(f"{rel}: 循环引用（已跳过）")
+            return ""
+        try:
+            return load_prompt(rel)
+        except Exception as e:  # noqa: BLE001 - 片段缺失不能让整个 prompt 加载失败
+            missing.append(f"{rel}: {e}")
+            return m.group(0)
+
+    new_text = _INCLUDE_RE.sub(_sub, text)
+    if missing:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            f"[prompts] include 片段加载失败，已保留原标记: {'; '.join(missing)}"
+        )
+    return new_text
 
 
 # ==================== 模板注册表 ====================
@@ -82,6 +133,9 @@ TEMPLATES: dict[str, list[str]] = {
         "anchor_text", "visible_text_text", "selector_text", "ac_text",
         "render_info",
     ],
+    # 恒定规则段（无占位符，但仍走 .format：模板里的 JSON 示例按约定写成 `{{ }}`，
+    # 不 format 会把 `{{` 原样发给模型）。
+    "verify/ac_translator_system.md": [],
 }
 
 
