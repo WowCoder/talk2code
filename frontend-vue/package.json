@@ -12,9 +12,10 @@
     "check:gate": "node scripts/gate-check.mjs",
     "check:waiting": "node scripts/waiting-lines-check.mjs",
     "check:cost": "node scripts/cost-format-check.mjs",
-    "check": "node scripts/role-check.mjs && node scripts/timeline-rows-check.mjs && node scripts/gate-check.mjs && node scripts/waiting-lines-check.mjs && node scripts/cost-format-check.mjs && node scripts/admin-table-check.mjs",
-    "replay:role": "node scripts/role-replay.mjs",
-    "check:admin-table": "node scripts/admin-table-check.mjs"
+    "check:admin-table": "node scripts/admin-table-check.mjs",
+    "check:eval-page": "node scripts/eval-page-check.mjs",
+    "check": "node scripts/role-check.mjs && node scripts/timeline-rows-check.mjs && node scripts/gate-check.mjs && node scripts/waiting-lines-check.mjs && node scripts/cost-format-check.mjs && node scripts/admin-table-check.mjs && node scripts/eval-page-check.mjs",
+    "replay:role": "node scripts/role-replay.mjs"
   },
   "dependencies": {
     "@codemirror/basic-setup": "^0.20.0",

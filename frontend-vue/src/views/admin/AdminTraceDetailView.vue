@@ -20,7 +20,7 @@
 
     <div v-if="errorMsg" class="error-bar">{{ errorMsg }}</div>
 
-    <!-- ===== 需求汇总：整个需求的总量，不随轮次切换而变 =====
+    <!-- ===== 轨迹汇总：整个需求的总量，不随轮次切换而变 =====
          轮次切换器管的是「看哪一轮」，这一行管的是「总共多少」——两者放一起会
          被误读成「当前轮次的量」，所以标题写清是需求级。 -->
     <div v-if="summary" class="sum-wrap">
@@ -47,17 +47,17 @@
 
         <div class="sum-card">
           <span class="sum-label">总 Token</span>
-          <span class="sum-value">{{ summary.tokens > 0 ? fmt(summary.tokens) : '—' }}</span>
+          <span class="sum-value">{{ summary.tokens > 0 ? fmtCount(summary.tokens) : '—' }}</span>
           <span class="sum-sub">
             <template v-if="summary.tokens > 0">
-              in {{ fmt(summary.tokens_in) }} · out {{ fmt(summary.tokens_out) }}
+              in {{ fmtCount(summary.tokens_in) }} · out {{ fmtCount(summary.tokens_out) }}
             </template>
             <template v-else>仅部分调用记录 usage</template>
           </span>
           <!-- 缓存命中单独一行：它是 in 的**子集**，塞进上一行会被读成第三类 token。
                分母只含上报过缓存信息的调用，样本量一并给出（见首页同款注释）。 -->
           <span v-if="summary.cache_hit_rate != null" class="sum-sub">
-            缓存命中 {{ fmt(summary.cached_tokens) }}
+            缓存命中 {{ fmtCount(summary.cached_tokens) }}
             · {{ (summary.cache_hit_rate * 100).toFixed(1) }}% of 输入
             · {{ summary.cache_reported_calls }} 次上报
           </span>
@@ -137,70 +137,13 @@
       </div>
     </div>
 
-    <!-- ===== 两栏：时间线（内联分组） + 事件详情 ===== -->
-    <!-- 为什么不再单开一栏「执行树」：分组与排序不是两种视图，而是同一条时间线的
-         两个属性。单开一栏只能是同一份数据的第二次渲染（同源、同筛选、同点击），
-         而那一栏还叫「树」——数据里并没有父子关系字段，兑现不了层级承诺。 -->
+    <!-- ===== 两栏：时间线 + 事件详情 =====
+         两个组件与评测页共用（TraceTimeline / EventDetailPanel）——同一条时间线
+         只该有一套渲染，否则分组规则一改就会有一边漏改。 -->
     <div class="cols" ref="colsRef">
-      <!-- 左：事件时间线（阶段 → 迭代 两级内联分组，可折叠） -->
-      <section class="col" :style="{ width: leftW + 'px' }">
-        <div class="col-head">
-          <span class="col-title">事件时间线</span>
-          <span class="col-count">{{ filtered.length }}</span>
-        </div>
-        <div class="filter-chips">
-          <button class="fchip" :class="{ on: !kindFilter }" @click="kindFilter = ''">全部</button>
-          <button
-            v-for="f in filterChips" :key="f"
-            class="fchip" :class="{ on: kindFilter === f }"
-            @click="kindFilter = f">{{ kindLabel(f) }}</button>
-        </div>
-        <div class="col-body">
-          <template v-for="row in rows" :key="row.key">
-            <!-- 阶段分组头 -->
-            <button v-if="row.t === 'stage'" class="grp-head grp-stage"
-                    @click="toggleGroup(row.key)">
-              <svg class="grp-caret" :class="{ open: isOpen(row.key) }"
-                   viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor"
-                   stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-                <path d="m9 6 6 6-6 6" />
-              </svg>
-              <span class="grp-bar" :style="{ background: row.color }"></span>
-              <span class="grp-title">{{ row.label }}</span>
-              <span class="grp-meta">{{ row.count }} 步 · {{ fmtDuration(row.ms) }}</span>
-            </button>
-
-            <!-- 迭代分组头（仅编码阶段会出现：其余阶段的事件不带迭代号） -->
-            <button v-else-if="row.t === 'iter'" class="grp-head grp-iter"
-                    @click="toggleGroup(row.key)">
-              <svg class="grp-caret" :class="{ open: isOpen(row.key) }"
-                   viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor"
-                   stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-                <path d="m9 6 6 6-6 6" />
-              </svg>
-              <span class="grp-title">{{ row.label }}</span>
-              <span class="grp-meta">{{ row.count }} 步 · {{ fmtDuration(row.ms) }}</span>
-            </button>
-
-            <!-- 事件条目：所属阶段/迭代已由分组头承担，副标题不再重复 -->
-            <button v-else
-                    class="evt" :class="[`d${row.depth}`, { 'evt-on': selectedId === row.e.id }]"
-                    @click="openEvent(row.e.id)">
-              <span class="evt-dot" :style="{ background: kindColor(row.e.kind) }"></span>
-              <span class="evt-body">
-                <span class="evt-time">{{ fmtClock(row.e.ts) }}</span>
-                <span class="evt-label">{{ row.e.label || row.e.kind }}</span>
-                <span class="evt-sub">
-                  <template v-if="row.e.model">{{ row.e.model }} · </template>
-                  <template v-if="row.e.duration_ms">{{ fmtDuration(row.e.duration_ms) }}</template>
-                </span>
-              </span>
-              <span v-if="row.e.status === 'error'" class="evt-err">失败</span>
-            </button>
-          </template>
-          <div v-if="!filtered.length && !loading" class="col-empty">没有匹配的事件</div>
-        </div>
-      </section>
+      <TraceTimeline
+        :events="events" :contract="contract" :selected-id="selectedId"
+        :loading="loading" :width="leftW" @select="openEvent" />
 
       <!-- 拖拽手柄 -->
       <div class="handle" :class="{ dragging: dragging === 1 }"
@@ -208,259 +151,31 @@
         <span class="hd"></span><span class="hd"></span><span class="hd"></span>
       </div>
 
-      <!-- 右：事件明细。宽度吃掉剩余空间 —— 中栏删掉后它是唯一需要大宽度的一栏 -->
-      <section class="col col-detail">
-        <div class="col-head">
-          <span class="col-title">事件详情</span>
-          <button v-if="detail" class="copy-btn" @click="copyJson">
-            {{ copyLabel('json', '复制 JSON') }}
-          </button>
-        </div>
-        <div class="col-body dark-body">
-          <div v-if="detailLoading" class="dark-empty">加载中…</div>
-          <div v-else-if="!detail" class="dark-empty">
-            从左侧选择任意事件<br />查看完整输入与输出
-          </div>
-          <template v-else>
-            <!-- 概览条 -->
-            <div class="d-head">
-              <div class="d-title">{{ detail.label || detail.kind }}</div>
-              <div class="d-meta">
-                {{ fmtClock(detail.ts) }} ·
-                <template v-if="detail.duration_ms">{{ fmtDuration(detail.duration_ms) }} · </template>
-                <template v-if="detail.model">{{ detail.model }}</template>
-                <!-- call_id 是 llm_traffic.log 的索引键：点一下复制，就能直接
-                     去传输层捞这次请求的原始报文。只显示前 8 位防换行，
-                     title 与复制内容都是完整的。 -->
-                <span v-if="detail.call_id" class="cid"
-                      :title="`点击复制 call_id（完整：${detail.call_id}），可在 llm_traffic.log 里定位这次请求的原始报文`"
-                      @click="copy(detail.call_id, 'cid')">· call_id {{ detail.call_id.slice(0, 8) }}<template v-if="copyState['cid'] === 'ok'"> 已复制</template></span>
-              </div>
-              <div class="d-params">
-                <span v-if="detail.messages.length" class="p-item">
-                  messages <b>{{ detail.messages.length }}</b>
-                </span>
-                <span v-if="detail.tokens_in || detail.tokens_out" class="p-item">
-                  tokens <b>{{ detail.tokens_in }}/{{ detail.tokens_out }}</b>
-                </span>
-                <span v-if="detail.tools" class="p-item">
-                  tools <b>{{ detail.tools.length }}</b>
-                </span>
-              </div>
-            </div>
-
-            <!-- ===== 分页签 =====
-                 单签时不渲染签行 —— 只有一块内容还摆一排 tab 是噪声。
-                 签上带计数：不点进去也知道这块有多大。 -->
-            <div v-if="detailTabs.length > 1" class="d-tabs">
-              <button v-for="t in detailTabs" :key="t.key" class="d-tab"
-                      :class="{ on: activeTab === t.key }" @click="activeTab = t.key">
-                {{ t.label }}<span v-if="t.count != null" class="d-tab-n">{{ t.count }}</span>
-              </button>
-            </div>
-
-            <!-- 要点：里程碑事件写入的 meta（判定 / 得分 / 未达成 AC / 修复轮次…）。
-                 不渲染它，这些字段就只躺在库里 —— 界面上「验收为什么没过」没有答案，
-                 排查还得回去翻 DB，等于埋点白做。 -->
-            <template v-if="activeTab === 'overview' && metaRows.length">
-              <div class="d-section">要点</div>
-              <div class="kf">
-                <div v-for="row in metaRows" :key="row.k" class="kf-row">
-                  <span class="kf-k" :title="row.k">{{ row.label }}</span>
-                  <!-- title 挂完整值：一行里被 clip 过的明细，悬停仍能看到全文 -->
-                  <span class="kf-v" :class="{ alert: row.alert }" :title="row.v">{{ row.v }}</span>
-                </div>
-              </div>
-            </template>
-
-            <!-- ===== REQUEST / 入参 ===== -->
-            <template v-if="activeTab === 'request'">
-              <!-- 工具行：条数 + 批量展开开关。
-                   旧版 MSG_PAGE=3 的分页已删 —— 排查时「默认只出 3 条」等于默认是瞎的；
-                   改为全量渲染，超长的单条仍默认折叠，批量开关一次全开/全收。 -->
-              <div v-if="detail.messages.length || detail.tools" class="req-bar">
-                <span class="req-note">
-                  <template v-if="detail.messages.length">{{ detail.messages.length }} 条 message</template>
-                  <template v-if="detail.messages.length && detail.tools"> · </template>
-                  <template v-if="detail.tools">{{ detail.tools.length }} 项工具定义</template>
-                </span>
-                <button v-if="longKeys.length" class="req-all" @click="toggleAllPrompts">
-                  {{ allLongExpanded
-                    ? '收起全部 prompt'
-                    : `展开全部 prompt（${longKeys.length} 段超长）` }}
-                </button>
-              </div>
-
-              <div v-for="m in detail.messages" :key="m.index" class="msg">
-                <div class="msg-bar">
-                  <span class="role-badge" :style="{ background: roleColor(m.role) }">{{ m.role }}</span>
-                  <span v-if="m.name" class="msg-tag">{{ m.name }}</span>
-                  <span v-if="m.missing" class="msg-missing">正文缺失</span>
-                  <span v-else class="msg-len">{{ fmt(m.char_len) }} chars</span>
-                  <button v-if="!m.missing" class="msg-copy" @click.stop="copy(m.content ?? '', 'msg' + m.index)">{{ copyLabel('msg' + m.index, '复制') }}</button>
-                </div>
-                <pre v-if="m.missing" class="msg-body msg-gap">
-这条 message 的正文没有存下来（blob 缺失），不是它本来为空。</pre>
-                <pre v-else class="msg-body" :class="{ clipped: !expanded.has('m' + m.index) }">{{ m.content }}</pre>
-                <button v-if="!m.missing && m.char_len > CLIP_LEN" class="more-btn" @click.stop="toggleMsg('m' + m.index)">
-                  {{ expanded.has('m' + m.index) ? '收起' : `展开全部 ${fmt(m.char_len)} 字符` }}
-                </button>
-              </div>
-
-              <!-- 工具入参（tool_call）：结构化渲染，不再整块 JSON。
-                   arguments 超长落库走内容寻址，后端会额外还原出 arguments_full ——
-                   有它才看得到 write_file 写入的完整文件（旧版只显示 2000 字符截断预览）。 -->
-              <template v-if="toolArgs.length">
-                <div v-for="a in toolArgs" :key="a.key" class="ta">
-                  <div class="ta-head">
-                    <span class="kf-k" :title="a.key">{{ a.label }}</span>
-                    <span v-if="a.full" class="ta-flag"
-                          title="参数超过 2000 字符时落库只存预览 + hash，此处是按 hash 还原出的完整原文">完整内容 · 预览已截断</span>
-                  </div>
-                  <pre v-if="a.long" class="msg-body" :class="{ clipped: !expanded.has(a.taKey) }">{{ a.value }}</pre>
-                  <div v-else class="ta-short">{{ a.value }}</div>
-                  <button v-if="a.long" class="more-btn" @click.stop="toggleMsg(a.taKey)">
-                    {{ expanded.has(a.taKey) ? '收起' : `展开全部 ${fmt(a.value.length)} 字符` }}
-                  </button>
-                </div>
-              </template>
-              <div v-else-if="hasArgs" class="msg">
-                <pre class="msg-body">{{ argsJson }}</pre>
-              </div>
-
-              <div v-if="detail.tools" class="msg">
-                <div class="msg-bar">
-                  <span class="role-badge tools-b">tools</span>
-                  <span class="msg-len">{{ detail.tools.length }} 项工具定义</span>
-                </div>
-                <button class="more-btn" @click.stop="toggleMsg('tools')">
-                  {{ expanded.has('tools') ? '收起' : '查看工具定义' }}
-                </button>
-                <!-- 展开后不再 clipped：旧版硬编码 clipped，4k 字符的定义永远只看到开头 -->
-                <pre v-if="expanded.has('tools')" class="msg-body">{{ toolsJson }}</pre>
-              </div>
-            </template>
-
-            <!-- ===== RESPONSE / 结果 ===== -->
-            <template v-if="activeTab === 'response'">
-              <template v-if="detail.response">
-                <div v-if="detail.response.content" class="msg">
-                  <div class="msg-bar">
-                    <span class="role-badge assistant-b">assistant</span>
-                    <span class="msg-len">{{ fmt(String(detail.response.content).length) }} chars</span>
-                    <button class="msg-copy" @click.stop="copy(detail.response.content, 'resp')">{{ copyLabel('resp', '复制') }}</button>
-                  </div>
-                  <pre class="msg-body" :class="{ clipped: !expanded.has('resp') }">{{ detail.response.content }}</pre>
-                  <button v-if="String(detail.response.content).length > CLIP_LEN"
-                          class="more-btn" @click.stop="toggleMsg('resp')">
-                    {{ expanded.has('resp') ? '收起' : '展开全部' }}
-                  </button>
-                </div>
-                <div v-if="detail.response.tool_calls && detail.response.tool_calls.length" class="msg">
-                  <div class="msg-bar">
-                    <span class="role-badge tools-b">tool_calls</span>
-                    <span class="msg-len">{{ detail.response.tool_calls.length }} 次调用</span>
-                  </div>
-                  <div v-for="(tc, i) in detail.response.tool_calls" :key="i" class="tc">
-                    <div class="tc-name">{{ tc.function?.name ?? tc.name ?? 'unknown' }}</div>
-                    <pre class="tc-args">{{ tc.function?.arguments ?? tc.arguments ?? '' }}</pre>
-                  </div>
-                </div>
-              </template>
-
-              <div v-if="detail.tool_content" class="msg">
-                <div class="d-section">TOOL RESULT</div>
-                <pre class="msg-body" :class="{ clipped: !expanded.has('tc') }">{{ detail.tool_content }}</pre>
-                <button v-if="detail.tool_content.length > CLIP_LEN" class="more-btn" @click.stop="toggleMsg('tc')">
-                  {{ expanded.has('tc') ? '收起' : `展开全部 ${fmt(detail.tool_content.length)} 字符` }}
-                </button>
-              </div>
-            </template>
-          </template>
-        </div>
-      </section>
+      <EventDetailPanel :detail="detail" :loading="detailLoading" />
     </div>
   </AdminShell>
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+/**
+ * 需求轨迹详情 —— 汇总 + 轮次切换 + 两栏（时间线 / 事件详情）。
+ *
+ * 两栏本身已抽成共用组件（`components/admin/TraceTimeline` 与
+ * `EventDetailPanel`），因为评测页要展示的是**同一条时间线**；本文件只负责
+ * 数据加载、轮次切换与拖拽。
+ */
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import AdminShell from '@/components/admin/AdminShell.vue'
+import EventDetailPanel from '@/components/admin/EventDetailPanel.vue'
+import TraceTimeline from '@/components/admin/TraceTimeline.vue'
 import { adminFetch } from '@/composables/useAdmin'
-import { buildTimelineRows } from './timelineRows'
 // 状态的中文名与语义档位与首页列表共用一份（见 ./statusMeta）
 import { statusLabel, statusTone } from './statusMeta'
 // 成本展示口径与首页列表共用一份（见 @/utils/cost）
 import { formatCost } from '@/utils/cost'
-
-interface Turn { turn_index: number; mode: string; event_count: number; llm_calls: number; started_at: string | null; ended_at: string | null; duration_ms: number }
-// 阶段时间线的一段 —— 按阶段聚合（不是按连续段），一段回答「这个阶段共花了多久」
-interface StageSeg {
-  stage: string; events: number; llm_calls: number; ms: number
-  started_at: string | null; ended_at: string | null
-}
-// 需求级汇总 —— 轮次可以单选切换，但「这个需求总共花了多少」必须一眼可见，
-// 否则得自己把各轮加起来。耗时取墙钟跨度（首末事件时间差），不是各事件耗时之和。
-interface Summary {
-  turns: number; events: number; llm_calls: number; tool_calls: number
-  error_count: number; tokens: number; tokens_in: number; tokens_out: number
-  /** cached 是 tokens_in 的子集，不是并列的第三类 token */
-  cached_tokens: number
-  /** null = 本需求没有任何调用上报缓存信息（≠ 0%，0% 是查过但没命中） */
-  cache_hit_rate: number | null
-  cache_reported_calls: number
-  cost: number; duration_ms: number
-  // 首调用 + 长尾 == duration_ms，由后端保证；前端只负责展示，不自己凑数
-  first_llm_ms: number; tail_ms: number
-  started_at: string | null; last_event_at: string | null
-  stages: StageSeg[]
-  by_model: { model: string; calls: number; cost: number }[]
-  verify_verdicts: (string | null)[]
-  repair_rounds: number
-  passed: boolean
-}
-// 需求基本信息（随 /turns 一起下发，省掉「去列表里捞标题」那次请求）
-interface ReqInfo {
-  id: number; title: string; status: string
-  creator: string; created_at: string | null
-  trace_id: string | null
-}
-interface Ev {
-  id: number; seq: number; turn_index: number; iteration: number | null
-  ts: string | null; kind: string; stage: string | null; label: string | null
-  status: string; model: string | null; duration_ms: number | null
-  tokens_in: number; tokens_out: number; has_payload: boolean; message_count: number
-}
-// missing：正文没存下来（blob 缺失）。后端不再把它静默成空串 ——
-// 空串分不清「这条本来就是空的」和「没存下来」，后者是事故。
-interface Msg {
-  index: number; role: string; content: string | null; char_len: number
-  missing?: boolean; name?: string
-}
-
-// 各家 LLM 的 tool_call 形状不统一：OpenAI 系用 function.{name,arguments} 嵌套，
-// 部分厂商是扁平的 name/arguments，两种都要能读。
-interface ToolCall {
-  function?: { name?: string; arguments?: string }
-  name?: string
-  arguments?: string
-}
-interface Detail {
-  id: number; label: string | null; kind: string; ts: string | null
-  model: string | null; duration_ms: number | null
-  trace_id: string | null; call_id: string | null
-  tokens_in: number; tokens_out: number
-  messages: Msg[]; tools: unknown[] | null
-  response: { content?: string; tool_calls?: ToolCall[] } | null
-  tool_content: string | null
-  // tool_call 事件的工具参数（LLM 事件里则是 messages/tools 之外的请求参数）
-  request_params: Record<string, unknown> | null
-  /** true/false：大参数按 hash 还原是否成功；false 时 arguments 是残缺的 */
-  args_resolved?: boolean
-  // 里程碑事件的结论字段（判定、得分、未达成 AC、修复轮次…）
-  meta: Record<string, unknown> | null
-}
+import { fmtClock, fmtCount, fmtDuration, fmtFull, fmtTime } from '@/utils/format'
+import type { Contract, Detail, Ev, Summary, TraceOwner, Turn } from '@/types/trace'
 
 const route = useRoute()
 const router = useRouter()
@@ -470,47 +185,12 @@ const turns = ref<Turn[]>([])
 const summary = ref<Summary | null>(null)
 const events = ref<Ev[]>([])
 const detail = ref<Detail | null>(null)
-const reqInfo = ref<ReqInfo | null>(null)
+const reqInfo = ref<TraceOwner | null>(null)
 const loading = ref(false)
 const detailLoading = ref(false)
 const errorMsg = ref('')
 const activeTurn = ref(0)
-const kindFilter = ref('')
 const selectedId = ref<number | null>(null)
-
-// ---- 详情区分页签 ----
-// 旧版 REQUEST / RESPONSE 上下堆在同一栏：长 prompt 展开后 response 被推到
-// 很下面，来回滚动才能对上。分页签把「看输入」和「看输出」分开。
-const activeTab = ref('overview')
-const CLIP_LEN = 700
-
-type DetailTab = { key: string; label: string; count?: number }
-const detailTabs = computed<DetailTab[]>(() => {
-  const d = detail.value
-  if (!d) return []
-  const tabs: DetailTab[] = []
-  if (metaRows.value.length) tabs.push({ key: 'overview', label: '要点' })
-  if (d.kind === 'tool_call') {
-    if (hasArgs.value) tabs.push({ key: 'request', label: '入参' })
-    if (d.tool_content) tabs.push({ key: 'response', label: '结果' })
-  } else {
-    // llm_turn 与里程碑：Request = 喂进去的 prompt（+工具定义），
-    // Response = 模型产出。里程碑事件补埋点后 messages/response 会有内容，
-    // 没补到的事件两个签都不出现，只剩「要点」。
-    if (d.messages.length || d.tools || hasArgs.value) {
-      tabs.push({ key: 'request', label: 'Request', count: d.messages.length || undefined })
-    }
-    if (d.response || d.tool_content) tabs.push({ key: 'response', label: 'Response' })
-  }
-  return tabs
-})
-
-const expanded = ref<Set<string>>(new Set())
-// 折叠状态 = 「用户显式点过的组」+「没点过时的默认值」。
-// 不预填 key：分组的 key 由 rows 生成，页面这边猜不出来（曾想用 `s${i}` 预填，
-// 但下标在换筛选后指向另一段，会张冠李戴）。
-const openState = ref<Map<string, boolean>>(new Map())
-const defaultOpen = ref(true)
 
 // ---- 两栏宽度（可拖拽）----
 const leftW = ref(260)
@@ -519,32 +199,9 @@ const colsRef = ref<HTMLElement | null>(null)
 
 // 事件类型的中文名与配色由后端契约下发（/api/admin/traces/contract）。
 // 新增阶段只改后端 event_contract.py，前端自动跟上 —— 不需要再同步两张 map。
-// 这张本地 map 仅是契约还没拉到时的首帧兜底。
-const KIND_FALLBACK: Record<string, string> = {
-  intent: '意图', memory: '记忆', clarify: '澄清', plan: '规划', coding: '编码',
-  llm_turn: 'LLM', tool_call: '工具', verify: '验收', repair: '修复', deliver: '交付',
-}
-type KindSpec = { label: string | null; color: string; stage: string | null }
-type Contract = {
-  kinds: Record<string, KindSpec>
-  stages: Record<string, { label: string | null; color: string }>
-  filter_kinds: string[]
-  fallback_kind: KindSpec
-  fallback_stage: { label: string | null; color: string }
-}
 const contract = ref<Contract | null>(null)
-
-const kindSpec = (k: string): KindSpec =>
-  contract.value?.kinds[k]
-  ?? contract.value?.fallback_kind
-  ?? { label: null, color: 'oklch(60% 0.02 70)', stage: null }
-const kindColor = (k: string) => kindSpec(k).color
-// 契约里没有的类型显示原名 —— 不假装认识它，否则分不清是新阶段还是脏数据
-const kindLabel = (k: string) => kindSpec(k).label ?? KIND_FALLBACK[k] ?? k
 const stageLabel = (s: string | null) =>
   s ? (contract.value?.stages[s]?.label ?? s) : ''
-const filterChips = computed(() =>
-  contract.value?.filter_kinds ?? ['llm_turn', 'tool_call', 'memory'])
 
 // ---- 头部：标题 / 副标题 / 状态与修复结论 ----
 // trace_id 随需求信息一起下发 —— 注意 /events 接口**不带**这个字段，
@@ -667,254 +324,16 @@ const stagesOverlap = computed(() => {
   return sum > s.duration_ms * 1.02 + 1000
 })
 
-const ROLE_COLOR: Record<string, string> = {
-  system: 'oklch(48% 0.14 250)',
-  user: 'oklch(50% 0.13 150)',
-  assistant: 'oklch(48% 0.15 300)',
-  tool: 'oklch(58% 0.13 70)',
-}
-const roleColor = (r: string) => ROLE_COLOR[r] ?? 'oklch(55% 0.02 70)'
-
-const filtered = computed(() =>
-  kindFilter.value ? events.value.filter(e => e.kind === kindFilter.value) : events.value)
-
-// ---- 结论要点（meta 的中文化渲染） ----
-// 键 → 人话。新增埋点时在这里补一行；没登记的键显示原名而不是隐藏 ——
-// 隐藏会让人分不清「后端没写」和「前端不认识」。
-const META_LABEL: Record<string, string> = {
-  verdict: '判定', score: '得分', fast_pass: '快速通过',
-  findings: '问题总数', critical_count: '严重问题', defect_count: '缺陷数',
-  failed_ac_ids: '未达成验收项', ac_total: '验收项总数',
-  round: '修复轮次', target_defects: '目标缺陷', written_files: '写入文件',
-  features: '功能点', ac_count: '验收项数', complexity: '复杂度',
-  dod_issues: 'DoD 问题', reason: '原因', question_count: '待答问题',
-  file_count: '文件数', files: '文件', intent: '意图', confidence: '置信度',
-  skill_name: '技能', has_feedback: '附修改意见', feedback_len: '意见字数',
-  blocked: '已拦截', unmet_acs: '未达成 AC', repair_rounds: '修复轮数',
-  gate: '闸门', restored_files: '已恢复文件', removed_files: '已删除文件',
-  summary: '摘要', injected: '注入条数', hit_ids: '命中记忆', hit: '命中条数',
-  error: '错误', message_count: '消息数', content_ref: '内容指纹',
-  thinking: '含思考', has_usage: '含用量', source: '来源',
-  // ---- B2 补埋点后新增的明细字段 ----
-  questions: '问题列表', feature_list: '功能清单', ac_list: '验收项明细',
-  plan_issues: '规划问题', items: '注入明细', feedback: '用户反馈',
-  confirmed_features: '确认的功能', confirmed_acs: '确认的验收项',
-}
-const ALERT_KEYS = new Set(['critical_count', 'failed_ac_ids', 'defect_count',
-  'target_defects', 'error', 'dod_issues', 'plan_issues'])
-// 过程性字段的「默认值」：等于默认值就不显示。全渲染会让「要点」退化成噪声
-// （每个 tool_call 都顶一行「已拦截 否」），排查时反而看不见真正的结论。
-// 反过来说，blocked=true、thinking=false 这类**偏离默认**的值会照常出现。
-const NEUTRAL_META: Record<string, unknown> = {
-  blocked: false, thinking: false, has_usage: true,
-}
-// 纯内部标识，对排查没有信息量（正文本身就在下面）
-const HIDDEN_META = new Set(['content_ref', 'message_count'])
-
-// 单条明细在一行里最多显示多少字。记忆教训后端存 200 字，不截会把「要点」
-// 撑成一大坨，反而看不见判定/得分这些真正要一眼看到的结论。
-const ITEM_TEXT_CAP = 100
-const clip = (s: string, n = ITEM_TEXT_CAP) =>
-  s.length > n ? `${s.slice(0, n)}…` : s
-
-const fmtMetaValue = (v: unknown): string => {
-  if (v === null || v === undefined || v === '') return '—'
-  if (typeof v === 'boolean') return v ? '是' : '否'
-  if (Array.isArray(v)) {
-    if (!v.length) return '无'
-    const head = v.slice(0, 6).map(x => {
-      if (typeof x === 'object' && x !== null) {
-        // 对象条目优先念人话字段（澄清问题的 label、记忆条目的 lesson），
-        // JSON 一行展开在要点区没法读。
-        //
-        // ⚠️ 记忆条目必须念 `lesson`（教训正文）而不是 `requirement`（来源需求）：
-        // 只念来源需求时，时间线上看到的是一条和自己毫无关系的旧需求标题，
-        // 看起来就像注入了噪音 —— 而真正被注入的那句教训一个字都没露出来。
-        // 来源需求保留为「来源：…」后缀：它是判断这条教训是否适用的依据。
-        const o = x as Record<string, unknown>
-        const prefix = o.id ? `${o.id} ` : ''
-        if (o.lesson) {
-          const src = o.requirement ? `（来源：${clip(String(o.requirement), 40)}）` : ''
-          return `${prefix}教训：${clip(String(o.lesson))}${src}`
-        }
-        const text = o.label ?? o.question ?? o.title ?? o.requirement
-        if (text) return `${prefix}${clip(String(text))}`
-        return clip(JSON.stringify(x))
-      }
-      return clip(String(x))
-    })
-    return v.length > 6 ? `${head.join('；')} 等 ${v.length} 项` : head.join('；')
-  }
-  if (typeof v === 'object') return JSON.stringify(v)
-  return String(v)
-}
-// 出现即代表「这次交付有麻烦」的字段标红：判定非 PASS、被拦截、有 critical…
-const metaAlert = (k: string, v: unknown): boolean => {
-  if (k === 'verdict') return String(v).toUpperCase() !== 'PASS'
-  if (k === 'blocked') return v === true
-  if (ALERT_KEYS.has(k)) return Array.isArray(v) ? v.length > 0 : !!v
-  return false
-}
-const metaRows = computed(() => {
-  const m = detail.value?.meta
-  const rows = !m || typeof m !== 'object' ? [] : Object.entries(m)
-    .filter(([k, v]) => !HIDDEN_META.has(k)
-      && !(k in NEUTRAL_META && v === NEUTRAL_META[k]))
-    .map(([k, v]) => ({
-      k, label: META_LABEL[k] ?? k, v: fmtMetaValue(v), alert: metaAlert(k, v),
-    }))
-  // 大参数还原失败：此时工具参数是**残缺**的（只显示预览截断），
-  // 不明说的话会被当成完整内容读 —— 这是唯一需要把 content_ref
-  // 的下落讲清楚的场合，单独列一行标红。
-  if (detail.value?.args_resolved === false) {
-    rows.push({ k: 'args_resolved', label: '参数还原',
-                v: '失败（正文缺失，参数只显示截断预览）', alert: true })
-  }
-  return rows
-})
-
-// ---- 时间线的两级分组 ----
-// 分组与排序不是两种视图，而是同一条时间线的两个属性 —— 所以这里不再单开一栏，
-// 层级直接内联在时间线里。规则（阶段连续段 → 编码迭代）抽在 ./timelineRows：
-// 纯函数，可以拿真实事件逐条断言，而不是靠肉眼看截图判断分组对不对。
-//
-// 事件多到一定程度时默认折叠各阶段，首屏先给一张「分了几段、每段几步」的目录。
-// 折叠能力是合并成一栏之后必须保住的 —— 否则长链路反而比改版前更难读。
-const AUTO_COLLAPSE_OVER = 40
-
-const rows = computed(() => buildTimelineRows<Ev>(filtered.value, {
-  isOpen,
-  label: stageLabel,
-  color: s => contract.value?.stages[s]?.color ?? 'oklch(60% 0.02 70)',
-}))
-
-const toolsJson = computed(() => JSON.stringify(detail.value?.tools ?? [], null, 2))
-const argsJson = computed(() => {
-  const p = detail.value?.request_params
-  return p ? JSON.stringify(p, null, 2) : ''
-})
-const hasArgs = computed(() => {
-  const p = detail.value?.request_params
-  return !!p && Object.keys(p).length > 0
-})
-
-// 详情切换后当前签可能已不存在（如 tool_call 没有「要点」），
-// 归位到第一个可用签，避免渲染出一块空白面板。
-watch(detailTabs, tabs => {
-  if (!tabs.some(t => t.key === activeTab.value)) {
-    activeTab.value = tabs[0]?.key ?? 'overview'
-  }
-}, { immediate: true })
-
-// ---- 工具入参的结构化渲染 ----
-// 旧版把 request_params 整块 JSON.stringify：name / arg_refs 是噪声，content
-// 转义成一行挤在中间；更糟的是 arguments 超 2000 字符时落库只有截断预览，
-// 完整内容在 arguments_full 里，旧版根本没显示 —— write_file 写了什么看不全。
-const ARG_LABEL: Record<string, string> = {
-  section: '写入小节', content: '内容', filename: '文件', path: '路径',
-  old_string: '替换前', new_string: '替换后', command: '命令',
-  query: '查询', url: '地址', code: '代码',
-}
-interface ToolArg {
-  key: string; label: string; value: string
-  /** 非 null = arguments 里是截断预览，value 已换成 arguments_full 的完整原文 */
-  full: string | null
-  long: boolean; taKey: string
-}
-const toolArgs = computed<ToolArg[]>(() => {
-  const p = detail.value?.request_params
-  if (!p) return []
-  const raw = p.arguments
-  if (!raw || typeof raw !== 'object') return []
-  const args = raw as Record<string, unknown>
-  const fullMap = (p.arguments_full ?? {}) as Record<string, unknown>
-  return Object.entries(args).map(([k, v], i) => {
-    const preview = typeof v === 'string' ? v : JSON.stringify(v, null, 2)
-    const resolved = fullMap[k]
-    const truncated = typeof resolved === 'string' && resolved !== preview
-    const value = truncated ? resolved : preview
-    return {
-      key: k,
-      label: ARG_LABEL[k] ?? k,
-      value,
-      full: truncated ? resolved : null,
-      long: value.length > 220 || value.includes('\n'),
-      taKey: `ta${i}`,
-    }
-  })
-})
-
-// ---- 批量展开 / 收起全部超长 prompt ----
-// 长文本默认折叠是为了首屏可读；但排查时经常要看全所有输入 —— 逐条点太磨人。
-// 收起/展开只作用于「超长」的条目（longKeys），短条目本来就没折叠，不受影响。
-const longKeys = computed<string[]>(() => {
-  const ks: string[] = []
-  for (const m of detail.value?.messages ?? []) {
-    if (!m.missing && m.char_len > CLIP_LEN) ks.push('m' + m.index)
-  }
-  if (String(detail.value?.response?.content ?? '').length > CLIP_LEN) ks.push('resp')
-  if ((detail.value?.tool_content ?? '').length > CLIP_LEN) ks.push('tc')
-  for (const a of toolArgs.value) if (a.long) ks.push(a.taKey)
-  return ks
-})
-const allLongExpanded = computed(() =>
-  longKeys.value.length > 0 && longKeys.value.every(k => expanded.value.has(k)))
-
-function toggleAllPrompts() {
-  if (allLongExpanded.value) {
-    const keep = new Set([...expanded.value].filter(k => !longKeys.value.includes(k)))
-    expanded.value = keep
-  } else {
-    expanded.value = new Set([...expanded.value, ...longKeys.value])
-  }
-}
-
-// ---- 格式化 ----
-function pad(n: number) { return String(n).padStart(2, '0') }
-function fmtDuration(ms: number | null): string {
-  if (!ms) return '—'
-  const s = Math.round(ms / 1000)
-  if (s < 60) return `${s}s`
-  const m = Math.floor(s / 60)
-  return m < 60 ? `${m}m ${s % 60}s` : `${Math.floor(m / 60)}h ${m % 60}m`
-}
-function fmtTime(iso: string | null): string {
-  if (!iso) return '—'
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return '—'
-  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
-}
-function fmtClock(iso: string | null): string {
-  if (!iso) return '--:--:--'
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return '--:--:--'
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
-}
-// 完整时间（带秒）：「提交于 2026-09-30 13:12:04」要精确到秒 ——
-// 同一天提交的多个需求，只到分钟分不出谁先谁后。
-function fmtFull(iso: string | null): string {
-  if (!iso) return '—'
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return '—'
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} `
-    + `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
-}
-function fmt(n: number): string {
-  // 与列表页同款分档：token 量级跨好几个数量级，单位写死任一个都不好读
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
-  return n >= 10000 ? `${(n / 1000).toFixed(1)}k` : String(n)
-}
-
 // ---- 数据 ----
 async function loadTurns() {
   const d = await adminFetch<{
-    items: Turn[]; summary?: Summary; requirement?: ReqInfo
+    items: Turn[]; summary?: Summary; requirement?: TraceOwner
   }>(`/api/admin/traces/${reqId.value}/turns`)
   turns.value = d.items
-  // summary 是后端算的需求级总量。这里不拿当前轮次的 events 自己加 ——
-  // 详情页每次只加载**一个轮次**的事件，前端求和只会得到那一轮的，不是整个需求。
+  // summary 是后端算的轨迹级总量。这里不拿当前轮次的 events 自己加 ——
+  // 详情页每次只加载**一个轮次**的事件，前端求和只会得到那一轮的，不是整个轨迹。
   summary.value = d.summary ?? null
-  // 需求基本信息随同一次请求下发：以前是去列表接口里翻标题，需求翻不到
+  // 基本信息随同一次请求下发：以前是去列表接口里翻标题，需求翻不到
   // 那一页时页面标题就空了，而「翻不到」恰恰是最需要知道标题的时候。
   reqInfo.value = d.requirement ?? null
   const first = d.items[0]?.turn_index ?? 0
@@ -925,10 +344,6 @@ async function loadEvents() {
   const d = await adminFetch<{ items: Ev[] }>(
     `/api/admin/traces/${reqId.value}/events?turn_index=${activeTurn.value}&limit=1000`)
   events.value = d.items
-  // 换轮次 / 换需求时重置折叠选择，否则上一轮的展开状态会带到下一轮
-  openState.value = new Map()
-  // 长链路首屏折叠成目录，短链路全展开 —— 改版不该把原本一眼可见的东西藏起来
-  defaultOpen.value = d.items.length <= AUTO_COLLAPSE_OVER
 }
 
 async function loadContract() {
@@ -941,10 +356,6 @@ async function openEvent(id: number) {
   if (selectedId.value === id && detail.value) return
   selectedId.value = id
   detailLoading.value = true
-  // 展开状态与当前签都跟着事件重置 —— 上一条事件里点开的 prompt
-  // 不该默默作用于下一条（长文本会以为没折叠，短文本会以为点了没反应）
-  expanded.value = new Set()
-  activeTab.value = 'overview'
   try {
     detail.value = await adminFetch<Detail>(`/api/admin/traces/events/${id}`)
   } catch (e) {
@@ -961,28 +372,9 @@ function pickTurn(t: number) {
   loadEvents()
 }
 
-// 没点过的组跟着 defaultOpen 走（长链路首屏折叠，见 AUTO_COLLAPSE_OVER）；
-// 点过就以用户的显式选择为准，且该选择会被记住。
-const isOpen = (k: string) => openState.value.get(k) ?? defaultOpen.value
-
-function toggleGroup(k: string) {
-  const m = new Map(openState.value)
-  m.set(k, !isOpen(k))
-  openState.value = m
-}
-
-function toggleMsg(k: string) {
-  // key 一律显式传入（'m0' / 'resp' / 'tc' / 'tools' / 'ta0'）——
-  // 旧版在这里做数字/字符串的猜测转换，'m-1' 这种 key 就是那么来的
-  const s = new Set(expanded.value)
-  s.has(k) ? s.delete(k) : s.add(k)
-  expanded.value = s
-}
-
 async function copy(text: string, key: string) {
   let ok = true
   try { await navigator.clipboard.writeText(text) } catch { ok = false }
-  // 静默吞掉异常时，用户按了按钮不知道有没有生效 —— 成功和失败都必须说出来
   copyState.value = { ...copyState.value, [key]: ok ? 'ok' : 'fail' }
   window.setTimeout(() => {
     const next = { ...copyState.value }
@@ -993,9 +385,6 @@ async function copy(text: string, key: string) {
 function copyLabel(key: string, idle: string) {
   const st = copyState.value[key]
   return st === 'ok' ? '已复制' : st === 'fail' ? '复制失败' : idle
-}
-async function copyJson() {
-  if (detail.value) await copy(JSON.stringify(detail.value, null, 2), 'json')
 }
 
 // ---- 拖拽：两栏之间只有一根分隔条，调的是时间线宽度 ----
@@ -1040,7 +429,6 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => { dragging.value = 0 })
-watch(() => route.params.id, () => { selectedId.value = null; detail.value = null })
 </script>
 
 <style scoped>
@@ -1099,7 +487,7 @@ watch(() => route.params.id, () => { selectedId.value = null; detail.value = nul
   text-overflow: ellipsis; font-variant-numeric: tabular-nums;
 }
 
-/* ---- 需求汇总指标 ---- */
+/* ---- 汇总指标 ---- */
 .sum-wrap { margin-bottom: 14px; }
 .sum-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
 .sum-title { font-size: 12.5px; font-weight: 600; color: var(--fg); }
@@ -1163,79 +551,8 @@ watch(() => route.params.id, () => { selectedId.value = null; detail.value = nul
   display: flex; align-items: stretch; gap: 0;
   height: calc(100vh - 330px); min-height: 520px;
 }
-.col {
-  display: flex; flex-direction: column; min-width: 0;
-  background: #fff; border: 1px solid oklch(90% 0.02 75); border-radius: 12px;
-  overflow: hidden;
-}
 /* 时间线宽度由拖拽决定、不参与伸缩；详情栏吃掉剩余空间 */
-.col:first-child { flex-shrink: 0; }
-.col-detail { flex: 1; }
-.col-head {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 11px 14px; border-bottom: 1px solid oklch(93% 0.02 75);
-  background: oklch(98.5% 0.01 80); flex-shrink: 0;
-}
-.col-title { font-size: 12px; font-weight: 600; color: oklch(40% 0.02 60); }
-.col-count {
-  font-size: 10.5px; color: oklch(58% 0.02 70); background: oklch(94% 0.02 75);
-  padding: 1px 7px; border-radius: 9px;
-}
-.col-body { flex: 1; overflow-y: auto; padding: 8px; }
-.col-empty { padding: 34px 12px; text-align: center; color: oklch(70% 0.02 70); font-size: 12.5px; }
-
-.filter-chips {
-  display: flex; gap: 5px; padding: 8px 10px; flex-wrap: wrap;
-  border-bottom: 1px solid oklch(94% 0.02 75);
-}
-.fchip {
-  padding: 3px 9px; border-radius: 6px; border: 1px solid oklch(89% 0.02 75);
-  background: #fff; font-size: 11px; cursor: pointer; font-family: inherit;
-  color: oklch(48% 0.02 65);
-}
-.fchip.on { background: oklch(30% 0.02 60); color: #fff; border-color: oklch(30% 0.02 60); }
-
-/* ---- 时间线条目 ---- */
-.evt {
-  display: flex; gap: 9px; width: 100%; text-align: left; padding: 7px 8px;
-  border: none; background: none; border-radius: 8px; cursor: pointer;
-  font-family: inherit; transition: background .12s;
-}
-.evt:hover { background: oklch(97.5% 0.01 80); }
-.evt-on { background: oklch(95% 0.04 45); }
-.evt-dot { width: 7px; height: 7px; border-radius: 50%; margin-top: 4px; flex-shrink: 0; }
-.evt-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
-.evt-time {
-  font-size: 10px; color: oklch(62% 0.02 70);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-.evt-label { font-size: 12px; color: oklch(28% 0.02 60); font-weight: 500; }
-.evt-sub { font-size: 10px; color: oklch(62% 0.02 70); }
-
-/* ---- 时间线内的两级分组头（阶段 → 迭代） ---- */
-.grp-head {
-  display: flex; align-items: center; gap: 7px; width: 100%; text-align: left;
-  padding: 6px 8px; border: none; background: none; border-radius: 7px;
-  cursor: pointer; font-family: inherit; transition: background .12s;
-}
-.grp-head:hover { background: oklch(96% 0.015 80); }
-/* 阶段是视觉主轴：底色 + 上间距，一眼看出时间线分成几段 */
-.grp-stage { margin-top: 6px; background: oklch(97% 0.02 80); }
-.grp-stage:first-child { margin-top: 0; }
-/* 迭代是阶段内的次级轴：只缩进、不加底色，避免和阶段抢注意力 */
-.grp-iter { padding-left: 24px; }
-.grp-bar { width: 3px; height: 13px; border-radius: 2px; flex-shrink: 0; }
-.grp-caret { transition: transform .15s; color: oklch(55% 0.02 70); flex-shrink: 0; }
-.grp-caret.open { transform: rotate(90deg); }
-.grp-title { font-size: 12px; font-weight: 600; color: oklch(32% 0.02 60); }
-.grp-meta { font-size: 10.5px; color: oklch(62% 0.02 70); margin-left: auto; }
-/* 事件按层级缩进：直接挂在阶段下的（如「编码收尾」）与迭代内的差一级 */
-.evt.d1 { padding-left: 22px; }
-.evt.d2 { padding-left: 36px; }
-.evt-err {
-  margin-left: auto; font-size: 10px; color: oklch(50% 0.18 25);
-  background: oklch(94% 0.05 25); padding: 1px 6px; border-radius: 4px; flex-shrink: 0;
-}
+.cols > :first-child { flex-shrink: 0; }
 
 /* ---- 拖拽手柄 ---- */
 .handle {
@@ -1246,151 +563,4 @@ watch(() => route.params.id, () => { selectedId.value = null; detail.value = nul
 .handle:hover, .handle.dragging { background: oklch(92% 0.04 45); }
 .hd { width: 3px; height: 3px; border-radius: 50%; background: oklch(66% 0.02 70); }
 .handle:hover .hd, .handle.dragging .hd { background: oklch(60% 0.14 32); }
-
-/* ---- 右栏深色明细 ---- */
-.dark-body { background: oklch(22% 0.012 65); padding: 0; }
-.dark-empty {
-  padding: 44px 20px; text-align: center; font-size: 12.5px;
-  color: oklch(62% 0.02 70); line-height: 1.8;
-}
-.d-head { padding: 12px 13px; border-bottom: 1px solid oklch(30% 0.015 65); }
-.d-title { font-size: 12.5px; font-weight: 600; color: oklch(93% 0.01 85); margin-bottom: 3px; }
-.d-meta {
-  font-size: 10.5px; color: oklch(66% 0.02 70);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-.d-params { display: flex; gap: 7px; margin-top: 7px; flex-wrap: wrap; }
-.cid { cursor: pointer; border-bottom: 1px dotted oklch(55% 0.02 70); }
-.cid:hover { color: oklch(85% 0.06 70); }
-.p-item {
-  font-size: 10px; color: oklch(66% 0.02 70); background: oklch(28% 0.015 65);
-  padding: 2px 7px; border-radius: 5px;
-}
-.p-item b { color: oklch(88% 0.03 75); font-weight: 600; }
-/* ---- 结论要点 ---- */
-.kf { padding: 2px 13px 10px; display: flex; flex-direction: column; gap: 4px; }
-.kf-row { display: flex; gap: 8px; align-items: baseline; }
-.kf-k { font-size: 10.5px; color: oklch(64% 0.02 70); flex-shrink: 0; min-width: 74px; }
-.kf-v {
-  font-size: 11.5px; color: oklch(90% 0.01 85); line-height: 1.6;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  word-break: break-word;
-}
-.kf-v.alert { color: oklch(74% 0.15 32); font-weight: 600; }
-.d-section {
-  padding: 9px 13px 5px; font-size: 10px; font-weight: 700; letter-spacing: .1em;
-  color: oklch(62% 0.03 70); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-.msg { padding: 6px 13px 9px; }
-.msg-bar { display: flex; align-items: center; gap: 7px; margin-bottom: 4px; }
-.role-badge {
-  font-size: 9.5px; font-weight: 600; color: #fff; padding: 1.5px 6px;
-  border-radius: 4px; text-transform: uppercase; letter-spacing: .04em;
-}
-.tools-b { background: oklch(58% 0.13 70) !important; }
-.assistant-b { background: oklch(48% 0.15 300) !important; }
-.msg-len {
-  font-size: 9.5px; color: oklch(58% 0.02 70);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-/* message 的附加来源（如系统每轮注入的工作区状态）—— 没有它，
-   这些 message 长得和真实用户输入一模一样 */
-.msg-tag {
-  font-size: 9.5px; padding: 1px 5px; border-radius: 3px;
-  background: oklch(94% 0.02 70); color: oklch(45% 0.04 70);
-  border: 1px solid oklch(88% 0.02 70);
-}
-.msg-missing {
-  font-size: 9.5px; padding: 1px 5px; border-radius: 3px;
-  background: oklch(93% 0.06 40); color: oklch(48% 0.14 35);
-}
-.msg-gap { color: oklch(55% 0.05 40); font-style: italic; }
-.msg-copy, .copy-btn {
-  margin-left: auto; background: none; border: none; font-size: 10px;
-  color: oklch(66% 0.05 60); cursor: pointer; font-family: inherit; padding: 0;
-}
-.msg-copy:hover, .copy-btn:hover { color: oklch(80% 0.06 70); }
-.copy-btn {
-  color: oklch(48% 0.02 65); font-size: 11px; margin-left: 0;
-}
-.msg-body {
-  margin: 0; padding: 8px 10px; border-radius: 7px;
-  background: oklch(27% 0.015 65); border: 1px solid oklch(33% 0.015 65);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px; line-height: 1.62; color: oklch(90% 0.012 85);
-  white-space: pre-wrap; word-break: break-word;
-}
-.msg-body.clipped { max-height: 148px; overflow: hidden; }
-.more-btn {
-  margin-top: 5px; background: none; border: none; padding: 0;
-  font-size: 10.5px; color: oklch(64% 0.08 55); cursor: pointer;
-  font-family: inherit; text-decoration: underline;
-}
-.more-btn:hover { color: oklch(76% 0.1 55); }
-.tc { padding: 5px 0 0; }
-.tc-name {
-  font-size: 11px; color: oklch(84% 0.1 70); font-weight: 600;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin-bottom: 2px;
-}
-.tc-args {
-  margin: 0; padding: 6px 9px; border-radius: 6px; background: oklch(25% 0.015 65);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 10.5px; color: oklch(80% 0.02 70); white-space: pre-wrap;
-  word-break: break-word; max-height: 130px; overflow: hidden;
-}
-/* ---- 详情区分页签 ---- */
-/* Request 与 Response 分签：长 prompt 展开后不再把 response 推出视口 */
-.d-tabs {
-  display: flex; gap: 2px; padding: 6px 13px 0;
-  border-bottom: 1px solid oklch(30% 0.015 65);
-}
-.d-tab {
-  padding: 6px 12px 7px; border: none; background: none; cursor: pointer;
-  font-family: inherit; font-size: 11.5px; color: oklch(62% 0.02 70);
-  border-bottom: 2px solid transparent; margin-bottom: -1px;
-  display: inline-flex; align-items: center; gap: 5px;
-}
-.d-tab:hover { color: oklch(84% 0.03 75); }
-.d-tab.on {
-  color: oklch(93% 0.01 85); font-weight: 600;
-  border-bottom-color: oklch(70% 0.12 60);
-}
-.d-tab-n {
-  font-size: 9.5px; padding: 0 5px; border-radius: 8px;
-  background: oklch(30% 0.015 65); color: oklch(74% 0.02 75);
-  font-variant-numeric: tabular-nums;
-}
-.d-tab.on .d-tab-n { background: oklch(36% 0.03 55); color: oklch(88% 0.04 70); }
-
-/* Request 签的工具行：条数 + 批量展开开关 */
-.req-bar {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 7px 13px 2px;
-}
-.req-note { font-size: 10px; color: oklch(60% 0.02 70); }
-.req-all {
-  background: none; border: none; padding: 0; cursor: pointer;
-  font-family: inherit; font-size: 10.5px;
-  color: oklch(70% 0.09 60); text-decoration: underline;
-}
-.req-all:hover { color: oklch(82% 0.1 65); }
-
-/* ---- 工具入参的结构化渲染 ---- */
-.ta { padding: 7px 13px 2px; }
-.ta-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 3px; }
-.ta-head .kf-k { min-width: 0; }
-.ta-flag {
-  font-size: 9.5px; padding: 1px 6px; border-radius: 4px;
-  background: oklch(30% 0.04 80); color: oklch(78% 0.08 80);
-  white-space: nowrap;
-}
-.ta-short {
-  font-size: 11.5px; color: oklch(90% 0.01 85); line-height: 1.6;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  word-break: break-word;
-}
-
-.col-body::-webkit-scrollbar { width: 8px; }
-.col-body::-webkit-scrollbar-thumb { background: oklch(86% 0.02 75); border-radius: 4px; }
-.dark-body::-webkit-scrollbar-thumb { background: oklch(38% 0.015 65); }
 </style>

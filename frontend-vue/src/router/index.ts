@@ -94,6 +94,20 @@ const router = createRouter({
       meta: { requiresAuth: false, requiresAdmin: true },
     },
     {
+      // 评测集：每次离线跑评测留一个运行目录，这里看过程与结果。
+      // 与需求轨迹是两条数据源（本地 SQLite vs 运营库），但共用同一套渲染。
+      path: '/admin/evals',
+      name: 'AdminEvals',
+      component: () => import('@/views/admin/AdminEvalsView.vue'),
+      meta: { requiresAuth: false, requiresAdmin: true },
+    },
+    {
+      path: '/admin/evals/:runId',
+      name: 'AdminEvalDetail',
+      component: () => import('@/views/admin/AdminEvalDetailView.vue'),
+      meta: { requiresAuth: false, requiresAdmin: true },
+    },
+    {
       path: '/:pathMatch(.*)*',
       redirect: '/',
     },

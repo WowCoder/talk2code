@@ -35,6 +35,20 @@
         <span class="nav-label">需求轨迹</span>
       </RouterLink>
 
+      <p class="nav-group">研发</p>
+
+      <!-- 评测集：离线跑评测留下的过程与结果。与需求轨迹共用同一套渲染，
+           但数据源不同（本地 SQLite vs 运营库），所以单独成组，不混进「运营」。 -->
+      <RouterLink to="/admin/evals" class="nav-item" active-class="active">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="5" y="4" width="14" height="17" rx="2.5" />
+          <path d="M9 3.5h6v2.5H9z" />
+          <path d="m8.5 13.5 2.2 2.2 4.3-4.3" />
+          <path d="M8.5 18.5h7" />
+        </svg>
+        <span class="nav-label">评测集</span>
+      </RouterLink>
+
       <p class="nav-group">规划中</p>
 
       <!-- 后端目前只有登录 / 邀请码 / 指标三类接口，未落地的模块按「规划中」置灰，
