@@ -9,6 +9,7 @@
 性能约定：列表页只碰 `agent_events`，明细（response / 完整 messages）在点开
 某个事件时才查 `agent_payloads` 与 blob，避免把数十 KB 正文拉进列表。
 """
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 from flask import request, jsonify
@@ -294,23 +295,38 @@ def admin_trace_list():
 
 # ==================== 时间线 ====================
 
-@app.route('/api/admin/traces/<int:requirement_id>/events', methods=['GET'])
-@admin_required
-def admin_trace_events(requirement_id):
-    """单个需求的完整事件时间线 —— 按 seq 排序。
+# ==================== 查询与组装（唯一定义处）====================
+#
+# 下面这几个 build_* 不碰 request / jsonify，只接受一个 session —— 于是同一段
+# 查询能被两处复用：运营库里的需求轨迹，以及一次评测运行的某道题（数据在
+# eval/runs/<run_id>/trace.db）。
+#
+# 为什么必须共用而不是各写一份：前端是同一套渲染组件（TraceTimeline），它吃的
+# 就是这里的字段。两份实现一旦分叉，字段就会漂移，而漂移在界面上只表现为
+# 「有个地方显示不出来」，排查成本远高于当初省下的抽取。
+
+
+@contextmanager
+def _use_db(session):
+    """把已有 session 包成 contextmanager。
+
+    存在的理由：同一段查询逻辑要能同时跑在 `transactional_db()`（生产）和
+    评测库的 session 上。把「从哪拿库」这一件事抽出去，查询与组装才能保持
+    一份实现。
+    """
+    yield session
+
+
+def build_events_payload(requirement_id, session, *, turn=None, kind=None,
+                         limit=500, offset=0) -> dict:
+    """单条轨迹的完整事件时间线。
 
     seq 是需求内全局递增序号，不依赖时间戳精度（同一秒内多个事件也能正确排序）。
-
-    query: turn_index, kind, limit, offset
+    query 参数由调用方解析（这里不碰 request）。
     """
     from models.models import AgentEvent
 
-    turn = request.args.get('turn_index')
-    kind = request.args.get('kind')
-    limit = min(1000, max(1, int(request.args.get('limit', 500))))
-    offset = max(0, int(request.args.get('offset', 0)))
-
-    with transactional_db() as db:
+    with _use_db(session) as db:
         query = db.query(AgentEvent).filter(
             AgentEvent.requirement_id == requirement_id)
         if turn is not None and turn != '':
@@ -342,26 +358,43 @@ def admin_trace_events(requirement_id):
                      if k != 'message_count'},
         } for r in rows]
 
-        return jsonify({
+        return {
             'requirement_id': requirement_id,
             'items': items,
             'total': total,
-        })
+        }
+
+
+@app.route('/api/admin/traces/<int:requirement_id>/events', methods=['GET'])
+@admin_required
+def admin_trace_events(requirement_id):
+    """单个需求的完整事件时间线 —— 按 seq 排序。
+
+    query: turn_index, kind, limit, offset
+    """
+    turn = request.args.get('turn_index')
+    kind = request.args.get('kind')
+    limit = min(1000, max(1, int(request.args.get('limit', 500))))
+    offset = max(0, int(request.args.get('offset', 0)))
+
+    with transactional_db() as db:
+        return jsonify(build_events_payload(
+            requirement_id, db,
+            turn=turn, kind=kind, limit=limit, offset=offset))
 
 
 # ==================== 轮次 ====================
 
-@app.route('/api/admin/traces/<int:requirement_id>/turns', methods=['GET'])
-@admin_required
-def admin_trace_turns(requirement_id):
-    """对话轮次列表 —— 驱动详情页顶部的「轮次切换器」。
+def build_turns_payload(requirement_id, session) -> dict:
+    """轮次 + 汇总 + 阶段时间线 + 按模型 —— 时间线的唯一实现。
 
-    turn_index 在**写入时**确定（存入 agent_events），不做查询时派生：
-    dialogue_history 里数 role='user' 的方式既脆弱又慢。
+    驱动详情页顶部的「轮次切换器」。turn_index 在**写入时**确定（存入
+    agent_events），不做查询时派生：dialogue_history 里数 role='user'
+    的方式既脆弱又慢。
     """
-    from models.models import AgentEvent, Requirement, User
+    from models.models import AgentEvent
 
-    with transactional_db() as db:
+    with _use_db(session) as db:
         rows = db.query(
             AgentEvent.turn_index,
             func.count(AgentEvent.id).label('event_count'),
@@ -513,12 +546,18 @@ def admin_trace_turns(requirement_id):
         # 需求基本信息（标题 / 创建人 / 提交时间）—— 详情页头部要用。
         # 以前是前端去列表接口里把标题捞出来：多一次请求，而且需求翻不到那一页
         # 时标题就空了。挂在这里，一次请求把头部需要的东西给全。
-        req_row = db.query(Requirement).filter(
-            Requirement.id == requirement_id).first()
+        # 需求头信息只存在于主库；评测库里没有 requirements / users 两张表，
+        # 查询会抛 OperationalError —— 降级为空信息，轨迹本身照常渲染。
         creator = ''
-        if req_row and req_row.user_id:
-            u = db.query(User).filter(User.id == req_row.user_id).first()
-            creator = u.username if u else ''
+        try:
+            from models.models import Requirement, User
+            req_row = db.query(Requirement).filter(
+                Requirement.id == requirement_id).first()
+            if req_row and req_row.user_id:
+                u = db.query(User).filter(User.id == req_row.user_id).first()
+                creator = u.username if u else ''
+        except Exception:
+            req_row = None
         # trace_id 贯穿整个 run，是跨表 / 跨日志把一次执行串起来的唯一线索，
         # 头部要能一键复制。取任意一条事件的值即可（同一 run 内一致）；
         # 一条都没有（早期数据没埋）就留空，前端会自行隐藏复制入口。
@@ -536,29 +575,36 @@ def admin_trace_turns(requirement_id):
             'created_at': _iso_utc(req_row.create_time if req_row else None),
         }
 
-        return jsonify({'requirement_id': requirement_id,
-                        'requirement': requirement,
-                        'summary': summary,
-                        'items': items})
+        return {'requirement_id': requirement_id,
+                'requirement': requirement,
+                'summary': summary,
+                'items': items}
+
+
+@app.route('/api/admin/traces/<int:requirement_id>/turns', methods=['GET'])
+@admin_required
+def admin_trace_turns(requirement_id):
+    """对话轮次列表 —— 驱动详情页顶部的「轮次切换器」。"""
+    with transactional_db() as db:
+        return jsonify(build_turns_payload(requirement_id, db))
 
 
 # ==================== 事件详情 ====================
 
-@app.route('/api/admin/traces/events/<int:event_id>', methods=['GET'])
-@admin_required
-def admin_trace_event_detail(event_id):
-    """单个事件详情 —— 完整还原 request / response。
+def build_event_detail(event_id, session):
+    """单个事件的完整还原（含 request / response / 完整 messages）。
 
-    这是唯一会触碰 `trace_message_blobs` 与 `agent_payloads` 的接口：
+    这是唯一会触碰 `trace_message_blobs` 与 `agent_payloads` 的查询：
     按 message_refs 批量取正文一次查询还原出完整 messages[]。
+    返回 None 表示事件不存在，由调用方决定 404。
     """
-    from models.models import AgentEvent, AgentPayload
     from harness.observability.trace_writer import TraceWriter
+    from models.models import AgentEvent, AgentPayload
 
-    with transactional_db() as db:
+    with _use_db(session) as db:
         ev = db.query(AgentEvent).filter(AgentEvent.id == event_id).first()
         if not ev:
-            return jsonify({'error': '事件不存在'}), 404
+            return None
 
         result = {
             'id': ev.id,
@@ -638,6 +684,17 @@ def admin_trace_event_detail(event_id):
             if tools_row:
                 result['tools'] = (tools_row.response or {}).get('tools')
 
+        return result
+
+
+@app.route('/api/admin/traces/events/<int:event_id>', methods=['GET'])
+@admin_required
+def admin_trace_event_detail(event_id):
+    """单个事件详情 —— 完整还原 request / response。"""
+    with transactional_db() as db:
+        result = build_event_detail(event_id, db)
+        if result is None:
+            return jsonify({'error': '事件不存在'}), 404
         return jsonify(result)
 
 

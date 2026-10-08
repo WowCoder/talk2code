@@ -11,6 +11,7 @@ import routes.market         # noqa: F401 - register 创意市集 routes
 import routes.invite         # noqa: F401 - register 邀请码申请 routes
 import routes.admin          # noqa: F401 - register 运营后台 routes
 import routes.admin_traces   # noqa: F401 - register Agent 可观测性 routes
+import routes.admin_evals    # noqa: F401 - register 评测观测 routes（只读）
 
 if __name__ == '__main__':
     # PORT 可覆盖，便于在不占用主线 5001 端口的隔离实例上跑发布链路 e2e（B10）。
