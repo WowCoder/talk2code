@@ -69,6 +69,8 @@ export interface SSEProgressData {
   status: string
   /** 阶段标识，用于渲染阶段指示器；缺省表示沿用上一阶段 */
   stage?: 'planning' | 'coding' | 'verifying' | 'repairing'
+  /** 事件产生时刻（毫秒）：用于识别重连回放的旧事件，避免覆盖刷新恢复出的进度 */
+  ts?: number
 }
 
 /**

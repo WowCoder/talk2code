@@ -5,6 +5,7 @@ SSE 工具函数
 """
 
 import json
+import time
 from datetime import datetime
 
 
@@ -92,7 +93,10 @@ class SSEMessage:
         payload = {
             'current_agent': current_agent,
             'progress': progress,
-            'status': status
+            'status': status,
+            # 毫秒时间戳：前端用它区分「实时事件」与「重连回放的旧事件」，
+            # 避免刷新恢复出的进度文案被回放覆盖（详见 sse_reporter.progress）。
+            'ts': int(time.time() * 1000),
         }
         if stage:
             payload['stage'] = stage

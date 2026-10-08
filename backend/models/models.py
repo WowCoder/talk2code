@@ -514,6 +514,30 @@ class AdminUser(Base):
         return f'<AdminUser {self.username}>'
 
 
+class RequirementProgress(Base):
+    """需求实时进度快照 —— 每个需求一行，刷新页面后据此恢复进度。
+
+    为什么需要它：进度（当前阶段 / 百分比 / "已完成 app.js（2/3）"）此前只存在
+    于 SSE 实时通道里，而 SSE 的回放缓冲只有最近 200 条消息 —— 一次生成会推送
+    几百条事件，等用户刷新时最早那批 progress 早就被挤出缓冲了。结果是「正在
+    处理时刷新一下，阶段、百分比、已完成文件数全没了」，而后端其实还在跑。
+
+    落库只发生在进度变化的那几刻（每个文件写完一次，一次生成几十次），
+    不碰对话与产物，写失败一律吞掉不阻断主流程。
+    """
+    __tablename__ = "requirement_progress"
+
+    requirement_id = Column(Integer, primary_key=True)   # 一个需求只保留最新一条
+    stage = Column(String(32), default='')               # planning/coding/verifying/repairing
+    percent = Column(Integer, default=0)
+    # 动作文案（"已完成 js/app.js（2/3）"）——直接显示在前端进度条上
+    message = Column(String(500), default='')
+    # 本次运行的起始时刻：用于算「已等待多久」。刷新后心跳是**连接**相对时间，
+    # 不落这个字段刷新一次就把等待计时清零，界面上"已等待 9 分钟"会变成 0。
+    started_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
 def _sql_false() -> str:
     return "FALSE" if settings.IS_POSTGRES else "0"
 

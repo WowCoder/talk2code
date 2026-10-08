@@ -30,11 +30,23 @@ class SSEReporter:
         是「AI 正在处理…」这类无信息展示的根因。
         """
         payload = {
-            "current_agent": message, "progress": percent, "status": "processing"
+            "current_agent": message, "progress": percent, "status": "processing",
+            # 毫秒时间戳：前端刷新后从落库快照恢复进度，重连回放的**旧**事件
+            # 靠它被识别并丢弃 —— 不带时间的话前端只能按百分比猜， equal-percent
+            # 的回放会把恢复出来的文案盖回几分钟前的那句。
+            "ts": int(__import__("time").time() * 1000),
         }
         if stage:
             payload["stage"] = stage
         self._send(requirement_id, "progress", payload)
+        # 顺手落一份快照：SSE 回放缓冲只有最近 200 条消息，跑一段之后刷新页面
+        # 时最早的 progress 早已被挤出去，界面会退回「准备中」（详见
+        # progress_snapshot 模块 docstring）。
+        try:
+            from harness.observability.progress_snapshot import record as _record
+            _record(requirement_id, percent=percent, message=message, stage=stage)
+        except Exception as e:
+            logger.debug(f"进度快照落库失败（忽略）: {e}")
 
     def dialogue(self, requirement_id: int, role: str, name: str, content: str, status: str = ""):
         self._send(requirement_id, "dialogue", {

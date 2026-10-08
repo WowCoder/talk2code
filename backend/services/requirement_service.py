@@ -1335,6 +1335,13 @@ class RequirementService:
                        stage: str = ''):
         message = SSEMessage.progress_message(agent_name, progress, 'processing', stage)
         sse_manager.broadcast(str(requirement_id), message)
+        # 与 SSEReporter.progress 同一口径：刷新页面要能恢复进度，
+        # 只推 SSE 不够（回放缓冲会被后续事件挤掉）。
+        try:
+            from harness.observability.progress_snapshot import record as _record
+            _record(requirement_id, percent=progress, message=agent_name, stage=stage)
+        except Exception as e:
+            logger.debug(f"进度快照落库失败（忽略）: {e}")
 
     def _send_dialogue(self, requirement_id: int, name: str, content: str,
                        role: str = 'agent', timestamp: str | None = None):

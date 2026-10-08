@@ -21,6 +21,16 @@ export interface ProgressState {
   updatedAt: number
 }
 
+/** 后端落库的实时进度快照：刷新页面后据此恢复「当前阶段 / 百分比 / 已完成几个文件」 */
+export interface ProgressSnapshot {
+  stage: string
+  percent: number
+  message: string
+  /** 本次运行的起始时刻（UTC ISO），用于算「已等待多久」 */
+  started_at: string | null
+  updated_at: string | null
+}
+
 export function emptyProgress(): ProgressState {
   return { currentAgent: '', percent: 0, stage: '', updatedAt: 0 }
 }
@@ -51,6 +61,9 @@ export const useRequirementStore = defineStore('requirement', () => {
   const planStatus = ref<'needs_confirmation' | 'confirmed' | null>(null)
   // Trace 总结数据
   const _traceSummary = ref<SSETraceSummaryData | null>(null)
+  // 进度快照的落库时刻（ms）：SSE 重连回放的旧 progress 事件据此被丢弃，
+  // 不然会把刚恢复出来的进度文案盖回几分钟前（见 useSSE 的 progress handler）
+  const _progressSnapshotTs = ref(0)
 
   // ===== 竞态 / 幂等去重（会话内，非响应式）=====
   // 递增请求序号：只有最新一次 loadRequirement 的结果允许写入 state
@@ -169,7 +182,7 @@ function messageKey(msg: DialogueMessage): string {
   return ''
 }
 
-  async function loadRequirement(id: number): Promise<{ requirement: Requirement; trace?: any; evaluator?: SSEEvaluatorResultData } | null> {
+  async function loadRequirement(id: number): Promise<{ requirement: Requirement; trace?: any; evaluator?: SSEEvaluatorResultData; progress?: ProgressSnapshot } | null> {
     const seq = ++loadSeq
 
     // ⚠️ 先取数据、成功后再清空旧状态。
@@ -177,7 +190,7 @@ function messageKey(msg: DialogueMessage): string {
     // （401 / 500 / 超时 / 网络抖动）都会把页面留在"刚重置完"的空状态里：
     // 消息、代码、任务进度全空，而异常只被调用方 catch 成一句 toast。
     // 用户看到的就是「刷新一下，啥都没了」。
-    const data = await api<{ requirement: Requirement; trace?: any; evaluator?: SSEEvaluatorResultData }>(`/api/requirements/${id}`)
+    const data = await api<{ requirement: Requirement; trace?: any; evaluator?: SSEEvaluatorResultData; progress?: ProgressSnapshot }>(`/api/requirements/${id}`)
 
     // 竞态保护：期间又发起了新的 loadRequirement，本次结果作废
     if (seq !== loadSeq) return null
@@ -196,6 +209,7 @@ function messageKey(msg: DialogueMessage): string {
     _specInsertIndex.value = null
     planStatus.value = null
     _traceSummary.value = null
+    _progressSnapshotTs.value = 0
 
     currentRequirement.value = data.requirement
 
@@ -247,6 +261,32 @@ function messageKey(msg: DialogueMessage): string {
       for (const m of data.requirement.dialogue_history) {
         const k = messageKey(m)
         if (k) seenMessageKeys.add(k)
+      }
+    }
+
+    // 恢复实时进度（阶段 / 百分比 / "已完成 app.js（2/3）"）。
+    // 进度此前只活在 SSE 推送里，而 SSE 的回放缓冲只保留最近 200 条消息——
+    // 一次生成几百条事件，刷新时最早那批 progress 早被挤掉了，界面会退回
+    // 「准备中」、百分比归零，可后端其实还在跑。后端现在把最新一条落库，
+    // 进页面时先读它，不等下一条实时事件（那条可能要等几十秒）。
+    if (data.progress) {
+      progress.value = {
+        currentAgent: data.progress.message || '',
+        percent: Number(data.progress.percent) || 0,
+        stage: data.progress.stage || '',
+        updatedAt: Date.now(),
+      }
+      // 记下快照时刻：SSE 重连回放的旧 progress 事件据此丢弃（useSSE）
+      const snapTs = data.progress.updated_at ? Date.parse(data.progress.updated_at) : NaN
+      _progressSnapshotTs.value = Number.isNaN(snapTs) ? 0 : snapTs
+      // 等待时长按**任务起点**算：心跳里的 elapsed_s 是后端按任务起点给的，
+      // 但刷新后要等下一次心跳（最长 15 秒）才有值，这里先补上，
+      // 否则「已等待 9 分钟」会先闪成「正在处理」再跳回 9 分钟。
+      if (data.progress.started_at) {
+        const t0 = new Date(data.progress.started_at).getTime()
+        if (!Number.isNaN(t0)) {
+          serverElapsedS.value = Math.max(0, Math.round((Date.now() - t0) / 1000))
+        }
       }
     }
 
@@ -811,6 +851,7 @@ function messageKey(msg: DialogueMessage): string {
     _specInsertIndex.value = null
     planStatus.value = null
     _traceSummary.value = null
+    _progressSnapshotTs.value = 0
   }
 
   return {
@@ -851,6 +892,7 @@ function messageKey(msg: DialogueMessage): string {
     _taskList,
     _specInsertIndex,
     _traceSummary,
+    _progressSnapshotTs,
     planStatus,
     confirmPlan,
     cancelTask,

@@ -132,12 +132,20 @@ export function useSSE(reqId: Ref<number | null>) {
       // 「一边等你选视觉风格、一边显示需求分析已等待 9 分钟」（req 221 实测，
       // question-form 事件被上面的去重条件挡掉，清不回来，只能在这里拦）。
       if (store.questionForm) return
-      store.isGenerating = true
+      // 回放防御（时间戳判据）：刷新后进度从落库快照恢复，紧跟着重连会整段
+      // 回放缓冲里的**旧** progress —— 只按百分比取 max 的话，文案/阶段仍会被
+      // 旧事件盖回几分钟前（实测「进度条 81%、文案是最早那句」的拼贴）。
+      // 带了 ts 的事件里，凡是早于快照时刻的一律丢弃；一旦收到比快照新的
+      // 实时事件就解除拦截，后续同百分比的正常事件不再受影响。
+      const evTs = Number(data.ts) || 0
+      if (evTs && store._progressSnapshotTs && evTs < store._progressSnapshotTs) return
+      if (evTs) store._progressSnapshotTs = 0
       // 进度只增不减：后端在「修复轮次 / coder 重入」时会按**轮内**位置重新
       // 上报更小的值（这是有意的，见 backend/harness/observability/progress_plan.py），
       // 这里对同一需求取历史最大值，保证用户看到的进度条不会往回跳。
       const prevPercent = Number(store.progress.percent) || 0
       const nextPercent = Math.max(prevPercent, Number(data.progress) || 0)
+      store.isGenerating = true
       store.progress = {
         currentAgent: data.current_agent,
         percent: nextPercent,

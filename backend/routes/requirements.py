@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """需求管理 API 路由"""
 import threading
+from datetime import datetime
 from flask import request, jsonify, Response
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from utils.db import get_db, transactional_db
@@ -25,6 +26,19 @@ _chat_semaphore = threading.BoundedSemaphore(settings.TASK_QUEUE_MAX_WORKERS)
 _chat_inflight: dict = {}
 _chat_inflight_lock = threading.Lock()
 _CHAT_ACQUIRE_TIMEOUT = 30  # 等待并发名额的最长秒数，超时返回 429
+
+
+def _reset_progress(req_id: int) -> None:
+    """新一轮开始：清掉上一轮的进度快照，重新计时。
+
+    必须在**每次任务入队**时调用（新建 / 澄清后重跑 / 确认计划后编码 / 断点续跑）。
+    不清的话上一轮的 started_at 会残留，刷新后「已等待」被算成从上次运行就开始等。
+    """
+    try:
+        from harness.observability.progress_snapshot import reset as _reset
+        _reset(req_id)
+    except Exception as e:
+        logger.debug(f"重置进度快照失败（忽略）: {e}")
 
 
 def _chat_quality_gate(workspace) -> tuple[list[dict], str]:
@@ -93,6 +107,7 @@ def create_requirement():
 
     # 事务已提交后再入队：避免 worker 在事务未提交时查不到该行导致任务失败
     logger.info(f"创建需求 {req_id}，准备提交到任务队列")
+    _reset_progress(req_id)
     task_id = task_queue.submit(req_id, process_requirement_async, req_id)
     if task_id is None:
         # 该需求已有 PENDING/RUNNING 任务：不另起线程（否则并发重复处理）
@@ -215,6 +230,17 @@ def get_requirement(req_id):
                     plan_status = 'confirmed'
                     break
 
+        # 实时进度快照：只在进行中返回。刷新页面时前端据此恢复「当前阶段 /
+        # 百分比 / 已完成 N 个文件」，不用等下一条 SSE 事件（而那条可能要等
+        # 几十秒，且回放缓冲里的旧 progress 早被挤掉了）。
+        progress_data = None
+        if requirement.status in ('pending', 'planning', 'processing', 'interrupted'):
+            try:
+                from harness.observability.progress_snapshot import read as _read_progress
+                progress_data = _read_progress(req_id)
+            except Exception:
+                progress_data = None
+
         result = {
             'requirement': {
                 'id': requirement.id,
@@ -236,6 +262,8 @@ def get_requirement(req_id):
             result['trace'] = trace_data
         if evaluator_data:
             result['evaluator'] = evaluator_data
+        if progress_data:
+            result['progress'] = progress_data
         return jsonify(result), 200
 
 
@@ -685,6 +713,7 @@ def clarify_requirement(req_id):
         flag_modified(req_record, 'dialogue_history')
 
     # 事务已提交后再入队（避免竞态）；已有任务则不重复启动线程
+    _reset_progress(req_id)
     task_id = task_queue.submit(req_id, process_requirement_async, req_id)
     if task_id is None:
         logger.warning(f"需求 {req_id} 已有任务在处理，跳过重复提交")
@@ -756,6 +785,7 @@ def confirm_plan(req_id):
 
     # 提交到任务队列（后台异步执行编码流程，在 DB session 外部）
     from services.requirement_service import confirm_plan_async
+    _reset_progress(req_id)
     task_id = task_queue.submit(req_id, confirm_plan_async, req_id, feedback)
     if task_id is None:
         logger.warning(f"需求 {req_id} 已有任务在处理，跳过重复提交")
@@ -849,6 +879,7 @@ def resume_requirement(req_id):
         req_record.status = 'pending'
 
     # 事务已提交后再入队，避免 worker 查不到该行
+    _reset_progress(req_id)
     task_id = task_queue.submit(req_id, process_requirement_async, req_id)
     if task_id is None:
         return jsonify({'error': '该需求已有任务在处理中'}), 409
@@ -987,6 +1018,20 @@ def sse_stream(req_id):
     client_id = str(req_id)
     sse_started_at = time.time()
 
+    # 「已等待多久」按**任务**起点算，不按连接起点算：刷新页面会重建连接，
+    # 连接相对时间归零，界面上「已等待 9 分钟」会瞬间变成 0（而任务其实还在跑）。
+    # 取不到快照（任务刚入队还没推第一条进度）时退回连接相对时间。
+    task_started_at = None
+    try:
+        from harness.observability.progress_snapshot import started_at as _task_started
+        _ts = _task_started(req_id)
+        if _ts is not None:
+            task_started_at = (_ts - datetime(1970, 1, 1)).total_seconds()
+    except Exception:
+        task_started_at = None
+    if task_started_at is None:
+        task_started_at = sse_started_at
+
     # 添加到 SSE 管理器
     sse_manager.add_client(client_id, client_queue)
     logger.debug(f"SSE 客户端已连接：client_id={client_id}")
@@ -1017,7 +1062,7 @@ def sse_stream(req_id):
                     sse_manager.touch(client_id, client_queue)
                     yield SSEMessage.format_event('heartbeat', {
                         'requirement_id': req_id,
-                        'elapsed_s': int(time.time() - sse_started_at),
+                        'elapsed_s': int(time.time() - task_started_at),
                         'timestamp': get_current_timestamp(),
                     })
         except GeneratorExit:
