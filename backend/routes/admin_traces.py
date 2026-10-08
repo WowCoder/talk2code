@@ -12,7 +12,7 @@
 from datetime import datetime, timedelta, timezone
 
 from flask import request, jsonify
-from sqlalchemy import func, case, or_
+from sqlalchemy import func, case, or_, false
 
 from factory import app, logger
 from utils.db import transactional_db
@@ -69,6 +69,68 @@ def _hit_rate(cached: int, reported_tokens_in: int):
     return round(cached / reported_tokens_in, 4)
 
 
+# ==================== 时间范围 ====================
+#
+# 筛选条给的四档：当天 / 近 3 天 / 近 7 天 / 近 30 天。
+# 口径统一为**自然日对齐**：近 N 天 = 本地今天 0 点往前推 N-1 天（含今天共 N 个
+# 日历日），「当天」就是 N=1。不按滚动的 now-N*24h 算 —— 那样「近 3 天」的边界
+# 落在当天的某个时刻，同一个需求在上午和下午筛选结果不同，数字没法复述。
+# 日界取**本地** 0 点（与 stats 里「今日完成需求」同一个日界），不硬编码时区，
+# 部署机器在哪个时区，业务日界就在哪个时区。
+#
+# ⚠️ 列表与 /stats 必须共用这一个函数：两边各写一份时间窗，chip 上的计数就会
+# 和点进去的行数对不上（「写着 17、点进去 15」是最伤信任的一类不一致）。
+def _range_since(raw):
+    """把时间范围参数解析成 UTC naive 下界；返回 None 表示不限。
+
+    接受：`today`（当天）与数字（近 N 天）；空值 / `all` / 0 / 非法值一律
+    当作「不限」—— 查询参数是用户输入，不能因为一个脏值把整个列表打挂。
+    """
+    key = str(raw if raw is not None else '').strip().lower()
+    if key in ('', 'all', 'none', '0'):
+        return None
+
+    # 本地 0 点 → UTC。datetime.now() 是本地时间，astimezone 会把缺时区的
+    # naive 值按本地解释，因此这条链路在任意部署时区下都成立。
+    local_midnight = datetime.now().replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).astimezone(timezone.utc).replace(tzinfo=None)
+
+    if key in ('today', 'day', '1', '1d'):
+        return local_midnight
+    try:
+        n = int(key.rstrip('d'))
+    except ValueError:
+        return None
+    if n <= 1:
+        return local_midnight
+    return local_midnight - timedelta(days=n - 1)
+
+
+def _created_expr(requirement_ts, fallback_first_event_ts):
+    """「创建时间」的统一表达式：需求创建时间，孤儿事件回退到首条事件时间。
+
+    孤儿事件（requirement_id 在 requirements 里查不到，实测有 requirement_id=0
+    的一批）没有创建时间。不回退的话它们会整批堆在排序末尾、且任何时间筛选
+    都筛不到，与 /stats 的「未知」桶对不上。
+    """
+    return func.coalesce(requirement_ts, fallback_first_event_ts)
+
+
+def _range_label(raw):
+    """把范围参数翻成中文短标签（列表副标题与 KPI 的窗口标注共用）。"""
+    key = str(raw if raw is not None else '').strip().lower()
+    if key in ('today', 'day', '1', '1d'):
+        return '当天'
+    if key in ('', 'all', 'none', '0'):
+        return ''
+    try:
+        n = int(key.rstrip('d'))
+    except ValueError:
+        return ''
+    return f'近 {n} 天' if n > 1 else '当天'
+
+
 # ==================== 列表 ====================
 
 @app.route('/api/admin/traces', methods=['GET'])
@@ -76,8 +138,11 @@ def _hit_rate(cached: int, reported_tokens_in: int):
 def admin_trace_list():
     """轨迹列表 —— 按需求聚合，从事件索引 GROUP BY 得出，不扫明细。
 
-    query: page, page_size, kind, status, bucket(状态桶), days(最近 N 天),
-           q(需求标题关键字)
+    query: page, page_size, kind, status, bucket(状态桶), range(时间范围),
+           sort(created|active), q(需求标题关键字)
+
+    默认排序：**创建时间倒序**。此前按「最近活跃」倒序，跑着的需求会不断把
+    自己顶到第一行，正在看的表会自己重排 —— 观感就是「排序很乱」。
     """
     from models.models import AgentEvent, Requirement, User
 
@@ -86,7 +151,12 @@ def admin_trace_list():
     kind = request.args.get('kind')
     status = request.args.get('status')
     bucket = (request.args.get('bucket') or '').strip()
-    days = request.args.get('days')
+    # 时间范围：`range` 是新参数（today / 3 / 7 / 30），`days` 作为旧参数保留兼容
+    raw_range = request.args.get('range')
+    if raw_range is None:
+        raw_range = request.args.get('days')
+    since = _range_since(raw_range)
+    sort = (request.args.get('sort') or 'created').strip().lower()
     q = (request.args.get('q') or '').strip()
 
     with transactional_db() as db:
@@ -129,6 +199,10 @@ def admin_trace_list():
             rows.c.error_count.label('error_count'),
             Requirement.title.label('title'),
             Requirement.status.label('status'),
+            # 创建时间：列表默认排序与「当天 / 近 N 天」筛选都用它，
+            # 与排序同一口径（此前排序看最近活跃、筛选也看最近活跃，
+            # 跑着的需求会不停换位置，整张表看着就是乱的）。
+            Requirement.create_time.label('created_at'),
             # 创建人：看这一列是为了回答「谁在用它」。走 outerjoin —— 孤儿事件
             # 没有 Requirement，自然也没有 User，不能因为查不到人就丢掉整行。
             User.username.label('creator'),
@@ -162,19 +236,24 @@ def admin_trace_list():
             elif bucket in STATUS_BUCKETS:
                 query = query.filter(Requirement.status.in_(STATUS_BUCKETS[bucket]))
 
-        # 时间范围：按「最近活跃」过滤，与列表默认排序同一口径。
-        # 滚动窗口（now - N 天），不做自然日对齐 —— 参数只精确到天，
-        # 假装能对齐到 0 点反而会让人以为边界是准的。
-        if days:
-            try:
-                since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
-                    days=int(days))
-                query = query.filter(rows.c.last_event_at >= since)
-            except (TypeError, ValueError):
-                pass  # 参数不是数字就当没传，不为一个查询参数把整个列表打挂
+        # 时间范围：按**创建时间**收窄，与默认排序同一口径。
+        # 孤儿事件（查不到 Requirement）没有创建时间，回退到首条事件时间 ——
+        # 否则它们永远落在窗口外，与 /stats 的「未知」桶对不上。
+        if since is not None:
+            query = query.filter(
+                _created_expr(Requirement.create_time, rows.c.started_at) >= since)
 
         total = query.count()
-        items = query.order_by(rows.c.last_event_at.desc().nullslast()).offset(
+
+        # 排序：默认创建时间倒序（新的在前）；sort=active 切回最近活跃倒序。
+        # 两个方向都必须显式 nullslast —— PG 的 DESC 默认把 NULL 排在最前，
+        # 孤儿行会整批压在真正的第一行之上。
+        if sort == 'active':
+            order = rows.c.last_event_at.desc().nullslast()
+        else:
+            order = _created_expr(
+                Requirement.create_time, rows.c.started_at).desc().nullslast()
+        items = query.order_by(order, rows.c.requirement_id.desc()).offset(
             (page - 1) * page_size).limit(page_size).all()
 
         data = []
@@ -199,6 +278,7 @@ def admin_trace_list():
                 'duration_ms': duration,
                 'started_at': _iso_utc(started),
                 'last_event_at': _iso_utc(last),
+                'created_at': _iso_utc(r.created_at),
                 'error_count': int(r.error_count or 0),
             })
 
@@ -207,6 +287,8 @@ def admin_trace_list():
             'total': total,
             'page': page,
             'page_size': page_size,
+            'range': _range_label(raw_range) or 'all',
+            'sort': sort if sort == 'active' else 'created',
         })
 
 
@@ -583,31 +665,58 @@ def admin_trace_stats():
     首页指标卡与筛选条的唯一数据源。与列表页同一口径：只聚合 `agent_events`，
     不触碰明细表（见模块 docstring 的性能约定）。
 
-    `days` 必须与列表页传同一个值。否则会出现「chip 上写着已完成 17，点进去
-    只有 15 行」—— 因为列表带时间窗、计数却按全时段算。数字对不上比没有这个
-    数字更糟，所以范围相关的指标一律按同一时间窗聚合；「今日 *」本身就是今天
-    的量，不受 `days` 影响。
+    `range` / `days` 必须与列表页传同一个值。否则会出现「chip 上写着已完成 17，
+    点进去只有 15 行」—— 因为列表带时间窗、计数却按全时段算。数字对不上比没有
+    这个数字更糟，所以范围相关的指标一律按同一时间窗聚合；「今日 *」本身就是今天
+    的量，不受窗口影响。
+
+    窗口口径与列表一致：**按需求创建时间**（孤儿事件回退首条事件时间），
+    不再是「窗口内有事件」。两边共用 `_range_since` 与 `_windowed_ids`，
+    因此 chip 上的计数与点进去的行数必然相等。
     """
     from models.models import AgentEvent, Requirement
 
-    since = None
-    raw_days = request.args.get('days')
-    if raw_days not in (None, '', '0'):
-        try:
-            since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
-                days=int(raw_days))
-        except (TypeError, ValueError):
-            since = None  # 参数脏就当没传，不为一个查询参数把整个首页打挂
+    # `range` 是新参数，`days` 保留兼容（旧前端 / 书签链接还在用）
+    raw_range = request.args.get('range')
+    if raw_range is None:
+        raw_range = request.args.get('days')
+    since = _range_since(raw_range)
 
     with transactional_db() as db:
-        def windowed(q):
-            """把查询限制在所选时间窗内；窗口为空时原样返回。
+        def _windowed_ids():
+            """窗口内的需求 id 集合；since 为空返回 None（不过滤）。
 
-            按 `AgentEvent.ts` 过滤与列表页的 `max(ts) >= since` 等价
-            （「最近一次事件落在窗内」⟺「存在事件落在窗内」），所以两边的
-            集合必然一致。
+            只算一次、两处复用（事件聚合与耗时样本），避免「同一次请求里
+            两个窗口」——那正是数字对不上的成因。
             """
-            return q if since is None else q.filter(AgentEvent.ts >= since)
+            if since is None:
+                return None
+            first = db.query(
+                AgentEvent.requirement_id.label('rid'),
+                func.min(AgentEvent.ts).label('t0'),
+            ).group_by(AgentEvent.requirement_id).subquery()
+            rows = db.query(first.c.rid).outerjoin(
+                Requirement, Requirement.id == first.c.rid
+            ).filter(
+                _created_expr(Requirement.create_time, first.c.t0) >= since
+            ).all()
+            return {r[0] for r in rows}
+
+        _ids = _windowed_ids()
+
+        def windowed(q):
+            """把查询限制在所选窗口内的**需求**上。
+
+            按 requirement_id 收窄而不是按 `AgentEvent.ts` —— 列表页筛的是
+            「某时创建的需求」，事件时间只是它的副产品。按事件时间过滤会把
+            「3 天前创建、今天还在跑」的需求从窗口里划出去，于是 chip 写 17、
+            点进去 15（这恰恰是本模块反复强调不能出现的那类不一致）。
+            """
+            if _ids is None:
+                return q
+            # 空集合直接判假：SQLAlchemy 对 `IN ()` 会告警，且语义不直观
+            return q.filter(AgentEvent.requirement_id.in_(_ids)) if _ids \
+                else q.filter(false())
 
         kind_rows = windowed(db.query(
             AgentEvent.kind, func.count(AgentEvent.id)
@@ -709,10 +818,8 @@ def admin_trace_stats():
         # （test_duration_sample_counts_only_done_requirements）。
         # 耗时跨度本身仍取全量（与列表页那一列逐行对得上），只把**样本**收窄到
         # 窗口内 —— 否则 KPI 会写「20 个样本」而「已完成」chip 只有 15。
-        windowed_ids = None
-        if since is not None:
-            windowed_ids = {rid for (rid,) in windowed(db.query(
-                func.distinct(AgentEvent.requirement_id))).all()}
+        # 复用上面同一份窗口集合，不再另算一遍（另算 = 两个窗口 = 数字对不上）。
+        windowed_ids = _ids
         dur_secs = sorted(
             (r[2] - r[1]).total_seconds() for r in span_rows
             if r[1] is not None and r[2] is not None and r[0] in done_ids
@@ -780,4 +887,6 @@ def admin_trace_stats():
                 'sample': len(dur_secs),
             },
             'writer_failures': write_failure_count(),
+            # 当前窗口与排序：前端副标题与 KPI 的窗口标注直接读，不在前端再拼一次
+            'range': _range_label(raw_range) or 'all',
         })

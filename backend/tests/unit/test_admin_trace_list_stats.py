@@ -14,7 +14,7 @@
 这些断言都用「基线 + 增量」而不是绝对值：测试库是 SQLite 文件（见 conftest 的
 `DATABASE_NAME=':memory:'`），数据会跨用例留存，写死绝对值必然变成假失败。
 """
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -56,12 +56,31 @@ def _mk_user(db):
     return u
 
 
-def _mk_req(db, user, status):
-    r = Requirement(user_id=user.id, title=f"tl-{status}", content="c", status=status)
+def _mk_req(db, user, status, title=None):
+    r = Requirement(user_id=user.id, title=title or f"tl-{status}",
+                    content="c", status=status)
     db.add(r)
     db.commit()
     db.refresh(r)
     return r
+
+
+def _set_created(db, req, when_utc):
+    """显式改创建时间（用于「按创建时间排序 / 筛选」的用例）。"""
+    req.create_time = when_utc
+    db.commit()
+    db.refresh(req)
+    return req
+
+
+def _utc_of_local(naive_local):
+    """本地 naive 时间 → 库里存的 UTC naive 时间。
+
+    与后端 `_range_since` 同一条链路：naive 值按**本地**解释再转 UTC。
+    用例里的时间都要按「业务日界」给，不能直接写 utcnow - N 天 —— 那样
+    在东八区会横跨到另一个日历日，断言会随机通过或失败。
+    """
+    return naive_local.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def _mk_event(db, requirement_id, *, seq=1, kind="llm_turn", ts=None,
@@ -249,6 +268,119 @@ def test_days_filter_narrows_and_survives_garbage(app_client, admin_token):
 
     # 参数是用户可控的：脏值应当被当成「没传」，而不是 500
     dirty = _get(app_client, admin_token, "/api/admin/traces?days=abc&page_size=5")
+    assert "items" in dirty
+
+
+# ==================== 排序 / 时间范围 ====================
+
+def test_list_sorts_by_created_time_by_default(app_client, admin_token):
+    """默认按**创建时间**倒序，且能切回最近活跃。
+
+    此前默认按最近活跃倒序：跑着的需求每推一条事件就把自己顶回第一行，
+    正在看的表会自己重排 —— 用户反馈就是「排序很乱」。
+    """
+    db = SessionLocal()
+    try:
+        u = _mk_user(db)
+        # 标题带运行号并用 q 收窄：测试库是留存的 SQLite 文件，历史行会让
+        # 这两个需求落在第 100 行之外，不收窄就永远筛不到它们。
+        tag = f"tlsort{_run}"
+        older = _mk_req(db, u, "finished", title=tag)
+        newer = _mk_req(db, u, "finished", title=tag)
+        _set_created(db, older, datetime.utcnow() - timedelta(days=6))
+        _set_created(db, newer, datetime.utcnow() - timedelta(days=1))
+        # 活跃时间故意反过来：旧需求刚刚还在跑，新需求早就没动静了
+        _mk_event(db, older.id, seq=1, ts=datetime.utcnow())
+        _mk_event(db, newer.id, seq=1, ts=datetime.utcnow() - timedelta(days=5))
+        ids = {older.id, newer.id}
+    finally:
+        db.close()
+
+    def _pos(data):
+        order = [r["requirement_id"] for r in data["items"]
+                 if r["requirement_id"] in ids]
+        return order
+
+    default = _get(app_client, admin_token,
+                   f"/api/admin/traces?page_size=100&sort=created&q={tag}")
+    seq = _pos(default)
+    assert seq == [newer.id, older.id], f"创建时间倒序应为新→旧，实际 {seq}"
+
+    # 不传 sort 时的默认行为必须与 sort=created 一致（默认参数不能是另一个口径）
+    bare = _get(app_client, admin_token,
+                f"/api/admin/traces?page_size=100&q={tag}")
+    assert _pos(bare) == seq, "不传 sort 时也必须按创建时间倒序"
+
+    active = _get(app_client, admin_token,
+                  f"/api/admin/traces?page_size=100&sort=active&q={tag}")
+    assert _pos(active) == [older.id, newer.id], "sort=active 应改按最近活跃倒序"
+
+
+def test_range_filter_windows_on_creation_day(app_client, admin_token):
+    """当天 / 近 N 天按**创建时间**收窄（自然日对齐），且与排序同一口径。
+
+    用例刻意让三条需求的「最近活跃」都是刚刚：若窗口按活跃时间算，三者会同时
+    进窗，这条断言就抓不到口径漂移。
+    """
+    local_midnight = datetime.now().replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    db = SessionLocal()
+    try:
+        u = _mk_user(db)
+        tag = f"tlrange{_run}"
+        today_req = _mk_req(db, u, "finished", title=tag)
+        d3_req = _mk_req(db, u, "finished", title=tag)
+        d10_req = _mk_req(db, u, "finished", title=tag)
+        _set_created(db, today_req,
+                     _utc_of_local(local_midnight + timedelta(hours=1)))
+        _set_created(db, d3_req,
+                     _utc_of_local(local_midnight - timedelta(days=2, hours=-1)))
+        _set_created(db, d10_req,
+                     _utc_of_local(local_midnight - timedelta(days=10)))
+        for r in (today_req, d3_req, d10_req):
+            _mk_event(db, r.id, seq=1, ts=datetime.utcnow())
+        ids = (today_req.id, d3_req.id, d10_req.id)
+    finally:
+        db.close()
+
+    def _ids_of(rng):
+        data = _get(app_client, admin_token,
+                    f"/api/admin/traces?page_size=100&range={rng}&q={tag}")
+        return {r["requirement_id"] for r in data["items"]}
+
+    today_set = _ids_of("today")
+    assert ids[0] in today_set, "今天创建的需求必须出现在「当天」"
+    assert ids[1] not in today_set and ids[2] not in today_set
+
+    d3_set = _ids_of("3")
+    assert ids[0] in d3_set and ids[1] in d3_set, "近 3 天应含今天与前 2 个日历日"
+    assert ids[2] not in d3_set
+
+    d7_set = _ids_of("7")
+    assert ids[0] in d7_set and ids[1] in d7_set
+    assert ids[2] not in d7_set
+
+    all_set = _ids_of("all")
+    assert set(ids) <= all_set, "全部时间不该筛掉任何一条"
+
+
+def test_range_counts_match_between_stats_and_list(app_client, admin_token):
+    """换用 `range` 后 chip 与列表仍必须同窗口（旧参数 `days` 同样要兼容）。
+
+    这是本文件最核心的不变式：窗口解释分散在两处时，chip 会写 17 而列表给 15。
+    """
+    for param in ("range", "days"):
+        win_stats = _get(app_client, admin_token,
+                         f"/api/admin/traces/stats?{param}=7")
+        win_list = _get(app_client, admin_token,
+                        f"/api/admin/traces?{param}=7&page_size=100")
+        assert win_stats["total_requirements"] == win_list["total"], \
+            f"{param}: chip 写 {win_stats['total_requirements']}，列表 {win_list['total']}"
+        assert sum(b["count"] for b in win_stats["status_buckets"]) \
+            == win_stats["total_requirements"]
+
+    # 脏值退化成「不过滤」，不能 500
+    dirty = _get(app_client, admin_token, "/api/admin/traces?range=abc&page_size=5")
     assert "items" in dirty
 
 

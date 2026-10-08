@@ -175,10 +175,14 @@
               <rect x="3.5" y="5" width="17" height="15.5" rx="2.5" />
               <path d="M3.5 10h17M8 3v4M16 3v4" />
             </svg>
-            <select v-model.number="days" @change="reload">
-              <option :value="0">全部时间</option>
-              <option :value="7">近 7 天</option>
-              <option :value="30">近 30 天</option>
+            <!-- 四档按**创建时间**收窄（自然日对齐：「近 3 天」= 今天 + 前 2 个日历日），
+                 与默认排序同一口径。窗口由后端 `_range_since` 唯一解释，前端不另算边界。 -->
+            <select v-model="rangeFilter" @change="reload">
+              <option value="all">全部时间</option>
+              <option value="today">当天</option>
+              <option value="3">近 3 天</option>
+              <option value="7">近 7 天</option>
+              <option value="30">近 30 天</option>
             </select>
           </div>
         </div>
@@ -222,11 +226,20 @@
             <th>需求摘要</th>
             <th class="c">状态</th>
             <th>创建人</th>
+            <!-- 两列时间都可点排序，默认按创建时间倒序：跑着的需求若按「最近活跃」
+                 排序会不停把自己顶到第一行，正在看的表会自己重排 -->
+            <th class="sortable" :class="{ on: sortKey === 'created' }"
+                @click="pickSort('created')">
+              创建时间<i class="arrow">{{ sortKey === 'created' ? '↓' : '' }}</i>
+            </th>
+            <th class="sortable" :class="{ on: sortKey === 'active' }"
+                @click="pickSort('active')">
+              最近活跃<i class="arrow">{{ sortKey === 'active' ? '↓' : '' }}</i>
+            </th>
             <th class="r">耗时</th>
             <th class="c">LLM 调用</th>
             <th class="r">Token</th>
             <th class="r">成本</th>
-            <th>最近活跃</th>
             <th class="c">操作</th>
           </tr>
         </thead>
@@ -241,7 +254,7 @@
                 <span class="chip" :class="r.turn_count > 1 ? 'chip-dialog' : 'chip-initial'">
                   {{ r.turn_count > 1 ? `${r.turn_count} 轮对话` : '初次生成' }}
                 </span>
-                <span class="req-id">#{{ r.requirement_id }} · {{ fmtTime(r.last_event_at) }}</span>
+                <span class="req-id">#{{ r.requirement_id }}</span>
               </span>
             </td>
             <td class="c">
@@ -249,6 +262,8 @@
               {{ statusLabel(r.status) }}
             </td>
             <td class="mono dim">{{ r.creator || '—' }}</td>
+            <td class="mono dim">{{ fmtDateTime(r.created_at) }}</td>
+            <td class="mono dim">{{ relTime(r.last_event_at) }}</td>
             <td class="r mono">{{ fmtDuration(r.duration_ms) }}</td>
             <td class="c mono">{{ r.llm_calls }}</td>
             <td class="r mono">
@@ -259,7 +274,6 @@
               <template v-if="r.cost > 0">{{ formatCost(r.cost) }}</template>
               <span v-else class="muted">—</span>
             </td>
-            <td class="mono dim">{{ relTime(r.last_event_at) }}</td>
             <td class="c"><span class="open-link">查看轨迹 →</span></td>
           </tr>
         </tbody>
@@ -302,6 +316,8 @@ interface TraceRow {
   duration_ms: number
   started_at: string | null
   last_event_at: string | null
+  /** 需求创建时间（孤儿事件为 null，此时列表回退用首条事件时间） */
+  created_at: string | null
   error_count: number
 }
 
@@ -329,6 +345,8 @@ interface Stats {
   active: { total: number; awaiting_user: number }
   duration: { avg_ms: number; p95_ms: number; sample: number }
   writer_failures: number
+  /** 当前时间窗口的中文标签（后端下发），前端不另算边界 */
+  range: string
 }
 
 type KindSpec = { label: string | null; color: string; stage: string | null }
@@ -363,17 +381,23 @@ const errorMsg = ref('')
 const keyword = ref('')
 const kindFilter = ref('')
 const bucketFilter = ref('')
-const days = ref(7)   // 默认近 7 天：轨迹页看的是「最近发生了什么」
+// 时间范围：'all' | 'today' | '3' | '7' | '30'。默认近 7 天 —— 轨迹页看的是
+// 「最近这批需求怎么样」，全时段会把几个月前的历史一起拉进来。
+const rangeFilter = ref('7')
+// 排序：'created' = 创建时间倒序（默认），'active' = 最近活跃倒序。
+// 默认不再是最近活跃：跑着的需求会不断刷新自己的活跃时间、不停顶到第一行，
+// 正在看的表会自己重排，观感就是「排序很乱」。
+const sortKey = ref<'created' | 'active'>('created')
 
 const maxPage = computed(() => Math.max(1, Math.ceil(total.value / PAGE_SIZE)))
 
 // 时间范围的短标签。KPI「进行中 / 平均完成耗时」跟这个下拉同窗口（否则它们
 // 会与状态 chip 对不上），不标出来就成了「同一个数字，含义随下拉静默切换」。
+// 直接读后端下发的标签 —— 窗口边界由后端 `_range_since` 唯一解释，
+// 前端再拼一份就等于承认有两个真相。
 const rangeLabel = computed(() => {
-  if (!days.value) return ''
-  if (days.value === 7) return '近 7 天'
-  if (days.value === 30) return '近 30 天'
-  return `近 ${days.value} 天`
+  const r = stats.value?.range
+  return !r || r === 'all' ? '' : r
 })
 
 // 桶 chip：计数来自后端，顺序固定。count 为 0 的「未知」不显示 ——
@@ -412,7 +436,7 @@ const deltaText = computed(() => {
 
 // 副标题：「最近更新于 N 分钟前」是判断「后台还活着吗」最快的一眼
 const subtitle = computed(() => {
-  const base = '按需求维度查看 Agent 工作流全过程 · 默认按最近活跃倒序'
+  const base = '按需求维度查看 Agent 工作流全过程 · 默认按创建时间倒序'
   const ts = stats.value?.last_event_at
   return ts ? `${base} · 最近更新于 ${relTime(ts)}` : base
 })
@@ -433,12 +457,13 @@ function fmtDuration(ms: number): string {
   return `${Math.floor(m / 60)}h ${m % 60}m`
 }
 
-function fmtTime(iso: string | null): string {
+// 创建时间要带年份：跨月/跨年的需求只显示 MM-DD 会分不清是哪一天
+function fmtDateTime(iso: string | null): string {
   if (!iso) return '—'
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return '—'
   const pad = (n: number) => String(n).padStart(2, '0')
-  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
 // 相对时间（设计稿的「2 分钟前」）。后端给的是 UTC ISO，Date 会按本地时区解析，
@@ -462,7 +487,10 @@ function buildParams(p: number, size: number): string {
   if (keyword.value.trim()) params.set('q', keyword.value.trim())
   if (kindFilter.value) params.set('kind', kindFilter.value)
   if (bucketFilter.value) params.set('bucket', bucketFilter.value)
-  if (days.value > 0) params.set('days', String(days.value))
+  if (rangeFilter.value && rangeFilter.value !== 'all') {
+    params.set('range', rangeFilter.value)
+  }
+  params.set('sort', sortKey.value)
   return params.toString()
 }
 
@@ -486,7 +514,8 @@ async function load() {
 // **必须带上当前时间范围**：状态 chip 上的计数要和列表行数相等，两边窗口
 // 不一致就会变成「写着已完成 17、点进去只有 15」。
 async function loadMeta() {
-  const qs = days.value > 0 ? `?days=${days.value}` : ''
+  const qs = rangeFilter.value && rangeFilter.value !== 'all'
+    ? `?range=${rangeFilter.value}` : ''
   try {
     stats.value = await adminFetch<Stats>(`/api/admin/traces/stats${qs}`)
   } catch (e) {
@@ -528,6 +557,13 @@ function pickKind(k: string) {
   reload()
 }
 
+// 换排序必然回到第一页：停在第 3 页换一种顺序，看到的仍是一批不相干的行
+function pickSort(s: 'created' | 'active') {
+  if (sortKey.value === s) return
+  sortKey.value = s
+  reload()
+}
+
 function open(id: number) {
   router.push(`/admin/traces/${id}`)
 }
@@ -556,13 +592,14 @@ async function exportCsv() {
     // 成本列在表头声明单位、单元格保持纯数值：带上 ¥ 前缀 Excel 会当文本，就没法求和了
     const header = ['需求编号', '标题', '创建人', '状态', '对话轮次', '事件数',
       'LLM 调用', '工具调用', 'Token', '成本(元)', '耗时(秒)',
-      '开始时间', '最近活跃']
+      '创建时间', '开始时间', '最近活跃']
     const lines = [header.map(csvCell).join(',')]
     for (const r of all) {
       lines.push([
         r.requirement_id, r.title, r.creator, statusLabel(r.status), r.turn_count,
         r.event_count, r.llm_calls, r.tool_calls, r.tokens, r.cost.toFixed(6),
-        Math.round(r.duration_ms / 1000), r.started_at ?? '', r.last_event_at ?? '',
+        Math.round(r.duration_ms / 1000), r.created_at ?? '',
+        r.started_at ?? '', r.last_event_at ?? '',
       ].map(csvCell).join(','))
     }
 
@@ -723,6 +760,11 @@ onMounted(() => {
 .trace-table tbody tr:last-child td { border-bottom: none; }
 /* 末列贴边太紧时「查看轨迹 →」的箭头会被压出视野，给最后一列留出内边距 */
 .trace-table th:last-child, .trace-table td:last-child { padding-right: 20px; }
+/* 可点排序的表头：默认「创建时间」生效，箭头只标在当前生效的那一列上 */
+.trace-table th.sortable { cursor: pointer; user-select: none; }
+.trace-table th.sortable:hover { color: var(--accent); }
+.trace-table th.sortable.on { color: var(--accent); }
+.arrow { font-style: normal; margin-left: 3px; }
 .c { text-align: center; }
 .r { text-align: right; }
 .mono { font-variant-numeric: tabular-nums; font-family: var(--font-mono); font-size: 12px; }
