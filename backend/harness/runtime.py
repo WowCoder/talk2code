@@ -115,10 +115,12 @@ class ToolCallLoop:
         db = None
         if req_id:
             try:
-                from models.models import SessionLocal
+                # 取 session 走 trace_db：生产等同 SessionLocal，评测模式下列
+                # TALK2CODE_TRACE_DB 指向独立库（见 trace_db 模块说明）。
+                from harness.observability.trace_db import trace_session
                 from harness.observability.trace_writer import TraceWriter
                 md = state.get("metadata") or {}
-                db = SessionLocal()
+                db = trace_session()
                 self._trace_writer = TraceWriter(
                     db, requirement_id=req_id,
                     trace_id=md.get("trace_id") or None,

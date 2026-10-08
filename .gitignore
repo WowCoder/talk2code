@@ -13,6 +13,9 @@ deploy/
 # Eval 运行产物（基线报告不纳入版本控制，保持 results/ 为生成态）
 eval/results/
 
+# Eval 单次运行目录：trace.db（过程）+ run.json（结果摘要），同样是生成态
+eval/runs/
+
 # 数据库文件
 *.db
 *.sqlite

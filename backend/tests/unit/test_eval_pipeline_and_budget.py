@@ -23,9 +23,12 @@
 
 import ast
 import importlib.util
+import json
 import shutil
 import tempfile
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -153,6 +156,36 @@ def test_run_eval_defaults_to_real_planning():
     src = _run_eval_source()
     assert "from harness.instructions.nodes import coder_node" in src, (
         "run_one_task 必须走真实 coder_node（否则 tool_thinking / 契约 / Phase2 补全全丢）"
+    )
+
+
+def test_main_snapshots_progress_after_every_task():
+    """主循环里**每跑完一题**都要落一次进度快照（含 resume 跳过的分支）。
+
+    这是「跑的时候能逐题看到成绩」的唯一来源：漏掉任何一条追加 `results` 的
+    分支，那一类题在整轮里都不会出现在页面上，而且不会有任何报错 ——
+    典型的静默退化。所以按 AST 数调用次数，而不是靠 grep 看个大概。
+    """
+    tree = ast.parse(_run_eval_source())
+    main = next(n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == "main")
+    loop = next(n for n in ast.walk(main)
+                if isinstance(n, ast.For)
+                and isinstance(n.target, ast.Tuple)
+                and any(isinstance(t, ast.Name) and t.id == "task"
+                        for t in n.target.elts))
+    snaps = [n for n in ast.walk(loop)
+             if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Name) and n.func.id == "snap"]
+    appends = [n for n in ast.walk(loop)
+               if isinstance(n, ast.Call)
+               and isinstance(n.func, ast.Attribute)
+               and n.func.attr == "append"
+               and isinstance(n.func.value, ast.Name)
+               and n.func.value.id == "results"]
+    assert len(snaps) == len(appends) == 2, (
+        f"每条追加 results 的分支（正常 + resume 跳过）后面都要跟一次快照，"
+        f"当前 snap={len(snaps)} append={len(appends)}"
     )
 
 
@@ -575,3 +608,44 @@ def test_syntax_only_excludes_broken_references():
         )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------- 7. 运行中的进度快照 ----------
+
+def test_write_progress_is_atomic_and_handed_over_to_run_json(monkeypatch):
+    """进度快照：每跑完一题写一次，最终由 run.json 接管。
+
+    两个容易做错的地方：
+      · **写要原子**（先写 .tmp 再 os.replace）。后台随时可能在读它，
+        读到写了一半的 JSON 会解析失败 —— 页面会在一次运行中途闪成「不存在」。
+      · **交接要干净**。run.json 落盘后快照必须消失，否则「结果侧」有两个
+        来源，而其中一个还写着「进行中」。
+    """
+    mod = _load_run_eval()
+    monkeypatch.setattr(mod, "_resolve_model_name", lambda: "agnes-3.0-flash")
+    run_dir = Path(tempfile.mkdtemp())
+    try:
+        args = SimpleNamespace(with_plan=True, with_memory=False,
+                               no_preview=False, tasks=None)
+        r = mod.TaskResult(id="t01", name="个人名片页", level=1, passed=True,
+                           duration_s=12.3)
+
+        mod.write_progress(run_dir, args=args, started_at=time.time(),
+                           results=[r], tasks_total=21)
+
+        snap = run_dir / "progress.json"
+        payload = json.loads(snap.read_text(encoding="utf-8"))
+        assert payload["tasks_total"] == 21
+        assert payload["model"] == "agnes-3.0-flash"
+        assert [t["id"] for t in payload["tasks"]] == ["t01"]
+        assert payload["tasks"][0]["passed"] is True
+        assert not (run_dir / "progress.json.tmp").exists(), (
+            "临时文件必须被 os.replace 换掉，不能留在目录里被当成数据库文件"
+        )
+
+        mod.write_run_manifest(run_dir, args=args, started_at=time.time(),
+                               results=[r])
+        assert (run_dir / "run.json").exists()
+        assert not snap.exists(), "run.json 落盘后不能留着写着「进行中」的快照"
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)

@@ -676,8 +676,8 @@ def _open_writer(requirement_id, trace_id=None, turn_index=0):
     传 `writer=` 复用调用方持有的长 writer，省掉每事件一次的 session 创建与
     MAX(seq) 查询（见 TraceWriter 的 run 级复用约定）。
     """
-    from models.models import SessionLocal
-    db = SessionLocal()
+    from harness.observability.trace_db import trace_session
+    db = trace_session()
     return db, TraceWriter(db, requirement_id=requirement_id,
                            trace_id=trace_id, turn_index=turn_index)
 
