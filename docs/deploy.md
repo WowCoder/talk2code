@@ -305,9 +305,26 @@ pip install --no-deps /tmp/torch.whl
 grep -vE "^--extra-index-url|^torch==" requirements.lock > /tmp/req-rest.txt
 pip install -r /tmp/req-rest.txt
 
-# ③ 浏览器（走 npmmirror；playwright.azureedge.net 在大陆很慢）
-PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright playwright install chromium
+# ③ 浏览器内核（走 npmmirror；playwright 官方 CDN 在大陆拉不动）
+# ★ pip 装了 playwright ≠ 装了内核。缺内核时服务端所有 chromium launch 直接失败，
+#   AC 逐条验收 / 冒烟 / 截图会**静默**回退「直读工作区文件」——冒烟甚至打印
+#   available=True 的假绿（它是读本地文件判的），验收链路形同虚设。
+#   内核落到 /opt/talk2code/.pw-browsers（不依赖 HOME），并在步骤 8 的
+#   两个 systemd unit 里写 PLAYWRIGHT_BROWSERS_PATH 指向它。
+export PLAYWRIGHT_BROWSERS_PATH=/opt/talk2code/.pw-browsers
+PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright playwright install chromium
 '
+
+# ★ 光"装完"不算数：`playwright install` 只下载、不校验能否启动。
+#   真拉起一次，不过就别往下走（宁可部署失败，也别带着"验收永远假绿"上线）。
+sudo -u talk2code -H env PLAYWRIGHT_BROWSERS_PATH=/opt/talk2code/.pw-browsers \
+  /opt/talk2code/backend/venv/bin/python - <<'PY'
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    b = p.chromium.launch(headless=True)
+    print("chromium 启动正常:", b.version)
+    b.close()
+PY
 ```
 
 > 校验：`backend/venv/bin/python -c "import torch;print(torch.__version__)"` → `2.13.0+cpu`
@@ -403,6 +420,9 @@ WorkingDirectory=/opt/talk2code/backend
 Environment="PYTHONPATH=/opt/talk2code/backend"
 # 模型缓存失效时会在线补下，国内必须指向镜像
 Environment="HF_ENDPOINT=https://hf-mirror.com"
+# ★ Playwright 内核路径，必须与步骤 4 的安装路径一致，且两个 unit 都要写。
+#   漏写 → 服务进程找不到内核 → 验收链路静默降级（见步骤 4 与「验收链路自检」）
+Environment="PLAYWRIGHT_BROWSERS_PATH=/opt/talk2code/.pw-browsers"
 Environment="PYTHONUNBUFFERED=1"
 ExecStart=/opt/talk2code/backend/venv/bin/gunicorn \
   -w 2 -k gthread --threads 8 \
@@ -614,6 +634,42 @@ nc -zv <公网IP> 6380 ; nc -zv <公网IP> 5434
 4. 「一键发布」→ 拿到 `https://<slug>.<APEX>` 链接且可访问
 5. 刷新详情页 → 进度条与文案能恢复（进度快照生效）
 6. 后台 `/admin` → 轨迹列表、评测列表有数据
+
+### 验收链路自检（必做）
+
+平台的核心承诺是「AI 写的代码真的能跑」，而这条链路有**两处不会报错、只会静默降级**
+的失效方式 —— 不查就会带着「验收永远假绿」上线（实测踩过，见下）。逐条核对：
+
+```bash
+# ① Playwright 内核在不在 + 能不能真启动（缺内核 → 验收全走"直读文件"）
+sudo -u talk2code env PLAYWRIGHT_BROWSERS_PATH=/opt/talk2code/.pw-browsers \
+  /opt/talk2code/backend/venv/bin/python -c \
+  "from playwright.sync_api import sync_playwright as S; p=S().start(); b=p.chromium.launch(headless=True); print('ok', b.version); b.close()"
+
+# ② 预览载荷不能带 X-Frame-Options（带了 → file:// 宿主页的 iframe 根本不导航）
+#    期望：只有 Content-Security-Policy，没有 X-Frame-Options
+URL=$(cd /opt/talk2code/backend && sudo -u talk2code env PYTHONPATH=. \
+      venv/bin/python -c "from utils.preview_token import make_preview_url as m; print(m(1,1,'index.html',absolute=True))")
+curl -sI "$URL" | grep -iE "x-frame-options|content-security-policy"
+#    对照：主站必须仍然是 SAMEORIGIN
+curl -sI http://127.0.0.1:5001/api/health | grep -i x-frame-options
+
+# ③ 跑一条真实需求后，日志里不该有降级标记
+journalctl -u talk2code-celery -n 300 | grep -c "沙箱预览链路不可用"   # 期望 0
+```
+
+②的原因：服务端验收浏览器的宿主页是 `file://` 临时文件（见
+`preview_runner._make_sandbox_wrapper_uri`），与预览地址**跨源**。预览响应一旦带上
+`X-Frame-Options: SAMEORIGIN`，iframe 直接不导航 → `frame.url` 为空 → 命中
+`_frame_load_failure()` 的「页面未导航 (url=空)」→ AC 逐条验收 / 冒烟 / 截图**全部**
+回退直读工作区文件，而冒烟还会输出 `available=True, page_loads=True`（它是读本地
+文件判的）。预览载荷真正的隔离来自 `CSP: sandbox allow-scripts allow-forms`
+（唯一 opaque origin，读不到 cookie / localStorage、够不到父页），故它必须豁免 XFO；
+主站与 `<slug>.<APEX>` 已发布站点照常 `SAMEORIGIN`。守卫：
+`backend/tests/unit/test_security_headers.py`。
+
+> 另需确认 `PREVIEW_PUBLIC_BASE_URL` **留空**（同源反代部署的正确取值）：它只被
+> 服务端验收浏览器消费，填上公网域名等于让验证浏览器绕自己的公网地址一圈。
 
 ---
 

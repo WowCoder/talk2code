@@ -67,7 +67,18 @@ chown -R "$RUN_USER:$RUN_USER" "$APP_DIR"
 
 # ==================== 4/9 后端环境 ====================
 log "[4/9] 后端 venv + Python 依赖 + Playwright 浏览器"
-sudo -u "$RUN_USER" -H bash -c "
+# ★ Playwright 浏览器内核：pip 装了 playwright **不等于**装了内核。缺内核时
+#   服务端所有 `chromium launch` 直接失败 → AC 逐条验收 / 冒烟 / 截图**静默**
+#   回退「直读工作区文件」（冒烟还会打印 available=True 的假绿，因为它是读本地
+#   文件判的）→ 验收链路形同虚设，日志里只有一句「沙箱预览链路不可用」。
+#   内核放 $APP_DIR 下（不依赖 HOME），并同步写进两个 systemd unit。
+#   国内网络：走 npmmirror 镜像，playwright 官方 CDN 通常拉不动。
+PW_BROWSERS="$APP_DIR/.pw-browsers"
+PW_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
+sudo -u "$RUN_USER" -H env \
+  PLAYWRIGHT_BROWSERS_PATH="$PW_BROWSERS" \
+  PLAYWRIGHT_DOWNLOAD_HOST="$PW_DOWNLOAD_HOST" \
+  bash -c "
   set -e
   cd '$APP_DIR/backend'
   [ -d venv ] || $PY -m venv venv
@@ -83,6 +94,17 @@ sudo -u "$RUN_USER" -H bash -c "
   fi
   playwright install chromium
 "
+# 真拉起一次内核才算装好（`playwright install` 只下载、不校验能否启动）。
+# 这一步不过就直接终止：宁可部署失败，也不要带着「验收永远假绿」上线。
+sudo -u "$RUN_USER" -H env PLAYWRIGHT_BROWSERS_PATH="$PW_BROWSERS" \
+  "$APP_DIR/backend/venv/bin/python" - <<'PY' \
+  || { echo "Playwright 内核无法启动（验收链路会静默降级），终止"; exit 1; }
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    _b = p.chromium.launch(headless=True)
+    print("    chromium 启动正常:", _b.version)
+    _b.close()
+PY
 # requirements.txt 已含 gunicorn；这里只做确认，避免静默降级到开发服务器
 sudo -u "$RUN_USER" -H "$APP_DIR/backend/venv/bin/gunicorn" --version >/dev/null \
   || { echo "gunicorn 安装失败，终止"; exit 1; }
@@ -161,6 +183,7 @@ User=$RUN_USER
 Group=$RUN_USER
 WorkingDirectory=$APP_DIR/backend
 Environment="PYTHONPATH=$APP_DIR/backend"
+Environment="PLAYWRIGHT_BROWSERS_PATH=$APP_DIR/.pw-browsers"
 Environment="PYTHONUNBUFFERED=1"
 ExecStart=$APP_DIR/backend/venv/bin/gunicorn \\
   -w 2 -k gthread --threads 8 \\
@@ -187,6 +210,7 @@ User=$RUN_USER
 Group=$RUN_USER
 WorkingDirectory=$APP_DIR/backend
 Environment="PYTHONPATH=$APP_DIR/backend"
+Environment="PLAYWRIGHT_BROWSERS_PATH=$APP_DIR/.pw-browsers"
 ExecStart=$APP_DIR/backend/venv/bin/celery \\
   -A celery_app.celery_app worker --loglevel=info --concurrency=1
 Restart=always
@@ -236,13 +260,16 @@ cat <<EOF
 
 ==> 部署脚本执行完毕。
 
-必须手工完成的三件事：
+必须手工完成的四件事：
   1) 在 $APP_DIR/backend/.env 填入真实 LLM_API_KEY，然后：
        systemctl restart talk2code talk2code-celery
   2) 创建后台管理员与邀请码（注册强制要求邀请码）：
        cd $APP_DIR/backend && sudo -u $RUN_USER venv/bin/python manage.py admin create-user --username ops
        cd $APP_DIR/backend && sudo -u $RUN_USER venv/bin/python manage.py invite create --count 20
   3) 若需「一键发布」到 *.$APEX，先申请泛域名证书并在 nginx 确认已包含该 server 块。
+  4) ★ 跑一条真实需求，确认日志里**没有**「沙箱预览链路不可用」——有就说明验收
+     在静默降级（见 docs/deploy.md 的「验收链路自检」）：
+       journalctl -u talk2code-celery -n 200 | grep -c "沙箱预览链路不可用"   # 期望 0
 
 验收：curl -sI https://$DOMAIN/ ；文档：docs/deploy.md
 EOF
