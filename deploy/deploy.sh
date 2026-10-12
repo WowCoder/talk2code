@@ -17,22 +17,19 @@ REPO=https://github.com/WowCoder/talk2code.git
 DOMAIN="${1:?用法: sudo bash deploy.sh <域名> [apex]}"
 APEX="${2:-$DOMAIN}"
 RUN_USER=talk2code
-PY=/usr/bin/python3.11
+PY=/usr/bin/python3.10
+[ -x "$PY" ] || PY=/usr/bin/python3   # 兜底：系统默认 python3
 
 log()  { echo "==> $*"; }
 warn() { echo "    [注意] $*"; }
 
 # ==================== 1/9 系统依赖 ====================
-log "[1/9] 安装系统依赖（Python3.11 / Node20 / Nginx / Docker / Playwright 系统库）"
+log "[1/9] 安装系统依赖（Python3.10 / Node20 / Nginx / Docker / Playwright 系统库）"
 apt-get update -y
 apt-get install -y software-properties-common curl ca-certificates gnupg lsof
 
-# 已装则跳过，避免重复 add-apt-repository 拖慢
-if ! apt-cache policy python3.11 2>/dev/null | grep -q 'Candidate: [0-9]'; then
-  add-apt-repository -y ppa:deadsnakes/ppa
-  apt-get update -y
-fi
-apt-get install -y python3.11 python3.11-venv python3.11-dev python3-pip nginx git
+# Ubuntu 22.04 官方源自带 Python 3.10.12，无需 deadsnakes PPA
+apt-get install -y python3.10 python3.10-venv python3.10-dev python3-pip nginx git
 
 # Docker（用 compose v2 插件，docker-compose v1 已停止维护）
 apt-get install -y docker.io docker-compose-plugin
@@ -74,7 +71,12 @@ sudo -u "$RUN_USER" -H bash -c "
   [ -d venv ] || $PY -m venv venv
   source venv/bin/activate
   pip install -q --upgrade pip
-  pip install -q -r requirements.txt
+  if [ -f requirements.lock ]; then
+    pip install -q -r requirements.lock
+  else
+    echo '[warn] requirements.lock 缺失，回退 requirements.txt（版本不可复现）'
+    pip install -q -r requirements.txt
+  fi
   playwright install chromium
 "
 # requirements.txt 已含 gunicorn；这里只做确认，避免静默降级到开发服务器

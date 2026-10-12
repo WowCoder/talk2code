@@ -38,7 +38,7 @@
 | 6  | **P2** | 无全局安全响应头（无 HSTS / X-Frame-Options / CSP），可被 iframe 点击劫持 | `backend/factory.py:42-53`                                          |
 | 7  | **P2** | JWT 前台有效期 24h，且改密/登出后旧 token 不失效                        | `backend/config.py:115-123`                                         |
 | 8  | **P2** | `/api/market/users/<id>` 免登录返回用户名，可枚举用户名辅助撞库            | `backend/routes/market.py:469-500`                                  |
-| 9  | **P2** | 依赖全部 `>=` 无上界，新机器装出的版本不可复现、难审计 CVE                      | `backend/requirements.txt`                                          |
+| 9  | **P2** | ✅ 已锁定：新增 `backend/requirements.lock`（用 Python 3.10 环境生成，钉到**本机已验证**的版本） | `backend/requirements.lock`                                          |
 | 10 | **P2** | `DATABASE_URL` 为空时静默回退 SQLite，多 worker 下写锁竞争            | `backend/config.py:38-57`                                           |
 | 11 | 🟡     | `.env` 明文存 LLM API Key（已被 gitignore，未入库），需控权限与分发范围      | `backend/.env:49`                                                   |
 
@@ -165,7 +165,13 @@ def _security_headers(resp):
 
 - **#7 JWT 24h**：公网建议缩到 8h 以下，并引入 `jti` + 吊销表；当前改密/登出后旧 token 仍有效。
 - **#8 用户名枚举**：`/api/market/users/<id>` 改为只返回聚合计数，或加 `@jwt_required()`。
-- **#9 依赖锁定**：`pip freeze > requirements.lock`，部署用 `-r requirements.lock`。
+- **#9 依赖锁定**：✅ 已做。`backend/requirements.lock` 由 `pip-compile` 在 **Python 3.10 容器**中生成
+  （服务器版本 3.10.12），并用**本机已验证的版本**做约束。
+  **为什么不直接解析「最新」**：`requirements.txt` 全是 `>=`，裸解析会装到 `sentence-transformers 6.1.0`
+  / `transformers 5.19.0` / `numpy 2.2.6`，而本机跑通 1267 个测试的组合是 `2.7.0` / `4.57.6` / `1.26.4`
+  —— 跨了 4 个与 1 个大版本，BGE-M3 检索链路有真实破坏风险。锁文件的基准必须是「验证过的环境」。
+  ⚠️ 已知遗留：PyPI 的 Linux `torch` 会拖 15 个 `nvidia-*` 加 `triton`（约 2–3 GB）。无 GPU 的机器建议改用
+  CPU 版：加 `--extra-index-url https://download.pytorch.org/whl/cpu`。
 - **#10 SQLite 回退**：把「`APP_DEBUG=false` + `DATABASE_URL` 为空」加入  
   `factory.py::check_production_security()` 的 `fatal_issues`。
 
@@ -202,9 +208,8 @@ def _security_headers(resp):
 sudo apt-get update -y
 sudo apt-get install -y software-properties-common curl ca-certificates gnupg lsof
 
-sudo add-apt-repository -y ppa:deadsnakes/ppa
-sudo apt-get update -y
-sudo apt-get install -y python3.11 python3.11-venv python3.11-dev python3-pip nginx git
+# Ubuntu 22.04 官方源自带 Python 3.10.12，无需 deadsnakes PPA
+sudo apt-get install -y python3.10 python3.10-venv python3.10-dev python3-pip nginx git
 
 # Node.js 20（前端构建）
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -
@@ -248,11 +253,10 @@ sudo chown -R talk2code:talk2code /opt/talk2code
 ```bash
 sudo -u talk2code -H bash -c '
 cd /opt/talk2code/backend
-python3.11 -m venv venv
+python3.10 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
-pip install -r requirements.txt
-pip install "gunicorn>=21.2.0"          # P0-2：requirements.txt 里没有
+pip install -r requirements.lock          # 版本锁定（在 3.10 下生成，钉本机已验证版本）
 playwright install chromium
 '
 ```
