@@ -71,11 +71,13 @@ sudo -u "$RUN_USER" -H bash -c "
   [ -d venv ] || $PY -m venv venv
   source venv/bin/activate
   pip install -q --upgrade pip
+  # torch 用 CPU 版（部署机无 GPU，不需要 PyPI 那 2–3 GB 的 nvidia-*/triton）；
+  # 锁文件里也带了该 index 指令，这里显式给一份以覆盖回退 requirements.txt 的分支
   if [ -f requirements.lock ]; then
-    pip install -q -r requirements.lock
+    pip install -q --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.lock
   else
     echo '[warn] requirements.lock 缺失，回退 requirements.txt（版本不可复现）'
-    pip install -q -r requirements.txt
+    pip install -q --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
   fi
   playwright install chromium
 "

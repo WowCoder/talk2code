@@ -8,16 +8,21 @@
 # 所以这里只钉「版本跳跃大、且已被验证过」的关键包；其余交给解析器在
 # Python 3.10（服务器版本 3.10.12）下自选兼容版本，保证依赖图自洽。
 #
+# torch 用 CPU 版：PyPI 的 Linux torch 会拖 15 个 nvidia-* 加 triton（约 2–3 GB），
+# 而部署机无 GPU，装了纯属浪费磁盘与安装时间。带 "+cpu" 后缀的版本只存在于
+# https://download.pytorch.org/whl/cpu，所以解析与安装都要带 --extra-index-url。
+#
 # 重新生成 lock（需要 Docker；必须用 3.10，本机 macOS 解析出的二进制包在
 # Linux 服务器可能装不上）：
 #   docker run --rm -v "$PWD":/w -w /w python:3.10-slim sh -c \
 #     "python -m venv /tmp/v && /tmp/v/bin/pip install -q pip-tools && \
 #      /tmp/v/bin/pip-compile --resolver=backtracking \
+#        --extra-index-url https://download.pytorch.org/whl/cpu \
 #        -c requirements.constraints -o requirements.lock requirements.txt"
 
 sentence-transformers==2.7.0
 transformers==4.57.6
 tokenizers==0.22.2
 numpy==1.26.4
-torch==2.13.0
+torch==2.13.0+cpu
 gunicorn==21.2.0

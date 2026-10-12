@@ -170,8 +170,9 @@ def _security_headers(resp):
   **为什么不直接解析「最新」**：`requirements.txt` 全是 `>=`，裸解析会装到 `sentence-transformers 6.1.0`
   / `transformers 5.19.0` / `numpy 2.2.6`，而本机跑通 1267 个测试的组合是 `2.7.0` / `4.57.6` / `1.26.4`
   —— 跨了 4 个与 1 个大版本，BGE-M3 检索链路有真实破坏风险。锁文件的基准必须是「验证过的环境」。
-  ⚠️ 已知遗留：PyPI 的 Linux `torch` 会拖 15 个 `nvidia-*` 加 `triton`（约 2–3 GB）。无 GPU 的机器建议改用
-  CPU 版：加 `--extra-index-url https://download.pytorch.org/whl/cpu`。
+  `torch` 用 **CPU 版**（`2.13.0+cpu`，来自 `--extra-index-url https://download.pytorch.org/whl/cpu`）：
+  PyPI 的 Linux `torch` 会拖 15 个 `nvidia-*` 加 `triton`（约 2–3 GB），部署机无 GPU 用不上。
+  该 index 指令已写进锁文件，`pip install -r requirements.lock` 会自动读取。
 - **#10 SQLite 回退**：把「`APP_DEBUG=false` + `DATABASE_URL` 为空」加入  
   `factory.py::check_production_security()` 的 `fatal_issues`。
 
@@ -257,6 +258,7 @@ python3.10 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.lock          # 版本锁定（在 3.10 下生成，钉本机已验证版本）
+                                          # 锁文件自带 --extra-index-url pytorch/whl/cpu，torch 自动走 CPU 版
 playwright install chromium
 '
 ```
