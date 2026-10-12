@@ -31,8 +31,10 @@ apt-get install -y software-properties-common curl ca-certificates gnupg lsof
 # Ubuntu 22.04 官方源自带 Python 3.10.12，无需 deadsnakes PPA
 apt-get install -y python3.10 python3.10-venv python3.10-dev python3-pip nginx git
 
-# Docker（用 compose v2 插件，docker-compose v1 已停止维护）
-apt-get install -y docker.io docker-compose-plugin
+# Docker（compose v2）。注意包名：Ubuntu 官方源里叫 docker-compose-v2，
+# docker-compose-plugin 是 Docker 官方 apt 仓库的包名、在官方源中不存在 ——
+# 两者混写会让整条 apt 命令因 "Unable to locate package" 失败，连 docker 都装不上。
+apt-get install -y docker.io docker-compose-v2
 
 # Node.js 20（前端构建需要）
 if ! command -v node >/dev/null 2>&1; then

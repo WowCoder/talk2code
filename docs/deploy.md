@@ -222,21 +222,44 @@ sudo apt-get install -y libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2
   libpango-1.0-0 libcairo2 libasound2 libatspi2.0-0
 
 # Docker（仅用于跑 PostgreSQL / Redis）
-sudo apt-get install -y docker.io docker-compose-plugin
+# ⚠️ Ubuntu 官方源的包名是 docker-compose-v2；docker-compose-plugin 是 Docker
+#    官方 apt 仓库的包名、在官方源里不存在 —— 混写会让整条命令因
+#    "Unable to locate package" 失败，连 docker.io 都装不上。
+sudo apt-get install -y docker.io docker-compose-v2
 sudo usermod -aG docker "$USER"   # 重新登录后生效
+
+# 腾讯云机器建议配内网镜像加速（拉 pgvector / redis 镜像用）
+sudo mkdir -p /etc/docker
+echo '{"registry-mirrors":["https://mirror.ccs.tencentyun.com"]}' | sudo tee /etc/docker/daemon.json
+sudo systemctl restart docker
 ```
 
 ### 步骤 2：获取代码
 
+**先判断服务器能否直连 GitHub。** 大陆节点常见 TLS 干扰，实测报
+`GnuTLS recv error (-110): The TLS connection was non-properly terminated.`，
+直连、`gitclone.com`（504）、`ghfast.top` 等镜像均不可用。最可靠的是从**开发机**打包上传：
+
+```bash
+# ① 在开发机（能访问 GitHub）
+git bundle create /tmp/talk2code.bundle main
+scp /tmp/talk2code.bundle root@<SERVER_IP>:/root/
+
+# ② 在服务器
+rm -rf /opt/talk2code
+git clone -q -b main /root/talk2code.bundle /opt/talk2code
+git -C /opt/talk2code remote set-url origin https://github.com/WowCoder/talk2code.git
+```
+
+若服务器能直连 GitHub，可简化为：
+
 ```bash
 sudo mkdir -p /opt && cd /opt
 sudo git clone https://github.com/WowCoder/talk2code.git talk2code
-cd /opt/talk2code
-
-# 若改用 rsync 从本地推送，务必排除本地 .env：
-# rsync -av --exclude 'backend/.env*' --exclude 'node_modules/' --exclude 'venv/' \
-#       --exclude 'tmp/' --exclude 'logs/' ./ user@server:/opt/talk2code/
 ```
+
+> 后续更新同理：本地 `git bundle create /tmp/inc.bundle <新提交范围>` → `scp` →
+> 服务器 `git pull /root/inc.bundle main`。
 
 
 ### 步骤 3：建运行用户
@@ -251,33 +274,67 @@ sudo chown -R talk2code:talk2code /opt/talk2code
 
 ### 步骤 4：后端环境
 
+**先把 pip / npm 源换成国内镜像**（实测默认源下载速率低至 24–36 KB/s）：
+
+```bash
+# pip：清华源（腾讯云内网源 mirrors.cloud.tencent.com 实测回源很慢）
+sudo -u talk2code -H mkdir -p /home/talk2code/.pip
+printf '[global]\nindex-url = https://pypi.tuna.tsinghua.edu.cn/simple\ntrusted-host = pypi.tuna.tsinghua.edu.cn\ntimeout = 120\n' \
+  | sudo tee /home/talk2code/.pip/pip.conf >/dev/null
+sudo chown -R talk2code:talk2code /home/talk2code/.pip
+
+sudo -u talk2code -H npm config set registry https://registry.npmmirror.com
+```
+
+装依赖时 **torch 必须单独装**：锁文件里 `torch==2.13.0+cpu` 只存在于
+`download.pytorch.org`，pip 会把它当成一个 index 去解析，并连带从该 index 拉
+numpy / networkx 等依赖 —— 实测这些包会掉到 30 KB/s 并卡死。拆成三步即可：
+
 ```bash
 sudo -u talk2code -H bash -c '
 cd /opt/talk2code/backend
 python3.10 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
-pip install -r requirements.lock          # 版本锁定（在 3.10 下生成，钉本机已验证版本）
-                                          # 锁文件自带 --extra-index-url pytorch/whl/cpu，torch 自动走 CPU 版
-playwright install chromium
+
+# ① torch：curl 直下 wheel（实测 4.8 MB/s），不让 pip 参与解析
+curl -o /tmp/torch.whl "https://download.pytorch.org/whl/cpu/torch-2.13.0%2Bcpu-cp310-cp310-manylinux_2_28_x86_64.whl"
+pip install --no-deps /tmp/torch.whl
+
+# ② 其余依赖走清华源（剔除锁文件里的 pytorch index 与 torch 行）
+grep -vE "^--extra-index-url|^torch==" requirements.lock > /tmp/req-rest.txt
+pip install -r /tmp/req-rest.txt
+
+# ③ 浏览器（走 npmmirror；playwright.azureedge.net 在大陆很慢）
+PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright playwright install chromium
 '
 ```
 
-预下载 BGE-M3 模型（避免线上首次检索卡住）：
+> 校验：`backend/venv/bin/python -c "import torch;print(torch.__version__)"` → `2.13.0+cpu`
+
+预下载 BGE-M3 模型（约 2.3GB，避免线上首次检索卡 1–2 分钟）。
+
+**必须带 HF 镜像，并装 `hf_transfer`**：不加镜像在国内下不动；不加 `hf_transfer`
+实测只有约 100 KB/s（2.3GB 要下数小时），加上后实测 8.7 MB/s。
 
 ```bash
 sudo -u talk2code -H bash -c '
 cd /opt/talk2code/backend && source venv/bin/activate
-python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer(\"BAAI/bge-m3\", device=\"cpu\")"
+pip install hf_transfer
+HF_ENDPOINT=https://hf-mirror.com HF_HUB_ENABLE_HF_TRANSFER=1 \
+  python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer(\"BAAI/bge-m3\", device=\"cpu\")"
 '
 ```
+
+> 服务运行期同样需要 `HF_ENDPOINT`（缓存失效时会在线补下），已在 systemd unit 中
+> 写入 `Environment="HF_ENDPOINT=https://hf-mirror.com"`（见步骤 8）。
 
 ### 步骤 5：前端构建
 
 ```bash
 sudo -u talk2code -H bash -c '
 cd /opt/talk2code/frontend-vue
-npm install
+npm ci --silent        # 有 package-lock.json 时用 ci：可复现、更快
 npm run build
 '
 ```
@@ -344,6 +401,8 @@ User=talk2code
 Group=talk2code
 WorkingDirectory=/opt/talk2code/backend
 Environment="PYTHONPATH=/opt/talk2code/backend"
+# 模型缓存失效时会在线补下，国内必须指向镜像
+Environment="HF_ENDPOINT=https://hf-mirror.com"
 Environment="PYTHONUNBUFFERED=1"
 ExecStart=/opt/talk2code/backend/venv/bin/gunicorn \
   -w 2 -k gthread --threads 8 \
@@ -485,8 +544,15 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ```bash
 sudo apt-get install -y certbot python3-certbot-nginx
-sudo certbot --nginx -d <DOMAIN>
+sudo certbot --nginx -d <DOMAIN> -d www.<DOMAIN> \
+  --non-interactive --agree-tos -m admin@<DOMAIN> --redirect
 ```
+
+> ⚠️ **`server_name` 必须同时包含 www**（步骤 9 主站块已配）。certbot 申请多域名证书时，
+> 只要有一个域名在 nginx 配置里找不到匹配的 `server_name`，它会判定安装失败并
+> **回滚整个 443 部署** —— 证书签下来了，但 nginx 配置一点没改，表现就是「证书有了、
+> HTTPS 却打不开」。修法：补全 `server_name` 后重跑同一条命令
+> （`--keep-until-expiring` 会复用已签发的证书，不会重复申请）。
 
 泛域名证书（发布站需要，走 DNS 验证）：
 
