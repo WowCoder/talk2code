@@ -40,6 +40,13 @@ class Settings(BaseSettings):
         description='PostgreSQL 连接串，例如 postgresql+psycopg://user:pass@host:5432/db。为空时回退到 SQLite'
     )
 
+    # 生产强制使用 PostgreSQL：开启后 DATABASE_URL 为空将拒绝启动。
+    # 默认关闭，避免测试/CI（会刻意清空 DATABASE_URL 走 SQLite）被打挂。
+    REQUIRE_POSTGRES: bool = Field(
+        default=False,
+        description='true 时 DATABASE_URL 为空将拒绝启动（生产环境应设为 true）'
+    )
+
     # 数据库连接池配置
     DATABASE_POOL_SIZE: int = Field(default=10, ge=1, le=50, description='连接池大小')
     DATABASE_MAX_OVERFLOW: int = Field(default=20, ge=0, le=50, description='连接池最大溢出')
@@ -116,7 +123,12 @@ class Settings(BaseSettings):
         default='talk2code-secret-key-change-in-production',
         description='JWT 密钥（生产环境必须修改）'
     )
-    JWT_ACCESS_TOKEN_EXPIRES_HOURS: int = Field(default=24, description='Token 过期时间（小时）')
+    # 默认 8 小时：登出/改密不做服务端吊销，靠缩短有效窗口收敛风险
+    # （完整吊销需要 jti/版本号，而项目无 alembic，加列要手工 DDL，故暂不做）
+    JWT_ACCESS_TOKEN_EXPIRES_HOURS: int = Field(
+        default=8,
+        description='Token 过期时间（小时）',
+    )
 
     @property
     def JWT_ACCESS_TOKEN_EXPIRES(self) -> timedelta:

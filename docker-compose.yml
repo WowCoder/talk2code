@@ -2,6 +2,10 @@
 # 使用: docker compose up -d
 # 停止: docker compose down
 # 重置数据: docker compose down -v
+#
+# ⚠️ 口令来自仓库根目录的 .env（已被 .gitignore 忽略）。首次使用：
+#     cp .env.example .env   # 再编辑填入随机口令
+#     生成随机口令: python3 -c "import secrets;print(secrets.token_urlsafe(24))"
 
 services:
   # ==================== PostgreSQL + pgvector ====================
@@ -10,11 +14,13 @@ services:
     container_name: talk2code-postgres
     restart: unless-stopped
     ports:
-      # 宿主 5434 → 容器 5432（避开其他项目占用的 5432/5433）
-      - "5434:5432"
+      # 只绑回环：容器端口不对公网开放，仅本机进程可连。
+      # 直接写 "5434:5432" 会被 Docker 绑到 0.0.0.0，公网可直连数据库。
+      - "127.0.0.1:5434:5432"
     environment:
       POSTGRES_USER: talk2code
-      POSTGRES_PASSWORD: talk2code
+      # 必须显式提供，杜绝"忘记改口令就拿弱口令上线"
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?未设置 POSTGRES_PASSWORD：请先 cp .env.example .env 并填入随机口令}
       POSTGRES_DB: talk2code
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -30,13 +36,22 @@ services:
     container_name: talk2code-redis
     restart: unless-stopped
     ports:
-      # 宿主 6380 → 容器 6379（避开其他项目占用的 6379）
-      - "6380:6379"
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+      # 同上，只绑回环
+      - "127.0.0.1:6380:6379"
+    environment:
+      # 留空则不启用密码（本地开发）；生产必须填 —— Redis 一旦可达等同于 RCE 面
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    # 口令为空时不追加 --requirepass，避免本地开发被强制设密
+    command: >
+      sh -c 'exec redis-server --appendonly yes --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      $([ -n "$$REDIS_PASSWORD" ] && printf -- "--requirepass %s" "$$REDIS_PASSWORD")'
     volumes:
       - redisdata:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test:
+        - CMD-SHELL
+        - if [ -n "$$REDIS_PASSWORD" ]; then redis-cli -a "$$REDIS_PASSWORD" --no-auth-warning ping; else redis-cli ping; fi | grep -q PONG
       interval: 5s
       timeout: 3s
       retries: 5

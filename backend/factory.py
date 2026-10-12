@@ -61,6 +61,35 @@ if '*' in settings.cors_origins_list:
     else:
         raise RuntimeError(_cors_msg)
 
+
+# ==================== 安全响应头 ====================
+# 统一注入基础安全头。用 SAMEORIGIN 而非 DENY：详情页的预览 iframe 与主站同源
+# （src 走 /api/pt/...），DENY 会直接打断预览链路。
+# 已发布站点跑在 <slug>.<PUBLISH_APEX>，是独立子域，SAMEORIGIN 使其不被任何
+# 站外页面嵌套，同时不影响其自身页面的正常渲染。
+# ⚠️ 刻意不注入 CSP：前端 CodeMirror 会动态注入 <style>，收紧 style-src 会白屏。
+# 预览页自身的 `CSP: sandbox ...` 由 routes/preview.py 设置，setdefault 不会覆盖它。
+def _forwarded_proto_is_https() -> bool:
+    """X-Forwarded-Proto 是否表示 HTTPS。
+
+    仅在显式开启 TRUST_PROXY_HEADERS（即确实部署在可信反代之后）时采信，
+    否则该头可被请求方伪造。取最左段 —— nginx 侧用 $scheme 单值覆盖，不追加。
+    """
+    if not settings.TRUST_PROXY_HEADERS:
+        return False
+    return request.headers.get('X-Forwarded-Proto', '').split(',')[0].strip().lower() == 'https'
+
+
+@app.after_request
+def _apply_security_headers(resp: Response) -> Response:
+    resp.headers.setdefault('X-Frame-Options', 'SAMEORIGIN')
+    resp.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    resp.headers.setdefault('Referrer-Policy', 'strict-origin-when-cross-origin')
+    # HSTS 只在确认走 HTTPS 时下发：应用在反向代理之后，直连时 request.is_secure 恒为 False
+    if request.is_secure or _forwarded_proto_is_https():
+        resp.headers.setdefault('Strict-Transport-Security', 'max-age=31536000')
+    return resp
+
 # JWT 配置
 # ⚠️ 隔离红线：已发布站点跑在 <slug>.<PUBLISH_APEX>，与主站同属一个可注册域。
 # 主站登录态之所以不会被「任意一份 AI 生成的代码」读走，唯一依赖就是这里的
@@ -172,6 +201,20 @@ def check_production_security():
         if not settings.APP_DEBUG:
             fatal_issues.append(msg)
             logger.critical("🔴 LLM_API_KEY 未配置")
+
+    # 2.5 检查数据库后端
+    # DATABASE_URL 留空时 config.DATABASE_URI 会静默回退 SQLite：pgvector + HNSW
+    # 索引全部失效，且 gunicorn 多 worker 下 SQLite 写锁竞争会导致任务状态错乱。
+    # 用显式的 REQUIRE_POSTGRES 开关判定，不用 APP_DEBUG 兼职安全开关
+    # （测试与 CI 会刻意清空 DATABASE_URL，不能因此拒绝启动）。
+    if not settings.DATABASE_URL:
+        msg = "DATABASE_URL 未配置，数据库回退 SQLite（pgvector/HNSW 失效、多 worker 写锁竞争）"
+        if settings.REQUIRE_POSTGRES:
+            fatal_issues.append(msg)
+            logger.critical("🔴 REQUIRE_POSTGRES=true 但 DATABASE_URL 为空，拒绝启动")
+        else:
+            issues.append(msg)
+            logger.warning("⚠️  DATABASE_URL 为空，使用 SQLite（仅限本地开发）")
 
     # 3. 检查调试模式
     if settings.APP_DEBUG:

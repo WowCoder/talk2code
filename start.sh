@@ -88,13 +88,15 @@ if [ "$MODE" = "dev" ]; then
     python app.py
 elif [ "$MODE" = "prod" ]; then
     # 生产模式：使用 gunicorn
+    # -k gthread：SSE 是长连接，sync worker 下每个连接独占一个 worker，2 个用户即可打满
+    # --bind 127.0.0.1：只让反向代理访问，不把应用端口暴露到公网
     if command -v gunicorn &>/dev/null; then
         cd "$BACKEND_DIR"
-        gunicorn -w 2 -b "0.0.0.0:$PORT" app:app
+        gunicorn -w 2 -k gthread --threads 8 --timeout 120 --graceful-timeout 30 \
+            --bind "127.0.0.1:$PORT" app:app
     else
-        warn "gunicorn 未安装，使用 Flask 内置服务器"
-        cd "$BACKEND_DIR"
-        python app.py
+        err "gunicorn 未安装（pip install -r requirements.txt），拒绝以 Flask 开发服务器对外服务"
+        exit 1
     fi
 else
     err "未知模式: $MODE (可选: dev, prod)"
