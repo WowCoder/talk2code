@@ -69,6 +69,20 @@ if '*' in settings.cors_origins_list:
 # 站外页面嵌套，同时不影响其自身页面的正常渲染。
 # ⚠️ 刻意不注入 CSP：前端 CodeMirror 会动态注入 <style>，收紧 style-src 会白屏。
 # 预览页自身的 `CSP: sandbox ...` 由 routes/preview.py 设置，setdefault 不会覆盖它。
+#
+# ★ 预览载荷（/api/pt/、/api/preview/）**必须豁免 X-Frame-Options**（见 _NO_XFO_PREFIXES）：
+#   服务端验收浏览器（harness/tools/preview_runner.py）的宿主页是 `file://` 临时文件，
+#   与预览地址**跨源**，SAMEORIGIN 会让 iframe 根本不导航 → frame.url 为空 →
+#   `_frame_load_failure` 命中「页面未导航 (url=空)」→ AC 逐条验收 / 冒烟 / 截图
+#   全部**静默回退直读工作区文件**（冒烟还会输出 available=True 的假绿，
+#   因为 page_loads 是读本地文件判的）。实测：带该头 iframe 地址为空、剥掉即加载成功。
+#   载荷自身的隔离靠 routes/preview.py 下发的 `CSP: sandbox allow-scripts allow-forms`
+#   —— 该文档落在**唯一 opaque origin**：读不到 cookie/localStorage，够不到父页 DOM。
+#   主站与 `<slug>.<PUBLISH_APEX>` 已发布站点照常 SAMEORIGIN。
+#   守卫：tests/unit/test_security_headers.py
+_NO_XFO_PREFIXES = ('/api/pt/', '/api/preview/')
+
+
 def _forwarded_proto_is_https() -> bool:
     """X-Forwarded-Proto 是否表示 HTTPS。
 
@@ -82,7 +96,9 @@ def _forwarded_proto_is_https() -> bool:
 
 @app.after_request
 def _apply_security_headers(resp: Response) -> Response:
-    resp.headers.setdefault('X-Frame-Options', 'SAMEORIGIN')
+    # 预览载荷豁免 XFO，理由见上方 _NO_XFO_PREFIXES 注释（框不住 file:// 宿主页）
+    if not request.path.startswith(_NO_XFO_PREFIXES):
+        resp.headers.setdefault('X-Frame-Options', 'SAMEORIGIN')
     resp.headers.setdefault('X-Content-Type-Options', 'nosniff')
     resp.headers.setdefault('Referrer-Policy', 'strict-origin-when-cross-origin')
     # HSTS 只在确认走 HTTPS 时下发：应用在反向代理之后，直连时 request.is_secure 恒为 False
