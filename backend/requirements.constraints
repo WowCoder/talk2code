@@ -1,0 +1,23 @@
+# 依赖锁定的约束文件（与 requirements.lock 配套）
+#
+# 背景：requirements.txt 全部使用 ">="，直接解析会装到远高于本机验证环境的版本
+# —— 实测裸解析的版本分别是 sentence-transformers 6.1.0 / transformers 5.19.0 /
+# numpy 2.2.6，而本机跑通 1267 个单元测试的组合是 2.7.0 / 4.57.6 / 1.26.4，
+# 跨了 4 个与 1 个大版本。拿这种环境上线，BGE-M3 检索链路有真实破坏风险。
+#
+# 所以这里只钉「版本跳跃大、且已被验证过」的关键包；其余交给解析器在
+# Python 3.10（服务器版本 3.10.12）下自选兼容版本，保证依赖图自洽。
+#
+# 重新生成 lock（需要 Docker；必须用 3.10，本机 macOS 解析出的二进制包在
+# Linux 服务器可能装不上）：
+#   docker run --rm -v "$PWD":/w -w /w python:3.10-slim sh -c \
+#     "python -m venv /tmp/v && /tmp/v/bin/pip install -q pip-tools && \
+#      /tmp/v/bin/pip-compile --resolver=backtracking \
+#        -c requirements.constraints -o requirements.lock requirements.txt"
+
+sentence-transformers==2.7.0
+transformers==4.57.6
+tokenizers==0.22.2
+numpy==1.26.4
+torch==2.13.0
+gunicorn==21.2.0
