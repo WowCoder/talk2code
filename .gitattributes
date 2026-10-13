@@ -1,0 +1,3 @@
+# 自托管字体的 woff2 是二进制素材（frontend-vue/public/fonts/）：
+# 显式声明为 binary，避免 git 尝试文本 diff，也避免日后被换行符规则动到。
+*.woff2 binary

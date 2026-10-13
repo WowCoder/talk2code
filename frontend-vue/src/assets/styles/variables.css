@@ -13,9 +13,14 @@
   --accent-soft: #f6ebdd;
   --accent-hover: #c05c51;
 
-  /* Typography — loaded via Google Fonts in index.html */
+  /* Typography
+   * 拉丁字形自托管于 public/fonts（由 scripts/fetch-fonts.mjs 生成）；
+   * 中文不下发 webfont，落各平台系统黑体（macOS 苹方 / Windows 雅黑 /
+   * Android Noto Sans CJK）—— 中文整包 4.4 MB、每页仍要拉 368~783 KB，
+   * 是页面重量的绝对大头，交给系统字体可整项归零。 */
   --font-display: 'Newsreader', 'Iowan Old Style', Georgia, serif;
-  --font-body: 'Noto Sans SC', 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --font-body: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', 'Noto Sans CJK SC', system-ui, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, 'IBM Plex Mono', Menlo, monospace;
 
   /* Semantic color tokens */
