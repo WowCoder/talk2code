@@ -1,7 +1,7 @@
 <template>
   <div class="login-page">
     <section class="brand-pane">
-      <img src="@/assets/logo.png" alt="Talk2Code" class="brand-logo" />
+      <img src="@/assets/logo.webp" alt="Talk2Code" class="brand-logo" />
       <span class="brand-tag">运营后台</span>
       <h1 class="brand-headline">让每一个想法<br />都跑起来</h1>
       <p class="brand-sub">

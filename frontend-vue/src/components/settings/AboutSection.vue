@@ -5,7 +5,7 @@
     <!-- 版本卡 -->
     <div class="brand-card">
       <div class="brand-row">
-        <img src="@/assets/logo.png" alt="Talk2Code" class="brand-logo" />
+        <img src="@/assets/logo.webp" alt="Talk2Code" class="brand-logo" />
         <div class="brand-info">
           <div class="brand-name-row">
             <span class="brand-name">Talk2Code</span>

@@ -2,7 +2,7 @@
   <div class="admin-shell">
     <aside class="admin-sidebar">
       <div class="brand-row">
-        <img src="@/assets/logo.png" alt="Talk2Code" class="brand-logo" />
+        <img src="@/assets/logo.webp" alt="Talk2Code" class="brand-logo" />
         <span class="brand-name">Talk<span class="brand-accent">2</span>Code</span>
         <span class="brand-tag">后台</span>
       </div>

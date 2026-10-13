@@ -14,7 +14,7 @@
       </template>
       <template v-else>
         <router-link :to="isGuest ? '/market' : '/'" class="nav-brand">
-          <img src="@/assets/logo.png" alt="Talk2Code" class="nav-logo" /><span class="brand-text">Talk<span>2</span>Code</span>
+          <img src="@/assets/logo.webp" alt="Talk2Code" class="nav-logo" /><span class="brand-text">Talk<span>2</span>Code</span>
         </router-link>
         <div class="nav-links">
           <!-- 顶部三个常驻 TAB：首页 / 创意市集 / 历史记录。设置收进右侧头像下拉，

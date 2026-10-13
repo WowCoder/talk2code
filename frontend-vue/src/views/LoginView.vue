@@ -3,7 +3,7 @@
     <div class="login-card">
       <!-- Brand（沿用项目现有 Logo） -->
       <div class="brand">
-        <img src="@/assets/logo.png" alt="Talk2Code" class="brand-logo" />
+        <img src="@/assets/logo.webp" alt="Talk2Code" class="brand-logo" />
         <h1 class="brand-title">
           Talk<span>2</span>Code
         </h1>
