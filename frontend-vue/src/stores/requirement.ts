@@ -182,15 +182,23 @@ function messageKey(msg: DialogueMessage): string {
   return ''
 }
 
-  async function loadRequirement(id: number): Promise<{ requirement: Requirement; trace?: any; evaluator?: SSEEvaluatorResultData; progress?: ProgressSnapshot } | null> {
+  /**
+   * 按 slug 加载（对外地址栏只带 slug）。
+   * 仍接受纯数字：老链接 /detail/123 要先读得出来，才能被 replace 成 slug 版。
+   */
+  async function loadRequirement(slugOrId: string | number): Promise<{ requirement: Requirement; trace?: any; evaluator?: SSEEvaluatorResultData; progress?: ProgressSnapshot } | null> {
     const seq = ++loadSeq
+    const key = String(slugOrId)
+    const path = /^\d+$/.test(key)
+      ? `/api/requirements/${key}`
+      : `/api/requirements/s/${encodeURIComponent(key)}`
 
     // ⚠️ 先取数据、成功后再清空旧状态。
     // 早先这里把「重置全部 state」放在 await 之前，于是**任何一次加载失败**
     // （401 / 500 / 超时 / 网络抖动）都会把页面留在"刚重置完"的空状态里：
     // 消息、代码、任务进度全空，而异常只被调用方 catch 成一句 toast。
     // 用户看到的就是「刷新一下，啥都没了」。
-    const data = await api<{ requirement: Requirement; trace?: any; evaluator?: SSEEvaluatorResultData; progress?: ProgressSnapshot }>(`/api/requirements/${id}`)
+    const data = await api<{ requirement: Requirement; trace?: any; evaluator?: SSEEvaluatorResultData; progress?: ProgressSnapshot }>(path)
 
     // 竞态保护：期间又发起了新的 loadRequirement，本次结果作废
     if (seq !== loadSeq) return null

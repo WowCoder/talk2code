@@ -69,8 +69,11 @@ class Requirement(Base):
     __tablename__ = 'requirements'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    # 对外身份：URL 里只放这个，不放自增 id。id 是全局自增的，暴露它等于
+    # 把「平台累计做过多少需求」写在地址栏里，且链接可被顺序枚举。
+    slug = Column(String(20), unique=True, nullable=True, index=True)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
-    title = Column(String(500), nullable=False)  # 需求标题/摘要
+    title = Column(String(500), nullable=False)  # 需求名称（短，给人看的）
     content = Column(Text, nullable=False)  # 完整需求内容
     status = Column(String(20), default='pending')  # pending/processing/finished/failed
     create_time = Column(DateTime, default=datetime.utcnow)
@@ -584,6 +587,34 @@ def _backfill_null(table: str, column: str, literal: str) -> None:
             pass
 
 
+def _backfill_requirement_slugs() -> None:
+    """给存量需求补发 slug（每行一个随机值，无法用单条 UPDATE 表达）。
+
+    ALTER 只加列，不改写既有行 —— 历史需求的 slug 全是 NULL，链接里拿不到
+    slug 就只好退回自增 id，等于白改。new_slug() 是 100 bit 随机，撞号概率
+    可忽略；真撞了由唯一约束兜住，失败只是这条需求暂时没有 slug，不阻塞启动。
+    """
+    from services.publish.slug import new_slug
+
+    db = SessionLocal()
+    try:
+        rows = db.query(Requirement).filter(Requirement.slug.is_(None)).all()
+        if not rows:
+            return
+        for row in rows:
+            row.slug = new_slug()
+        db.commit()
+        logger.info("[init_db] 已为 %d 条存量需求补发 slug", len(rows))
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.warning("[init_db] 回填需求 slug 失败（链接将暂时退回 id）：%s", e)
+    finally:
+        db.close()
+
+
 # 初始化数据库（创建所有表）
 def init_db():
     """初始化数据库，创建所有表并执行迁移"""
@@ -623,6 +654,19 @@ def init_db():
 
     # 修复已有数据：将 NULL 的 is_deleted 统一设为假（非删除状态）
     _backfill_null("requirements", "is_deleted", _sql_false())
+
+    # 迁移：需求对外身份 slug。_add_column 只加列，唯一索引要另外建 ——
+    # 没有唯一约束时并发补发可能给出两个相同 slug，按 slug 查就会返回多行。
+    _add_column("requirements", "slug", pg="VARCHAR(20)", sqlite="VARCHAR(20)")
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_requirements_slug "
+                "ON requirements(slug)"))
+            conn.commit()
+    except Exception as e:
+        logger.warning("[init_db] 创建 ux_requirements_slug 失败（可能已存在重复 slug）：%s", e)
+    _backfill_requirement_slugs()
 
     # 迁移：创意市集。
     _add_column("published_sites", "market_visible", pg="BOOLEAN DEFAULT FALSE", sqlite="BOOLEAN DEFAULT 0")

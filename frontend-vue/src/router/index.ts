@@ -18,7 +18,9 @@ const router = createRouter({
       meta: { requiresAuth: true },
     },
     {
-      path: '/detail/:id',
+      // 地址栏只放 slug：自增 id 会泄露平台累计需求数，还能被顺序枚举。
+      // 老的 /detail/123 仍能打开（详情页加载后 replace 成 slug 版）。
+      path: '/detail/:slug',
       name: 'Detail',
       component: () => import('@/views/DetailView.vue'),
       meta: { requiresAuth: true },

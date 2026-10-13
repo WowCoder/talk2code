@@ -11,6 +11,8 @@ from services.task_queue import task_queue
 from factory import app, rate_limit_requirement, rate_limit_chat, limiter, logger
 from services.requirement_service import process_requirement_async
 from utils.preview_token import make_preview_token
+from utils.requirement_title import summarize_title
+from services.publish.slug import new_slug, is_valid_slug
 from config import settings
 
 # ==================== 需求管理 API ====================
@@ -83,11 +85,14 @@ def create_requirement():
         return jsonify({'error': '需求内容不能为空'}), 400
 
     content = data.get('content', '').strip()
-    title = content[:100]
+    # 占位名：TL 还没出计划，先用规则摘要顶上（详见 utils/requirement_title.py）。
+    # 此前直接存 content[:100]，列表里每行的前 100 字都长得一样，认不出是哪条。
+    title = summarize_title(content)
 
     with transactional_db() as db:
         requirement = Requirement(
             user_id=current_user_id,
+            slug=new_slug(),
             title=title,
             content=content,
             status='pending',
@@ -103,6 +108,7 @@ def create_requirement():
         db.flush()  # flush 执行 INSERT 并填充自增 ID，但不提交事务
         req_id = requirement.id
         req_title = requirement.title
+        req_slug = requirement.slug
         req_status = requirement.status
 
     # 事务已提交后再入队：避免 worker 在事务未提交时查不到该行导致任务失败
@@ -117,6 +123,7 @@ def create_requirement():
         'message': '需求已提交，正在处理',
         'requirement': {
             'id': req_id,
+            'slug': req_slug,
             'title': req_title,
             'status': req_status
         }
@@ -148,6 +155,7 @@ def list_requirements():
             'requirements': [
                 {
                     'id': r.id,
+                    'slug': r.slug,
                     'title': r.title,
                     'status': r.status,
                     'create_time': r.create_time.isoformat() if r.create_time else None,
@@ -159,22 +167,57 @@ def list_requirements():
         }), 200
 
 
+def _owned_requirement(db, user_id: int, *, req_id: int = None, slug: str = None):
+    """按归属取需求：user_id 必带，id / slug 二选一。归属条件不能省。"""
+    from models import Requirement
+
+    query = db.query(Requirement).filter(Requirement.user_id == user_id)
+    if req_id is not None:
+        return query.filter(Requirement.id == req_id).first()
+    return query.filter(Requirement.slug == slug).first()
+
+
 @app.route('/api/requirements/<int:req_id>', methods=['GET'])
 @jwt_required()
 def get_requirement(req_id):
-    """获取需求详情"""
-    from models import Requirement
+    """获取需求详情（按自增 id）。
+
+    保留供内部调用与老链接；浏览器地址栏一律走 /s/<slug> —— id 全局自增，
+    放进 URL 等于把「平台累计做过多少需求」写出来，而且能被顺序枚举。
+    """
+    current_user_id = int(get_jwt_identity())
+    with get_db() as db:
+        requirement = _owned_requirement(db, current_user_id, req_id=req_id)
+        if not requirement:
+            return jsonify({'error': '需求不存在'}), 404
+        return jsonify(_build_requirement_detail(requirement)), 200
+
+
+@app.route('/api/requirements/s/<slug>', methods=['GET'])
+@jwt_required()
+def get_requirement_by_slug(slug):
+    """获取需求详情（按对外 slug）"""
+    # 大小写不敏感：Crockford Base32 的惯例，手敲或复制时大小写不该影响命中
+    slug = (slug or '').upper()
+    if not is_valid_slug(slug):
+        return jsonify({'error': '需求不存在'}), 404
 
     current_user_id = int(get_jwt_identity())
     with get_db() as db:
-        requirement = db.query(Requirement).filter(
-            Requirement.id == req_id,
-            Requirement.user_id == current_user_id
-        ).first()
-
+        requirement = _owned_requirement(db, current_user_id, slug=slug)
         if not requirement:
             return jsonify({'error': '需求不存在'}), 404
+        return jsonify(_build_requirement_detail(requirement)), 200
 
+
+def _build_requirement_detail(requirement) -> dict:
+    """组装详情响应体（id / slug 两个入口共用）。
+
+    自己开会话而不是复用调用方的：调用方那个 session 在取到需求后就关了，
+    这里还要查 trace、读工作区快照，用已关闭的 session 会炸在半路。
+    """
+    req_id = requirement.id
+    with get_db() as db:
         # 查询 trace 数据（已完成/失败需求加载时前端可展示执行详情面板）
         trace_data = None
         if requirement.status in ('finished', 'failed'):
@@ -244,6 +287,7 @@ def get_requirement(req_id):
         result = {
             'requirement': {
                 'id': requirement.id,
+                'slug': requirement.slug,
                 'title': requirement.title,
                 'content': requirement.content,
                 'status': requirement.status,
@@ -264,7 +308,7 @@ def get_requirement(req_id):
             result['evaluator'] = evaluator_data
         if progress_data:
             result['progress'] = progress_data
-        return jsonify(result), 200
+        return result
 
 
 @app.route('/api/requirements/<int:req_id>/trash', methods=['PUT'])

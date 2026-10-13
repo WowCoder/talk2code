@@ -12,6 +12,7 @@ from typing import Optional
 
 from models import Requirement
 from utils.db import get_db
+from utils.requirement_title import summarize_title
 from harness.observability.logger import get_logger
 from utils.sse import SSEMessage, get_current_timestamp
 from services.sse_manager import sse_manager
@@ -498,6 +499,12 @@ class RequirementService:
                         requirement.dialogue_history = dialogue
                         from sqlalchemy.orm.attributes import flag_modified
                         flag_modified(requirement, 'dialogue_history')
+                    # 正式名称：TL 已经用一句人话复述了「用户要什么」（≤40 字，
+                    # plan 校验器保证），比创建时的规则摘要更准，直接顶掉它。
+                    # 复述缺失时保留占位名，不写空串（title 列 NOT NULL）。
+                    restated = ((final_state.get('plan') or {}).get('requirement_restated') or '').strip()
+                    if restated:
+                        requirement.title = restated[:60]
                     requirement.status = 'planning'
                     db.commit()
                     logger.info(f"[Service] 需求 {requirement_id} 进入 planning 状态，等待用户确认")
@@ -598,8 +605,13 @@ class RequirementService:
                 plan = final_state.get('plan') or {}
                 if isinstance(plan, dict) and plan:  # 有有效 plan 数据时才推送
                     logger.info(f"[SSE] 推送 SPEC 和 task_list for requirement {requirement_id}")
+                    # 卡片标题优先用 TL 的人话复述，而不是原文前 60 字：后者在长输入
+                    # 下会被 CSS 截断成一串看不懂的半句话。
+                    spec_title = (plan.get('requirement_restated') or '').strip()[:60]
+                    if not spec_title:
+                        spec_title = summarize_title(final_state.get('requirement_content') or '')
                     spec_msg = SSEMessage.format_event('spec', {
-                        'title': (final_state.get('requirement_content') or '')[:60],
+                        'title': spec_title,
                         # 需求契约在前：用户签字的对象必须和验收依据同源。
                         # acceptance_criteria 此前就推了，但前端卡片没接，
                         # 导致「用户确认的内容」与「判定的内容」是两份。
@@ -636,7 +648,7 @@ class RequirementService:
                     # TL 失败且无有效 plan，推送错误信息
                     logger.warning(f"[SSE] TL 失败无有效 plan for requirement {requirement_id}")
                     error_msg = SSEMessage.format_event('spec', {
-                        'title': (final_state.get('requirement_content') or '')[:60],
+                        'title': summarize_title(final_state.get('requirement_content') or ''),
                         'features': [],
                         'acceptance_criteria': [],
                         'file_structure': [],

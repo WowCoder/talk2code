@@ -8,7 +8,9 @@
             <path d="M15 19l-7-7 7-7"/>
           </svg>
         </button>
-        <span class="nav-title">{{ title }}</span>
+        <!-- 名称是截断显示的，鼠标悬停要能读到全文：否则长需求名只能看到一半，
+             用户连「现在看的是哪一条」都确认不了。 -->
+        <span class="nav-title" :title="title">{{ title }}</span>
       </template>
       <template v-else>
         <router-link :to="isGuest ? '/market' : '/'" class="nav-brand">

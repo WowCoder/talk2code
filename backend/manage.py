@@ -25,6 +25,7 @@ os.environ.setdefault('JWT_SECRET_KEY', 'manage-cli-local')
 from models import User, Requirement, AgentTrace, PublishedSite, InviteCode, AdminUser  # noqa: E402
 from models import init_db  # noqa: E402
 from utils.db import get_db, transactional_db  # noqa: E402
+from services.publish.slug import new_slug  # noqa: E402
 from utils.security import hash_password  # noqa: E402
 from config import settings  # noqa: E402
 
@@ -155,6 +156,8 @@ def cmd_demo_transfer(args) -> int:
                         continue
                     db.add(Requirement(
                         user_id=demo_id,
+                        # 副本是另一条需求，slug 必须另发一个（原 slug 有唯一约束）
+                        slug=new_slug(),
                         title=r.title,
                         content=r.content,
                         status=r.status,

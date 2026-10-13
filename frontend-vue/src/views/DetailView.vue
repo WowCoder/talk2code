@@ -165,11 +165,13 @@ onMounted(() => {
   window.addEventListener('pointerup', onSplitterUp)
 })
 
-// SSE connection
-const reqId = computed(() => {
-  const id = route.params.id
-  return id ? Number(id) : null
-})
+// 地址栏只带 slug：自增 id 会泄露平台累计需求数，还能被顺序枚举。
+// 数字 id 仅用于内部通道（SSE / 对话 / 发布），从详情响应里取，不进 URL。
+const routeSlug = computed(() => String(route.params.slug || ''))
+// 已加载需求的规范键（slug 优先，历史数据没 slug 时退回 id）：用来判断
+// 「地址栏变了」是切换需求，还是老链接被 replace 成 slug。
+const loadedKey = ref('')
+const reqId = ref<number | null>(null)
 const { connect, disconnect, isConnected, connectionError, serverElapsedS } = useSSE(reqId)
 
 const pageTitle = computed(() => {
@@ -250,20 +252,30 @@ function describeLoadError(err: any): string {
 }
 
 async function load() {
-  if (!reqId.value) {
+  const key = routeSlug.value
+  if (!key) {
     router.push('/')
     return
   }
   loading.value = true
   try {
-    const data = await store.loadRequirement(reqId.value)
+    const data = await store.loadRequirement(key)
     // 竞态保护：本次加载已被更新的请求取代
     if (!data) return
 
     const req = store.currentRequirement
     if (!req) return
 
+    // 先认领规范键，再 replace —— 否则下面那次地址变更会被 watch 当成
+    // 「切换了另一个需求」，白刷新一遍（消息流会闪一下）。
+    reqId.value = req.id
+    loadedKey.value = req.slug || String(req.id)
     loadError.value = ''
+
+    // 老链接（/detail/123）：换成 slug 版本，地址栏不再出现自增 id
+    if (/^\d+$/.test(key) && req.slug) {
+      router.replace(`/detail/${req.slug}`)
+    }
 
     if (req.status === 'finished' || req.status === 'finished_with_issues' || req.status === 'needs_user_input') {
       store.isGenerating = false
@@ -347,15 +359,15 @@ watch(connectionError, (msg) => {
   if (msg) show(msg, 'error')
 })
 
-// Handle SSE disconnection when leaving
-watch(reqId, (newId, oldId) => {
-  if (oldId) disconnect()
-  if (newId) {
-    // 切换需求是明确的"换一个"：先清干净，再走与首次挂载同一条加载路径
-    // （失败时会落到 loadError 提示条，不再静默留白）
-    store.reset()
-    load()
-  }
+// 切换需求（地址栏换 slug）：先清干净，再走与首次挂载同一条加载路径
+// （失败时会落到 loadError 提示条，不再静默留白）。
+// loadedKey 比对是必须的：把老链接 replace 成 slug 也会改地址栏，那不是换需求。
+watch(routeSlug, (next) => {
+  if (!next || next === loadedKey.value) return
+  if (reqId.value) disconnect()
+  reqId.value = null
+  store.reset()
+  load()
 })
 
 // Chat send handler
