@@ -357,7 +357,79 @@ npm run build
 ```
 
 产物落在 `frontend-vue/dist`，由 Nginx 直接托管。前端所有请求走同源 `/api`（`useApi.ts:17`  
-用相对路径 + `credentials: 'include'`），**不需要**配置任何 `VITE_API_BASE`。
+用相对路径 + `credentials: include`），**不需要**配置任何 `VITE_API_BASE`。
+
+#### 字体：拉丁自托管，中文走系统字体栈
+
+`index.html` 曾经外链 `fonts.googleapis.com` —— 那是一张**阻塞渲染的跨域样式表**。  
+在网络到不了 Google 的环境（大陆最常见）下，浏览器会卡在这个请求上直到超时，首屏长时间白屏。  
+
+现在**只自托管两族拉丁字体**，中文交给系统黑体：
+
+| | 处理方式 | 为什么 |
+|---|---|---|
+| Newsreader（品牌衬线） | 自托管 | 跨平台字形必须一致，且只覆盖拉丁 |
+| JetBrains Mono（代码等宽） | 自托管 | 同上 |
+| 中文 | `-apple-system / PingFang SC / 微软雅黑 / Noto Sans CJK` | 见下 |
+
+**中文不下发 webfont**，是实测出来的结论。原先自托管整套 Noto Sans SC（101 个
+`unicode-range` 分片、4.4 MB 字体池）后，一个中文页仍要拉 9~16 个分片、
+**368~783 KB**，占页面总传输量的 **82%~91%**；更要命的是分片由渲染逐批发现、
+分批下载，弱网下会把路由 JS 与后端接口全部堵在连接里 —— 实测加载
+`/admin/metrics` 时 13 个字体分片连续请求了 **19 秒**，4.5 KB 的路由 JS 排在后面。
+改用系统字体后这一项归零，页面总传输量降 73%~85%。中文站（淘宝/知乎/B站）都这么做。
+
+| 位置 | 说明 |
+|---|---|
+| `frontend-vue/public/fonts/*.woff2` | 15 个文件、约 244 KB，随代码一起入库 |
+| `frontend-vue/src/assets/styles/fonts.css` | 由脚本生成，`main.ts` 里 import |
+
+重新生成（例如升级字体版本）：
+
+```bash
+cd /opt/talk2code/frontend-vue
+sudo -u talk2code npm run fonts       # 脚本：scripts/fetch-fonts.mjs
+```
+
+几个容易踩的点：
+
+- **必须保留 `unicode-range` 分片**：浏览器只下载页面实际用到的字形分片，不会整包拉。
+  （改字体族配置后要重跑 `npm run fonts`，脚本会自动清掉上一代残留的孤儿分片文件。）
+- **Newsreader 刻意不带 `opsz` 轴**：带 `opsz` 的 latin 分片 128.8 KB，只请求 `wght`
+  轴的同族同分片只有 56.8 KB（−56%）。opsz 只按字号微调笔画对比度，肉眼不可辨。
+- **字重区间要判对**：两族都是可变字体，所以每个分片只需一条 `font-weight: 400 700`。
+  写成逗号列表（`400, 500, 600, 700`）会让该条 descriptor 整体失效、回落成 `normal`，
+  粗体全部变成合成加粗。  
+  ⚠️ 当用 `wght@400..700` 请求时 Google 直接回**区间串** `400 700`，把它当字重列表
+  逐项 `Number()` 会算出 `NaN`，生成 `font-weight: NaN` 这种非法声明被浏览器**静默丢弃**
+  —— 脚本里已加写盘前自检，非法值直接让构建失败。唯一的单值例外是 JetBrains Mono
+  的斜体（Google 下发的是静态 400）。
+- Nginx 侧必须有独立的 `location /fonts/`（见步骤 9）：nginx 自带 `mime.types` **没有 woff2**，  
+  不显式声明会下发成 `application/octet-stream`；且若落进 `location /`，
+  文件缺失会命中 `try_files` 回落到 `index.html`，浏览器拿到 200 + text/html，字体静默失效。
+
+#### 首屏性能预算（改动前端时对照）
+
+实测（服务器本机无代理，冷缓存）：
+
+| 页面 | 传输量 | 请求数 |
+|---|---|---|
+| `/market`（游客入口） | 174 KB | 17 |
+| `/login` | 118 KB | 8 |
+| `/admin/metrics` | 155 KB | 13 |
+| `/admin/traces` | 159 KB | 16 |
+
+三条硬约束，破了就会回到「一页 1 MB、字体刷 19 秒」：
+
+1. **中文只能走系统字体**，不得引入中文 webfont（见上）。
+2. **详情页的 CodeMirror 必须保持按需加载**：它一个 chunk 就是 815 KB（gzip 270 KB），
+   而默认落在预览 Tab。`DetailView.vue` 里用 `defineAsyncComponent` + 首次进入才挂载，
+   只在需求 `finished` 后空闲预取（生成中不预取，把带宽留给 SSE 进度流）。
+3. **`main.ts` 不得在挂载前 `await` 任何网络请求**。原先 `await initAuth()` 之后才
+   `app.mount()`，而 `#app` 在挂载前是空的 —— 每个页面（含免登录的市集）的首屏内容
+   都被一个 `/api/user/info` 往返挡住，该请求内部还有 4 秒超时兜底，最坏就是 4 秒白屏。
+   现在先挂载，路由守卫只在「判定确实依赖登录态」的路由上 `await authStore.authReady`。
+
 
 ### 步骤 6：数据库与缓存
 
@@ -475,72 +547,76 @@ sudo systemctl status talk2code talk2code-celery --no-pager
 
 ### 步骤 9：Nginx
 
-主站配置 `/etc/nginx/sites-available/talk2code`（替换 `<DOMAIN>` / `<APEX>` 为实际域名）：
+主站、www 跳转、发布站的 server 块**都在 `deploy/nginx.conf` 里**（`deploy.sh`
+会用实际域名替换 `<DOMAIN>` / `<APEX>` 占位符后装到
+`/etc/nginx/sites-available/talk2code`）。全局调优在 `deploy/nginx-tuning.conf`,
+装到 `/etc/nginx/conf.d/`。**改配置只改这两个文件**，不在本文档里另抄一份。
 
-```nginx
-# ---------- 通用安全响应头 ----------
-add_header X-Frame-Options "SAMEORIGIN" always;
-add_header X-Content-Type-Options "nosniff" always;
-add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+下面是这些配置里几处「不写注释就会被后人改回去」的决定：
 
-server {
-    listen 80;
-    server_name <DOMAIN>;
+| 配置 | 为什么必须这样 |
+|---|---|
+| `location /index.html` 里 `open_file_cache off;` | 全局开了 `open_file_cache`（省 syscall），它会把**打开的文件描述符**一起缓存。而 `index.html` 是本站唯一「文件名不变、内容会变」的文件 —— 每次构建换成新 inode，缓存里的旧 fd 仍指向旧 inode，于是部署后 nginx 继续下发**旧 HTML**，里面引用的是已被删除的旧 hash 资源 → **整站白屏**，直到缓存过期（inactive 60s / valid 120s）。实测踩过：响应头 `last-modified` 停在上一版构建。其余文件不受影响 —— `/assets/` 与 `/fonts/` 的文件名里带 hash，内容即身份。 |
+| `location /index.html` 里 `Cache-Control: no-cache` | SPA 入口引用带 hash 的产物文件名，被浏览器启发式缓存后，重新部署会让用户拿着旧 HTML 去请求已删除的旧 hash 文件 → 白屏且不强刷不自愈。 |
+| `location /assets/`、`location /fonts/` 用 `expires 1y` + `immutable` | 文件名即内容指纹，内容永不改变。 |
+| 主站 `listen 443 ssl http2;` | certbot 生成的是 `listen 443 ssl;`。nginx 的 http2 是 **listen socket 级**参数 —— 目前是靠发布站块的 `listen 443 ssl http2;` 顺带把同一 socket 打开的，所以主站事实上走 HTTP/2。发布站块一旦被裁掉（泛域名证书缺失时 `deploy.sh` 会裁），主站会**静默掉回 HTTP/1.1**（每域名 6 条并发连接）。`deploy.sh` 有一步幂等 sed 补 `http2`，并有一步**实测协议版本**。 |
+| www 的两个跳转块用 `location / { return 301 … }`，不用 server 级 `return` | server 级 `return` 在 rewrite 阶段执行、先于 location 匹配，会把 certbot 续期时要访问的 `/.well-known/acme-challenge/` 一并 301 掉 → 续期失败。也不要自己预先声明 ACME location：续期由 certbot 的 nginx 插件插入，预先占位会让它报重复 location 而中断续期。 |
+| `location /fonts/` 单开 + 显式 `types { font/woff2 woff2; }` | ① nginx 自带 `mime.types` **没有 woff2**，不声明会下发成 `application/octet-stream`；② 落进 `location /` 的话，文件缺失会命中 `try_files` 回落到 `index.html`，浏览器拿到 200 + text/html，字体**静默失效**且毫无线索。 |
+| `location /api/` 的 `proxy_buffering off` | SSE 的硬要求，否则流式进度被攒住，实时效果全无。 |
+| `proxy_set_header X-Forwarded-For $remote_addr`（覆盖而非追加） | `$proxy_add_x_forwarded_for` 的最左段由客户端自带，限流可被伪造绕过。 |
 
-    client_max_body_size 50m;
+**访问日志带耗时**：`deploy/nginx-tuning.conf` 定义了 `talk2code_timed` 格式
+（比默认 `combined` 多了 `rt=$request_time` 与 `urt=$upstream_response_time`）。
+默认格式**没有任何时间字段**，事后无法区分「服务端慢」与「用户网络慢」——
+排查首屏慢时只能靠猜。按耗时倒序看最慢请求：
 
-    # 前端静态产物
-    location / {
-        root /opt/talk2code/frontend-vue/dist;
-        try_files $uri $uri/ /index.html;
-    }
-
-    # 带 hash 的构建产物可长缓存
-    location /assets/ {
-        root /opt/talk2code/frontend-vue/dist;
-        expires 7d;
-        add_header Cache-Control "public, immutable";
-    }
-
-    # 后端 API + SSE 长连接
-    # proxy_buffering off 是 SSE 的硬要求，否则流式输出被攒住
-    location /api/ {
-        proxy_pass http://127.0.0.1:5001;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        # 覆盖而非追加：配合 TRUST_PROXY_HEADERS=true 得到不可伪造的客户端 IP
-        proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header Connection "";
-
-        proxy_buffering off;
-        proxy_cache off;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-        chunked_transfer_encoding on;
-    }
-}
+```bash
+awk -F'rt=' '/rt=/{split($2,a," "); print a[1], $0}' /var/log/nginx/access.log | sort -rn | head
 ```
 
-**已发布站点（一键发布功能依赖此项）** `/etc/nginx/sites-available/talk2code-publish`：
+
+**已发布站点（一键发布功能依赖此项）**
+
+发布站的 server 块**已经写在 `deploy/nginx.conf` 的文件末尾**，`deploy.sh` 会按泛域名
+证书是否存在自动保留 / 裁剪它（证书没签时该块会让 `nginx -t` 直接失败，连主站都起不来，
+所以脚本会主动省略）。手工配置时的等价内容：
 
 ```nginx
 # 前置条件：
-#   1) DNS 加 *. <APEX> 泛解析指向本机
-#   2) 泛域名证书（云厂商免费证书通常不含通配符，用 acme.sh 走 DNS 验证申请）
+#   1) DNS 加 *.<APEX> 泛解析指向本机
+#   2) 泛域名证书 /etc/letsencrypt/live/wildcard.<APEX>/（见步骤 10）
 server {
     listen 80;
-    listen 443 ssl;
-    server_name ~^(?<slug>[a-z0-9]+)\.<APEX_ESCAPED>$;
+    server_name "~^[a-z0-9]{20}\.<APEX_ESCAPED>$";
+    return 301 https://$host$request_uri;
+}
 
-    ssl_certificate     /etc/letsencrypt/live/<APEX>/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/<APEX>/privkey.pem;
+server {
+    listen 443 ssl http2;
+    server_name "~^[a-z0-9]{20}\.<APEX_ESCAPED>$";
+
+    ssl_certificate     /etc/letsencrypt/live/wildcard.<APEX>/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/wildcard.<APEX>/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    # 发布站跑的是用户生成的代码，禁止被任何站点 iframe 嵌套
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 
     location / {
         proxy_pass http://127.0.0.1:5001;
+        # 上游 Flask 给**所有**响应统一加主站那套头（XFO: SAMEORIGIN +
+        # 面向主站 SPA 的 CORS）。不隐掉的话响应里会出现两个同名 XFO
+        # （SAMEORIGIN 在前），浏览器取第一个 → 上面的 DENY 形同虚设。
+        proxy_hide_header X-Frame-Options;
+        proxy_hide_header Access-Control-Allow-Origin;
+        proxy_hide_header Access-Control-Allow-Credentials;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Connection "";
         proxy_buffering off;
@@ -548,17 +624,28 @@ server {
 }
 ```
 
-> `<APEX_ESCAPED>` 是把域名点号转义后的形式，例如 `example\.com`。  
+> `<APEX_ESCAPED>` 是把域名点号转义后的形式，例如 `example\.com`。
 > 不配这一块，「一键发布」生成的链接将无法访问。
+
+三个实测踩到的点（都在上面体现）：
+1. `server_name` 的正则含 `{20}` 这类花括号时**必须用双引号包住**，否则 nginx 把 `{`
+   当块起始，报 `directive "server_name" is not terminated by ";"`。
+2. 正则取 20 位，与 `services/publish/slug.py::is_valid_slug` 一致；写成 `[a-z0-9]+`
+   会把以后新增的常规子域（如 `blog.<APEX>`）也收进发布站。
+3. 必须 `proxy_hide_header` 掉上游的同名头，否则 `DENY` 被前一个 `SAMEORIGIN` 顶掉。
 
 启用并校验：
 
 ```bash
 sudo ln -sf /etc/nginx/sites-available/talk2code /etc/nginx/sites-enabled/talk2code
-sudo ln -sf /etc/nginx/sites-available/talk2code-publish /etc/nginx/sites-enabled/talk2code-publish
 sudo rm -f /etc/nginx/sites-enabled/default
 sudo nginx -t && sudo systemctl reload nginx
 ```
+
+> ⚠️ 改完配置**必须实测一次响应头**再宣布成功。实测遇到过 `systemctl reload nginx`
+> 没真正应用新配置的情况（`nginx -T` 已是新内容，线上行为却还是旧的）——
+> `systemctl restart nginx` 后才生效。
+
 
 ### 步骤 10：SSL 证书
 
@@ -574,13 +661,21 @@ sudo certbot --nginx -d <DOMAIN> -d www.<DOMAIN> \
 > HTTPS 却打不开」。修法：补全 `server_name` 后重跑同一条命令
 > （`--keep-until-expiring` 会复用已签发的证书，不会重复申请）。
 
-泛域名证书（发布站需要，走 DNS 验证）：
+泛域名证书（发布站需要，**只能走 DNS-01** —— 通配符不支持 HTTP 验证）：
 
 ```bash
+# --cert-name 固定证书目录 → /etc/letsencrypt/live/wildcard.<APEX>/
+# 刻意不 --expand 进主站那张：通配符**不覆盖 apex**，主站仍需自己的
+# <DOMAIN> + www 证书；拆成两张，互不牵连。
 sudo certbot certonly --manual --preferred-challenges dns \
-  -d "*.<APEX>" -d "<APEX>"
-# 按提示添加 _acme-challenge TXT 记录，等待生效后回车
+  --cert-name wildcard.<APEX> -d "*.<APEX>"
+# 按提示把 TXT 值加到 _acme-challenge.<APEX>，验证通过后该记录即可删除
 ```
+
+> ⚠️ **手动签发的证书不会自动续期**：certbot 无法无人值守地重放 DNS 挑战，
+> `certbot renew` 会跳过它 —— 90 天后需重跑上面这条命令（下面的 `--dry-run`
+> 对它不构成有效验证）。要自动续期，得装对应服务商的 DNS 插件并配好 API 凭据
+> （如 DNSPod / 腾讯云），再用 `--authenticator dns-<vendor>`。
 
 自动续期检查：
 
@@ -656,7 +751,73 @@ curl -sI http://127.0.0.1:5001/api/health | grep -i x-frame-options
 
 # ③ 跑一条真实需求后，日志里不该有降级标记
 journalctl -u talk2code-celery -n 300 | grep -c "沙箱预览链路不可用"   # 期望 0
+
+# ④ 静态资源确实走了 gzip（没开 → JS/CSS 原样下发，实测多传 60%+ 流量）
+curl -sI -H 'Accept-Encoding: gzip' "https://$DOMAIN/" | grep -i content-encoding   # 期望 gzip
+
+# ⑤ 整站无外部 origin 依赖（外链字体 = 阻塞渲染，网络不通时首屏白屏十几秒）
+curl -s "https://$DOMAIN/" | grep -oE '(href|src)="https?://'        # 期望无输出
+
+# ⑥ 自托管字体三连：mime 正确 / 长缓存 / 缺文件返回 404 而不是首页
+FONT=$(ls /opt/talk2code/frontend-vue/dist/fonts/*.woff2 | head -1 | xargs basename)
+curl -sI "https://$DOMAIN/fonts/$FONT" | grep -iE "content-type|cache-control"
+#    期望 content-type: font/woff2、cache-control: max-age=31536000
+curl -sI "https://$DOMAIN/fonts/does-not-exist.woff2" | head -1     # 期望 404，不是 200
+
+# ⑦ 部署后 nginx 必须已经在发**新**的 index.html
+#    open_file_cache 会把旧文件的 fd 缓存住，漏配 open_file_cache off 时会继续发旧 HTML
+#    → 里面引用的旧 hash 资源已被删除 → 整站白屏，且要等 60~120s 才自愈。
+#    判据：响应头 last-modified 不早于 dist/index.html 的 mtime。
+curl -sI "https://$DOMAIN/" | grep -i last-modified
+stat -c '%y  ← dist/index.html 实际 mtime' /opt/talk2code/frontend-vue/dist/index.html
+#    入口引用的每个资源都必须 200（曾经出现过 HTML 是在发的、但 hash 已过期）
+for u in $(curl -s "https://$DOMAIN/" | grep -oE '/assets/[^"?]+'); do
+  printf '%s %s\n' "$(curl -s -o /dev/null -w '%{http_code}' "https://$DOMAIN$u")" "$u"
+done   # 期望全部 200
+
+# ⑧ 主站必须走 HTTP/2（HTTP/1.1 下每域名只有 6 条并发连接，静态资源会排队）
+curl -s -o /dev/null -w '%{http_version}\n' "https://$DOMAIN/"       # 期望 2
+
+# ⑨ www 必须 301 到 apex（不跳 = 两个域名各自 200、缓存与收录分裂）
+curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' "https://www.$DOMAIN/"   # 期望 301 https://<DOMAIN>/
+curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' "http://www.$DOMAIN/"    # 期望一跳直达 https://<DOMAIN>/
 ```
+
+**浏览器侧实测**（只看 curl 不够，字体的真实加载只有浏览器知道）：
+
+```js
+// 在 https://<DOMAIN>/ 的控制台执行
+// 中文走系统字体栈：只要本机装了对应字族，这两项应为 true
+document.fonts.check('16px "PingFang SC"') || document.fonts.check('16px "Microsoft YaHei"')
+// 自托管的拉丁族必须真加载到了
+document.fonts.check('16px "Newsreader"')     // 期望 true
+document.fonts.check('16px "JetBrains Mono"') // 期望 true
+// 可变字体区间声明是否真的区分字重（换成逗号列表会让四档全部塌成 normal）
+[400,500,600,700].map(w => { const s=document.createElement('span');
+  s.style.cssText=`position:absolute;visibility:hidden;font:${w} 64px "Newsreader"`;
+  s.textContent='WgHamburgefonstiv'; document.body.appendChild(s);
+  const r=s.getBoundingClientRect().width; s.remove(); return Math.round(r); })
+// 期望 4 个互不相同的宽度
+```
+
+性能预算核对（数字对不上就说明有回归）：
+
+```bash
+# 首屏传输量：市集 ≤ 200 KB / 后台 ≤ 200 KB（回归时会是 600 KB ~ 1 MB）
+# 请求数：市集 ≤ 18 / 后台 ≤ 14
+# 字体请求：每页 ≤ 2 个分片（回归时会变成 9~16 个）
+# 详情页：CodeMirror 的 815 KB **不得**出现在首屏资源里（它是按需 + 空闲预取）
+#   实测判据：performance.getEntriesByType('resource')
+#              .filter(r => r.name.includes('codemirror'))[0].startTime > loadEventEnd
+```
+
+
+> ④ 的原因：Ubuntu 自带的 `/etc/nginx/nginx.conf` 把 `gzip_types` 整段**注释掉了**，
+> 只压 `text/html`。结果是所有 JS/CSS/JSON 原样传 —— `codemirror.js` 834KB 变成
+> 277KB、`vue-router` 88KB 变成 34KB（实测省 61–67%）。`deploy.sh` 步骤 9 会自动补上
+> 这组配置，但**改完必须实测响应头**：`nginx -t` 通过不等于生效（见过一次
+> `reload` 后 `nginx -T` 已是新内容、线上行为却还是旧的，`restart` 才对）。
+> 注意 `gzip_types` **不得**包含 `text/event-stream` —— SSE 进度推送被压缩会破坏流式即时性。
 
 ②的原因：服务端验收浏览器的宿主页是 `file://` 临时文件（见
 `preview_runner._make_sandbox_wrapper_uri`），与预览地址**跨源**。预览响应一旦带上
