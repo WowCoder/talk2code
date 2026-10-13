@@ -117,16 +117,29 @@ const router = createRouter({
 })
 
 // Navigation guard
-router.beforeEach((to, _from, next) => {
-  const authStore = useAuthStore()
-
-  // 后台路由：独立的 sessionStorage 登录态，与前台 cookie 互不干扰
-  if (to.meta.requiresAdmin && !getAdminToken()) {
-    next({ name: 'AdminLogin' })
+//
+// 应用不再等登录态探测完成才挂载（见 main.ts），所以这里要自己决定「这次判定
+// 是否真的需要登录态」：需要才 await authStore.authReady，不需要就直接放行 ——
+// 免登录页面（市集、后台）因此可以立刻渲染，不为一个后台探测付首屏时间。
+router.beforeEach(async (to, _from, next) => {
+  // 后台路由用独立的 sessionStorage 登录态，与前台 cookie 无关：既不 await 前台探测，
+  // 也不会被前台登录态影响。
+  if (to.meta.requiresAdmin) {
+    if (getAdminToken()) next()
+    else next({ name: 'AdminLogin' })
     return
   }
 
-  // 登录态已在 main.ts 中通过 initAuth() 恢复
+  const authStore = useAuthStore()
+
+  // 需要等的三种情况：
+  //   · requiresAuth 未显式声明为 false（首页、详情、历史、设置、通配重定向）
+  //   · 登录页 —— 已登录时要跳回首页，判定依赖登录态
+  // meta.requiresAuth === false 的市集各页不在此列。
+  if (to.meta.requiresAuth !== false || to.name === 'Login') {
+    await authStore.authReady
+  }
+
   if (!authStore.isAuthenticated && to.path === '/') {
     // 游客的默认落点是市集：先让人看见别人做出来的东西，比先甩一个登录框
     // 更能说明这产品能干什么。（/history、/settings 仍走下面的登录门禁）

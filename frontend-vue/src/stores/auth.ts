@@ -12,7 +12,27 @@ export const useAuthStore = defineStore('auth', () => {
   // 前端的 isDemo 只负责 UX —— 置灰按钮、展示引导。
   const isDemo = ref(false)
 
-  /** 应用启动时调用：请求后端确认 cookie 是否有效（带超时，避免白屏） */
+  // 登录态探测是否已有结论。main.ts 挂载前不等它，守卫按需 await。
+  // 兜底 5s：即使 initAuth 因为意外没被调用或提前抛错，也不会把守卫永久挂起
+  // （挂起的表现是整页空白，比按未登录处理糟糕得多）。
+  let markAuthReady!: () => void
+  const authReady = new Promise<void>((resolve) => {
+    markAuthReady = resolve
+  })
+  const authReadyTimeout = setTimeout(() => markAuthReady(), 5000)
+  function settleAuthReady() {
+    clearTimeout(authReadyTimeout)
+    markAuthReady()
+  }
+
+  /**
+   * 应用启动时调用：请求后端确认 cookie 是否有效（带超时，避免白屏）
+   *
+   * 完成后 resolve `authReady`，路由守卫据此判断是否要等首屏。之所以要这个信号：
+   * 应用不再等它返回才挂载（那会让每个页面都白等到这个往返回来，最坏 4 秒），
+   * 改成「先渲染、按需等待」——免登录页面（市集、后台）立刻出内容，
+   * 只有判定确实依赖登录态的路由才 await。
+   */
   async function initAuth(): Promise<void> {
     try {
       const controller = new AbortController()
@@ -33,6 +53,9 @@ export const useAuthStore = defineStore('auth', () => {
       }
     } catch {
       // 网络异常按未登录处理
+    } finally {
+      // 无论成功、401 还是异常（含 4s 超时）都必须放行，否则守卫会永远挂起
+      settleAuthReady()
     }
     isAuthenticated.value = false
     isDemo.value = false
@@ -113,6 +136,7 @@ export const useAuthStore = defineStore('auth', () => {
     email,
     isAuthenticated,
     isDemo,
+    authReady,
     initAuth,
     login,
     enterDemo,

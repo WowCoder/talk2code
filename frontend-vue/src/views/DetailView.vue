@@ -83,9 +83,12 @@
           <PreviewFrame />
         </div>
 
-        <!-- Code view：编辑器自己管理滚动，外层不再滚动，避免双滚动条 -->
+        <!-- Code view：编辑器自己管理滚动，外层不再滚动，避免双滚动条。
+             CodeMirror 一个 chunk 就是 815 KB（gzip 270 KB），而默认落在预览 Tab，
+             绝大多数访问根本不会打开代码 —— 所以走异步组件 + 首次进入才挂载。
+             挂载后改用 v-show 常驻：切走再切回来不丢正在看的文件与光标。 -->
         <div v-show="activeTab === 'code'" class="view active view-embed">
-          <CodePanel @download="onDownload" />
+          <CodePanel v-if="codeEverOpened" @download="onDownload" />
         </div>
 
         <!-- Publish view -->
@@ -104,7 +107,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, watch, onMounted, defineAsyncComponent } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useRequirementStore, emptyProgress } from '@/stores/requirement'
 import { useAuthStore } from '@/stores/auth'
@@ -117,10 +120,14 @@ import PanelTabs from '@/components/detail/PanelTabs.vue'
 import SpecPanel from '@/components/detail/SpecPanel.vue'
 import TaskPanel from '@/components/detail/TaskPanel.vue'
 import PreviewFrame from '@/components/detail/PreviewFrame.vue'
-import CodePanel from '@/components/detail/CodePanel.vue'
 import PublishPanel from '@/components/detail/PublishPanel.vue'
 import TokenBar from '@/components/detail/TokenBar.vue'
 import type { SSETraceSummaryData } from '@/types/sse'
+
+// 代码面板内部是一整个 CodeMirror 编辑器（单独 chunk 815 KB / gzip 270 KB），
+// 而默认落在预览 Tab，大多数访问根本不会打开代码 —— 所以整块延迟加载。
+const loadCodePanel = async () => (await import('@/components/detail/CodePanel.vue')).default
+const CodePanel = defineAsyncComponent(loadCodePanel)
 
 const route = useRoute()
 const router = useRouter()
@@ -128,6 +135,44 @@ const store = useRequirementStore()
 const authStore = useAuthStore()
 const { show } = useToast()
 const activeTab = ref('preview')
+
+// ---- 代码面板的按需挂载 ----
+// 一旦打开过就保持挂载（配合 v-show），切走再切回来不丢正在看的文件与滚动位置。
+const codeEverOpened = ref(false)
+
+// 预取时机：只在**需求已经跑完**、用户也没关掉省流量时，空闲里把 CodeMirror
+// 那块拉进 HTTP 缓存 —— 让真正点开「代码」的人几乎瞬间看到内容。
+//
+// 为什么不在页面一挂载就预取：生成进行中时页面上挂着 SSE 进度流，这条 270 KB
+// 的后台下载会和进度消息抢带宽（弱网下会被用户实实在在感知到卡顿）。而生成
+// 过程中「代码」Tab 本来也没有完整内容可看，等跑完再拉正好。
+const CODE_PREFETCH_DELAY_MS = 2000
+let prefetchTimer = 0
+function prefetchCodePanel() {
+  if (codeEverOpened.value) return
+  if (store.currentRequirement?.status !== 'finished') return
+  if ((navigator as Navigator & { connection?: { saveData?: boolean } }).connection?.saveData) return
+  clearTimeout(prefetchTimer)
+  const idle: (cb: () => void) => void =
+    typeof window.requestIdleCallback === 'function'
+      ? (cb) => void window.requestIdleCallback(cb)
+      : (cb) => void window.setTimeout(cb, 300)
+  prefetchTimer = window.setTimeout(() => idle(() => void loadCodePanel().catch(() => {})), CODE_PREFETCH_DELAY_MS)
+}
+
+// immediate：默认 Tab 万一不是 preview（后续改动/直链），第一次渲染就要正确挂载。
+watch(
+  activeTab,
+  (tab) => {
+    if (tab !== 'code') return
+    clearTimeout(prefetchTimer)
+    codeEverOpened.value = true
+  },
+  { immediate: true },
+)
+
+// 需求从生成中翻到 finished 的那一刻开始预取（历史需求进来就是 finished，立即生效）
+watch(() => store.currentRequirement?.status, prefetchCodePanel, { immediate: true })
 
 // ---- 可拖拽分栏 ----
 // 对话流宽度百分比（25~60 之间拖动），默认 38。宽度只存内存，
