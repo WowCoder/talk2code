@@ -224,7 +224,10 @@ function switchTab(tab: 'active' | 'trash') {
 }
 
 function onSearch(query: string) { searchQuery.value = query }
-function onSelect(id: number) { router.push(`/detail/${id}`) }
+// 跳 slug（地址栏不放自增 id）；历史需求没 slug 时退回 id，详情页会自行换成 slug
+function onSelect(item: RequirementSummary) {
+  router.push(`/detail/${item.slug || item.id}`)
+}
 
 // ===== Multi-select =====
 

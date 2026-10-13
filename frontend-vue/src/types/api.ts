@@ -13,6 +13,8 @@ export type RequirementStatus = 'pending' | 'processing' | 'planning' | 'interru
 
 export interface RequirementSummary {
   id: number
+  /** 对外身份：URL 里只放它。历史需求可能为空（回填前创建的），此时退回 id */
+  slug?: string | null
   title: string
   status: RequirementStatus
   create_time: string
@@ -138,6 +140,8 @@ export interface VerifyCard {
 
 export interface Requirement {
   id: number
+  /** 对外身份：URL 里只放它（历史需求可能为空） */
+  slug?: string | null
   title: string
   content: string
   status: RequirementStatus

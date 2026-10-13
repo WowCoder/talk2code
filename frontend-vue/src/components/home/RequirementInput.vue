@@ -76,7 +76,9 @@ async function submit() {
     }
 
     const data = await response.json()
-    router.push(`/detail/${data.requirement.id}`)
+    // slug 优先：地址栏不放自增 id。历史需求没 slug 时退回 id，
+    // 详情页加载后会自动 replace 成 slug 版。
+    router.push(`/detail/${data.requirement.slug || data.requirement.id}`)
   } catch (err: any) {
     show(err.message || '创建需求失败', 'error')
   } finally {

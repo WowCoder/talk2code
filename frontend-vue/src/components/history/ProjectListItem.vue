@@ -21,7 +21,7 @@
 
     <div class="card-body">
       <div class="card-header">
-        <span class="card-title">{{ project.title }}</span>
+        <span class="card-title" :title="project.title">{{ project.title }}</span>
         <StatusBadge :status="project.status" />
       </div>
       <div class="card-meta">
@@ -233,9 +233,13 @@ function formatDate(dateStr: string): string {
   font-size: 14.5px;
   font-weight: 600;
   color: var(--fg);
-  white-space: nowrap;
+  /* 两行而不是一行：需求名现在最多 30 字，一行放不下就被截成半句，
+     列表里每一行看起来都一样。超两行才省略（悬停可读全文）。 */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .card-meta {

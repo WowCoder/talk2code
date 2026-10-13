@@ -11,7 +11,7 @@
       :mode="mode"
       :selected="selectedIds?.has(project.id)"
       :show-checkbox="showCheckbox"
-      @click="$emit('select', project.id)"
+      @click="$emit('select', project)"
       @trash="$emit('trash', $event)"
       @restore="$emit('restore', $event)"
       @permanent-delete="$emit('permanentDelete', $event)"
@@ -36,7 +36,8 @@ const props = defineProps<{
 }>()
 
 defineEmits<{
-  select: [id: number]
+  // 整条带出来：跳转要用 slug，只要 id 的话调用方还得回头查一遍列表
+  select: [project: RequirementSummary & { content?: string; file_count?: number }]
   trash: [id: number]
   restore: [id: number]
   permanentDelete: [id: number]

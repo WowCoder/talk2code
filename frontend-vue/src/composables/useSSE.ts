@@ -394,6 +394,11 @@ export function useSSE(reqId: Ref<number | null>) {
     es.addEventListener('spec', (e: MessageEvent) => {
       const data: SSESpecData = JSON.parse(e.data)
       store._specData = data
+      // TL 出计划即带上正式名称（人话复述，≤40 字）：导航栏与列表要立刻显示它，
+      // 而不是等到下次刷新才从详情接口里读到。
+      if (data.title && store.currentRequirement) {
+        store.currentRequirement.title = data.title
+      }
       // 标记紧随其后的那条 TL 分析文本消息：它与计划卡是**同一份内容**
       // （requirement_restated + features + acceptance_criteria 逐字相同），
       // 只是卡片的纯文本副本。不标记的话，用户要把同一份计划读两遍
