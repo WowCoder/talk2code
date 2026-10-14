@@ -547,10 +547,26 @@ sudo systemctl status talk2code talk2code-celery --no-pager
 
 ### 步骤 9：Nginx
 
-主站、www 跳转、发布站的 server 块**都在 `deploy/nginx.conf` 里**（`deploy.sh`
-会用实际域名替换 `<DOMAIN>` / `<APEX>` 占位符后装到
-`/etc/nginx/sites-available/talk2code`）。全局调优在 `deploy/nginx-tuning.conf`,
-装到 `/etc/nginx/conf.d/`。**改配置只改这两个文件**，不在本文档里另抄一份。
+主站（80 + 443）、:80 一跳归一、www 的 https 跳转、发布站的 server 块**全部都在
+`deploy/nginx.conf` 里**（`deploy.sh` 替换 `<DOMAIN>` / `<APEX>` 占位符后**整文件覆盖**
+`/etc/nginx/sites-available/talk2code`）。全局调优在 `deploy/nginx-tuning.conf`，
+装到 `/etc/nginx/conf.d/`。**改配置只改这两个文件** —— 不在服务器上直接改，也不在本文档里
+另抄一份：第 9 步是整文件覆盖，任何只存在于线上的改动都会在下一次部署时消失。
+
+★ 模板里三对 `# >>> xxx-start` / `# <<< xxx-end` 标记是**按证书裁剪**的开关，`deploy.sh`
+按「apex 证书 + `options-ssl-nginx.conf` + `ssl-dhparams.pem` 三件齐备」/「泛域名证书在不在」
+决定保留还是整段删除：
+
+| 标记区间 | 裁剪条件 | 误保留会怎样 |
+|---|---|---|
+| `apex-ssl`（主站的 `listen 443 ssl http2;` + 证书 + TLS 参数） | apex 证书 + certbot 的 TLS 参数文件 | `nginx -t` 因 `ssl_certificate` 加载不到文件而**直接失败**，连主站都起不来 |
+| `apex-http-redirect`（:80 一跳归一） | 同上 | 把用户 301 到一个连不上的 https 地址 |
+| `www-https`（www 的 https 301） | 同上 | 同上 |
+| 「已发布站点 → EOF」 | 泛域名证书 | 同上 |
+
+裁剪的 sed **一律允许行首空白**（`^[[:space:]]*#`）：`apex-ssl` 那对标记写在 server 块
+内部、天然带缩进。曾经写成按行首 `^#` 锚 —— 结果那一段根本没被删掉，而 `nginx -t` 照样
+通过（它只校验「配置能不能加载」，不校验「该删的删没删」）。
 
 下面是这些配置里几处「不写注释就会被后人改回去」的决定：
 
@@ -559,8 +575,11 @@ sudo systemctl status talk2code talk2code-celery --no-pager
 | `location /index.html` 里 `open_file_cache off;` | 全局开了 `open_file_cache`（省 syscall），它会把**打开的文件描述符**一起缓存。而 `index.html` 是本站唯一「文件名不变、内容会变」的文件 —— 每次构建换成新 inode，缓存里的旧 fd 仍指向旧 inode，于是部署后 nginx 继续下发**旧 HTML**，里面引用的是已被删除的旧 hash 资源 → **整站白屏**，直到缓存过期（inactive 60s / valid 120s）。实测踩过：响应头 `last-modified` 停在上一版构建。其余文件不受影响 —— `/assets/` 与 `/fonts/` 的文件名里带 hash，内容即身份。 |
 | `location /index.html` 里 `Cache-Control: no-cache` | SPA 入口引用带 hash 的产物文件名，被浏览器启发式缓存后，重新部署会让用户拿着旧 HTML 去请求已删除的旧 hash 文件 → 白屏且不强刷不自愈。 |
 | `location /assets/`、`location /fonts/` 用 `expires 1y` + `immutable` | 文件名即内容指纹，内容永不改变。 |
-| 主站 `listen 443 ssl http2;` | certbot 生成的是 `listen 443 ssl;`。nginx 的 http2 是 **listen socket 级**参数 —— 目前是靠发布站块的 `listen 443 ssl http2;` 顺带把同一 socket 打开的，所以主站事实上走 HTTP/2。发布站块一旦被裁掉（泛域名证书缺失时 `deploy.sh` 会裁），主站会**静默掉回 HTTP/1.1**（每域名 6 条并发连接）。`deploy.sh` 有一步幂等 sed 补 `http2`，并有一步**实测协议版本**。 |
-| www 的两个跳转块用 `location / { return 301 … }`，不用 server 级 `return` | server 级 `return` 在 rewrite 阶段执行、先于 location 匹配，会把 certbot 续期时要访问的 `/.well-known/acme-challenge/` 一并 301 掉 → 续期失败。也不要自己预先声明 ACME location：续期由 certbot 的 nginx 插件插入，预先占位会让它报重复 location 而中断续期。 |
+| 主站的 443 由**模板自己写**（`apex-ssl` 区间），不留给 certbot 追加 | certbot 只在签发/续期那一次动配置，证书没到期时它直接跳过；而第 9 步是**整文件覆盖**。曾经 443 只存在于线上，重跑一次部署就把主站变回只监听 80：`:443` 上没有默认 server（没人写 `default_server`），nginx 取第一个 :443 块（www 跳转块）当默认 → `Host: <DOMAIN>` 被 301 到它自己 → **https 无限循环**（浏览器 ERR_TOO_MANY_REDIRECTS），而末尾两条验收还都打 ✓（301 响应本身就是 HTTP/2）。现在配置全部由模板产出，certbot 只负责签证书。 |
+| 主站 server 块**不写** `listen 80;` | 80 由 `apex-http-redirect` 块统一 301 到 https。主站若也占着 80，nginx 按「先出现的赢」把 `http://<DOMAIN>` 直接 200 出去，重定向静默失效；反过来，主站一个 listen 都没有时 nginx 会补默认的 `*:80`，同样会抢 80 —— 所以证书没齐时宁可整段删掉 `apex-ssl`，也不能让它退化成 80。 |
+| 主站 `listen 443 ssl http2;` 里的 `http2` | nginx 1.18 没有 `http2 on;` 这种写法，http2 只能写在 listen 上、而且是 **listen socket 级**参数 —— 丢了就掉回 HTTP/1.1（每域名 6 条并发连接，静态资源排队）。certbot 自己插进来的是不带 http2 的 `listen 443 ssl;`，所以 `deploy.sh` 保留了一步幂等 sed（certbot 前后各跑一次），另有一处**实测协议版本**。 |
+| certbot 之后**再渲染一遍模板**（`render_nginx_conf` 在第 9 步被调用两次） | certbot 的 nginx 插件每次「部署证书」都会改配置文件（`--nginx` 即使证书没到期也会走一遍 install）。除了给证书行加 `# managed by Certbot`（无害），它还会往 :80 块里插 **server 级** `if ($host = www.<DOMAIN>) return 301 https://www.<DOMAIN>` —— server 级 `if` 在 rewrite 阶段、先于 location 生效，于是 `http://www.<DOMAIN>` 从「一跳直达 apex」退化成**两跳**。渲染是幂等的，certbot 之后再跑一遍即可把它的改动冲掉，让线上内容恒等于模板内容；二次渲染若过不了 `nginx -t` 就回退到 certbot 那次的结果（线上仍可用）。验收里有一条专门守它。 |
+| www 的两个跳转块（`apex-http-redirect` 与 `www-https`）用 `location / { return 301 … }`，不用 server 级 `return` | server 级 `return`/`if` 在 rewrite 阶段执行、先于 location 匹配，会把该块里**所有**请求（含 certbot 续期要访问的 `/.well-known/acme-challenge/`）一并 301 掉。⚠️ 这个风险**实测没兑现**：`certbot renew --dry-run` 在上面的 server 级 `if` 存在时依然成功（它自己会保证挑战可达）——所以别把它当成"一定会坏"；真正的理由是写 `location /` 不依赖 certbot 的内部行为，且不会引入两跳。也不要自己预先声明 ACME location：续期由 certbot 的 nginx 插件插入，预先占位会让它报重复 location 而中断续期。 |
 | `location /fonts/` 单开 + 显式 `types { font/woff2 woff2; }` | ① nginx 自带 `mime.types` **没有 woff2**，不声明会下发成 `application/octet-stream`；② 落进 `location /` 的话，文件缺失会命中 `try_files` 回落到 `index.html`，浏览器拿到 200 + text/html，字体**静默失效**且毫无线索。 |
 | `location /api/` 的 `proxy_buffering off` | SSE 的硬要求，否则流式进度被攒住，实时效果全无。 |
 | `proxy_set_header X-Forwarded-For $remote_addr`（覆盖而非追加） | `$proxy_add_x_forwarded_for` 的最左段由客户端自带，限流可被伪造绕过。 |
@@ -781,6 +800,14 @@ curl -s -o /dev/null -w '%{http_version}\n' "https://$DOMAIN/"       # 期望 2
 # ⑨ www 必须 301 到 apex（不跳 = 两个域名各自 200、缓存与收录分裂）
 curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' "https://www.$DOMAIN/"   # 期望 301 https://<DOMAIN>/
 curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' "http://www.$DOMAIN/"    # 期望一跳直达 https://<DOMAIN>/
+
+# ⑩ ★ 主站 https 必须返回 200、http 一跳 301 —— 这才是「主站 443 还在」的判据。
+#    只测 ⑧⑨ 会漏：主站丢了 443 时请求会落到 :443 的默认 server（www 跳转块）上 → 301 到
+#    它自己，而那个 301 响应本身就是 HTTP/2、www 那条拿到的也正是 301 → 两条都判「正常」。
+#    实测踩过：重跑部署覆盖掉主站 443，日志全绿、站点打不开。
+curl -sS -o /dev/null -w '%{http_code} %{redirect_url}\n' "https://$DOMAIN/"       # 期望 200
+curl -s -o /dev/null -w '%{http_code} %{redirect_url} hops=%{num_redirects}\n' \
+  "http://$DOMAIN/market"                                                          # 期望 301 https://<DOMAIN>/market，1 跳
 ```
 
 **浏览器侧实测**（只看 curl 不够，字体的真实加载只有浏览器知道）：

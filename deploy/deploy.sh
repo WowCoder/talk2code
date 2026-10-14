@@ -16,6 +16,7 @@ REPO=https://github.com/WowCoder/talk2code.git
 DOMAIN="${1:?用法: sudo bash deploy.sh <域名> [apex]}"
 APEX="${2:-$DOMAIN}"
 RUN_USER=talk2code
+NGINX_SITE_CONF=/etc/nginx/sites-available/talk2code
 PY=/usr/bin/python3.10
 [ -x "$PY" ] || PY=/usr/bin/python3   # 兜底：系统默认 python3
 
@@ -110,10 +111,20 @@ sudo -u "$RUN_USER" -H "$APP_DIR/backend/venv/bin/gunicorn" --version >/dev/null
 
 # ==================== 5/9 预下载模型 ====================
 log "[5/9] 预下载 BGE-M3 模型（避免线上首次检索卡 1-2 分钟）"
-sudo -u "$RUN_USER" -H bash -c "
+# ★ 必须显式给 HF_ENDPOINT：默认端点 huggingface.co 在国内机房是 `Network is
+#   unreachable`，而 huggingface_hub 会对**每个文件**重试 5 次（1/2/4/8/8s 退避）
+#   —— 实测这一步能拖 20 分钟以上，最后超时失败还会因 set -e 把整个部署带走
+#   （前几步都成功了，却停在模型预热上）。镜像端点已同时写进两个 systemd unit，
+#   这里保持一致；可用 HF_ENDPOINT=... 覆盖。
+#   失败不再终止：模型已缓存时它只是校验一遍；即使没下成，运行时会用同一个
+#   HF_ENDPOINT 自动补齐，属于「慢一点」而非「坏掉」。
+sudo -u "$RUN_USER" -H env \
+  HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}" \
+  HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}" \
+  bash -c "
   cd '$APP_DIR/backend' && source venv/bin/activate
   python -c \"from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-m3', device='cpu')\"
-"
+" || warn "模型预热未成功（HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}）；运行时会自行补齐，继续部署"
 
 # ==================== 6/9 前端构建 ====================
 log "[6/9] 前端构建"
@@ -131,17 +142,26 @@ if grep -qE '(href|src)="https?://' "$DIST/index.html"; then
   grep -oE '(href|src)="https?://[^"]*"' "$DIST/index.html" | sort -u
   exit 1
 fi
-FONT_N=$(find "$DIST/fonts" -name '*.woff2' 2>/dev/null | wc -l | tr -d ' ')
+FONT_N=$(find "$DIST/fonts" -name '*.woff2' 2>/dev/null | wc -l | tr -d ' ') || FONT_N=0
+FONT_N=${FONT_N:-0}
 if [ "$FONT_N" -lt 1 ]; then
   echo "自托管字体缺失（dist/fonts 里没有 woff2），终止。"
   echo "补齐：cd $APP_DIR/frontend-vue && sudo -u $RUN_USER npm run fonts"
   exit 1
 fi
-# 字体文件数与 CSS 里的 url('/fonts/...') 引用数必须一一对应：
+# 字体文件数与 CSS 里引用到的 /fonts/*.woff2 必须一一对应：
 #   多了 → 改过字体族配置后残留的孤儿文件（白占仓库与磁盘，还会被部署上去）
 #   少了 → CSS 引用了不存在的文件，浏览器静默不加载，字形回退且无任何报错
-FONT_REF=$(grep -oh "url('/fonts/[^']*')" "$DIST"/assets/*.css 2>/dev/null \
-  | sed "s#url('/fonts/##; s#')##" | sort -u | wc -l | tr -d ' ')
+#
+# ⚠️ 两处坑（实测各踩过一次）：
+#   ① 不能按 `url('/fonts/xxx')` 匹配 —— Vite 压缩会**把 url() 里的引号去掉**，
+#      产物里是 `url(/fonts/xxx.woff2)`，写死单引号会永远匹配 0 条；
+#   ② 不能直接 `VAR=$(grep ... | wc -l)` —— grep 无命中返回非 0，在
+#      `set -e -o pipefail` 下**赋值就失败、脚本无任何提示地退出**
+#      （表现：前端刚构建完，7/8/9 步全被跳过）。所以统一兜 `|| VAR=0`。
+FONT_REF=$(grep -ohE "/fonts/[A-Za-z0-9._-]+\.woff2" "$DIST"/assets/*.css 2>/dev/null \
+  | sort -u | wc -l | tr -d ' ') || FONT_REF=0
+FONT_REF=${FONT_REF:-0}
 if [ "$FONT_N" != "$FONT_REF" ]; then
   echo "字体文件数（$FONT_N）与 CSS 引用数（$FONT_REF）不一致，终止。"
   echo "重新生成：cd $APP_DIR/frontend-vue && sudo -u $RUN_USER npm run fonts && npm run build"
@@ -293,42 +313,78 @@ if [ -f "$APP_DIR/deploy/nginx-tuning.conf" ]; then
   echo "    已安装 conf.d/talk2code-tuning.conf"
 fi
 
-if [ -f "$APP_DIR/deploy/nginx.conf" ]; then
+# ★ 渲染 + 裁剪抽成函数：第 9 步要跑**两遍** —— 一遍在 certbot 之前，一遍在它之后。
+#   第二遍的理由：certbot 的 nginx 插件每次「部署证书」都会往配置里塞自己的东西
+#   （server 级的 `if ($host = …) return 301`、给证书行加 `# managed by Certbot`）。
+#   其中 server 级 if 会抢在 location 之前生效，把 http://www.<DOMAIN> 先跳成
+#   https://www.<DOMAIN> —— 「一跳归一」就退化成两跳。渲染是幂等的，再跑一遍即可把
+#   它冲掉，让线上内容始终 == 模板内容（唯一事实源）。
+render_nginx_conf() {
   sed -e "s#<DOMAIN>#${DOMAIN}#g" \
       -e "s#<APEX_REGEX>#$(echo "$APEX" | sed 's#\.#\\\\.#g')#g" \
       -e "s#<APEX>#${APEX}#g" \
-      "$APP_DIR/deploy/nginx.conf" > /etc/nginx/sites-available/talk2code
-  # ★ 依赖证书的块按证书是否已签发裁剪 —— 否则 nginx -t 会因 ssl_certificate
-  #   加载不到文件而**直接失败**，连主站都起不来。两处独立判据、两步裁剪：
-  #     ① www 的 https 跳转块：需要 apex 证书（<DOMAIN>）
-  #     ② 发布站块：需要泛域名证书（wildcard.<APEX>）
-  #   顺序不能反：②的删除范围是「标记 → EOF」，先跑①才不会把①的块一起吞掉。
+      "$APP_DIR/deploy/nginx.conf" > "$NGINX_SITE_CONF"
+  # ★ 依赖证书的段落按证书是否**齐备**裁剪 —— 否则 nginx -t 会因 ssl_certificate
+  #   加载不到文件而**直接失败**，连主站都起不来。三对标记 + 一个锚点：
+  #     apex-ssl / apex-http-redirect / www-https：同一判据 —— apex 证书 + certbot 的
+  #       TLS 参数文件（options-ssl-nginx.conf、ssl-dhparams.pem 是 include 的目标，
+  #       缺了照样起不来）
+  #     「已发布站点 → EOF」：泛域名证书
+  #   顺序不能反：最后那个的删除范围是「锚点 → EOF」，放前面会把别的块一起吞掉。
   #   证书签好后重跑本脚本，被裁掉的块会自动加回。
-  if [ ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]; then
-    sed -i '/^# >>> www-https-start/,/^# <<< www-https-end/d' /etc/nginx/sites-available/talk2code
-    warn "未检测到 apex 证书 /etc/letsencrypt/live/${DOMAIN}/，本次省略 www 的 https 跳转块"
+  #   ⚠️ 匹配一律允许行首空白（`^[[:space:]]*#`）：apex-ssl 那对标记写在 server 块
+  #      内部、天然带缩进。实测踩过按行首 `^#` 锚的版本 —— 匹配不上，那一段根本没被
+  #      删掉，而 `nginx -t` 照样通过（它只校验"配置能不能加载"，不校验"该删的删没删"）。
+  #
+  # ★ 主站的 443 为什么写在模板里、而不是像以前那样留给 certbot 追加：
+  #   certbot 只在「签发/续期」那一次动配置，证书没到期时它直接跳过，而第 9 步是
+  #   **整文件覆盖** —— 以前 443 只存在于线上，重跑一次部署就把主站变回只监听 80：
+  #   :443 上没有默认 server（没人写 default_server），nginx 取第一个 :443 块（www 的
+  #   跳转块）当默认，`Host: <DOMAIN>` 于是被 301 到它自己 → https 无限循环；而末尾
+  #   两条验收都还会打 ✓（301 响应本身就是 HTTP/2）。现在配置全部由模板产出，
+  #   certbot 只负责签证书。
+  APEX_READY=0
+  if [ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ] \
+     && [ -f /etc/letsencrypt/options-ssl-nginx.conf ] \
+     && [ -f /etc/letsencrypt/ssl-dhparams.pem ]; then
+    APEX_READY=1
+    echo "    apex 证书与 TLS 参数齐备，保留主站 443 与两个跳转块"
+  else
+    sed -i '/^[[:space:]]*# >>> apex-ssl-start/,/^[[:space:]]*# <<< apex-ssl-end/d' "$NGINX_SITE_CONF"
+    sed -i '/^[[:space:]]*# >>> apex-http-redirect-start/,/^[[:space:]]*# <<< apex-http-redirect-end/d' "$NGINX_SITE_CONF"
+    sed -i '/^[[:space:]]*# >>> www-https-start/,/^[[:space:]]*# <<< www-https-end/d' "$NGINX_SITE_CONF"
+    warn "apex 证书或 certbot 的 TLS 参数文件缺失，本次未启用 HTTPS（主站只在 :80 上服务）"
+    warn "签好证书后重跑本脚本即自动启用：certbot --nginx -d $DOMAIN -d www.$DOMAIN"
   fi
   if [ ! -f "/etc/letsencrypt/live/wildcard.${APEX}/fullchain.pem" ]; then
-    sed -i '/^# ==================== 已发布站点/,$d' /etc/nginx/sites-available/talk2code
+    sed -i '/^[[:space:]]*# ==================== 已发布站点/,$d' "$NGINX_SITE_CONF"
     warn "未检测到泛域名证书 /etc/letsencrypt/live/wildcard.${APEX}/，本次省略发布站块"
   fi
-  ln -sf /etc/nginx/sites-available/talk2code /etc/nginx/sites-enabled/talk2code
+
+  # ★ 兜底断言：保留了 443 段却 grep 不到主站的 `listen 443 ssl`，说明标记区间被改坏
+  #   或模板回退成了旧版 —— 部署上去就是 https 无限 301，而旧版两条验收都发现不了。
+  if [ "$APEX_READY" = "1" ] \
+     && ! grep -qE '^[[:space:]]*listen[[:space:]]+443[[:space:]]+ssl' "$NGINX_SITE_CONF"; then
+    warn "★ 主站没有 443 监听（apex-ssl 标记区间被改坏？）—— 现在部署上去会让 https 无限 301"
+  fi
+
+  # ★ 给 443 的 listen 补 http2（幂等）。nginx 1.18 没有 `http2 on;` 这种写法，http2
+  #   只能写在 listen 上、而且是 **socket 级**参数 —— 丢了就掉回 HTTP/1.1（每域名 6
+  #   条并发连接，一页十几个静态资源要排队）。模板里的 443 都自带 http2，这一步只兜
+  #   首次部署时 certbot 自己插进来的那行 `listen 443 ssl;`。
+  sed -i -E 's#^([[:space:]]*listen[[:space:]]+443[[:space:]]+ssl)([[:space:]]*;)#\1 http2\2#' "$NGINX_SITE_CONF"
+}
+
+if [ -f "$APP_DIR/deploy/nginx.conf" ]; then
+  render_nginx_conf
+  ln -sf "$NGINX_SITE_CONF" /etc/nginx/sites-enabled/talk2code
   rm -f /etc/nginx/sites-enabled/default
-
-  # ★ 给主站的 443 补 http2（幂等）。certbot 生成的 `listen 443 ssl;` 不带 http2，
-  #   目前是靠发布站块的 `listen 443 ssl http2;` 顺带把同一个 listen socket 打开的
-  #   —— nginx 的 http2 是 **socket 级**参数。于是发布站块一旦被裁掉，主站会静默
-  #   掉回 HTTP/1.1（每域名 6 条并发连接，一页十几个静态资源要排队）。
-  #   写成 `listen 443 ssl http2;` 后两者解耦。
-  sed -i -E 's#^([[:space:]]*listen[[:space:]]+443[[:space:]]+ssl)([[:space:]]*;)#\1 http2\2#' \
-    /etc/nginx/sites-available/talk2code
-
   if nginx -t; then
     # 用 restart 而非 reload：实测过一次 reload 后 `nginx -T` 已是新内容、
     # 线上行为却还是旧的（同名响应头未更新），restart 后才生效。
     systemctl restart nginx
   else
-    warn "nginx 配置校验失败，请检查 /etc/nginx/sites-available/talk2code"
+    warn "nginx 配置校验失败，请检查 $NGINX_SITE_CONF"
   fi
 else
   warn "未找到 deploy/nginx.conf，跳过（见 docs/deploy.md 步骤 9）"
@@ -341,21 +397,63 @@ apt-get install -y certbot python3-certbot-nginx
 certbot --nginx -d "$DOMAIN" -d "www.$DOMAIN" --non-interactive --agree-tos -m "admin@${DOMAIN}" \
   || warn "certbot 未成功（常见原因：域名未解析 / 备案未完成）。备案后手动跑：certbot --nginx -d $DOMAIN -d www.$DOMAIN"
 
+# ★ certbot 的 nginx 插件每次「部署证书」都会改配置（往 :80 块里插 server 级
+#   `if ($host = …) return 301`、给证书行加 `# managed by Certbot`）。server 级 if 会
+#   抢在 location 之前生效，于是 http://www.<DOMAIN> 先跳 https://www.<DOMAIN>、
+#   再由 www 的块跳第二次 —— 「一跳归一」退化成两跳。渲染是幂等的，这里再跑一遍把它的
+#   改动冲掉，让线上内容 == 模板内容。渲染后必须 restart 才生效；万一二次渲染过不了
+#   nginx -t，就退回 certbot 那次的结果（线上仍然可用）。
+if [ -f "$APP_DIR/deploy/nginx.conf" ]; then
+  cp -p "$NGINX_SITE_CONF" "$NGINX_SITE_CONF.certbot-result"
+  render_nginx_conf
+  if nginx -t >/dev/null 2>&1; then
+    systemctl restart nginx 2>/dev/null || true
+    echo "    ✓ certbot 的改动已渲染掉，线上内容 == 模板内容"
+    rm -f "$NGINX_SITE_CONF.certbot-result"
+  else
+    cp -p "$NGINX_SITE_CONF.certbot-result" "$NGINX_SITE_CONF"
+    rm -f "$NGINX_SITE_CONF.certbot-result"
+    warn "certbot 之后的二次渲染没通过 nginx -t，已回退到 certbot 那次的结果"
+  fi
+fi
+
 # ---- 实测验收：协议版本与 www 跳转 ----
 # 只校验配置文件内容是没用的 —— 实测踩过 `systemctl reload nginx` 后 `nginx -T`
 # 已是新内容、线上行为却还是旧的。这里一律打到线上实际响应上。
 systemctl restart nginx 2>/dev/null || true
 sleep 1
 if command -v curl >/dev/null; then
-  VER=$(curl -sS -o /dev/null -w '%{http_version}' "https://$DOMAIN/" 2>/dev/null || echo "?")
-  if [ "$VER" = "2" ]; then echo "    ✓ 主站协议 HTTP/2"
-  else warn "主站协议是 HTTP${VER}（期望 2）—— 静态资源会受每域名 6 连接限制"; fi
+  if [ "$APEX_READY" = "1" ]; then
+    # ★ 先断言首页真的返回 200，再谈协议版本。主站丢了 443 时，请求会落到 :443 的默认
+    #   server（www 跳转块）上 → 301 到它自己；而那个 301 响应本身就是 HTTP/2，只测协议
+    #   版本会判成「正常」（历史事故），所以必须先看状态码。
+    HTTPS_CODE=$(curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' "https://$DOMAIN/" 2>/dev/null || echo "?")
+    case "$HTTPS_CODE" in
+      200*) echo "    ✓ 主站 https 返回 200" ;;
+      *) warn "★ 主站 https 没返回 200（实测：$HTTPS_CODE）—— 若是 301 到自身即死循环，检查主站 443 块是否还在" ;;
+    esac
 
-  WWW=$(curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' "https://www.$DOMAIN/" 2>/dev/null || echo "?")
-  case "$WWW" in
-    301*"https://$DOMAIN/"*) echo "    ✓ www.$DOMAIN 已 301 到 $DOMAIN" ;;
-    *) warn "www.$DOMAIN 未按预期 301（实测：$WWW）—— 检查 apex 证书与 www 的 server 块" ;;
-  esac
+    VER=$(curl -sS -o /dev/null -w '%{http_version}' "https://$DOMAIN/" 2>/dev/null || echo "?")
+    if [ "$VER" = "2" ]; then echo "    ✓ 主站协议 HTTP/2"
+    else warn "主站协议是 HTTP${VER}（期望 2）—— 静态资源会受每域名 6 连接限制"; fi
+
+    WWW=$(curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' "https://www.$DOMAIN/" 2>/dev/null || echo "?")
+    case "$WWW" in
+      301*"https://$DOMAIN/"*) echo "    ✓ www.$DOMAIN 已 301 到 $DOMAIN" ;;
+      *) warn "www.$DOMAIN 未按预期 301（实测：$WWW）—— 检查 apex 证书与 www 的 server 块" ;;
+    esac
+
+    # ★ www 的 http 必须**一跳**直达 https://<DOMAIN>。certbot 部署证书时会往 :80 块里插
+    #   server 级 `if ($host = www…) return 301 https://www…`，那会让它先跳 https://www
+    #   再跳一次（两跳，缓存与收录都吃亏）—— 二次渲染就是为了冲掉它，这里是它的守卫。
+    WWW_HTTP=$(curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' "http://www.$DOMAIN/" 2>/dev/null || echo "?")
+    case "$WWW_HTTP" in
+      301*"https://$DOMAIN/"*) echo "    ✓ http://www.$DOMAIN 一跳直达 https://$DOMAIN" ;;
+      *) warn "http://www.$DOMAIN 不是一跳直达 apex（实测：$WWW_HTTP）—— certbot 又往 :80 块里插了 server 级 if？" ;;
+    esac
+  else
+    warn "本次未启用 HTTPS（证书或 TLS 参数缺失），跳过 https 验收；主站当前只在 :80 上服务"
+  fi
 fi
 
 # ==================== 完成 ====================
