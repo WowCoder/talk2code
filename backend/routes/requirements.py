@@ -71,6 +71,27 @@ def _chat_quality_gate(workspace) -> tuple[list[dict], str]:
         logger.warning(f"Chat 质量闸门异常（放行降级）: {e}")
         return [], ""
 
+def _chat_run_outcome(current_step: str, writes_landed: bool) -> str:
+    """Chat 轮终态判定：'failed' / 'finished'。
+
+    背景（线上 req 74A9W0HSDEFM2EYDH58E，2026-10-14）：修掉「遮蔽邀请重读 /
+    熔断拦截重读」的死锁后，弱模型（deepseek-flash）把所有修改在第 2 轮就改完，
+    随后几轮全用在核对读取上，从不发出「不带工具调用的完成声明」——
+    current_step=max_iterations 但工作已全部落地。此时报 failed 有两个后果：
+    用户看到的是「失败」而文件其实已改；质量闸门（冒烟 + 回滚）被跳过。
+
+    判定规则（保持诚实优先）：
+      · llm_error / coding_error（基础设施故障）→ 永远 failed；
+      · max_iterations / no_progress 且**没有任何写入** → failed（真没干活）；
+      · 其余（含「耗尽但写入已落地」）→ finished，由质量闸门决定放行/回滚。
+    """
+    if current_step in ("llm_error", "coding_error"):
+        return "failed"
+    if current_step in ("max_iterations", "no_progress") and not writes_landed:
+        return "failed"
+    return "finished"
+
+
 @app.route('/api/requirements', methods=['POST'])
 @rate_limit_requirement
 @jwt_required()
@@ -531,8 +552,13 @@ def chat_with_requirement(req_id):
             sse_reporter=sse,
             on_iteration=_persist_dialogue,
         )
-        # Chat 模式下降低迭代上限（修改任务应该在 3-5 轮内完成）
-        tool_loop.MAX_ITERATIONS = 4
+        # Chat 模式下迭代上限（修改任务量小，但不止"读+改"两轮）。
+        # 2026-10-14 线上 req 74A9W0HSDEFM2EYDH58E 修复死锁后实测：读 2 轮
+        # （并行读全部 → 补读漏掉的）+ 改 1 轮 + 改后验证读 1 轮 + 收尾 1 轮
+        # = 5 轮；4 轮会把"修改已全部落地"误判成 max_iterations 失败。
+        # 主循环的自修复扩容（SELF_REPAIR_EXTRA_ITERATIONS）不覆盖 chat 路径，
+        # 这里直接给足，仍远小于编码主流程的 10 轮。
+        tool_loop.MAX_ITERATIONS = 6
 
         # 临时替换 system prompt 为修改模式
         def _chat_prompt(state):
@@ -589,8 +615,15 @@ def chat_with_requirement(req_id):
                 _chat_inflight.pop(req_id, None)
 
         # ---- 轻量质量闸门：改完自动跑一次 smoke，引入缺陷则回滚本次修改 ----
+        # 除了「模型主动声明完成」，「迭代耗尽但写入已落地」也过闸门：弱模型
+        # 改完常继续核对读取而耗尽预算，工作本身已完成（见 _chat_run_outcome）。
+        current_step = final_state.get('current_step', '')
+        writes_landed = bool(final_state.get('_any_write_done'))
+        run_gate = current_step == 'task_complete' or (
+            current_step in ('max_iterations', 'no_progress') and writes_landed
+        )
         gate_note = None
-        if final_state.get('current_step') == 'task_complete':
+        if run_gate:
             defects, defect_summary = _chat_quality_gate(workspace)
             if defects:
                 logger.warning(
@@ -661,9 +694,9 @@ def chat_with_requirement(req_id):
             }]
         requirement.dialogue_history = final_dialogue
         requirement.code_files = updated_files
-        # 检查 current_step：只有真正完成才标记 finished
-        current_step = final_state.get('current_step', '')
-        if current_step in ('no_progress', 'max_iterations', 'llm_error', 'coding_error'):
+        # 终态判定（含「耗尽但写入已落地 → finished」）：只有真正没干活才 failed
+        outcome = _chat_run_outcome(current_step, writes_landed)
+        if outcome == 'failed':
             requirement.status = 'failed'
             # 构建诊断错误信息
             error_parts = [f"对话执行终止: {current_step}"]

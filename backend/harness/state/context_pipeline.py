@@ -36,6 +36,15 @@ KEEP_TAIL = 6
 # 口径：history 单独计（不含 head），因为 head（system prompt）是每轮重建的
 # 固定开销，不该挤占历史的治理空间。
 HISTORY_SOFT_BUDGET = 6000
+# Chat 修改轮（is_chat）的历史软预算。该轮的对话背景已被
+# condense_chat_background 裁到只剩「原始需求 + 计划理解 + 本轮诉求」，
+# read_file 结果是本轮唯一实质内容，而 chat_modify.md 是两段式 prompt
+# （「第1轮一次性读全部、第2轮执行修改」）——用默认 6000 会把刚读到的
+# 文件正文遮成占位符，第 2 轮的地基直接被拆掉。线上 req
+# 74A9W0HSDEFM2EYDH58E 实测：8 个 read ≈9.5k tok 触发遮蔽 → 重读又被
+# 同内容熔断拦截 → 4 轮空转 max_iterations。放宽到 20000（硬预算仍 24000
+# 兜底），遮蔽路径由 runtime 的 masked 豁免作为第二道防线。
+CHAT_HISTORY_SOFT_BUDGET = 20000
 # 永不遮蔽的工具（write/edit 变更摘要 + 验证结果），对应 Anthropic exclude_tools 白名单
 EXCLUDE_TOOLS = {
     "write_file", "edit_file", "update_task_notes",
@@ -79,11 +88,21 @@ _READ_HEADER_RE = re.compile(
     r"\)\]"
 )
 
+# 现行 read_file 头部格式（file_tools.py:132 起）：
+#   [文件: <name> — 全文共 N 行，未截断]
+#   [文件: <name> — 共 N 行；本次返回第 a-b 行，…]
+# 旧括号格式（(行 a-b / 共 n 行)）已废弃，两者都兼容。
+# 注意不能锚 $：头部后面还跟着正文，只匹配行首到头部右括号为止。
+_READ_HEADER_DASH_RE = re.compile(r"^\[文件:\s*(.+?)\s*—\s*(.+?)\]")
+
 
 def _parse_read_header(content: str):
     """从 read_file 结果里解析 (filename, range_info)。"""
     m = _READ_HEADER_RE.match(content.lstrip())
     if not m:
+        m = _READ_HEADER_DASH_RE.match(content.lstrip())
+        if m:
+            return m.group(1).strip(), m.group(2).strip()
         return None, ""
     filename = m.group(1).strip()
     if m.group(3):  # 带行范围
@@ -426,6 +445,17 @@ class ContextPipeline:
             req = requirement_content or "请根据以上系统提示开始任务。"
             messages.append({"role": "user", "content": req})
 
+        # 被遮蔽的 read_file 文件名回传（软/硬预算两阶段累计，masked 标志
+        # 在 staged 上累积）。调用方（runtime 的同内容重读熔断）据此豁免：
+        # 正文已被遮出上下文时，「内容已在上方工具结果里」是假话，重读是
+        # 恢复路径而不是浪费——见 runtime._same_content_read_block。
+        stats["masked_read_files"] = [
+            (s.get("arguments") or {}).get("filename")
+            for s in staged
+            if s.get("masked") and s["kind"] == "tool" and s["name"] == "read_file"
+            and (s.get("arguments") or {}).get("filename")
+        ]
+
         return messages, stats
 
     # ---------- L0 角色通道 ----------
@@ -584,7 +614,11 @@ class ContextPipeline:
             if s["name"] == "read_file":
                 filename, range_info = _parse_read_header(s["content"])
                 if not filename:
-                    filename = s["name"]
+                    # 头部解析失败时回退 arguments 元数据（stage 时保留，
+                    # 见 _stage_history）——tool_call 条目本来就带 filename，
+                    # 比从正文正则反推可靠。此前回落成工具名 "read_file"，
+                    # 占位符里「文件：read_file」等于没告诉模型哪个文件被省略。
+                    filename = (s.get("arguments") or {}).get("filename") or s["name"]
                 if i in superseded:
                     placeholder = (
                         f"[工具 read_file 返回结果]（已省略；文件：{filename}；"

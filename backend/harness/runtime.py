@@ -545,32 +545,10 @@ class ToolCallLoop:
                 ):
                     _rf2 = tc.arguments.get("filename", "") or ""
                     if _rf2:
-                        try:
-                            import hashlib as _hashlib
-                            _raw_now = self.workspace.read(_rf2)
-                            _h_now = _hashlib.md5(
-                                _raw_now.encode("utf-8", "ignore")
-                            ).hexdigest()
-                            _prev_hashes = state.setdefault("_read_file_hashes", {})
-                            if _prev_hashes.get(_rf2) == _h_now:
-                                _read_limited = True
-                                from harness.tools.registry import ToolResult as _TR2
-                                result = _TR2(
-                                    blocked=True,
-                                    content=(
-                                        f"[已跳过] {_rf2} 自上次读取后内容完全没有变化，"
-                                        f"你拿到的会是和上一轮逐字相同的结果（已在上方工具结果里）。"
-                                        f"不要为确认而重读它 —— 直接基于已有内容继续；"
-                                        f"需要改动就用 write_file / edit_file 写入。"
-                                        # 同内容重读同理：直接把首尾贴出来，省掉下一次尝试
-                                        f"{self._file_preview_snippet(_rf2)}"
-                                    ),
-                                )
-                                logger.info(f"[ToolLoop] 同内容重读跳过: {_rf2}")
-                            else:
-                                _prev_hashes[_rf2] = _h_now
-                        except Exception:
-                            pass  # 读不到（文件不存在等）时放行，交给正常执行路径报错
+                        _block = self._same_content_read_block(state, _rf2)
+                        if _block is not None:
+                            _read_limited = True
+                            result = _block
 
                 if not _read_limited:
                     result = self._execute_tool(state, tc)
@@ -1438,11 +1416,23 @@ class ToolCallLoop:
 
         # 预算从 56000 收紧到 24000：贪吃蛇实测 prompt_tokens 高达 20.9 万，
         # 主要来自每轮重发完整 plan + 文件摘要 + 最近 30 条工具结果。
-        from harness.state.context_pipeline import ContextPipeline, _local_summary
+        from harness.state.context_pipeline import (
+            ContextPipeline, _local_summary,
+            CHAT_HISTORY_SOFT_BUDGET, HISTORY_SOFT_BUDGET,
+        )
+        # Chat 修改轮放宽历史软预算：该轮 read 结果是唯一实质内容，而
+        # chat_modify.md 是「第1轮读全部、第2轮改完」两段式 prompt ——
+        # 用默认 6000 会把刚读到的正文遮成占位符，第 2 轮无正文可改
+        # （线上 req 74A9W0HSDEFM2EYDH58E：遮蔽与重读熔断互斥 → 死锁）。
+        # 硬预算 24000 不变；遮蔽仍可能发生时，由熔断处的 masked 豁免兜底。
+        _is_chat_round = bool((state.get("metadata") or {}).get("is_chat"))
         pipeline = ContextPipeline(
             budget=24000,
             llm_summary=_local_summary,
             ref_store=self._make_ref_store(),
+            history_soft_budget=(
+                CHAT_HISTORY_SOFT_BUDGET if _is_chat_round else HISTORY_SOFT_BUDGET
+            ),
         )
         # 估算口径对齐真实 messages：进 msg[0] 的是 stable_prompt（已剥离可变尾段），
         # 传完整 system_prompt 会把尾段重复计入 head，预算判断系统性偏高。
@@ -1459,6 +1449,10 @@ class ToolCallLoop:
             hook_failures=hook_failures,
             requirement_content=requirement_content,
         )
+
+        # 被预算遮蔽的 read_file 文件名回传：同内容重读熔断对它们放行
+        # （正文已被遮出上下文时，「已在上方工具结果里」是假话，重读是恢复）
+        state["_masked_read_files"] = set(stats.get("masked_read_files") or [])
 
         messages = []
         if stable_prompt:
@@ -2557,6 +2551,50 @@ class ToolCallLoop:
             (ln[:200] + " …" if len(ln) > 200 else ln) for ln in body.split("\n")
         )
         return f"\n\n【{filename} 共 {total} 行，首尾预览】\n{body}"
+
+    def _same_content_read_block(self, state: AgentState, filename: str):
+        """同内容重读判定：返回 ToolResult（blocked）表示拦截，None 表示放行。
+
+        判据：磁盘当前内容与上次读取时的 md5 一致（`_read_file_hashes`）。
+
+        ★ masked 豁免：该文件在上一轮 `_build_messages` 里被上下文管道遮成了
+        占位符（`state["_masked_read_files"]`，由 ContextPipeline 回传）——
+        此时「内容就在上方工具结果里」是假话（上方只剩占位符），模型重读是
+        在走占位符指明的恢复路径，必须放行。线上 req 74A9W0HSDEFM2EYDH58E
+        的死亡闭环：遮蔽把正文收起来 → 占位符邀请重新读取 → 熔断以「已在
+        上方」为由拦截 → 4 轮空转 max_iterations。两道规则必须互相让路。
+
+        读不到文件（不存在等）时放行，交给正常执行路径报错。
+        """
+        if not filename:
+            return None
+        try:
+            disk = self.workspace.read(filename)
+        except Exception:
+            return None
+        h_now = self._content_hash(disk)
+        prev = state.setdefault("_read_file_hashes", {})
+        if prev.get(filename) != h_now:
+            prev[filename] = h_now
+            return None
+        if filename in (state.get("_masked_read_files") or set()):
+            # 正文已被遮出上下文：放行重读（恢复路径），并刷新指纹
+            prev[filename] = h_now
+            logger.info(f"[ToolLoop] 同内容重读放行（内容已被遮蔽，重读即恢复）: {filename}")
+            return None
+        from harness.tools.registry import ToolResult
+        logger.info(f"[ToolLoop] 同内容重读跳过: {filename}")
+        return ToolResult(
+            blocked=True,
+            content=(
+                f"[已跳过] {filename} 自上次读取后内容完全没有变化，"
+                f"你拿到的会是和上一轮逐字相同的结果（已在上方工具结果里）。"
+                f"不要为确认而重读它 —— 直接基于已有内容继续；"
+                f"需要改动就用 write_file / edit_file 写入。"
+                # 同内容重读同理：直接把首尾贴出来，省掉下一次尝试
+                f"{self._file_preview_snippet(filename)}"
+            ),
+        )
 
     def _created_read_block(self, state: AgentState, filename: str):
         """创建后免回读判定：返回 ToolResult（blocked）表示拦截，None 表示放行。
