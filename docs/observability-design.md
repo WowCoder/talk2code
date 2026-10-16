@@ -6,7 +6,7 @@ Talk2Code 内置一套轻量级可观测性设施，目标是**每一次需求�
 
 1. **按需求聚合，而非按需求分流**。运行期保持日志单流追加，每条日志携带 `req_id` / `trace_id`；需求维度的聚合交给查询与归档完成。全局性共因（如模型端点不可达、数据库连接耗尽）需要跨需求视图才能识别，分文件反而会破坏它。
 2. **自研轻量实现**。不引入 Prometheus / OpenTelemetry 等重型依赖；数据出口保持标准形态（结构化日志、JSON、可 SQL 查询的表），将来需要时可平滑接入第三方平台。
-3. **宁可低估，不可高估**。统计口径取不到时归零，绝不产出看似漂亮的假数字。
+3. **未知不能当零**。没有上报的 usage、缓存或价格必须保留未知状态，同时给出数据覆盖率。
 
 ## 组成
 
@@ -45,7 +45,26 @@ cd backend && PYTHONPATH=. python -m harness.observability.metrics_report
 
 - 每次（重）执行生成唯一 `trace_id`，整条 trace（spans、tokens、cost）落 `agent_traces` 表（JSON data + 冗余统计列），跨重启可查
 - span 覆盖编码迭代轮次、verify 评估与缺陷修复；trace 级汇总 `total_tokens` / `cached_tokens` / `cache_hit_rate` / `total_cost` / `duration_ms`
-- `cache_hit_rate = 命中输入 token / 总输入 token`，用于度量提示词缓存优化的实际效果
+- `cache_hit_rate = 命中输入 token / 上报缓存信息的输入 token`；同时显示这些输入占全部已知输入的覆盖率。没有上报显示未知，实际零命中显示 0%。
+- 每次真实 LLM HTTP 请求（含重试、错误、备用模型）生成唯一 `attempt_id`，由客户端统一写 `llm_turn`。业务埋点补阶段与轮次，不重复累计用量。
+- 请求开始前冻结阶段与用途，意图识别、澄清归规划，任务反思归交付；旧数据缺失阶段时显示“未归类”。独立调用在后台单列，离线评测写隔离轨迹库，两者均不混入用户需求费用。
+- 完成的请求先进入 `backend/logs/llm-accounting-pending/<目标库哈希>/` 持久队列，再落数据库；默认启动时及每30秒按 `attempt_id` 幂等补记。保留原时间、用量与价格快照，成功后删除，不重发请求。目录0700、文件0600，按目标库隔离；失败计数与待补记数量供后台对账。`LLM_ACCOUNTING_REPLAY_INTERVAL_SECONDS=0` 可关闭后台轮询。
+- 普通输入、缓存读取、缓存写入和输出按协议归一化；金额以 Decimal 计算，事件保留价格快照与精确金额字符串。展示统一为估算成本 USD，不代表供应商实际扣费。
+- 详情同时提供 `usage_summary` 需求累计和 trace 本次执行；运营列表、统计与需求累计复用事件汇总。
+
+### 历史修复
+
+更新后端并完成新增列迁移后，可先预览单需求，再显式应用：
+
+```bash
+cd backend
+PYTHONPATH=. python scripts/rebuild_usage.py --requirement-id 123
+PYTHONPATH=. python scripts/rebuild_usage.py --requirement-id 123 --apply
+```
+
+默认预览不写数据。应用只修复有原始 usage 的历史事件和 trace 汇总，新客户端事件保留当时价格快照。历史价格无法确认时标记历史估算；原本未记录的请求不能重建。重复应用保持结果一致。
+
+具体字段和验收约定见 [用量计量设计](design/usage-accounting.md)。
 
 ## 指标体系
 

@@ -130,7 +130,7 @@
             <span class="v-divider"></span>
             <div class="stat">
               <span class="stat-value">{{ formatCost(m.observability.cost_7d, 2) }}</span>
-              <span class="stat-label">7 日成本</span>
+              <span class="stat-label">7 日估算成本 USD</span>
             </div>
           </div>
         </div>

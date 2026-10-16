@@ -1,5 +1,6 @@
 import type { SSEQuestionFormData } from './sse'
 import type { PlanSpec } from './spec'
+import type { RequirementUsageSummary } from './usage'
 
 // ===== User Types =====
 export interface User {
@@ -216,6 +217,7 @@ export interface RequirementListResponse {
 
 export interface RequirementDetailResponse {
   requirement: Requirement
+  usage_summary?: RequirementUsageSummary | null
 }
 
 export interface ChatResponse {

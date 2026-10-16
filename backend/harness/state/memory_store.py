@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import time
 from typing import Optional
+from harness.observability.log_context import llm_context
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,7 @@ class MemoryStore:
     def _persisted(self) -> bool:
         return self._db is not None
 
+    @llm_context(stage='delivering', purpose='memory_extraction')
     def extract_memories(self, dialogue_context: list, requirement_id: int, user_id: int) -> list:
         """用 LLM 扫描对话，提取值得长期记忆的事实"""
         if not self._llm or not dialogue_context:
@@ -232,6 +234,7 @@ class MemoryStore:
 
     # ---------- 通用辅助 ----------
 
+    @llm_context(purpose='memory_filter')
     def _llm_filter(self, memories: list, query: str, top_k: int) -> list:
         """用 LLM 从候选记忆中筛选最相关的"""
         if not self._llm or len(memories) <= top_k:

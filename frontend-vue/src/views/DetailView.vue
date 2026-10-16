@@ -97,9 +97,25 @@
         </div>
 
         <TokenBar
-          :tokens="tokenInfo.totalTokens"
-          :cost="tokenInfo.totalCost"
-          :time-ms="tokenInfo.totalDurationMs"
+          :scope="tokenInfo.scope"
+          :summary-stale="store._usageSummaryStale"
+          :tokens="tokenInfo.usage.tokens"
+          :cost="tokenInfo.usage.cost"
+          :time-ms="store._traceSummary?.total_duration_ms"
+          :cached-tokens="tokenInfo.usage.cached_tokens"
+          :input-tokens="tokenInfo.usage.tokens_in"
+          :cache-hit-rate="tokenInfo.usage.cache_hit_rate"
+          :cache-coverage="tokenInfo.usage.cache_coverage"
+          :cache-reported-tokens-in="tokenInfo.usage.cache_reported_tokens_in"
+          :cache-reported-calls="tokenInfo.usage.cache_reported_calls"
+          :usage-reported-calls="tokenInfo.usage.usage_reported_calls"
+          :usage-coverage="tokenInfo.usage.usage_coverage"
+          :llm-calls="tokenInfo.usage.llm_calls"
+          :cost-fallback-calls="tokenInfo.usage.cost_fallback_calls"
+          :cache-savings="tokenInfo.usage.cache_savings"
+          :cache-savings-reported-calls="tokenInfo.usage.cache_savings_reported_calls"
+          :execution-tokens="store._traceSummary?.total_tokens"
+          :execution-cost="reportedCost(store._traceSummary?.total_cost, store._traceSummary?.usage_reported_calls, store._traceSummary?.llm_calls)"
         />
       </div>
     </div>
@@ -122,7 +138,8 @@ import TaskPanel from '@/components/detail/TaskPanel.vue'
 import PreviewFrame from '@/components/detail/PreviewFrame.vue'
 import PublishPanel from '@/components/detail/PublishPanel.vue'
 import TokenBar from '@/components/detail/TokenBar.vue'
-import type { SSETraceSummaryData } from '@/types/sse'
+import { reportedCost } from '@/utils/cost'
+import { selectRequirementUsage } from '@/utils/usageDisplay'
 
 // 代码面板内部是一整个 CodeMirror 编辑器（单独 chunk 815 KB / gzip 270 KB），
 // 而默认落在预览 Tab，大多数访问根本不会打开代码 —— 所以整块延迟加载。
@@ -264,14 +281,7 @@ const failureText = computed(() => {
   return `${outcome}。可以重新生成一次，或在对话里补充要求后再试。`
 })
 
-const tokenInfo = computed(() => {
-  const trace = store._traceSummary as SSETraceSummaryData | null
-  return {
-    totalTokens: trace?.total_tokens || 0,
-    totalCost: trace?.total_cost || 0,
-    totalDurationMs: trace?.total_duration_ms || 0,
-  }
-})
+const tokenInfo = computed(() => selectRequirementUsage(store._usageSummary, store._traceSummary))
 
 // Load requirement, then decide to connect SSE
 const loadError = ref('')
@@ -350,6 +360,17 @@ function retryLoad() {
 }
 
 onMounted(load)
+
+watch(() => store.isGenerating, (generating, wasGenerating) => {
+  if (generating) {
+    store._usageSummaryStale = true
+    // 新执行尚未上报时，不能把上一次执行的 trace 当作本次实时值。
+    if (!loading.value) store._traceSummary = null
+  } else if (wasGenerating && store.currentRequirement) {
+    // 刷新失败时保留待刷新标识，不影响已经完成的生成。
+    void store.refreshUsageSummary().catch(() => {})
+  }
+})
 
 // Auto-switch tabs on SSE events
 watch(() => store.planStatus, (status) => {

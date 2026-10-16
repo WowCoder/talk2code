@@ -14,6 +14,13 @@ import pytest
 from models import Requirement, SessionLocal
 
 
+@pytest.fixture(autouse=True)
+def _no_background_generation(monkeypatch):
+    """Preview fixtures seed finished code; a real worker would race that data."""
+    from services.task_queue import task_queue
+    monkeypatch.setattr(task_queue, "submit", lambda *args, **kwargs: None)
+
+
 def _create_requirement_with_files(app_client, auth_token, files):
     """创建需求并在数据库中预设代码文件"""
     # 创建需求

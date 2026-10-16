@@ -366,12 +366,17 @@ class TraceWriter:
     def llm_call(self, *, call_id=None, iteration=None, request: dict = None,
                  response: dict = None, model=None, duration_ms=None,
                  tokens_in=0, tokens_out=0, cached_tokens=None, cost=0.0, stage=None,
-                 label=None, status="ok", meta=None, ts=None) -> int:
+                 label=None, status="ok", meta=None, ts=None, attempt_id=None) -> int:
         """写一次 LLM 调用。
 
         request.messages[] 走内容寻址只存索引；tools schema 单独去重。
         response 与其余非 message 字段落到 agent_payloads。
         """
+        if attempt_id:
+            from models.models import AgentEvent
+            existing = self._db.query(AgentEvent.seq).filter_by(attempt_id=attempt_id).first()
+            if existing:
+                return existing[0]
         refs = []
         tools_ref = None
         request_tail = None
@@ -400,6 +405,7 @@ class TraceWriter:
                 requirement_id=self.rid,
                 trace_id=self.trace_id,
                 call_id=call_id,
+                attempt_id=attempt_id,
                 seq=seq,
                 turn_index=self.turn_index,
                 iteration=iteration,
@@ -622,7 +628,8 @@ def _usage_dict(usage) -> dict:
            for k in ("prompt_tokens", "completion_tokens",
                      "input_tokens", "output_tokens")}
     for k in ("prompt_tokens_details", "prompt_cache_hit_tokens",
-              "cache_read_input_tokens"):
+              "cache_read_input_tokens", "cache_creation_input_tokens",
+              "cache_creation", "input_tokens_details"):
         v = getattr(usage, k, None)
         if v is None:
             continue
@@ -633,9 +640,9 @@ def _usage_dict(usage) -> dict:
 
 
 def _tokens_from_usage(usage: dict) -> tuple:
-    u = usage or {}
-    return (int(u.get("prompt_tokens") or u.get("input_tokens") or 0),
-            int(u.get("completion_tokens") or u.get("output_tokens") or 0))
+    from harness.observability.usage import normalize_usage
+    u = normalize_usage(usage)
+    return u['input_tokens'], u['output_tokens']
 
 
 def _cached_from_usage(usage: dict):
@@ -646,22 +653,15 @@ def _cached_from_usage(usage: dict):
     字段，界面上会表现为「命中率掉到 0%」，与「缓存真的失效了」长得一模一样，
     而这两者的处置方式完全相反。
 
-    解析规则复用 `CostTracker.extract_cache_hit`：后台展示的命中量必须与
+    解析规则复用 `CostTracker.cache_hit_or_none`：后台展示的命中量必须与
     累计成本里记的命中量同源。各写一份的话，两个数字迟早会互相矛盾。
     """
     u = usage or {}
     if not u:
         return None
-    det = u.get("prompt_tokens_details")
-    det = det if isinstance(det, dict) else {}
-    reported = (det.get("cached_tokens") is not None
-                or u.get("prompt_cache_hit_tokens") is not None
-                or u.get("cache_read_input_tokens") is not None)
-    if not reported:
-        return None
     try:
         from harness.observability.cost import CostTracker
-        return int(CostTracker.extract_cache_hit(u) or 0)
+        return CostTracker.cache_hit_or_none(u)
     except Exception:
         return None
 
@@ -736,26 +736,65 @@ def record_llm_turn(requirement_id, *, stage, iteration=None, model=None,
     except Exception:
         pass  # 文件明细失败无所谓，库里的索引才是后台的数据源
 
-    # ---- 成本累计：所有 LLM 调用的唯一记账点 ----
+    attempt_ids = getattr(response, 'attempt_ids', None)
+    if isinstance(attempt_ids, (list, tuple)) and attempt_ids:
+        try:
+            from harness.observability.llm_accounting import enrich_attempts
+            enrich_attempts(requirement_id, attempt_ids, stage=stage,
+                            iteration=iteration, turn_index=turn_index,
+                            trace_id=trace_id, label=label)
+            if writer is not None:
+                # 实际请求使用独立事务写了新 seq；长 writer 下次重新读取最大值。
+                writer._seq_cache = None
+        except Exception:
+            _count_failure()
+            logger.warning('LLM 请求语义补充失败', exc_info=True)
+        return None
+
+    # 旧日志回放、测试客户端及兼容调用仍可在此记账；正式客户端已在上面返回。
+    model = getattr(response, 'model', None) or model
+
+    # ---- 兼容旧调用/回放的成本累计 ----
     # 刻意放在 `requirement_id` 判空**之前**：CostTracker 是按 **trace_id** 键的，
     # 而「有 trace 但没需求号」是存在的（评测链路就是），放在判空之后会被静默漏掉。
     usage = _usage_dict(getattr(response, "usage", None))
-    tin, tout = _tokens_from_usage(usage)
-    cached = _cached_from_usage(usage)
+    from harness.observability.usage import normalize_usage
+    provider = getattr(response, 'provider', None) or ''
+    normalized = normalize_usage(usage, provider)
+    tin, tout = normalized['input_tokens'], normalized['output_tokens']
+    cached = normalized['cached_tokens']
+    # 先落成局部变量：import 失败时也要让后面的埋点继续走，
+    # 不能因为在 except 里留下未定义的名字把整条事件带崩。
+    cost = 0.0
+    cost_fallback = False
+    quote = None
     try:
         from harness.observability.cost import (
-            estimate_cost_usd, shared_cost_tracker,
+            quote_cost, shared_cost_tracker,
         )
         # cached 为 None 时按 0 计（= 全部按全价）—— 供应商没上报命中量时
         # 保守地按未命中算，宁可略高也不虚报节省。
-        cost = estimate_cost_usd(model, tin, tout, cached or 0)
+        quote = quote_cost(model, normalized, provider)
+        cost = quote['cost']
         # 此前只有 ToolCallLoop 里的编码调用调 cost_tracker.record，
         # 规划 / 验收 / 修复 / AC 翻译的 token 只存在于单条事件里，
         # trace 级汇总（详情页 TokenBar、后台 cost_7d）看不到它们 ——
         # 于是同一个「本次成本」在不同页面是两个数。
         eff_trace = trace_id or _current_trace_or_none()
-        if (tin or tout) and eff_trace:
-            shared_cost_tracker().record(eff_trace, tin, tout, model, cached or 0)
+        if eff_trace:
+            # cached 原样透传（含 None）：record() 要按三态决定这笔是否
+            # 计入命中率分母。传 `cached or 0` 会把「没上报」伪装成
+            # 「上报了但没命中」，分母被污染、命中率系统性偏低。
+            shared_cost_tracker().record(
+                eff_trace, tin, tout, model, cached, provider=provider,
+                cache_creation_tokens=normalized['cache_creation_tokens'],
+                cache_creation_5m_tokens=normalized['cache_creation_5m_tokens'],
+                cache_creation_1h_tokens=normalized['cache_creation_1h_tokens'],
+                usage_reported=normalized['has_usage'],
+            )
+        # 模型未登记（前缀回退也没匹配上）时计价走兜底价 —— 这个事实必须
+        # 跟着事件走，否则后台看起来每条成本都像精确账单。
+        cost_fallback = quote['cost_source'] == 'fallback'
     except Exception as e:
         logger.debug("[TraceWriter] 成本累计失败（不阻断）：%s", e)
         cost = 0.0
@@ -794,7 +833,17 @@ def record_llm_turn(requirement_id, *, stage, iteration=None, model=None,
             duration_ms=int(latency_ms) if latency_ms else None,
             tokens_in=tin, tokens_out=tout, cached_tokens=cached, cost=cost,
             stage=stage, label=label, status=status,
-            meta={"thinking": bool(thinking), "has_usage": bool(usage)},
+            # cost_fallback 只在**真的走了兜底价**时才加这个键：未登记模型的
+            # 计价是量级参考不是账单，后台必须能把这类事件筛出来。
+            # 常态（精确价）不加键，meta 不因这次改动变脏。
+            meta={**{"thinking": bool(thinking), "has_usage": normalized['has_usage']},
+                  **({"cost_decimal": quote['cost_decimal'],
+                      "cost_source": quote['cost_source'],
+                      "price_snapshot": quote['price_snapshot'],
+                      "cache_savings": quote['cache_savings'],
+                      "cache_creation_tokens": normalized['cache_creation_tokens']}
+                     if quote else {}),
+                  **({"cost_fallback": True} if cost_fallback else {})},
         )
     except Exception as e:
         logger.warning("[TraceWriter] record_llm_turn 失败（不阻断）：%s", e)

@@ -496,6 +496,8 @@ class Settings(BaseSettings):
     )
     LOG_FILE: str = Field(default='logs/app.log', description='日志文件路径')
     LOG_DIR: str = Field(default='logs', description='日志目录（项目根目录下）')
+    LLM_ACCOUNTING_REPLAY_INTERVAL_SECONDS: float = Field(
+        default=30, ge=0, description='LLM 持久补记间隔秒数；0 关闭后台轮询')
     AGENT_LOG_RETENTION_DAYS: int = Field(default=30, description='agent/llm 日志保留天数')
     APP_LOG_RETENTION_DAYS: int = Field(default=90, description='app/access 日志保留天数')
     LOG_FILE_MAX_SIZE_MB: int = Field(default=50, description='单日志文件最大大小 (MB)')

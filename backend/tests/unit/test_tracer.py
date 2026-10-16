@@ -9,6 +9,35 @@ from harness.observability.tracer import Tracer, Trace, Span
 from harness.observability.cost import CostTracker, CostReport
 
 
+def test_trace_report_keeps_unknown_attempts_and_coverage():
+    tracker = CostTracker()
+    tracer = Tracer(cost_tracker=tracker)
+    trace = tracer.start_trace(42, 1)
+    tracker.record(trace.trace_id, 100, 10, "gpt-4o", cached_tokens=40)
+    tracker.record(trace.trace_id, 0, 0, "gpt-4o", usage_reported=False)
+    tracer.end_trace(trace.trace_id, status="paused")
+    report = tracer.get_trace(trace.trace_id).to_dict()
+    assert report["status"] == "paused"
+    assert report["llm_calls"] == report["calls"] == 2
+    assert report["usage_reported_calls"] == 1
+    assert report["usage_coverage"] == .5
+    assert report["cache_coverage"] == 1
+    assert report["cost_currency"] == "USD"
+    assert report["cost_is_estimate"] is True
+    assert report["cache_savings"] is not None
+    assert report["cache_savings"] >= 0
+
+
+def test_error_and_paused_trace_close_all_open_spans():
+    for status in ("error", "paused", "awaiting_confirmation"):
+        tracer = Tracer()
+        trace = tracer.start_trace(42, 1)
+        span = tracer.start_span(trace.trace_id, "planning")
+        tracer.end_trace(trace.trace_id, status=status)
+        assert span.end_time is not None
+        assert span.status != "running"
+
+
 class TestSpan:
     """Span 测试"""
 
@@ -466,3 +495,164 @@ class TestCostAccounting:
             src = (root / rel).read_text(encoding="utf-8")
             assert "shared_cost_tracker()" in src, rel
             assert "CostTracker()" not in src, f"{rel} 里还有各建各的 CostTracker()"
+
+    # ---- ④ total_tokens 与成本同源（2026-10-15 修少计 25%~41%） ----
+
+    def test_end_trace_tokens_match_cost_report(self):
+        """total_tokens 必须与 total_cost 同源，不能按 span 求和。
+
+        此前 tokens 按 `span.metadata["tokens"]` 求和，而那个键**只有编码循环写**
+        （runtime.py:303）—— 规划 / 验收 / 修复 / AC 翻译的用量一分不计。
+        实测 req233：span 和 153,364 vs 事件聚合 247,777，少计 38%。
+        """
+        tracker = CostTracker()
+        tracer = Tracer(cost_tracker=tracker)
+        trace = tracer.start_trace(1, 100)
+
+        # 编码 span：这个键只有编码循环会写，且与 record_llm_turn 记账的是
+        # **同一批调用**（同一次 response.usage）—— 被报告覆盖不会丢
+        span = tracer.start_span(trace.trace_id, "tool_coder_iter_0")
+        span.metadata["tokens"] = 1000
+        tracer.end_span(span)
+        tracker.record(trace.trace_id, 800, 200, "agnes-3.0-flash")
+
+        # 规划阶段的调用只进累计报告，span 不带 tokens 键
+        tracker.record(trace.trace_id, 5000, 500, "agnes-3.0-flash")
+
+        tracer.end_trace(trace.trace_id)
+        # 6500 = (800+200) + (5000+500)；按 span 求和只会得到 1000，少计 84%
+        assert trace.total_tokens == 6500
+        assert trace.input_tokens == 5800
+        # 与成本同源：tokens 与 cost 必须描述同一批调用
+        assert trace.total_cost > 0
+
+    def test_end_trace_without_tracker_falls_back_to_spans(self):
+        """无 cost_tracker 时仍按 span 求和（无参构造的旧路径不能坏）"""
+        tracer = Tracer()
+        trace = tracer.start_trace(1, 100)
+        span = tracer.start_span(trace.trace_id, "tool_coder_iter_0")
+        span.metadata["tokens"] = 1000
+        tracer.end_span(span)
+        tracer.end_trace(trace.trace_id)
+        assert trace.total_tokens == 1000
+
+    def test_trace_to_dict_cache_fields(self):
+        """to_dict 要带缓存三件套；一条都没上报时命中率是 None 不是 0%"""
+        import time
+        trace = Trace(trace_id="tr_cache", requirement_id=1, user_id=1,
+                      start_time=time.time())
+        d = trace.to_dict()
+        assert d["cached_tokens"] == 0
+        assert d["cache_reported_tokens_in"] == 0
+        assert d["cache_hit_rate"] is None, "没数据必须给 None，0% 会被读成「缓存失效」"
+
+        trace.cached_tokens = 400
+        trace.cache_reported_tokens_in = 1000
+        d = trace.to_dict()
+        assert d["cache_hit_rate"] == 0.4
+
+    # ---- ⑤ 命中率分母只含上报过的调用（三态语义） ----
+
+    def test_hit_rate_denominator_excludes_unreported(self):
+        """没上报缓存字段的调用不进分母 —— 否则命中率被系统性算低。"""
+        t = CostTracker()
+        t.record("t_denom", 1000, 0, "agnes-3.0-flash", 400)   # 上报·命中
+        t.record("t_denom", 1000, 0, "agnes-3.0-flash", 0)     # 上报·未命中
+        t.record("t_denom", 8000, 0, "agnes-3.0-flash")        # 没上报（无挂账）
+        rep = t.get_report("t_denom")
+        assert rep.reported_calls == 2, "没上报的调用不该进样本量"
+        assert rep.reported_input_tokens == 2000, "分母只含上报过的两次"
+        assert rep.input_tokens == 10000, "但总输入要如实记账，不能为分母好看就藏起来"
+        assert rep.cache_hit_rate == 0.2
+
+    def test_hit_rate_none_when_nothing_reported(self):
+        """一次都没上报 → None，与「查过、一次没命中」（0.0）分开"""
+        t = CostTracker()
+        t.record("t_none", 5000, 100, "agnes-3.0-flash")
+        rep = t.get_report("t_none")
+        assert rep.cache_hit_rate is None
+        assert rep.reported_calls == 0
+
+    def test_extract_usage_only_registers_reported_calls(self):
+        """extract_usage 只在 usage 真带缓存字段时挂账。
+
+        挂 0 会让随后到来的 record() 把这笔算进「上报过」，分母被污染。
+        """
+        from harness.observability.log_context import bind_trace_id
+        t = CostTracker()
+        bind_trace_id("tr_pending")
+        try:
+            t.extract_usage({"prompt_tokens": 10, "completion_tokens": 1},
+                            "openai_compatible")
+            assert "tr_pending" not in t._pending_cache, "没带缓存字段不该留痕"
+
+            t.extract_usage({"prompt_tokens": 10, "completion_tokens": 1,
+                             "prompt_tokens_details": {"cached_tokens": 4}},
+                            "openai_compatible")
+            assert t._pending_cache["tr_pending"] == 4
+            t.record("tr_pending", 10, 1, "agnes-3.0-flash")
+            rep = t.get_report("tr_pending")
+            assert (rep.reported_calls, rep.cached_tokens) == (1, 4)
+        finally:
+            bind_trace_id(None)
+            t.clear()
+
+    def test_explicit_cached_none_still_counts_as_reported(self):
+        """显式传 0 = 上报了没命中，必须进分母（与不传是两件事）"""
+        t = CostTracker()
+        t.record("t_zero", 1000, 0, "agnes-3.0-flash", 0)
+        rep = t.get_report("t_zero")
+        assert rep.reported_calls == 1
+        assert rep.cache_hit_rate == 0.0
+
+    # ---- ⑥ vendor 命名空间前缀 + 兜底标记 ----
+
+    def test_vendor_namespace_matches_family_price(self):
+        """"deepseek/deepseek-flash" 这类带厂商前缀的名字要走族价。
+
+        直接按前缀匹配会全部落空 → 静默按 $1/$4 兜底价计。实测 80 次调用、
+        143 万 input token 因此记了 $2.68，按 v3 刊价只值约 $0.73。
+        """
+        # 同族回退仍是估算，不能伪装成该具体模型的已登记价格。
+        assert CostTracker.uses_fallback("deepseek/deepseek-flash") is True
+        assert CostTracker.price_for("deepseek/deepseek-flash")["input"] == \
+            CostTracker.PRICING["deepseek-v3"]["input"]
+        assert CostTracker.uses_fallback("qwen/qwen-plus") is False
+
+    def test_uses_fallback_flags_unregistered(self):
+        """未登记模型要能被标记出来（兜底价是量级参考，不是账单）"""
+        assert CostTracker.uses_fallback("gpt-5.6") is True
+        assert CostTracker.uses_fallback("minimax-m3") is True
+        assert CostTracker.uses_fallback("agnes-3.0-flash") is False
+        assert CostTracker.uses_fallback("") is False
+        assert CostTracker.uses_fallback(None) is False
+
+    def test_record_llm_turn_marks_cost_fallback_in_meta(self):
+        """兜底计价的事件必须带 cost_fallback，精确价的不带（meta 不变脏）"""
+        from types import SimpleNamespace
+        from harness.observability import trace_writer as tw
+
+        class _W:
+            def __init__(self):
+                self.kw = None
+
+            def llm_call(self, **kw):
+                self.kw = kw
+                return "ok"
+
+        resp = SimpleNamespace(
+            usage={"prompt_tokens": 100, "completion_tokens": 10},
+            content="ok", is_error=False, error=None,
+            finish_reason="stop", reasoning_content=None, tool_calls=None,
+        )
+        w_fallback = _W()
+        tw.record_llm_turn(1, stage="coding", model="gpt-5.6",
+                           system_prompt="s", prompt="p", response=resp,
+                           writer=w_fallback)
+        assert w_fallback.kw["meta"].get("cost_fallback") is True
+
+        w_exact = _W()
+        tw.record_llm_turn(1, stage="coding", model="agnes-3.0-flash",
+                           system_prompt="s", prompt="p", response=resp,
+                           writer=w_exact)
+        assert "cost_fallback" not in w_exact.kw["meta"]

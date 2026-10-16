@@ -1,6 +1,10 @@
 <template>
-  <AdminShell title="需求轨迹" :subtitle="subtitle">
+  <AdminShell :title="scope === 'independent' ? '独立调用' : '需求轨迹'" :subtitle="subtitle">
     <template #actions>
+      <select v-model="scope" class="scope-select" aria-label="调用范围" :disabled="exporting" @change="changeScope">
+        <option value="requirement">需求轨迹</option>
+        <option value="independent">独立调用</option>
+      </select>
       <button class="ghost-btn" :disabled="exporting || !total" @click="exportCsv">
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M12 3v12M7.5 10.5 12 15l4.5-4.5" />
@@ -41,12 +45,12 @@
             </svg>
           </span>
         </div>
-        <span class="kpi-label">今日完成需求</span>
+        <span class="kpi-label">{{ scope === 'independent' ? '今日成功调用' : '今日完成需求' }}</span>
         <span class="kpi-value">{{ stats.today.finished }}</span>
         <span class="kpi-sub">{{ deltaText }}</span>
       </div>
 
-      <div class="kpi-card">
+      <div v-if="scope === 'requirement'" class="kpi-card">
         <div class="kpi-head">
           <span class="kpi-tile running">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -76,7 +80,7 @@
             </svg>
           </span>
         </div>
-        <span class="kpi-label">平均完成耗时<em v-if="rangeLabel" class="kpi-scope">{{ rangeLabel }}</em></span>
+        <span class="kpi-label">{{ scope === 'independent' ? '平均调用耗时' : '平均完成耗时' }}<em v-if="rangeLabel" class="kpi-scope">{{ rangeLabel }}</em></span>
         <span class="kpi-value">{{ fmtDuration(stats.duration.avg_ms) }}</span>
         <!-- 样本数必须写出来：几十条样本上的 P95 不是稳定承诺，
              不标样本量会让人把它当成 SLA -->
@@ -93,9 +97,14 @@
             </svg>
           </span>
         </div>
-        <span class="kpi-label">今日累计成本</span>
-        <span class="kpi-value">{{ formatCost(stats.today.cost) }}</span>
-        <span class="kpi-sub">今日 {{ fmt(stats.today.llm_calls) }} 次 LLM 调用</span>
+        <span class="kpi-label">估算成本 USD<em v-if="rangeLabel" class="kpi-scope">{{ rangeLabel }}</em></span>
+        <span class="kpi-value">{{ formatCost(reportedCost(stats.total_cost, stats.usage_reported_calls, stats.llm_calls)) }}</span>
+        <span class="kpi-sub">
+          usage 覆盖率 {{ formatUsagePercent(stats.usage_coverage) }}
+          · {{ stats.usage_reported_calls ?? '—' }} / {{ stats.llm_calls ?? '—' }} 次调用
+        </span>
+        <span v-if="stats.cost_fallback_calls" class="kpi-sub accounting-warning">{{ stats.cost_fallback_calls }} 次调用按兜底价估算</span>
+        <span v-if="stats.cache_savings != null" class="kpi-sub" :title="cacheSavingsTitle(stats)">已知样本缓存净节省 USD {{ formatCost(stats.cache_savings) }}</span>
       </div>
 
       <!-- 缓存命中率：命中量是 input token 的**子集**，不是并列的第三类 token。
@@ -110,38 +119,40 @@
               <path d="M4.5 8 12 12.5 19.5 8M12 12.5v8" />
             </svg>
           </span>
-          <span v-if="stats.cache_hit_rate === null" class="kpi-chip flat">无数据</span>
+          <span v-if="stats.cache_hit_rate == null" class="kpi-chip flat">未上报</span>
         </div>
         <span class="kpi-label">缓存命中率<em v-if="rangeLabel" class="kpi-scope">{{ rangeLabel }}</em></span>
         <span class="kpi-value">
-          {{ stats.cache_hit_rate === null ? '—' : (stats.cache_hit_rate * 100).toFixed(1) + '%' }}
+          {{ formatUsagePercent(stats.cache_hit_rate) }}
         </span>
         <span class="kpi-sub">
-          <template v-if="stats.cache_hit_rate === null">范围内没有调用上报缓存信息</template>
+          <template v-if="stats.cache_hit_rate == null">范围内没有调用上报缓存信息</template>
           <template v-else>
-            {{ fmt(stats.cached_tokens) }} / {{ fmt(stats.cache_reported_tokens_in) }} 输入 token
+            {{ fmt(stats.cached_tokens) }} / {{ fmt(stats.cache_reported_tokens_in) }} 已上报输入 token
             · {{ fmt(stats.cache_reported_calls) }} 次调用
           </template>
         </span>
+        <span class="kpi-sub" :title="cacheUsageTitle(stats)">输入覆盖率 {{ formatUsagePercent(stats.cache_coverage) }}</span>
       </div>
 
       <!-- 埋点自身的健康度：写入失败只告警不抛出，不看这个就分不清
            「后台没数据」和「这次没产生数据」 -->
-      <div class="kpi-card" :class="{ alert: stats.writer_failures > 0 }">
+      <div class="kpi-card" :class="{ alert: stats.pending_attempts > 0 }">
         <div class="kpi-head">
-          <span class="kpi-tile health" :class="{ bad: stats.writer_failures > 0 }">
+          <span class="kpi-tile health" :class="{ bad: stats.pending_attempts > 0 }">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M12 3.5 3.5 19h17z" />
               <path d="M12 9.5v4M12 16.2v.3" />
             </svg>
           </span>
-          <span class="kpi-chip" :class="stats.writer_failures > 0 ? 'warn' : 'ok'">
-            {{ stats.writer_failures > 0 ? '需关注' : '正常' }}
+          <span class="kpi-chip" :class="stats.pending_attempts > 0 ? 'warn' : 'ok'">
+            {{ stats.pending_attempts > 0 ? '待补记' : '正常' }}
           </span>
         </div>
-        <span class="kpi-label">埋点写入失败</span>
-        <span class="kpi-value">{{ stats.writer_failures }}</span>
-        <span class="kpi-sub">本次进程内累计 · 0 为正常</span>
+        <span class="kpi-label">当前待补记请求</span>
+        <span class="kpi-value">{{ stats.pending_attempts }}</span>
+        <span class="kpi-sub">全范围 · 持久队列等待重试</span>
+        <span class="kpi-sub">本进程累计写入失败 {{ stats.writer_failures }} 次（含重试）</span>
       </div>
     </div>
 
@@ -168,7 +179,7 @@
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
               <circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" />
             </svg>
-            <input v-model="keyword" placeholder="搜索需求编号 / 标题" @keyup.enter="reload" />
+            <input v-model="keyword" :placeholder="scope === 'independent' ? '搜索请求编号 / 模型 / 用途' : '搜索需求编号 / 标题'" @keyup.enter="reload" />
           </div>
           <div class="range-box">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -207,7 +218,7 @@
 
     <!-- 令牌覆盖提示：usage 只有部分调用会记录，不能假装有全量 -->
     <div class="notice-bar">
-      Token 用量仅涵盖带 <code>usage</code> 字段的调用，"未记录"与"零消耗"在此不可区分。
+      Token 与估算成本仅涵盖已上报 usage 的调用；未上报保持未知。{{ scope === 'independent' ? '每行是一笔独立请求，不计入需求费用。' : '独立调用与评测不计入需求费用。' }}
     </div>
 
     <!-- 骨架 -->
@@ -223,7 +234,7 @@
       <table class="trace-table">
         <thead>
           <tr>
-            <th>需求摘要</th>
+            <th>{{ scope === 'independent' ? '调用摘要' : '需求摘要' }}</th>
             <th class="c">状态</th>
             <th>创建人</th>
             <!-- 两列时间都可点排序，默认按创建时间倒序：跑着的需求若按「最近活跃」
@@ -239,22 +250,23 @@
             <th class="r">耗时</th>
             <th class="c">LLM 调用</th>
             <th class="r">Token</th>
-            <th class="r">成本</th>
+            <th class="r" title="命中率分母仅含已上报缓存的输入；输入覆盖率为已上报输入 / 全部已知输入">缓存命中 / 覆盖</th>
+            <th class="r">估算成本 USD</th>
             <th class="c">操作</th>
           </tr>
         </thead>
         <tbody>
-          <tr v-for="r in rows" :key="r.requirement_id" class="row-link"
-              @click="open(r.requirement_id)">
+          <tr v-for="r in rows" :key="r.event_id ?? r.requirement_id" class="row-link"
+              @click="open(r)">
             <!-- 轮次标签贴在标题下（与设计稿一致）：它描述这条需求本身，
                  不适合单占一列，否则「第几轮」会和「几次调用」抢注意力 -->
             <td class="title-cell">
               <span class="req-title">{{ r.title }}</span>
               <span class="req-meta">
                 <span class="chip" :class="r.turn_count > 1 ? 'chip-dialog' : 'chip-initial'">
-                  {{ r.turn_count > 1 ? `${r.turn_count} 轮对话` : '初次生成' }}
+                  {{ scope === 'independent' ? (r.model || '独立调用') : r.turn_count > 1 ? `${r.turn_count} 轮对话` : '初次生成' }}
                 </span>
-                <span class="req-id">#{{ r.requirement_id }}</span>
+                <span class="req-id" :title="r.attempt_id">{{ scope === 'independent' ? `#${r.event_id} · ${r.attempt_id?.slice(0, 8) ?? '—'}` : `#${r.requirement_id}` }}</span>
               </span>
             </td>
             <td class="c">
@@ -267,14 +279,20 @@
             <td class="r mono">{{ fmtDuration(r.duration_ms) }}</td>
             <td class="c mono">{{ r.llm_calls }}</td>
             <td class="r mono">
-              <template v-if="r.tokens > 0">{{ fmt(r.tokens) }}</template>
+              <template v-if="r.tokens > 0 || (r.usage_reported_calls ?? 0) > 0 || r.llm_calls === 0">{{ fmt(r.tokens) }}</template>
               <span v-else class="muted" title="该需求的调用未记录 usage">—</span>
+              <small class="metric-sub" :title="`${r.usage_reported_calls ?? '—'} / ${r.llm_calls} 次调用上报 usage`">usage {{ formatUsagePercent(r.usage_coverage) }}</small>
+            </td>
+            <td class="r mono" :title="cacheUsageTitle(r)">
+              {{ formatUsagePercent(r.cache_hit_rate) }}
+              <small class="metric-sub">覆盖 {{ formatUsagePercent(r.cache_coverage) }}</small>
             </td>
             <td class="r mono">
-              <template v-if="r.cost > 0">{{ formatCost(r.cost) }}</template>
-              <span v-else class="muted">—</span>
+              {{ formatCost(reportedCost(r.cost, r.usage_reported_calls, r.llm_calls)) }}
+              <small v-if="r.cost_fallback_calls" class="metric-sub accounting-warning">{{ r.cost_fallback_calls }} 次兜底估价</small>
+              <small v-if="r.cache_savings != null" class="metric-sub" :title="cacheSavingsTitle(r)">已知样本缓存净节省 {{ formatCost(r.cache_savings) }}</small>
             </td>
-            <td class="c"><span class="open-link">查看轨迹 →</span></td>
+            <td class="c"><span class="open-link">{{ scope === 'independent' ? '查看调用 →' : '查看轨迹 →' }}</span></td>
           </tr>
         </tbody>
       </table>
@@ -288,6 +306,12 @@
     </div>
 
     <div v-else-if="!loading" class="empty-panel">暂无轨迹数据</div>
+    <div v-if="independentEventId !== null" class="detail-backdrop" @click.self="closeIndependent">
+      <section class="independent-detail" role="dialog" aria-modal="true" aria-label="独立调用详情" @keydown.esc="closeIndependent">
+        <button class="ghost-btn detail-close" @click="closeIndependent">关闭调用详情</button>
+        <EventDetailPanel :detail="independentDetail" :loading="independentDetailLoading" />
+      </section>
+    </div>
   </AdminShell>
 </template>
 
@@ -295,13 +319,20 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import AdminShell from '@/components/admin/AdminShell.vue'
+import EventDetailPanel from '@/components/admin/EventDetailPanel.vue'
 import { adminFetch } from '@/composables/useAdmin'
 // 状态的中文名与配色与详情页共用一份（见 ./statusMeta）
 import { statusColor, statusLabel } from './statusMeta'
-// 成本展示口径（¥ 符号 + 精度）与其余页面共用一份（见 @/utils/cost）
-import { formatCost } from '@/utils/cost'
+import { costCsvValue, formatCost, reportedCost } from '@/utils/cost'
+import { cacheSavingsTitle, cacheUsageTitle, formatUsagePercent } from '@/utils/usageDisplay'
+import type { UsageAccounting } from '@/types/usage'
+import type { Detail } from '@/types/trace'
 
-interface TraceRow {
+interface TraceRow extends UsageAccounting {
+  scope?: 'requirement' | 'independent'
+  event_id?: number
+  attempt_id?: string
+  model?: string
   requirement_id: number
   title: string
   creator: string
@@ -312,6 +343,12 @@ interface TraceRow {
   llm_calls: number
   tool_calls: number
   tokens: number
+  /** cached 是 tokens_in 的**子集**（命中的输入部分按缓存价计），不是第三类 token */
+  cached_tokens: number
+  /** 命中率 = cached_tokens / cache_reported_tokens_in；null = 无任何调用上报缓存信息 */
+  cache_hit_rate: number | null
+  cache_reported_tokens_in: number
+  cache_reported_calls: number
   cost: number
   duration_ms: number
   started_at: string | null
@@ -321,7 +358,7 @@ interface TraceRow {
   error_count: number
 }
 
-interface Stats {
+interface Stats extends UsageAccounting {
   by_kind: { kind: string; count: number }[]
   by_status: { status: string; count: number }[]
   status_buckets: { key: string; count: number }[]
@@ -345,6 +382,7 @@ interface Stats {
   active: { total: number; awaiting_user: number }
   duration: { avg_ms: number; p95_ms: number; sample: number }
   writer_failures: number
+  pending_attempts: number
   /** 当前时间窗口的中文标签（后端下发），前端不另算边界 */
   range: string
 }
@@ -369,6 +407,12 @@ const BUCKET_META: Record<string, { label: string; color: string }> = {
 const BUCKET_ORDER = ['active', 'done', 'failed', 'unknown']
 
 const router = useRouter()
+const scope = ref<'requirement' | 'independent'>('requirement')
+const independentEventId = ref<number | null>(null)
+const independentDetail = ref<Detail | null>(null)
+const independentDetailLoading = ref(false)
+let listRequestVersion = 0
+let statsRequestVersion = 0
 const rows = ref<TraceRow[]>([])
 const stats = ref<Stats | null>(null)
 const contract = ref<Contract | null>(null)
@@ -436,7 +480,9 @@ const deltaText = computed(() => {
 
 // 副标题：「最近更新于 N 分钟前」是判断「后台还活着吗」最快的一眼
 const subtitle = computed(() => {
-  const base = '按需求维度查看 Agent 工作流全过程 · 默认按创建时间倒序'
+  const base = scope.value === 'independent'
+    ? '每行是一笔独立请求 · 与需求费用分开统计'
+    : '按需求维度查看 Agent 工作流全过程 · 默认按创建时间倒序'
   const ts = stats.value?.last_event_at
   return ts ? `${base} · 最近更新于 ${relTime(ts)}` : base
 })
@@ -484,6 +530,7 @@ function relTime(iso: string | null): string {
 // 筛选参数只在这里拼一次 —— 列表与导出共用，导出的必定是屏幕上那一份
 function buildParams(p: number, size: number): string {
   const params = new URLSearchParams({ page: String(p), page_size: String(size) })
+  params.set('scope', scope.value)
   if (keyword.value.trim()) params.set('q', keyword.value.trim())
   if (kindFilter.value) params.set('kind', kindFilter.value)
   if (bucketFilter.value) params.set('bucket', bucketFilter.value)
@@ -495,18 +542,21 @@ function buildParams(p: number, size: number): string {
 }
 
 async function load() {
+  const version = ++listRequestVersion
   loading.value = true
   errorMsg.value = ''
   try {
     const data = await adminFetch<{ items: TraceRow[]; total: number }>(
       `/api/admin/traces?${buildParams(page.value, PAGE_SIZE)}`)
+    if (version !== listRequestVersion) return
     rows.value = data.items
     total.value = data.total
   } catch (e) {
+    if (version !== listRequestVersion) return
     errorMsg.value = (e as Error).message || '加载失败'
     rows.value = []
   } finally {
-    loading.value = false
+    if (version === listRequestVersion) loading.value = false
   }
 }
 
@@ -514,11 +564,14 @@ async function load() {
 // **必须带上当前时间范围**：状态 chip 上的计数要和列表行数相等，两边窗口
 // 不一致就会变成「写着已完成 17、点进去只有 15」。
 async function loadMeta() {
-  const qs = rangeFilter.value && rangeFilter.value !== 'all'
-    ? `?range=${rangeFilter.value}` : ''
+  const version = ++statsRequestVersion
+  const params = new URLSearchParams({ scope: scope.value })
+  if (rangeFilter.value && rangeFilter.value !== 'all') params.set('range', rangeFilter.value)
   try {
-    stats.value = await adminFetch<Stats>(`/api/admin/traces/stats${qs}`)
+    const result = await adminFetch<Stats>(`/api/admin/traces/stats?${params}`)
+    if (version === statsRequestVersion) stats.value = result
   } catch (e) {
+    if (version !== statsRequestVersion) return
     // 指标拉不到不该挡住列表 —— 列表自己能拿到数据就先给列表
     errorMsg.value = errorMsg.value || (e as Error).message || '指标加载失败'
   }
@@ -564,8 +617,41 @@ function pickSort(s: 'created' | 'active') {
   reload()
 }
 
-function open(id: number) {
-  router.push(`/admin/traces/${id}`)
+function changeScope() {
+  bucketFilter.value = ''
+  kindFilter.value = ''
+  keyword.value = ''
+  rows.value = []
+  stats.value = null
+  closeIndependent()
+  reload()
+}
+
+function closeIndependent() {
+  independentEventId.value = null
+  independentDetail.value = null
+  independentDetailLoading.value = false
+}
+
+async function open(row: TraceRow) {
+  if (scope.value === 'requirement') {
+    router.push(`/admin/traces/${row.requirement_id}`)
+    return
+  }
+  if (row.event_id === undefined) return
+  const id = row.event_id
+  independentEventId.value = id
+  independentDetail.value = null
+  independentDetailLoading.value = true
+  try {
+    const detail = await adminFetch<Detail>(`/api/admin/traces/events/${id}`)
+    if (independentEventId.value === id) independentDetail.value = detail
+  } catch (e) {
+    errorMsg.value = (e as Error).message || '调用详情加载失败'
+    closeIndependent()
+  } finally {
+    if (independentEventId.value === id) independentDetailLoading.value = false
+  }
 }
 
 // ---- 导出 CSV ----
@@ -580,24 +666,37 @@ async function exportCsv() {
   exporting.value = true
   errorMsg.value = ''
   try {
+    const exportScope = scope.value
+    const params = new URLSearchParams(buildParams(1, 100))
     const all: TraceRow[] = []
     // 每页 100（接口上限），最多 50 页 —— 兜底防呆循环，不是业务上限
     for (let p = 1; p <= 50; p += 1) {
+      params.set('page', String(p))
       const d = await adminFetch<{ items: TraceRow[]; total: number }>(
-        `/api/admin/traces?${buildParams(p, 100)}`)
+        `/api/admin/traces?${params}`)
       all.push(...d.items)
       if (!d.items.length || all.length >= d.total) break
     }
 
-    // 成本列在表头声明单位、单元格保持纯数值：带上 ¥ 前缀 Excel 会当文本，就没法求和了
-    const header = ['需求编号', '标题', '创建人', '状态', '对话轮次', '事件数',
-      'LLM 调用', '工具调用', 'Token', '成本(元)', '耗时(秒)',
+    // 表头声明 USD 与估算性质，金额保留纯数值和原始精度，便于求和。
+    const header = ['范围', '需求编号', '事件编号', '请求编号', '标题', '创建人', '状态', '对话轮次', '事件数',
+      'LLM 调用', '工具调用', 'Token', '缓存命中率(%)', '缓存输入覆盖率(%)',
+      '缓存上报输入Token', '缓存上报调用', 'usage上报调用', 'usage覆盖率(%)',
+      '估算成本(USD)', '兜底估价调用', '已知样本缓存净节省(USD)', '缓存净节省已知样本调用', '耗时(秒)',
       '创建时间', '开始时间', '最近活跃']
     const lines = [header.map(csvCell).join(',')]
     for (const r of all) {
       lines.push([
-        r.requirement_id, r.title, r.creator, statusLabel(r.status), r.turn_count,
-        r.event_count, r.llm_calls, r.tool_calls, r.tokens, r.cost.toFixed(6),
+        exportScope, r.requirement_id, r.event_id ?? '', r.attempt_id ?? '', r.title, r.creator, statusLabel(r.status), r.turn_count,
+        r.event_count, r.llm_calls, r.tool_calls, r.tokens,
+        // 空串而不是 0：没上报过缓存信息的需求写 0 会被读成「缓存失效」
+        r.cache_hit_rate === null || r.cache_hit_rate === undefined
+          ? '' : (r.cache_hit_rate * 100).toFixed(1),
+        r.cache_coverage == null ? '' : (r.cache_coverage * 100).toFixed(1),
+        r.cache_reported_tokens_in, r.cache_reported_calls, r.usage_reported_calls,
+        r.usage_coverage == null ? '' : (r.usage_coverage * 100).toFixed(1),
+        costCsvValue(reportedCost(r.cost, r.usage_reported_calls, r.llm_calls)),
+        r.cost_fallback_calls, costCsvValue(r.cache_savings), r.cache_savings_reported_calls,
         Math.round(r.duration_ms / 1000), r.created_at ?? '',
         r.started_at ?? '', r.last_event_at ?? '',
       ].map(csvCell).join(','))
@@ -610,7 +709,7 @@ async function exportCsv() {
     const a = document.createElement('a')
     const stamp = new Date().toISOString().slice(0, 10)
     a.href = url
-    a.download = `需求轨迹-${stamp}.csv`
+    a.download = `${exportScope === 'independent' ? '独立调用' : '需求轨迹'}-${stamp}.csv`
     document.body.appendChild(a)
     a.click()
     document.body.removeChild(a)
@@ -630,6 +729,13 @@ onMounted(() => {
 </script>
 
 <style scoped>
+.scope-select { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; background: var(--surface); color: var(--text); }
+.detail-backdrop { position: fixed; inset: 0; z-index: 100; background: rgb(0 0 0 / 35%); display: flex; justify-content: flex-end; padding: 24px; }
+.independent-detail { width: min(900px, 100%); display: flex; flex-direction: column; min-height: 0; gap: 12px; }
+.detail-close { align-self: flex-end; background: var(--surface); }
+.independent-detail :deep(.col-detail) { min-height: 0; }
+.metric-sub { display: block; margin-top: 3px; font-size: 10px; color: var(--faint); }
+.accounting-warning { color: var(--color-warning); }
 /* ===== 指标卡（与 AdminMetricsView 同一套骨架）===== */
 /* min 取 150px 而不是 216px：5 张卡要在常见宽度下排成**一行**。
    auto-fit 会自动折叠空列，所以卡片数少于栏位数时不会留空洞。 */

@@ -51,7 +51,8 @@ ok(thCount === tdCount,
    `表头与单元格列数一致（${thCount}）`)
 
 // ---- 2. 时间范围档位齐全 ----
-const rangeBlock = src.slice(src.indexOf('range-box'), src.indexOf('</select>'))
+const rangeStart = src.indexOf('range-box')
+const rangeBlock = src.slice(rangeStart, src.indexOf('</select>', rangeStart))
 const values = [...rangeBlock.matchAll(/<option\s+value="([^"]+)"/g)].map(m => m[1])
 ok(JSON.stringify(values) === JSON.stringify(['all', 'today', '3', '7', '30']),
    `时间范围五档齐全：${values.join(' / ')}`)

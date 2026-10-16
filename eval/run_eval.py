@@ -96,8 +96,7 @@ _pipeline_loaded = False
 def load_pipeline():
     """导入生成管线（幂等）。正常路径上必须在 `redirect_trace_db()` 之后调用。
 
-    未改道时调用不会报错，只是轨迹会跟随主库 —— 那是给「直接调 run_one_task」
-    的调用方留的降级路径，不是推荐用法。
+    main、单任务入口及 preflight 都会先确保改道，避免直接调用时写回运营库。
     """
     global WorkspaceFS, AgentState, create_tool_registry
     global create_default_hook_manager, ToolCallLoop, _pipeline_loaded
@@ -144,6 +143,32 @@ def redirect_trace_db(run_id: str) -> Path:
     run_dir.mkdir(parents=True, exist_ok=True)
     os.environ["TALK2CODE_TRACE_DB"] = f"sqlite:///{run_dir / 'trace.db'}"
     return run_dir
+
+
+def _ensure_eval_isolation(run_id: str = None) -> None:
+    """Direct eval entry points must also keep requests out of the operational DB."""
+    if not (os.environ.get("TALK2CODE_TRACE_DB") or "").strip():
+        redirect_trace_db(run_id or new_run_id())
+
+
+def _replay_eval_accounting() -> None:
+    """Eval has no application recovery worker; retry only its current ledger."""
+    warning = None
+    try:
+        from harness.observability.llm_accounting import (
+            pending_attempt_count, replay_pending_attempts,
+        )
+        replay_pending_attempts()
+        pending = pending_attempt_count()
+        if pending:
+            warning = f"[accounting] 仍有 {pending} 笔请求待补记，已保留供后续恢复。"
+    except Exception as exc:
+        warning = f"[accounting] 请求补记暂不可用（{type(exc).__name__}），评测继续。"
+    if warning:
+        try:
+            print(warning, file=sys.stderr, flush=True)
+        except Exception:
+            pass
 
 
 def prune_runs(keep: int = KEEP_RUNS) -> list:
@@ -549,6 +574,7 @@ def plan_for_task(task: dict) -> tuple[dict, str]:
     —— 那正是用户填完澄清表单后需求里会带的东西，不是为测试造的旁路。
     """
     from harness.instructions.nodes import team_leader_node
+    from harness.observability.log_context import current_trace_id
 
     scratch: AgentState = {
         "requirement_id": int(task["id"].lstrip("t")),
@@ -558,7 +584,7 @@ def plan_for_task(task: dict) -> tuple[dict, str]:
             + "\n\n[用户补充说明]\n评测运行：无需澄清，请直接给出实现计划。"
         ),
         "dialogue_history": [],
-        "metadata": {},
+        "metadata": {"trace_id": current_trace_id()},
     }
     try:
         res = team_leader_node(scratch) or {}
@@ -577,14 +603,40 @@ def plan_for_task(task: dict) -> tuple[dict, str]:
 # ---------- 单任务执行 ----------
 
 def run_one_task(task: dict, args) -> TaskResult:
+    """Run one task with a trace in the eval database and restore caller context."""
+    run_id = getattr(args, "run_id", None) or new_run_id()
+    _ensure_eval_isolation(run_id)
+    load_pipeline()
+    _replay_eval_accounting()
+    from harness.observability.cost import shared_cost_tracker
+    from harness.observability.log_context import llm_context
+    from harness.observability.trace_db import trace_session
+    from harness.observability.tracer import Tracer
+
+    requirement_id = int(task["id"].lstrip("t"))
+    with llm_context(requirement_id=requirement_id, trace_id=None, turn_index=0,
+                     call_id=None, stage=None, origin="evaluation", purpose="task"):
+        with trace_session() as db:
+            tracer = Tracer(db_session=db, cost_tracker=shared_cost_tracker())
+            trace = tracer.start_trace(requirement_id, user_id=0)
+            status = "error"
+            try:
+                result = _run_one_task_impl(task, args, run_id=run_id)
+                status = "finished" if result.passed else "error"
+                return result
+            finally:
+                _replay_eval_accounting()
+                tracer.end_trace(trace.trace_id, status=status)
+
+
+def _run_one_task_impl(task: dict, args, *, run_id: str) -> TaskResult:
     """驱动 ToolCallLoop 生成一个任务，然后检查断言"""
-    load_pipeline()   # 防御：绕过 main() 直接调用本函数时也要有管线可用
+    from harness.observability.log_context import current_trace_id, llm_context
     tid = task["id"]
     result = TaskResult(id=tid, name=task["name"], level=task["level"], passed=False)
     t0 = time.time()
 
     # 工作区隔离：每次 run 用唯一目录，避免并发/重跑互相覆盖污染结果
-    run_id = getattr(args, "run_id", time.strftime("%Y%m%d_%H%M%S"))
     eval_base = Path("/tmp") / "talk2code_eval_runs" / run_id
     ws = WorkspaceFS(user_id=0, requirement_id=int(tid.lstrip("t")), base_dir=eval_base)
     if ws.path.exists():
@@ -600,9 +652,10 @@ def run_one_task(task: dict, args) -> TaskResult:
     if getattr(args, "with_memory", False):
         mem_user = getattr(args, "memory_user", 0) or 0
         result.memory_enabled = True
-        block, mem_hit_ids = _inject_memory(
-            loop, task["requirement"], mem_user,
-            requirement_id=int(tid.lstrip("t")), run_id=run_id)
+        with llm_context(stage="coding", purpose="memory_selection"):
+            block, mem_hit_ids = _inject_memory(
+                loop, task["requirement"], mem_user,
+                requirement_id=int(tid.lstrip("t")), run_id=run_id)
         result.memory_block_chars = len(block)
 
     state: AgentState = {
@@ -621,6 +674,7 @@ def run_one_task(task: dict, args) -> TaskResult:
             # 不注入的话 coder_node 找不到 ToolCallLoop / Workspace。
             "_tool_loop": loop,
             "_workspace": ws,
+            "trace_id": current_trace_id(),
         },
         "tool_call_count": 0,
         "no_progress_count": 0,
@@ -633,7 +687,8 @@ def run_one_task(task: dict, args) -> TaskResult:
     # 规划失败不把整个任务判死：退回旧的「裸 ToolCallLoop」口径继续跑，
     # 但把失败原因记进结果，避免下一次又靠翻日志才发现计划整段是空的。
     if getattr(args, "with_plan", True):
-        pres, plan_err = plan_for_task(task)
+        with llm_context(stage="planning", purpose="planning"):
+            pres, plan_err = plan_for_task(task)
         if pres.get("plan"):
             state["plan"] = pres["plan"]
             for key in ("tasks", "interfaces", "implementation_order"):
@@ -658,19 +713,20 @@ def run_one_task(task: dict, args) -> TaskResult:
     #   ① metadata["tool_thinking"]="disabled"（裸跑会带着思考模式烧完额度）
     #   ② CompletionContract 按 implementation_order 初始化（Default-FAIL 硬约束）
     #   ③ Phase 2 定向补全：批量编码漏建的文件会被逐个补齐
+    final_state = state
     try:
-        if result.plan_used:
-            from harness.instructions.nodes import coder_node
-            # coder_node 返回的是**局部增量**（LangGraph 语义），不是完整 state：
-            # 错误必须从返回值读，读 state 会拿到 None 而把失败静默成成功。
-            coder_out = coder_node(state) or {}
-            final_state = state
-            if coder_out.get("error"):
-                result.error = str(coder_out["error"])
-        else:
-            final_state = loop.run(state)
-            if final_state.get("error"):
-                result.error = str(final_state["error"])
+        with llm_context(stage="coding", purpose="coding"):
+            if result.plan_used:
+                from harness.instructions.nodes import coder_node
+                # coder_node 返回的是**局部增量**（LangGraph 语义），不是完整 state：
+                # 错误必须从返回值读，读 state 会拿到 None 而把失败静默成成功。
+                coder_out = coder_node(state) or {}
+                if coder_out.get("error"):
+                    result.error = str(coder_out["error"])
+            else:
+                final_state = loop.run(state)
+                if final_state.get("error"):
+                    result.error = str(final_state["error"])
     except Exception as e:
         import traceback
         result.error = f"生成异常: {e}\n{traceback.format_exc()}"
@@ -691,19 +747,21 @@ def run_one_task(task: dict, args) -> TaskResult:
     result.duration_s = round(time.time() - t0, 1)
 
     # 断言检查
-    checker = AssertionChecker(ws, run_preview=not args.no_preview)
-    for a in task.get("assertions", []):
-        result.assertions.append(asdict(checker.check(a)))
+    with llm_context(stage="verifying", purpose="assertion_checks"):
+        checker = AssertionChecker(ws, run_preview=not args.no_preview)
+        for a in task.get("assertions", []):
+            result.assertions.append(asdict(checker.check(a)))
 
     result.passed = all(ar["passed"] for ar in result.assertions) and not result.error
 
     # 记账回填：把这个任务的结果写回本次注入的每一行记账记录。
     # 有了它，每条记忆都能算出"被注入 N 次、其中 M 次任务通过"。
-    if mem_hit_ids:
-        try:
-            _get_eval_memory_manager().resolve_hits(mem_hit_ids, result.passed)
-        except Exception as e:
-            print(f"[memory] 记账回填失败（不影响结果）: {e}", flush=True)
+    with llm_context(stage="delivering", purpose="result_finalization"):
+        if mem_hit_ids:
+            try:
+                _get_eval_memory_manager().resolve_hits(mem_hit_ids, result.passed)
+            except Exception as e:
+                print(f"[memory] 记账回填失败（不影响结果）: {e}", flush=True)
 
     # 清理临时工作区。
     # 失败时默认保留一份（--no-keep-failed 可关掉）：报告里的 detail 只有一行，
@@ -887,6 +945,19 @@ def compare_diff(latest_payload: dict, baseline_path: Path):
 # ---------- 主 ----------
 
 def _preflight_llm() -> tuple:
+    """Keep preflight usage separate from a caller's production requirement."""
+    _ensure_eval_isolation()
+    _replay_eval_accounting()
+    from harness.observability.log_context import llm_context
+    with llm_context(requirement_id=None, trace_id=None, turn_index=0, call_id=None,
+                     stage="planning", purpose="preflight", origin="evaluation"):
+        try:
+            return _preflight_llm_impl()
+        finally:
+            _replay_eval_accounting()
+
+
+def _preflight_llm_impl() -> tuple:
     """开跑前的 LLM 自检：一次最小调用，验证鉴权 / 额度 / 连通性。
 
     为什么值得单独做一次（而不是"反正第一个任务会暴露"）：

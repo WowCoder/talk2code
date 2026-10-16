@@ -177,6 +177,11 @@ else:
 # 初始化数据库
 init_db()
 
+from harness.observability.llm_accounting import (  # noqa: E402
+    start_accounting_replay, stop_accounting_replay,
+)
+start_accounting_replay()
+
 # 启动期僵尸清理：上一进程在跑的需求会永久停在 processing（队列是纯内存的），
 # 这里改判为 interrupted，使其可经 /api/requirements/<id>/resume 续跑。
 # 必须放在服务器开始接收请求之前，且失败不阻断启动。
@@ -280,6 +285,7 @@ def cleanup():
         pass
     try:
         logger.info("清理资源...")
+        stop_accounting_replay()
         sse_manager.shutdown()
         task_queue.shutdown(wait=False)
     except Exception as e:

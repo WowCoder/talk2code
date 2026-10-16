@@ -19,6 +19,7 @@ from llm.client import _try_fix_json as try_fix_json
 from utils.sse import get_current_timestamp as _ts
 from harness.instructions.prompts import load_prompt, load_prompt_template
 from harness.observability.logger import get_logger
+from harness.observability.log_context import llm_context
 from harness.harness_context import get_tool_loop, get_workspace
 from harness.instructions.ac_verdict_policy import _ac_state, _should_invalidate_ac_cache
 from harness.observability.event_contract import (
@@ -467,6 +468,7 @@ def _extract_clarify_payload(content: str):
     return None
 
 
+@llm_context(stage=STAGE_PLANNING, purpose='clarification')
 def _generate_clarify_questions_ex(client, requirement: str) -> tuple[list, str, dict]:
     """生成澄清问题，并区分「问了 / 明确不问 / 压根没问成」三种结果。
 
@@ -727,6 +729,7 @@ def _render_previous_plan_section(prev_plan: dict) -> str:
     return "\n".join(lines)
 
 
+@llm_context(stage=STAGE_PLANNING, purpose='plan_generation')
 def team_leader_node(state: AgentState) -> Dict[str, Any]:
     """TeamLeader 节点：需求分析 → 结构化 Plan
 
@@ -1096,6 +1099,7 @@ def team_leader_node(state: AgentState) -> Dict[str, Any]:
         }
 
 
+@llm_context(stage=STAGE_CODING, purpose='code_generation')
 def tool_coder_node(state: AgentState) -> Dict[str, Any]:
     """
     FrontendEngineer 节点：内部执行完整的 ToolCallLoop
@@ -1163,12 +1167,13 @@ def _execute_delegated_tasks(state: AgentState) -> Dict[str, Any]:
             logger.info(f"[AgentDelegate] 执行 research 任务: {task_desc[:80]}")
             from llm.client import get_client
             client = get_client()
-            resp = client.chat(
-                prompt=f"请研究以下问题并给出简洁回答：\n\n{task_desc}\n\n"
-                       f"上下文需求：{requirement[:500]}",
-                max_tokens=2000,
-                timeout=_aux_timeout(),
-            )
+            with llm_context(purpose='research'):
+                resp = client.chat(
+                    prompt=f"请研究以下问题并给出简洁回答：\n\n{task_desc}\n\n"
+                           f"上下文需求：{requirement[:500]}",
+                    max_tokens=2000,
+                    timeout=_aux_timeout(),
+                )
             research_result = resp.content if resp and resp.content else ""
             # 将 research 结果注入 dialogue_history 供后续任务参考
             state.setdefault("dialogue_history", []).append({
@@ -1216,6 +1221,7 @@ def _execute_delegated_tasks(state: AgentState) -> Dict[str, Any]:
     }
 
 
+@llm_context(purpose='code_review')
 def _review_single_file(workspace, filename: str, state: AgentState) -> str:
     """审查单个文件，返回审查结果文本"""
     try:
@@ -1293,7 +1299,9 @@ def _delivered_files(state: AgentState) -> list:
 
 def coder_node(state: AgentState) -> Dict[str, Any]:
     """编码节点入口：跑实现体，再把本次编码的结论落成里程碑（见上）。"""
-    result = _coder_node_impl(state)
+    stage = STAGE_REPAIRING if (state.get('metadata') or {}).get('repair_count') else STAGE_CODING
+    with llm_context(stage=stage, purpose='code_generation'):
+        result = _coder_node_impl(state)
     try:
         _emit_coding_milestone(state, result)
     except Exception as e:
@@ -1741,6 +1749,7 @@ def _ac_translate_system_prompt() -> str:
     return load_prompt_template("verify/ac_translator_system.md")
 
 
+@llm_context(stage=STAGE_VERIFYING, purpose='ac_translation')
 def _translate_one_ac_batch(
     batch: list, selector_text: str, render_info: str, visible_text_text: str,
     requirement_id: int = None, turn_index: int = 0, trace_id: str = None,
@@ -2096,6 +2105,7 @@ def _traced_node(name: str):
     return decorator
 
 
+@llm_context(stage=STAGE_VERIFYING, purpose='quality_evaluation')
 @_traced_node("verify")
 def verify_node(state: AgentState) -> Dict[str, Any]:
     """
@@ -2982,6 +2992,7 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
                     pass
         return {}
 
+    @llm_context(purpose='evaluation_reformat')
     def _reformat_evaluator_output(raw: str):
         """把「上一次评估的原始输出」交给 LLM 重新排成合法 JSON —— **小请求**。
 
@@ -4077,6 +4088,7 @@ def _apply_diff_edits(workspace, edits: list) -> tuple[list, str]:
 
 
 @_traced_node("defect_repair")
+@llm_context(stage=STAGE_REPAIRING, purpose='defect_repair')
 def defect_repair_node(state: AgentState) -> Dict[str, Any]:
     """小上下文定向修复：针对通用冒烟测试发现的确定性缺陷
 

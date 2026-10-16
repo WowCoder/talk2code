@@ -6,6 +6,13 @@ import pytest
 from models import Requirement, SessionLocal
 
 
+@pytest.fixture(autouse=True)
+def _no_background_generation(monkeypatch):
+    """SSE/chat API checks must not leave generation workers running across tests."""
+    from services.task_queue import task_queue
+    monkeypatch.setattr(task_queue, "submit", lambda *args, **kwargs: None)
+
+
 class TestSSEConnection:
     """SSE connection tests"""
 

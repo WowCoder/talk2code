@@ -7,6 +7,7 @@ import type {
 } from '@/types/api'
 import type { SSEQuestionFormData, SSEEvaluatorResultData, SSESpecData, SSETraceSummaryData, SSETask, SSEIterationStartData, SSEIterationAppendData, SSEQAStepData, SSEQAAcData, SSEVerifyStartData, SSEVerifyStepData } from '@/types/sse'
 import type { VerifyStep } from '@/types/api'
+import type { RequirementUsageSummary } from '@/types/usage'
 import { useApi } from '@/composables/useApi'
 import { normalizeDialogueMessage, normalizeDialogueList, roleOfName, DEV_NAME, QA_NAME } from '@/utils/dialogueRole'
 import { mergeProducedFiles } from '@/utils/publishGate'
@@ -61,6 +62,9 @@ export const useRequirementStore = defineStore('requirement', () => {
   const planStatus = ref<'needs_confirmation' | 'confirmed' | null>(null)
   // Trace 总结数据
   const _traceSummary = ref<SSETraceSummaryData | null>(null)
+  // 需求累计快照与本次执行 trace 分开，SSE 不把局部执行覆盖为需求累计。
+  const _usageSummary = ref<RequirementUsageSummary | null>(null)
+  const _usageSummaryStale = ref(false)
   // 进度快照的落库时刻（ms）：SSE 重连回放的旧 progress 事件据此被丢弃，
   // 不然会把刚恢复出来的进度文案盖回几分钟前（见 useSSE 的 progress handler）
   const _progressSnapshotTs = ref(0)
@@ -68,6 +72,7 @@ export const useRequirementStore = defineStore('requirement', () => {
   // ===== 竞态 / 幂等去重（会话内，非响应式）=====
   // 递增请求序号：只有最新一次 loadRequirement 的结果允许写入 state
   let loadSeq = 0
+  let usageRefreshSeq = 0
   // 已入列消息的幂等键集合（防 SSE 重连重放整段历史导致重复入列）
   const seenMessageKeys = new Set<string>()
 
@@ -186,7 +191,7 @@ function messageKey(msg: DialogueMessage): string {
    * 按 slug 加载（对外地址栏只带 slug）。
    * 仍接受纯数字：老链接 /detail/123 要先读得出来，才能被 replace 成 slug 版。
    */
-  async function loadRequirement(slugOrId: string | number): Promise<{ requirement: Requirement; trace?: any; evaluator?: SSEEvaluatorResultData; progress?: ProgressSnapshot } | null> {
+  async function loadRequirement(slugOrId: string | number): Promise<{ requirement: Requirement; trace?: SSETraceSummaryData; usage_summary?: RequirementUsageSummary | null; evaluator?: SSEEvaluatorResultData; progress?: ProgressSnapshot } | null> {
     const seq = ++loadSeq
     const key = String(slugOrId)
     const path = /^\d+$/.test(key)
@@ -198,7 +203,7 @@ function messageKey(msg: DialogueMessage): string {
     // （401 / 500 / 超时 / 网络抖动）都会把页面留在"刚重置完"的空状态里：
     // 消息、代码、任务进度全空，而异常只被调用方 catch 成一句 toast。
     // 用户看到的就是「刷新一下，啥都没了」。
-    const data = await api<{ requirement: Requirement; trace?: any; evaluator?: SSEEvaluatorResultData; progress?: ProgressSnapshot }>(path)
+    const data = await api<{ requirement: Requirement; trace?: SSETraceSummaryData; usage_summary?: RequirementUsageSummary | null; evaluator?: SSEEvaluatorResultData; progress?: ProgressSnapshot }>(path)
 
     // 竞态保护：期间又发起了新的 loadRequirement，本次结果作废
     if (seq !== loadSeq) return null
@@ -220,6 +225,8 @@ function messageKey(msg: DialogueMessage): string {
     _progressSnapshotTs.value = 0
 
     currentRequirement.value = data.requirement
+    _usageSummary.value = data.usage_summary ?? null
+    _usageSummaryStale.value = false
 
     // 恢复 trace（页面刷新后恢复 token/成本统计）
     if (data.trace) {
@@ -314,6 +321,19 @@ function messageKey(msg: DialogueMessage): string {
     }
 
     return data
+  }
+
+  /** 执行结束后只刷新计量，保留 SSE 已更新的对话、代码与工作台状态。 */
+  async function refreshUsageSummary() {
+    const id = currentRequirement.value?.id
+    if (!id) return
+    const seq = loadSeq
+    const refreshSeq = ++usageRefreshSeq
+    const data = await api<{ usage_summary?: RequirementUsageSummary | null; trace?: SSETraceSummaryData }>(`/api/requirements/${id}`)
+    if (seq !== loadSeq || refreshSeq !== usageRefreshSeq || currentRequirement.value?.id !== id || isGenerating.value) return
+    _usageSummary.value = data.usage_summary ?? null
+    if (data.trace) _traceSummary.value = data.trace
+    _usageSummaryStale.value = false
   }
 
   function addDialogueMessage(raw: DialogueMessage) {
@@ -859,6 +879,8 @@ function messageKey(msg: DialogueMessage): string {
     _specInsertIndex.value = null
     planStatus.value = null
     _traceSummary.value = null
+    _usageSummary.value = null
+    _usageSummaryStale.value = false
     _progressSnapshotTs.value = 0
   }
 
@@ -900,6 +922,9 @@ function messageKey(msg: DialogueMessage): string {
     _taskList,
     _specInsertIndex,
     _traceSummary,
+    _usageSummary,
+    _usageSummaryStale,
+    refreshUsageSummary,
     _progressSnapshotTs,
     planStatus,
     confirmPlan,

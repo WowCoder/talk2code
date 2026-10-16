@@ -272,13 +272,17 @@ const META_LABEL: Record<string, string> = {
   summary: '摘要', injected: '注入条数', hit_ids: '命中记忆', hit: '命中条数',
   error: '错误', message_count: '消息数', content_ref: '内容指纹',
   thinking: '含思考', has_usage: '含用量', source: '来源',
+  // 未登记模型按兜底价计：这条成本是量级参考、不是真实账单，
+  // 必须能一眼分辨，否则后台每个数字看起来都像精确账单。
+  cost_fallback: '成本按兜底价估算',
   // ---- B2 补埋点后新增的明细字段 ----
   questions: '问题列表', feature_list: '功能清单', ac_list: '验收项明细',
   plan_issues: '规划问题', items: '注入明细', feedback: '用户反馈',
   confirmed_features: '确认的功能', confirmed_acs: '确认的验收项',
 }
 const ALERT_KEYS = new Set(['critical_count', 'failed_ac_ids', 'defect_count',
-  'target_defects', 'error', 'dod_issues', 'plan_issues', 'unmet'])
+  'target_defects', 'error', 'dod_issues', 'plan_issues', 'unmet',
+  'cost_fallback'])
 // 过程性字段的「默认值」：等于默认值就不显示。全渲染会让「要点」退化成噪声
 // （每个 tool_call 都顶一行「已拦截 否」），排查时反而看不见真正的结论。
 // 反过来说，blocked=true、thinking=false 这类**偏离默认**的值会照常出现。

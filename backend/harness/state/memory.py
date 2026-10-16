@@ -23,6 +23,7 @@ from models import SessionLocal, AgentMemoryV2, MemoryHit
 from sqlalchemy import func
 from harness.state.memory_retriever import create_retriever
 from harness.observability.logger import get_logger
+from harness.observability.log_context import llm_context
 
 logger = get_logger(__name__)
 
@@ -493,6 +494,7 @@ class MemoryManager:
         block = self.build_memory_block(requirement, user_id)
         return system_prompt + block if block else system_prompt
 
+    @llm_context(stage='delivering', purpose='memory_reflection')
     def after_task(self, requirement: str, complexity: str,
                    code_files: list, qa_result: dict = None,
                    user_id: int = 0):
@@ -1136,6 +1138,7 @@ class MemoryManager:
             ),
         }
 
+    @llm_context(stage='delivering', purpose='memory_reflection')
     def _reflect(self, requirement: str, code_summary: str, rating: float,
                  failure_context: str = "") -> dict:
         """LLM 3 问自答（失败任务附带失败上下文引导负面教训提取）"""
@@ -1189,6 +1192,7 @@ class MemoryManager:
 
         return {}
 
+    @llm_context(purpose='memory_filter')
     def _llm_verify(self, query: str, candidates: list[Memory]) -> list[Memory]:
         """LLM 校验并筛选候选记忆"""
         if not self._llm or len(candidates) <= 2:
@@ -1264,6 +1268,7 @@ class MemoryManager:
             self._index_memories(active)
         logger.info(f"[MemoryManager] 维护完成: {len(active)} 条活跃记忆")
 
+    @llm_context(purpose='memory_consolidation')
     def _llm_consolidate(self, memories: list[Memory]):
         """LLM 驱动的记忆合并
 

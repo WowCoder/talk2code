@@ -48,6 +48,50 @@ def _mk_req(db, uid, status, title="t", **kw):
     return r
 
 
+def test_cost_7d_uses_attempt_events_including_paused_runs(app_client, admin_token):
+    from models.models import AgentEvent, AgentTrace
+
+    headers = {"Authorization": f"Bearer {admin_token}"}
+    before = app_client.get("/api/admin/metrics", headers=headers).get_json()["observability"]
+    with SessionLocal() as db:
+        req = _mk_req(db, _mk_user(db, f"cost_events_{_run}").id, "planning")
+        seq = int(db.query(func.max(AgentEvent.seq)).filter(
+            AgentEvent.requirement_id == req.id).scalar() or 0) + 1
+        db.add(AgentTrace(trace_id=f"cost_events_{_run}", requirement_id=req.id,
+                          user_id=req.user_id, total_cost=99))
+        db.add(AgentEvent(requirement_id=req.id, seq=seq, kind="llm_turn", ts=datetime.utcnow(),
+                          cost=99, meta={"has_usage": True,
+                                         "cost_decimal": "0.123456789"}))
+        db.add(AgentEvent(requirement_id=req.id, seq=seq + 1, kind="llm_turn",
+                          cost=5, ts=datetime.utcnow() - timedelta(days=8)))
+        db.commit()
+    after = app_client.get("/api/admin/metrics", headers=headers).get_json()["observability"]
+    assert after["cost_7d"] - before["cost_7d"] == pytest.approx(.123456789)
+    assert after["cost_currency"] == "USD"
+    assert after["cost_is_estimate"] is True
+
+
+def test_metrics_cost_excludes_explicit_nonrequirement_origins(app_client, admin_token):
+    from models.models import AgentEvent, AgentTrace
+
+    headers = {"Authorization": f"Bearer {admin_token}"}
+    before = app_client.get("/api/admin/metrics", headers=headers).get_json()["observability"]
+    with SessionLocal() as db:
+        req = _mk_req(db, _mk_user(db, f"scoped_events_{_run}").id, "finished")
+        for seq, origin, cost in ((1, "requirement", "0.1"), (2, "independent", "4.0"), (3, "evaluation", "5.0")):
+            tid = __import__("uuid").uuid4().hex
+            db.add(AgentTrace(trace_id=tid, requirement_id=req.id, user_id=req.user_id,
+                              data={}, duration_ms=seq * 100))
+            db.add(AgentEvent(requirement_id=req.id, trace_id=tid, seq=seq, kind="llm_turn", ts=datetime.utcnow(),
+                              tokens_in=100, meta={"origin": origin, "has_usage": True,
+                                                   "cost_decimal": cost}))
+        db.commit()
+    after = app_client.get("/api/admin/metrics", headers=headers).get_json()["observability"]
+    assert after["cost_7d"] - before["cost_7d"] == pytest.approx(.1)
+    assert after["usage_7d"]["llm_calls"] - before["usage_7d"]["llm_calls"] == 1
+    assert after["traces_7d"] - before["traces_7d"] == 1
+
+
 def test_metrics_shape_and_completion_rate(app_client, admin_token):
     db = SessionLocal()
     u = _mk_user(db, "metric_user1")

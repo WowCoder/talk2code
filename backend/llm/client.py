@@ -80,6 +80,30 @@ def _log_llm_response(call_id: str, status: int, body: dict, duration_ms: float)
     _llm_logger.info(json.dumps(record, ensure_ascii=False, default=str))
 
 
+def _best_effort_log(log_function, *args, **kwargs):
+    """诊断日志失败不能改变请求结果，尤其不能跳过随后的请求记账。"""
+    try:
+        log_function(*args, **kwargs)
+    except Exception:
+        # 日志通道本身可能已损坏，避免用另一次日志写入掩盖原请求。
+        pass
+
+
+def _record_attempt_safely(**attempt):
+    """记账与告警都不得替换运输层的正常结果或原始异常。"""
+    try:
+        from harness.observability.llm_accounting import record_attempt
+        record_attempt(**attempt)
+    except Exception:
+        try:
+            from harness.observability.trace_writer import _count_failure
+            _count_failure()
+        except Exception:
+            pass
+        _best_effort_log(logger.warning, 'LLM 请求计量失败 attempt=%s',
+                         attempt['attempt_id'], exc_info=True)
+
+
 def _sanitize_messages_for_replay(messages):
     """DeepSeek thinking 模式强制校验：assistant 消息回传时必须携带产生时的
     reasoning_content（实测 deepseek-v4-flash 报 400："The reasoning_content
@@ -141,7 +165,7 @@ def _log_and_raise(response, call_id: str = 'unknown', t0=None):
         except Exception:
             body = {"error_body": "<unreadable>"}
         duration_ms = (time.time() - t0) * 1000 if t0 else 0.0
-        _log_llm_response(call_id, response.status_code, body, duration_ms)
+        _best_effort_log(_log_llm_response, call_id, response.status_code, body, duration_ms)
     response.raise_for_status()
 
 
@@ -437,6 +461,9 @@ class LLMResponse:
     finish_reason: Optional[str] = None
     error: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = None
+    attempt_ids: List[str] = field(default_factory=list)
+    model: Optional[str] = None
+    provider: Optional[str] = None
 
     @property
     def is_error(self) -> bool:
@@ -458,6 +485,9 @@ class _LLMMeta:
     """
     usage: Optional[dict] = None
     finish_reason: Optional[str] = None
+    attempt_ids: List[str] = field(default_factory=list)
+    model: Optional[str] = None
+    provider: Optional[str] = None
 
 
 class CircuitBreakerOpenError(Exception):
@@ -666,6 +696,150 @@ class LLMClient:
         """获取会话记忆（格式化为 API 请求格式）"""
         return [{'role': m.role, 'content': m.content} for m in self._messages]
 
+    def _post_json(self, url, *, headers, data, timeout, endpoint, meta=None):
+        """一次实际 HTTP 尝试，包含救援/备用请求；总是在 finally 中记账。"""
+        import uuid
+        from harness.observability.log_context import capture_accounting_context
+
+        attempt_id = uuid.uuid4().hex
+        accounting_context = capture_accounting_context()
+        started = time.monotonic()
+        wall_started = time.time()
+        body = None
+        status = None
+        error = None
+        actual_model = endpoint.model
+        if meta is not None:
+            meta.attempt_ids.append(attempt_id)
+            meta.model, meta.provider = endpoint.model, endpoint.provider
+        _best_effort_log(_log_llm_request, attempt_id, endpoint.provider,
+                         endpoint.model, url, data)
+        try:
+            response = requests.post(url, headers=headers, json=data, timeout=timeout)
+            try:
+                status = int(response.status_code)
+            except (TypeError, ValueError):
+                pass
+            # HTTP 错误响应也可能携带有效 usage，先读响应再抛错。
+            try:
+                body = response.json()
+            except (ValueError, requests.exceptions.JSONDecodeError):
+                response.raise_for_status()
+                raise
+            if isinstance(body, dict) and isinstance(body.get('model'), str) and body['model']:
+                actual_model = body['model']
+                if meta is not None:
+                    meta.model = actual_model
+            _best_effort_log(_log_llm_response, attempt_id, status, body,
+                             (time.monotonic() - started) * 1000)
+            _log_and_raise(response, attempt_id, wall_started)
+            choices = body.get('choices') or [] if isinstance(body, dict) else []
+            if choices:
+                message = choices[0].get('message') or {}
+                if not message.get('content') and not message.get('tool_calls'):
+                    error = 'empty_response'
+            return body
+        except BaseException as exc:
+            error = str(exc) or type(exc).__name__
+            raise
+        finally:
+            _record_attempt_safely(
+                attempt_id=attempt_id, provider=endpoint.provider,
+                model=actual_model, request=data, response=body,
+                duration_ms=(time.monotonic() - started) * 1000,
+                error=error, http_status=status,
+                accounting_context=accounting_context,
+            )
+
+    def _stream_lines(self, url, *, headers, data, timeout, endpoint, meta=None):
+        """流式请求在结束或中断时记录已收到的 usage；缺失保持未知。"""
+        import uuid
+        from harness.observability.log_context import capture_accounting_context
+
+        attempt_id = uuid.uuid4().hex
+        accounting_context = capture_accounting_context()
+        started = time.monotonic()
+        status, error = None, None
+        usage = {}
+        response = None
+        completed = False
+        actual_model = endpoint.model
+        if meta is not None:
+            meta.attempt_ids.append(attempt_id)
+            meta.model, meta.provider = endpoint.model, endpoint.provider
+        _best_effort_log(_log_llm_request, attempt_id, endpoint.provider,
+                         endpoint.model, url, data)
+        try:
+            response = requests.post(url, headers=headers, json=data,
+                                     stream=True, timeout=timeout)
+            try:
+                status = int(response.status_code)
+            except (TypeError, ValueError):
+                pass
+            if status is not None and status >= 400:
+                try:
+                    error_body = response.json()
+                    if isinstance(error_body, dict) and isinstance(error_body.get('usage'), dict):
+                        usage.update(error_body['usage'])
+                except (TypeError, ValueError):
+                    pass
+            response.raise_for_status()
+            for line in response.iter_lines():
+                raw = line.decode('utf-8') if isinstance(line, bytes) else line
+                if raw == 'data: [DONE]':
+                    completed = True
+                    return
+                if raw and raw.startswith('data: '):
+                    try:
+                        chunk = json.loads(raw[6:])
+                    except (ValueError, TypeError):
+                        chunk = {}
+                    reported = chunk.get('usage') or (chunk.get('message') or {}).get('usage')
+                    reported_model = chunk.get('model') or (chunk.get('message') or {}).get('model')
+                    if isinstance(reported_model, str) and reported_model:
+                        actual_model = reported_model
+                    if isinstance(reported, dict):
+                        usage.update(reported)
+                    completed = chunk.get('type') == 'message_stop'
+                yield line
+                if completed:
+                    return
+            if not completed:
+                error = 'interrupted'
+        except GeneratorExit:
+            error = None if completed else 'cancelled'
+            raise
+        except BaseException as exc:
+            error = type(exc).__name__
+            raise
+        finally:
+            body = {'usage': usage or None}
+            try:
+                if response is not None:
+                    try:
+                        response.close()
+                    except Exception:
+                        _best_effort_log(logger.warning,
+                                         '流式 LLM 响应关闭失败 attempt=%s',
+                                         attempt_id, exc_info=True)
+                    except BaseException as exc:
+                        error = error or type(exc).__name__
+                        raise
+                if meta is not None and usage:
+                    meta.usage = usage
+                if meta is not None:
+                    meta.model = actual_model
+                _best_effort_log(_log_llm_response, attempt_id, status, body,
+                                 (time.monotonic() - started) * 1000)
+            finally:
+                _record_attempt_safely(
+                    attempt_id=attempt_id, provider=endpoint.provider,
+                    model=actual_model, request=data, response=body,
+                    duration_ms=(time.monotonic() - started) * 1000,
+                    error=error, http_status=status,
+                    accounting_context=accounting_context,
+                )
+
     def _build_messages(
         self,
         prompt: str,
@@ -736,6 +910,8 @@ class LLMClient:
             'temperature': self.temperature,
             'max_tokens': max_tokens if max_tokens is not None else self.max_tokens
         }
+        if stream:
+            data['stream_options'] = {'include_usage': True}
         # 思考模式开关：不同厂商参数格式完全不同，统一由 _build_thinking_params /
         # _build_thinking_disable_params 决定。**"关思考"绝不能靠省略字段**——
         # 省略在各端点语义不一致（实测矩阵，deepseek-v4-flash 于 2026-10-04 实测）：
@@ -764,13 +940,9 @@ class LLMClient:
             stream_yielded = False
             try:
                 if stream:
-                    response = requests.post(
-                        url, headers=headers, json=data,
-                        stream=True, timeout=effective_timeout
-                    )
-                    response.raise_for_status()
-
-                    for line in response.iter_lines():
+                    for line in self._stream_lines(
+                            url, headers=headers, data=data, timeout=effective_timeout,
+                            endpoint=ep, meta=meta):
                         if line:
                             line = line.decode('utf-8')
                             if line.startswith('data: '):
@@ -779,7 +951,8 @@ class LLMClient:
                                     break
                                 try:
                                     chunk = json.loads(content)
-                                    delta = chunk.get('choices', [{}])[0].get('delta', {})
+                                    choices = chunk.get('choices') or [{}]
+                                    delta = choices[0].get('delta', {})
                                     content_text = delta.get('content', '')
                                     # 注意：不 fallback 到 reasoning_content。
                                     # reasoning_content 是模型的内部思考链，不是最终回复。
@@ -792,17 +965,8 @@ class LLMClient:
                                 except json.JSONDecodeError:
                                     continue
                 else:
-                    import uuid
-                    call_id = uuid.uuid4().hex[:8]
-                    t0 = time.time()
-                    _log_llm_request(call_id, ep.provider, ep.model, url, data)
-                    response = requests.post(
-                        url, headers=headers, json=data,
-                        timeout=effective_timeout
-                    )
-                    _log_and_raise(response, call_id, t0)
-                    result = response.json()
-                    _log_llm_response(call_id, response.status_code, result, (time.time() - t0) * 1000)
+                    result = self._post_json(url, headers=headers, data=data,
+                                             timeout=effective_timeout, endpoint=ep, meta=meta)
                     choice = result.get('choices', [{}])[0]
                     msg = choice.get('message', {})
                     content = msg.get('content', '')
@@ -857,18 +1021,9 @@ class LLMClient:
                         )
                         retry_data = dict(data)
                         retry_data['max_tokens'] = fallback_tokens
-                        # 救援重试此前完全不记 traffic log，也不记响应 ——
-                        # 全链路看不到「曾经升档重试过」，排查时只能靠猜。
-                        # 复用同一 call_id：与原始请求在日志里天然成对。
-                        _log_llm_request(call_id, ep.provider, ep.model, url, retry_data)
-                        retry_response = requests.post(
-                            url, headers=headers, json=retry_data,
-                            timeout=effective_timeout
-                        )
-                        _log_and_raise(retry_response, call_id, t0)
-                        retry_result = retry_response.json()
-                        _log_llm_response(call_id, retry_response.status_code,
-                                          retry_result, (time.time() - t0) * 1000)
+                        retry_result = self._post_json(
+                            url, headers=headers, data=retry_data,
+                            timeout=effective_timeout, endpoint=ep, meta=meta)
                         retry_choice = retry_result.get('choices', [{}])[0]
                         retry_msg = retry_choice.get('message', {})
                         content = retry_msg.get('content', '')
@@ -951,13 +1106,9 @@ class LLMClient:
             stream_yielded = False
             try:
                 if stream:
-                    response = requests.post(
-                        url, headers=headers, json=data,
-                        stream=True, timeout=effective_timeout
-                    )
-                    response.raise_for_status()
-
-                    for line in response.iter_lines():
+                    for line in self._stream_lines(
+                            url, headers=headers, data=data, timeout=effective_timeout,
+                            endpoint=ep, meta=meta):
                         if line:
                             line = line.decode('utf-8')
                             if line.startswith('data: '):
@@ -975,17 +1126,8 @@ class LLMClient:
                                 except json.JSONDecodeError:
                                     continue
                 else:
-                    import uuid
-                    call_id = uuid.uuid4().hex[:8]
-                    t0 = time.time()
-                    _log_llm_request(call_id, ep.provider, ep.model, url, data)
-                    response = requests.post(
-                        url, headers=headers, json=data,
-                        timeout=effective_timeout
-                    )
-                    _log_and_raise(response, call_id, t0)
-                    result = response.json()
-                    _log_llm_response(call_id, response.status_code, result, (time.time() - t0) * 1000)
+                    result = self._post_json(url, headers=headers, data=data,
+                                             timeout=effective_timeout, endpoint=ep, meta=meta)
                     content_blocks = result.get('content', [])
                     text = ''.join(
                         block.get('text', '')
@@ -1252,7 +1394,9 @@ class LLMClient:
         # 三个只走 chat() 的阶段在后台 token 与成本恒为 0（成本数据不可信），且
         # 「被额度截断」与「端点故障」无法区分。现在如实带回底层观测到的事实。
         return LLMResponse(content=content, usage=meta.usage,
-                           finish_reason=meta.finish_reason, error=error)
+                           finish_reason=meta.finish_reason, error=error,
+                           attempt_ids=meta.attempt_ids, model=meta.model,
+                           provider=meta.provider)
 
     def chat_stream(
         self,
@@ -1552,7 +1696,9 @@ class LLMClient:
 
         return LLMResponse(content=content, reasoning_content=reasoning_content,
                            usage=usage, finish_reason=meta.finish_reason,
-                           error=error, tool_calls=tool_calls)
+                           error=error, tool_calls=tool_calls,
+                           attempt_ids=meta.attempt_ids, model=meta.model,
+                           provider=meta.provider)
 
     def _request_openai_with_tools(self, messages: list, tools: list, tool_choice: str,
                                     max_tokens: Optional[int] = None,
@@ -1561,7 +1707,6 @@ class LLMClient:
                                     endpoint: Optional[_Endpoint] = None,
                                     meta: Optional[_LLMMeta] = None):
         """OpenAI function calling 协议（meta 语义同 _request_openai）"""
-        import uuid
         ep = endpoint or self._primary_endpoint()
         effective_timeout = timeout if timeout is not None else self.timeout
         headers = {
@@ -1588,15 +1733,8 @@ class LLMClient:
             data.update(self._build_thinking_disable_params())
         url = f'{ep.base_url}/chat/completions'
 
-        call_id = uuid.uuid4().hex[:8]
-        t0 = time.time()
-        _log_llm_request(call_id, ep.provider, ep.model, url, data)
-
-        response = requests.post(url, headers=headers, json=data, timeout=effective_timeout)
-        _log_and_raise(response, call_id, t0)
-        result = response.json()
-
-        _log_llm_response(call_id, response.status_code, result, (time.time() - t0) * 1000)
+        result = self._post_json(url, headers=headers, data=data,
+                                 timeout=effective_timeout, endpoint=ep, meta=meta)
 
         choice = result.get('choices', [{}])[0]
         msg = choice.get('message', {})
@@ -1625,12 +1763,9 @@ class LLMClient:
                 )
                 retry_data = dict(data)
                 retry_data['max_tokens'] = retry_tokens
-                retry_response = requests.post(
-                    url, headers=headers, json=retry_data,
-                    timeout=effective_timeout
-                )
-                _log_and_raise(retry_response, call_id, t0)
-                retry_result = retry_response.json()
+                retry_result = self._post_json(
+                    url, headers=headers, data=retry_data,
+                    timeout=effective_timeout, endpoint=ep, meta=meta)
                 retry_choice = retry_result.get('choices', [{}])[0]
                 retry_msg = retry_choice.get('message', {})
                 content = retry_msg.get('content', '') or ''
@@ -1724,16 +1859,8 @@ class LLMClient:
 
         url = f'{ep.base_url}/messages'
 
-        import uuid
-        call_id = uuid.uuid4().hex[:8]
-        t0 = time.time()
-        _log_llm_request(call_id, ep.provider, ep.model, url, data)
-
-        response = requests.post(url, headers=headers, json=data, timeout=effective_timeout)
-        _log_and_raise(response, call_id, t0)
-        result = response.json()
-
-        _log_llm_response(call_id, response.status_code, result, (time.time() - t0) * 1000)
+        result = self._post_json(url, headers=headers, data=data,
+                                 timeout=effective_timeout, endpoint=ep, meta=meta)
 
         content = ""
         tool_calls = []

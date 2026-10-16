@@ -14,6 +14,8 @@ from utils.preview_token import make_preview_token
 from utils.requirement_title import summarize_title
 from services.publish.slug import new_slug, is_valid_slug
 from config import settings
+from harness.observability.log_context import llm_context
+from routes.preview import _handle_chat_quick, _handle_chat_ambiguous
 
 # ==================== 需求管理 API ====================
 
@@ -323,6 +325,8 @@ def _build_requirement_detail(requirement) -> dict:
                 'preview_token': make_preview_token(requirement.user_id, requirement.id),
             }
         }
+        from services.usage_summary import summarize_usage
+        result['usage_summary'] = summarize_usage(db, requirement_id=req_id)
         if trace_data:
             result['trace'] = trace_data
         if evaluator_data:
@@ -420,6 +424,7 @@ def _next_chat_turn_index(db, req_id: int) -> int:
 @app.route('/api/requirements/<int:req_id>/chat', methods=['POST'])
 @rate_limit_chat
 @jwt_required()
+@llm_context(stage='planning')
 def chat_with_requirement(req_id):
     """与需求对话（基于工具调用循环修改代码）"""
     from models import Requirement
@@ -448,278 +453,297 @@ def chat_with_requirement(req_id):
         if not requirement:
             return jsonify({'error': '需求不存在'}), 404
 
-        user_message = data.get('message', '').strip()
-        # 澄清表单提交时随消息携带：{'questions': [...], 'answers': {...}}
-        clarify = data.get('clarify')
-
-        # ===== 意图路由：Chat 模式下区分"提问"和"修改指令" =====
-        if '[用户补充说明]' not in user_message:
-            chat_router = IntentRouter()
-            chat_intent = chat_router.classify(
-                user_message, is_chat=True,
-                history=requirement.dialogue_history or [],
-            )
-            logger.info(f"Chat 意图分类: {chat_intent.intent.value} (req_id={req_id})")
-
-            if chat_intent.intent == IntentType.QUICK:
-                return _handle_chat_quick(
-                    req_id, requirement, user_message,
-                    chat_router, db
-                )
-            elif chat_intent.intent == IntentType.AMBIGUOUS:
-                return _handle_chat_ambiguous(
-                    req_id, requirement, user_message, db
-                )
-            elif chat_intent.intent == IntentType.SKILL:
-                # SKILL 进入完整工作流（见 requirement_service 的同名处理）
-                logger.info(
-                    f"Chat 命中工作流技能: {chat_intent.skill_name} (req_id={req_id})"
-                )
-            # TASK / SKILL: 继续以下流程（意图分类统一由 IntentRouter 处理，
-            # 不再重复调用 _is_vague_requirement 做二次检测）
-
-        # 初始化 harness 层
-        workspace = WorkspaceFS(current_user_id, req_id)
-        workspace.init(requirement.code_files)
-        git = GitVersioning(workspace)
-        tools = create_tool_registry()
-        hooks = create_default_hook_manager()
-        sse = SSEReporter(sse_manager)
-        # 第二轮对话此前只建了 tracer、**没挂 cost_tracker** —— 这条路径上的
-        # token 与成本从来没进过 trace 汇总。共享实例一并接上。
+        from harness.observability.log_context import (
+            bind_requirement, bind_turn_index, clear as clear_log_context,
+        )
+        turn_index = _next_chat_turn_index(db, req_id)
+        bind_requirement(req_id)
+        bind_turn_index(turn_index)
         cost_tracker = shared_cost_tracker()
         tracer = Tracer(db_session=db, cost_tracker=cost_tracker)
-
-        # 保存用户消息到数据库（立即持久化，防止崩溃丢失）
-        from sqlalchemy.orm.attributes import flag_modified
-        dialogue_list = list(requirement.dialogue_history or [])
-        user_entry = {
-            'role': 'user', 'name': '用户',
-            'content': user_message,
-            'timestamp': get_current_timestamp()
-        }
-        if clarify:
-            # 澄清表单提交：标记此前的表单消息为已提交，
-            # 本条 user 消息持久化为已完成卡片（content 仅存答案摘要，LLM 上下文用完整 user_message）
-            cl_answers = clarify.get('answers', {})
-            cl_questions = clarify.get('questions', [])
-            for i in range(len(dialogue_list) - 1, -1, -1):
-                msg = dialogue_list[i]
-                if isinstance(msg, dict) and msg.get('question_form') \
-                        and not msg['question_form'].get('submitted'):
-                    dialogue_list[i] = {
-                        **msg,
-                        'question_form': {
-                            **msg['question_form'],
-                            'submitted': True,
-                            'answers': cl_answers,
-                        }
-                    }
-                    break
-            answer_text = '；'.join(f'{q}: {a}' for q, a in cl_answers.items() if a)
-            user_entry['content'] = answer_text or '已确认'
-            user_entry['question_form'] = {
-                'questions': cl_questions,
-                'submitted': True,
-                'answers': cl_answers,
-            }
-        dialogue_list.append(user_entry)
-        requirement.dialogue_history = dialogue_list
-        flag_modified(requirement, 'dialogue_history')  # 确保 JSON 列变更被检测到
-        requirement.status = 'processing'
-        db.commit()
-
-        # 构建代码上下文
-        existing_files = workspace.list()
-        file_list_text = "\n".join(f"- {f}" for f in existing_files) if existing_files else "(空)"
-
-        # Chat 模式增量持久化回调
-        def _persist_dialogue(state):
-            try:
-                dialogue = state.get('dialogue_history', [])
-                if dialogue:
-                    requirement.dialogue_history = dialogue
-                    from sqlalchemy.orm.attributes import flag_modified
-                    flag_modified(requirement, 'dialogue_history')
-                    db.commit()
-            except Exception as e:
-                logger.warning(f"增量持久化对话失败（不阻断）：{e}")
-
-        # 进入 FrontendEngineer ReAct 循环（跳过 TeamLeader），使用修改专用 prompt
-        tool_loop = ToolCallLoop(
-            workspace=workspace, git=git, tools=tools,
-            hooks=hooks, tracer=tracer, cost_tracker=cost_tracker,
-            sse_reporter=sse,
-            on_iteration=_persist_dialogue,
-        )
-        # Chat 模式下迭代上限（修改任务量小，但不止"读+改"两轮）。
-        # 2026-10-14 线上 req 74A9W0HSDEFM2EYDH58E 修复死锁后实测：读 2 轮
-        # （并行读全部 → 补读漏掉的）+ 改 1 轮 + 改后验证读 1 轮 + 收尾 1 轮
-        # = 5 轮；4 轮会把"修改已全部落地"误判成 max_iterations 失败。
-        # 主循环的自修复扩容（SELF_REPAIR_EXTRA_ITERATIONS）不覆盖 chat 路径，
-        # 这里直接给足，仍远小于编码主流程的 10 轮。
-        tool_loop.MAX_ITERATIONS = 6
-
-        # 临时替换 system prompt 为修改模式
-        def _chat_prompt(state):
-            from harness.instructions.prompts import load_prompt_template
-            return load_prompt_template("coding/chat_modify.md",
-                user_message=user_message,
-                file_list_text=file_list_text,
-            )
-        tool_loop._build_system_prompt = _chat_prompt
-
-        state = {
-            'requirement_id': req_id,
-            'requirement_content': requirement.content,
-            'user_id': current_user_id,
-            'plan': {},
-            'current_step': 'tool_coder_ready',
-            'code_files': requirement.code_files or [],
-            'dialogue_history': dialogue_list,
-            'metadata': {'trace_id': '', 'is_chat': True,
-                         'turn_index': _next_chat_turn_index(db, req_id)},
-            'tool_call_count': 0,
-            'no_progress_count': 0,
-            'last_file_list': existing_files,
-            'hook_failures': {},
-        }
-
-        # ---- 并发管控：同需求互斥 + 全局并发上限（见模块头部说明）----
-        with _chat_inflight_lock:
-            if _chat_inflight.get(req_id):
-                return jsonify({'error': '该需求正在对话处理中，请稍候再试'}), 409
-            _chat_inflight[req_id] = True
-        if not _chat_semaphore.acquire(timeout=_CHAT_ACQUIRE_TIMEOUT):
-            with _chat_inflight_lock:
-                _chat_inflight.pop(req_id, None)
-            return jsonify({'error': '系统繁忙（并发对话已满），请稍后重试'}), 429
-
+        trace = tracer.start_trace(req_id, current_user_id)
+        sse = SSEReporter(sse_manager)
+        trace_status = 'error'
         try:
-            # 修改前快照：闸门判定引入新缺陷时用于回滚（零成本，纯内存）
-            pre_chat_files = {
-                f['filename']: f['content'] for f in workspace.snapshot()
+            user_message = data.get('message', '').strip()
+            # 澄清表单提交时随消息携带：{'questions': [...], 'answers': {...}}
+            clarify = data.get('clarify')
+
+            # ===== 意图路由：Chat 模式下区分"提问"和"修改指令" =====
+            if '[用户补充说明]' not in user_message:
+                chat_router = IntentRouter()
+                chat_intent = chat_router.classify(
+                    user_message, is_chat=True,
+                    history=requirement.dialogue_history or [],
+                )
+                logger.info(f"Chat 意图分类: {chat_intent.intent.value} (req_id={req_id})")
+
+                if chat_intent.intent == IntentType.QUICK:
+                    trace_status = 'finished'
+                    return _handle_chat_quick(
+                        req_id, requirement, user_message,
+                        chat_router, db
+                    )
+                elif chat_intent.intent == IntentType.AMBIGUOUS:
+                    trace_status = 'paused'
+                    return _handle_chat_ambiguous(
+                        req_id, requirement, user_message, db
+                    )
+                elif chat_intent.intent == IntentType.SKILL:
+                    # SKILL 进入完整工作流（见 requirement_service 的同名处理）
+                    logger.info(
+                        f"Chat 命中工作流技能: {chat_intent.skill_name} (req_id={req_id})"
+                    )
+                # TASK / SKILL: 继续以下流程（意图分类统一由 IntentRouter 处理，
+                # 不再重复调用 _is_vague_requirement 做二次检测）
+
+            # 初始化 harness 层
+            workspace = WorkspaceFS(current_user_id, req_id)
+            workspace.init(requirement.code_files)
+            git = GitVersioning(workspace)
+            tools = create_tool_registry()
+            hooks = create_default_hook_manager()
+            # 保存用户消息到数据库（立即持久化，防止崩溃丢失）
+            from sqlalchemy.orm.attributes import flag_modified
+            dialogue_list = list(requirement.dialogue_history or [])
+            user_entry = {
+                'role': 'user', 'name': '用户',
+                'content': user_message,
+                'timestamp': get_current_timestamp()
             }
-            final_state = tool_loop.run(state)
-        except Exception as e:
-            # 关键：同步长跑异常时不能把 requirement 永久卡死 processing
-            logger.error(f"Chat 执行异常 (req_id={req_id}): {e}", exc_info=True)
-            requirement.status = 'failed'
-            requirement.error_message = f"对话执行异常: {str(e)[:200]}"
+            if clarify:
+                # 澄清表单提交：标记此前的表单消息为已提交，
+                # 本条 user 消息持久化为已完成卡片（content 仅存答案摘要，LLM 上下文用完整 user_message）
+                cl_answers = clarify.get('answers', {})
+                cl_questions = clarify.get('questions', [])
+                for i in range(len(dialogue_list) - 1, -1, -1):
+                    msg = dialogue_list[i]
+                    if isinstance(msg, dict) and msg.get('question_form') \
+                            and not msg['question_form'].get('submitted'):
+                        dialogue_list[i] = {
+                            **msg,
+                            'question_form': {
+                                **msg['question_form'],
+                                'submitted': True,
+                                'answers': cl_answers,
+                            }
+                        }
+                        break
+                answer_text = '；'.join(f'{q}: {a}' for q, a in cl_answers.items() if a)
+                user_entry['content'] = answer_text or '已确认'
+                user_entry['question_form'] = {
+                    'questions': cl_questions,
+                    'submitted': True,
+                    'answers': cl_answers,
+                }
+            dialogue_list.append(user_entry)
+            requirement.dialogue_history = dialogue_list
+            flag_modified(requirement, 'dialogue_history')  # 确保 JSON 列变更被检测到
+            requirement.status = 'processing'
             db.commit()
-            return jsonify({'error': f'对话执行失败: {str(e)[:200]}'}), 500
-        finally:
-            # 无论成功/异常都要释放并发名额与互斥标记
-            _chat_semaphore.release()
+
+            # 构建代码上下文
+            existing_files = workspace.list()
+            file_list_text = "\n".join(f"- {f}" for f in existing_files) if existing_files else "(空)"
+
+            # Chat 模式增量持久化回调
+            def _persist_dialogue(state):
+                try:
+                    dialogue = state.get('dialogue_history', [])
+                    if dialogue:
+                        requirement.dialogue_history = dialogue
+                        from sqlalchemy.orm.attributes import flag_modified
+                        flag_modified(requirement, 'dialogue_history')
+                        db.commit()
+                except Exception as e:
+                    logger.warning(f"增量持久化对话失败（不阻断）：{e}")
+
+            # 进入 FrontendEngineer ReAct 循环（跳过 TeamLeader），使用修改专用 prompt
+            tool_loop = ToolCallLoop(
+                workspace=workspace, git=git, tools=tools,
+                hooks=hooks, tracer=tracer, cost_tracker=cost_tracker,
+                sse_reporter=sse,
+                on_iteration=_persist_dialogue,
+            )
+            # Chat 模式下迭代上限（修改任务量小，但不止"读+改"两轮）。
+            # 2026-10-14 线上 req 74A9W0HSDEFM2EYDH58E 修复死锁后实测：读 2 轮
+            # （并行读全部 → 补读漏掉的）+ 改 1 轮 + 改后验证读 1 轮 + 收尾 1 轮
+            # = 5 轮；4 轮会把"修改已全部落地"误判成 max_iterations 失败。
+            # 主循环的自修复扩容（SELF_REPAIR_EXTRA_ITERATIONS）不覆盖 chat 路径，
+            # 这里直接给足，仍远小于编码主流程的 10 轮。
+            tool_loop.MAX_ITERATIONS = 6
+
+            # 临时替换 system prompt 为修改模式
+            def _chat_prompt(state):
+                from harness.instructions.prompts import load_prompt_template
+                return load_prompt_template("coding/chat_modify.md",
+                    user_message=user_message,
+                    file_list_text=file_list_text,
+                )
+            tool_loop._build_system_prompt = _chat_prompt
+
+            state = {
+                'requirement_id': req_id,
+                'requirement_content': requirement.content,
+                'user_id': current_user_id,
+                'plan': {},
+                'current_step': 'tool_coder_ready',
+                'code_files': requirement.code_files or [],
+                'dialogue_history': dialogue_list,
+                'metadata': {'trace_id': trace.trace_id, 'is_chat': True,
+                             'turn_index': turn_index},
+                'tool_call_count': 0,
+                'no_progress_count': 0,
+                'last_file_list': existing_files,
+                'hook_failures': {},
+            }
+
+            # ---- 并发管控：同需求互斥 + 全局并发上限（见模块头部说明）----
             with _chat_inflight_lock:
-                _chat_inflight.pop(req_id, None)
+                if _chat_inflight.get(req_id):
+                    return jsonify({'error': '该需求正在对话处理中，请稍候再试'}), 409
+                _chat_inflight[req_id] = True
+            if not _chat_semaphore.acquire(timeout=_CHAT_ACQUIRE_TIMEOUT):
+                with _chat_inflight_lock:
+                    _chat_inflight.pop(req_id, None)
+                return jsonify({'error': '系统繁忙（并发对话已满），请稍后重试'}), 429
 
-        # ---- 轻量质量闸门：改完自动跑一次 smoke，引入缺陷则回滚本次修改 ----
-        # 除了「模型主动声明完成」，「迭代耗尽但写入已落地」也过闸门：弱模型
-        # 改完常继续核对读取而耗尽预算，工作本身已完成（见 _chat_run_outcome）。
-        current_step = final_state.get('current_step', '')
-        writes_landed = bool(final_state.get('_any_write_done'))
-        run_gate = current_step == 'task_complete' or (
-            current_step in ('max_iterations', 'no_progress') and writes_landed
-        )
-        gate_note = None
-        if run_gate:
-            defects, defect_summary = _chat_quality_gate(workspace)
-            if defects:
-                logger.warning(
-                    f"Chat 质量闸门拦截 (req_id={req_id}): {len(defects)} 个确定性缺陷，"
-                    f"回滚本次修改。{defect_summary[:200]}"
-                )
-                # 回滚到修改前快照：恢复旧文件、删除新增文件
-                try:
-                    current_files = set(workspace.list())
-                    for fname, content in pre_chat_files.items():
-                        workspace.write(fname, content)
-                    for fname in current_files - set(pre_chat_files.keys()):
-                        workspace.delete(fname)
-                except Exception as rollback_err:
-                    logger.error(f"Chat 质量闸门回滚失败 (req_id={req_id}): {rollback_err}")
-                gate_note = (
-                    "## ⛔ 本次修改已被质量闸门回滚\n\n"
-                    f"修改后的代码在浏览器冒烟测试中发现了确定性缺陷：\n"
-                    f"{defect_summary}\n\n"
-                    "已自动恢复为修改前的版本。请换一种描述方式，"
-                    "或把改动拆得更小再试。"
-                )
-                # 里程碑：闸门拦截 + 回滚。这两条是「用户说改了但没生效」这类
-                # 疑惑的唯一证据链（后台能看到是谁在什么时候回滚掉了什么）。
-                try:
-                    from harness.observability.trace_writer import record_event
-                    _md = (state.get('metadata') or {})
-                    _tin = int(_md.get('turn_index') or 0)
-                    record_event(
-                        req_id, "quality_gate",
-                        f"轻量质量闸门拦截 · {len(defects)} 个确定性缺陷",
-                        status="blocked", turn_index=_tin,
-                        meta={"blocked": True, "defect_count": len(defects),
-                              "summary": (defect_summary or '')[:300]},
+            try:
+                # 修改前快照：闸门判定引入新缺陷时用于回滚（零成本，纯内存）
+                pre_chat_files = {
+                    f['filename']: f['content'] for f in workspace.snapshot()
+                }
+                with llm_context(stage='coding', purpose='code_generation'):
+                    final_state = tool_loop.run(state)
+            except Exception as e:
+                # 关键：同步长跑异常时不能把 requirement 永久卡死 processing
+                logger.error(f"Chat 执行异常 (req_id={req_id}): {e}", exc_info=True)
+                requirement.status = 'failed'
+                requirement.error_message = f"对话执行异常: {str(e)[:200]}"
+                db.commit()
+                return jsonify({'error': f'对话执行失败: {str(e)[:200]}'}), 500
+            finally:
+                # 无论成功/异常都要释放并发名额与互斥标记
+                _chat_semaphore.release()
+                with _chat_inflight_lock:
+                    _chat_inflight.pop(req_id, None)
+
+            # ---- 轻量质量闸门：改完自动跑一次 smoke，引入缺陷则回滚本次修改 ----
+            # 除了「模型主动声明完成」，「迭代耗尽但写入已落地」也过闸门：弱模型
+            # 改完常继续核对读取而耗尽预算，工作本身已完成（见 _chat_run_outcome）。
+            current_step = final_state.get('current_step', '')
+            writes_landed = bool(final_state.get('_any_write_done'))
+            run_gate = current_step == 'task_complete' or (
+                current_step in ('max_iterations', 'no_progress') and writes_landed
+            )
+            gate_note = None
+            if run_gate:
+                defects, defect_summary = _chat_quality_gate(workspace)
+                if defects:
+                    logger.warning(
+                        f"Chat 质量闸门拦截 (req_id={req_id}): {len(defects)} 个确定性缺陷，"
+                        f"回滚本次修改。{defect_summary[:200]}"
                     )
-                    record_event(
-                        req_id, "rollback",
-                        f"回滚本次对话修改 · 恢复 {len(pre_chat_files)} 个文件",
-                        status="ok", turn_index=_tin,
-                        meta={"restored_files": sorted(pre_chat_files.keys())[:20],
-                              "removed_files": sorted(
-                                  current_files - set(pre_chat_files.keys()))[:20]},
+                    # 回滚到修改前快照：恢复旧文件、删除新增文件
+                    try:
+                        current_files = set(workspace.list())
+                        for fname, content in pre_chat_files.items():
+                            workspace.write(fname, content)
+                        for fname in current_files - set(pre_chat_files.keys()):
+                            workspace.delete(fname)
+                    except Exception as rollback_err:
+                        logger.error(f"Chat 质量闸门回滚失败 (req_id={req_id}): {rollback_err}")
+                    gate_note = (
+                        "## ⛔ 本次修改已被质量闸门回滚\n\n"
+                        f"修改后的代码在浏览器冒烟测试中发现了确定性缺陷：\n"
+                        f"{defect_summary}\n\n"
+                        "已自动恢复为修改前的版本。请换一种描述方式，"
+                        "或把改动拆得更小再试。"
                     )
-                except Exception:
-                    pass
+                    # 里程碑：闸门拦截 + 回滚。这两条是「用户说改了但没生效」这类
+                    # 疑惑的唯一证据链（后台能看到是谁在什么时候回滚掉了什么）。
+                    try:
+                        from harness.observability.trace_writer import record_event
+                        _md = (state.get('metadata') or {})
+                        _tin = int(_md.get('turn_index') or 0)
+                        record_event(
+                            req_id, "quality_gate",
+                            f"轻量质量闸门拦截 · {len(defects)} 个确定性缺陷",
+                            status="blocked", turn_index=_tin,
+                            meta={"blocked": True, "defect_count": len(defects),
+                                  "summary": (defect_summary or '')[:300]},
+                        )
+                        record_event(
+                            req_id, "rollback",
+                            f"回滚本次对话修改 · 恢复 {len(pre_chat_files)} 个文件",
+                            status="ok", turn_index=_tin,
+                            meta={"restored_files": sorted(pre_chat_files.keys())[:20],
+                                  "removed_files": sorted(
+                                      current_files - set(pre_chat_files.keys()))[:20]},
+                        )
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        from harness.observability.trace_writer import record_event
+                        record_event(
+                            req_id, "quality_gate", "轻量质量闸门通过",
+                            status="ok",
+                            turn_index=int((state.get('metadata') or {}).get('turn_index') or 0),
+                            meta={"blocked": False, "defect_count": 0},
+                        )
+                    except Exception:
+                        pass
+
+            # 获取更新后的文件
+            updated_files = workspace.snapshot()
+
+            # 保存结果
+            final_dialogue = final_state.get('dialogue_history', [])
+            if gate_note:
+                final_dialogue = list(final_dialogue) + [{
+                    'role': 'system', 'name': 'System',
+                    'content': gate_note,
+                    'type': 'quality_gate_rollback',
+                }]
+            requirement.dialogue_history = final_dialogue
+            requirement.code_files = updated_files
+            # 终态判定（含「耗尽但写入已落地 → finished」）：只有真正没干活才 failed
+            outcome = _chat_run_outcome(current_step, writes_landed)
+            if outcome == 'failed':
+                requirement.status = 'failed'
+                # 构建诊断错误信息
+                error_parts = [f"对话执行终止: {current_step}"]
+                error_detail = final_state.get('error', '')
+                if error_detail:
+                    error_parts.append(str(error_detail)[:200])
+                tc_count = final_state.get('tool_call_count', 0)
+                if tc_count:
+                    error_parts.append(f"(共 {tc_count} 轮迭代)")
+                np_count = final_state.get('no_progress_count', 0)
+                if np_count:
+                    error_parts.append(f"(连续 {np_count} 轮无进展)")
+                requirement.error_message = " — ".join(error_parts)
             else:
-                try:
-                    from harness.observability.trace_writer import record_event
-                    record_event(
-                        req_id, "quality_gate", "轻量质量闸门通过",
-                        status="ok",
-                        turn_index=int((state.get('metadata') or {}).get('turn_index') or 0),
-                        meta={"blocked": False, "defect_count": 0},
-                    )
-                except Exception:
-                    pass
+                requirement.status = 'finished'
+            db.commit()
 
-        # 获取更新后的文件
-        updated_files = workspace.snapshot()
+            trace_status = ('paused' if current_step == 'needs_clarification'
+                            else 'error' if outcome == 'failed' else 'finished')
+            return jsonify({
+                'message': 'success',
+                'code_files': updated_files,
+                'dialogue_history': final_dialogue,
+                'updated_files': [f['filename'] for f in updated_files],
+            }), 200
+        finally:
+            try:
+                tracer.end_trace(trace.trace_id, status=trace_status)
+                sse.trace_summary(req_id, tracer.get_trace(trace.trace_id).to_dict())
+            except Exception as exc:
+                logger.warning("Chat trace 收尾失败（不阻断）：%s", exc)
+            clear_log_context()
 
-        # 保存结果
-        final_dialogue = final_state.get('dialogue_history', [])
-        if gate_note:
-            final_dialogue = list(final_dialogue) + [{
-                'role': 'system', 'name': 'System',
-                'content': gate_note,
-                'type': 'quality_gate_rollback',
-            }]
-        requirement.dialogue_history = final_dialogue
-        requirement.code_files = updated_files
-        # 终态判定（含「耗尽但写入已落地 → finished」）：只有真正没干活才 failed
-        outcome = _chat_run_outcome(current_step, writes_landed)
-        if outcome == 'failed':
-            requirement.status = 'failed'
-            # 构建诊断错误信息
-            error_parts = [f"对话执行终止: {current_step}"]
-            error_detail = final_state.get('error', '')
-            if error_detail:
-                error_parts.append(str(error_detail)[:200])
-            tc_count = final_state.get('tool_call_count', 0)
-            if tc_count:
-                error_parts.append(f"(共 {tc_count} 轮迭代)")
-            np_count = final_state.get('no_progress_count', 0)
-            if np_count:
-                error_parts.append(f"(连续 {np_count} 轮无进展)")
-            requirement.error_message = " — ".join(error_parts)
-        else:
-            requirement.status = 'finished'
-        db.commit()
-
-        return jsonify({
-            'message': 'success',
-            'code_files': updated_files,
-            'dialogue_history': final_dialogue,
-            'updated_files': [f['filename'] for f in updated_files],
-        }), 200
 
 @app.route('/api/requirements/<int:req_id>/clarify', methods=['POST'])
 @jwt_required()

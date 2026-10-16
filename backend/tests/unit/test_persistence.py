@@ -177,8 +177,11 @@ class TestTracerPersistence:
 
         row = db.query(_AgentTrace).filter_by(trace_id=trace.trace_id).first()
         assert row is not None
-        # end_trace 用 span metadata 的 tokens 聚合（50），cost 由 cost_tracker 提供
-        assert row.total_tokens == 50
+        # total_tokens 与 total_cost **同源**（都取 cost_tracker 的累计报告）：
+        # 按 span metadata 求和会漏掉规划 / 验收 / 修复阶段的用量（实测少计 25%~41%）。
+        # 本用例里 record 的 100+200 就是全部用量，span 的 50 只是其中一笔的
+        # 展示用快照 —— 真正口径以累计报告为准。
+        assert row.total_tokens == 300
         assert row.data["span_count"] == 1
         assert row.total_cost > 0  # cost_tracker 已 record 过
 

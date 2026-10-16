@@ -6,6 +6,13 @@ import pytest
 from models import Requirement, SessionLocal
 
 
+@pytest.fixture(autouse=True)
+def _no_background_generation(monkeypatch):
+    """These API contracts stop at enqueue; workflow workers are tested separately."""
+    from services.task_queue import task_queue
+    monkeypatch.setattr(task_queue, "submit", lambda *args, **kwargs: None)
+
+
 class TestCreateRequirement:
     """Requirement creation tests"""
 

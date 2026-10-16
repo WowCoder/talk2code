@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+from contextlib import contextmanager
 from typing import Optional
 
 _EMPTY = "-"
@@ -41,6 +42,63 @@ _trace_var: contextvars.ContextVar[str] = contextvars.ContextVar(
 _call_var: contextvars.ContextVar[str] = contextvars.ContextVar(
     "t2c_call_id", default=""
 )
+_turn_var: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "t2c_turn_index", default=0
+)
+_stage_var = contextvars.ContextVar('t2c_llm_stage', default=None)
+_purpose_var = contextvars.ContextVar('t2c_llm_purpose', default=None)
+_origin_var = contextvars.ContextVar('t2c_llm_origin', default=None)
+_UNSET = object()
+
+
+@contextmanager
+def llm_context(*, requirement_id=_UNSET, trace_id=_UNSET, turn_index=_UNSET, call_id=_UNSET,
+                stage=_UNSET, purpose=_UNSET, origin=_UNSET):
+    """Scope attribution; omitted values inherit, explicit None clears a value."""
+    values = (
+        (_req_var, requirement_id, lambda x: str(x) if x is not None else _EMPTY),
+        (_trace_var, trace_id, lambda x: str(x) if x else _EMPTY),
+        (_turn_var, turn_index, lambda x: int(x or 0)),
+        (_call_var, call_id, lambda x: str(x) if x else ''),
+        (_stage_var, stage, lambda x: x),
+        (_purpose_var, purpose, lambda x: x),
+        (_origin_var, origin, lambda x: x),
+    )
+    tokens = []
+    try:
+        for var, value, convert in values:
+            if value is not _UNSET:
+                tokens.append((var, var.set(convert(value))))
+        yield
+    finally:
+        for var, token in reversed(tokens):
+            var.reset(token)
+
+
+def capture_accounting_context() -> dict:
+    """Freeze attribution before HTTP, including cancelled requests."""
+    try:
+        requirement_id = int(_req_var.get())
+        requirement_id = requirement_id if requirement_id > 0 else None
+    except (ValueError, TypeError):
+        requirement_id = None
+    trace_id = _trace_var.get()
+    return {
+        'requirement_id': requirement_id,
+        'trace_id': trace_id if trace_id and trace_id != _EMPTY else None,
+        'turn_index': _turn_var.get(),
+        'stage': _stage_var.get(),
+        'purpose': _purpose_var.get(),
+        'origin': _origin_var.get() or ('requirement' if requirement_id else 'independent'),
+    }
+
+
+def bind_turn_index(turn_index) -> None:
+    _turn_var.set(int(turn_index or 0))
+
+
+def current_turn_index() -> int:
+    return _turn_var.get()
 
 
 def bind_requirement(requirement_id) -> None:
@@ -71,6 +129,10 @@ def clear() -> None:
     _req_var.set(_EMPTY)
     _trace_var.set(_EMPTY)
     _call_var.set("")
+    _turn_var.set(0)
+    _stage_var.set(None)
+    _purpose_var.set(None)
+    _origin_var.set(None)
 
 
 def current_requirement_id() -> str:

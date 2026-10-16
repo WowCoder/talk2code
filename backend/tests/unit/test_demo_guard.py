@@ -27,6 +27,13 @@ def _future_feature():  # pragma: no cover - 演示守卫应在进入 handler �
     return {"ok": True}, 200
 
 
+@pytest.fixture(autouse=True)
+def _no_background_generation(monkeypatch):
+    """A permitted write verifies the guard, without starting the LLM workflow."""
+    from services.task_queue import task_queue
+    monkeypatch.setattr(task_queue, "submit", lambda *args, **kwargs: None)
+
+
 @pytest.fixture
 def demo_user():
     """预置演示帐号（生产环境由 manage.py demo init 创建）。"""
@@ -125,7 +132,7 @@ def test_demo_login_with_password_has_write_rights(app_client, demo_user):
 
     resp = _login(app_client, "demo", "demopass123")
     assert resp.status_code == 200
-    # 写请求不被拦（没有 demo claim）—— 用一个必失败的业务校验而非 403 来证明
+    # 合法写请求不被拦（没有 demo claim）；异步生成由本模块 fixture 隔离。
     resp = app_client.post("/api/requirements", json={"content": "x"})
     assert resp.status_code != 403
 
@@ -184,7 +191,7 @@ def test_demo_can_register_and_invite_request(app_client, demo_user):
 def test_normal_user_write_not_blocked(app_client, demo_user):
     uname = _register(app_client, "writer_user")
     _login(app_client, uname)
-    # 内容过短是业务校验（400），只要不是 403 就说明守卫没误伤
+    # "x" 是合法的非空需求；这里只验证守卫不误伤，不执行后续生成。
     resp = app_client.post("/api/requirements", json={"content": "x"})
     assert resp.status_code != 403
 

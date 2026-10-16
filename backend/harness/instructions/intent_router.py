@@ -25,6 +25,7 @@ from typing import Optional
 
 from llm.client import get_client
 from harness.observability.logger import get_logger
+from harness.observability.log_context import llm_context
 from harness.instructions.prompts import load_prompt
 
 logger = get_logger(__name__)
@@ -84,6 +85,7 @@ class IntentRouter:
             self._client = get_client()
         return self._client
 
+    @llm_context(stage='planning', purpose='intent_classification')
     def classify(self, requirement: str, is_chat: bool = False,
                  history: list = None) -> IntentResult:
         """
@@ -199,6 +201,7 @@ class IntentRouter:
             logger.warning(f"[IntentRouter] 分类异常: {e}，默认 TASK")
             return IntentResult(intent=IntentType.TASK, confidence=0.5)
 
+    @llm_context(stage='delivering', purpose='quick_answer')
     def handle_quick(self, requirement: str, history: list = None,
                      code_context: str = "", is_chat: bool = False) -> str:
         """

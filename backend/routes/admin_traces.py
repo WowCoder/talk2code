@@ -18,11 +18,123 @@ from sqlalchemy import func, case, or_, false
 from factory import app, logger
 from utils.db import transactional_db
 from utils.admin_guard import admin_required
+from services.usage_summary import (
+    USAGE_AGGREGATE_KEYS, build_usage_aggregate_columns, usage_summary_from_aggregate,
+    usage_scope_condition,
+)
 
 
 def _row_to_dict(row, keys):
     """把聚合查询结果转成 JSON 友好的 dict。"""
     return {k: getattr(row, k, None) for k in keys}
+
+
+def _requested_scope():
+    scope = (request.args.get('scope') or 'requirement').strip()
+    if scope not in ('requirement', 'independent'):
+        return None
+    return scope
+
+
+def _attempt_list_query(db, since=None, *, q='', kind=None, status=None, bucket=None):
+    """An independent row is one event, never a shared requirement-0 timeline."""
+    from models.models import AgentEvent
+
+    query = db.query(AgentEvent).filter(
+        usage_scope_condition('independent'), AgentEvent.kind == 'llm_turn')
+    if since is not None:
+        query = query.filter(AgentEvent.ts >= since)
+    if q:
+        query = query.filter(or_(AgentEvent.model.like(f'%{q}%'),
+                                 AgentEvent.attempt_id.like(f'%{q}%'),
+                                 AgentEvent.call_id.like(f'%{q}%'),
+                                 AgentEvent.meta['purpose'].as_string().like(f'%{q}%')))
+    if kind and kind != 'llm_turn':
+        query = query.filter(false())
+    if bucket == 'done' or status == 'finished':
+        query = query.filter(AgentEvent.status != 'error')
+    elif bucket == 'failed' or status == 'failed':
+        query = query.filter(AgentEvent.status == 'error')
+    elif bucket in ('active', 'unknown') or (status and status not in ('finished', 'failed')):
+        query = query.filter(false())
+    return query
+
+
+def _independent_list(db, page, page_size, since, *, q, kind, status, bucket, raw_range, sort):
+    query = _attempt_list_query(db, since, q=q, kind=kind, status=status, bucket=bucket)
+    total = query.count()
+    from models.models import AgentEvent
+    rows = query.with_entities(AgentEvent, *build_usage_aggregate_columns()).group_by(
+        AgentEvent.id).order_by(AgentEvent.ts.desc(), AgentEvent.id.desc()).offset(
+        (page - 1) * page_size).limit(page_size).all()
+    data = []
+    for aggregate in rows:
+        row = aggregate[0]
+        meta = row.meta or {}
+        failed = row.status == 'error'
+        data.append({
+            'requirement_id': row.requirement_id, 'event_id': row.id,
+            'attempt_id': row.attempt_id or row.call_id, 'trace_id': row.trace_id,
+            'scope': 'independent', 'model': row.model, 'provider': meta.get('provider'),
+            'title': meta.get('purpose') or row.label or '独立调用', 'creator': '',
+            'status': 'failed' if failed else 'finished', 'bucket': 'failed' if failed else 'done',
+            'turn_count': 1, 'event_count': 1, 'tool_calls': 0,
+            **usage_summary_from_aggregate(aggregate), 'duration_ms': int(row.duration_ms or 0),
+            'started_at': _iso_utc(row.ts), 'last_event_at': _iso_utc(row.ts),
+            'created_at': _iso_utc(row.ts), 'error_count': int(failed),
+        })
+    return {'scope': 'independent', 'items': data, 'total': total,
+            'page': page, 'page_size': page_size,
+            'range': _range_label(raw_range) or 'all', 'sort': sort}
+
+
+def _accounting_health():
+    from harness.observability.llm_accounting import pending_attempt_count
+    from harness.observability.trace_writer import write_failure_count
+
+    return {'pending_attempts': pending_attempt_count(), 'writer_failures': write_failure_count()}
+
+
+def _independent_stats(db, since, raw_range):
+    from models.models import AgentEvent
+
+    query = _attempt_list_query(db, since)
+    aggregate = query.with_entities(func.count(AgentEvent.id).label('events'),
+                                    *build_usage_aggregate_columns()).one()
+    usage = usage_summary_from_aggregate(aggregate)
+    states = query.with_entities(AgentEvent.status, func.count(AgentEvent.id)).group_by(
+        AgentEvent.status).all()
+    failed = sum(count for status, count in states if status == 'error')
+    done = int(aggregate.events or 0) - failed
+    durations = sorted(duration for (duration,) in query.with_entities(AgentEvent.duration_ms).all()
+                       if duration is not None)
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).astimezone(
+        timezone.utc).replace(tzinfo=None)
+    today_query = _attempt_list_query(db, today)
+    today_aggregate = today_query.with_entities(func.count(AgentEvent.id).label('events'),
+                                               *build_usage_aggregate_columns()).one()
+    today_done = today_query.filter(AgentEvent.status != 'error').count()
+    previous_done = _attempt_list_query(db, today - timedelta(days=1)).filter(
+        AgentEvent.ts < today, AgentEvent.status != 'error').count()
+    last = _attempt_list_query(db).with_entities(func.max(AgentEvent.ts)).scalar()
+    return {
+        'scope': 'independent', 'by_kind': [{'kind': 'llm_turn', 'count': usage['llm_calls']}],
+        'by_status': [{'status': 'finished', 'count': done}, {'status': 'failed', 'count': failed}],
+        'status_buckets': [{'key': key, 'count': count} for key, count in (
+            ('active', 0), ('done', done), ('failed', failed), ('unknown', 0))],
+        'total_events': int(aggregate.events or 0), 'total_independent_calls': usage['llm_calls'],
+        # Compatibility alias for existing paginated list consumers; scope defines the unit.
+        'total_requirements': usage['llm_calls'], 'requirements_total': usage['llm_calls'],
+        **usage, 'total_tokens': usage['tokens'], 'total_cost': usage['cost'],
+        'last_event_at': _iso_utc(last),
+        'today': {'finished': today_done, 'finished_prev': previous_done,
+                  **usage_summary_from_aggregate(today_aggregate), 'events': int(today_aggregate.events or 0)},
+        'active': {'total': 0, 'awaiting_user': 0},
+        'duration': {'avg_ms': int(sum(durations) / len(durations)) if durations else 0,
+                     'p95_ms': durations[min(len(durations)-1, int(len(durations)*.95))] if durations else 0,
+                     'sample': len(durations)},
+        **_accounting_health(), 'range': _range_label(raw_range) or 'all',
+    }
 
 
 # 状态聚合桶 —— 筛选条只给「进行中 / 已完成 / 失败」三档，而库里状态有 8 种。
@@ -49,25 +161,6 @@ def _iso_utc(dt):
     比才会暴露。
     """
     return None if dt is None else dt.replace(tzinfo=timezone.utc).isoformat()
-
-
-def _hit_rate(cached: int, reported_tokens_in: int):
-    """缓存命中率 = 命中缓存的 input token / **上报过缓存信息的** input token。
-
-    ⚠️ 分母既不是 `tokens_in + tokens_out`，也不是全部 `tokens_in`：
-    - 加上 tokens_out：命中量本身就是 input 的子集，混进输出会让命中率被
-      系统性算低，而这个数字看起来依然「像那么回事」，不会被任何人发现。
-    - 用全部 tokens_in：没带缓存字段的那些调用会撑大分母、分子不动，
-      命中率同样被算低 —— 实测 583 次有 usage 的调用里有 134 次没带缓存字段。
-    只把「确实上报了」的调用计入分母，得到的才是这批调用的真实命中率。
-    样本量（reported_calls）必须一并展示，否则读者无从判断这个率的可信度。
-
-    分母为 0 时返回 None 而不是 0：0% 的语义是「查过，一次没命中」，
-    「压根没数据」不该显示成同一个数字。
-    """
-    if not reported_tokens_in:
-        return None
-    return round(cached / reported_tokens_in, 4)
 
 
 # ==================== 时间范围 ====================
@@ -159,22 +252,26 @@ def admin_trace_list():
     since = _range_since(raw_range)
     sort = (request.args.get('sort') or 'created').strip().lower()
     q = (request.args.get('q') or '').strip()
+    scope = _requested_scope()
+    if scope is None:
+        return jsonify({'error': 'scope must be requirement or independent'}), 400
 
     with transactional_db() as db:
+        if scope == 'independent':
+            return jsonify(_independent_list(db, page, page_size, since,
+                q=q, kind=kind, status=status, bucket=bucket,
+                raw_range=raw_range, sort=sort))
         base = db.query(
             AgentEvent.requirement_id,
             func.count(AgentEvent.id).label('event_count'),
-            func.sum(case((AgentEvent.kind == 'llm_turn', 1), else_=0)).label('llm_calls'),
+            *build_usage_aggregate_columns(),
             func.sum(case((AgentEvent.kind == 'tool_call', 1), else_=0)).label('tool_calls'),
             func.count(func.distinct(AgentEvent.turn_index)).label('turn_count'),
-            func.sum(AgentEvent.tokens_in).label('tokens_in'),
-            func.sum(AgentEvent.tokens_out).label('tokens_out'),
-            func.sum(AgentEvent.cost).label('cost'),
             func.min(AgentEvent.ts).label('started_at'),
             func.max(AgentEvent.ts).label('last_event_at'),
             func.sum(AgentEvent.duration_ms).label('total_duration_ms'),
             func.sum(case((AgentEvent.status == 'error', 1), else_=0)).label('error_count'),
-        ).group_by(AgentEvent.requirement_id)
+        ).filter(usage_scope_condition(scope)).group_by(AgentEvent.requirement_id)
 
         if kind:
             # 只返回包含该类型事件的需求
@@ -188,12 +285,9 @@ def admin_trace_list():
         query = db.query(
             rows.c.requirement_id.label('requirement_id'),
             rows.c.event_count.label('event_count'),
-            rows.c.llm_calls.label('llm_calls'),
+            *(getattr(rows.c, key).label(key) for key in USAGE_AGGREGATE_KEYS),
             rows.c.tool_calls.label('tool_calls'),
             rows.c.turn_count.label('turn_count'),
-            rows.c.tokens_in.label('tokens_in'),
-            rows.c.tokens_out.label('tokens_out'),
-            rows.c.cost.label('cost'),
             rows.c.started_at.label('started_at'),
             rows.c.last_event_at.label('last_event_at'),
             rows.c.total_duration_ms.label('total_duration_ms'),
@@ -270,12 +364,8 @@ def admin_trace_list():
                 'bucket': _BUCKET_OF.get(r.status or 'unknown', 'unknown'),
                 'turn_count': int(r.turn_count or 1),
                 'event_count': int(r.event_count or 0),
-                'llm_calls': int(r.llm_calls or 0),
+                **usage_summary_from_aggregate(r),
                 'tool_calls': int(r.tool_calls or 0),
-                'tokens_in': int(r.tokens_in or 0),
-                'tokens_out': int(r.tokens_out or 0),
-                'tokens': int(r.tokens_in or 0) + int(r.tokens_out or 0),
-                'cost': round(float(r.cost or 0), 6),
                 'duration_ms': duration,
                 'started_at': _iso_utc(started),
                 'last_event_at': _iso_utc(last),
@@ -284,6 +374,7 @@ def admin_trace_list():
             })
 
         return jsonify({
+            'scope': scope,
             'items': data,
             'total': total,
             'page': page,
@@ -318,7 +409,7 @@ def _use_db(session):
 
 
 def build_events_payload(requirement_id, session, *, turn=None, kind=None,
-                         limit=500, offset=0) -> dict:
+                         limit=500, offset=0, scope=None) -> dict:
     """单条轨迹的完整事件时间线。
 
     seq 是需求内全局递增序号，不依赖时间戳精度（同一秒内多个事件也能正确排序）。
@@ -328,7 +419,7 @@ def build_events_payload(requirement_id, session, *, turn=None, kind=None,
 
     with _use_db(session) as db:
         query = db.query(AgentEvent).filter(
-            AgentEvent.requirement_id == requirement_id)
+            AgentEvent.requirement_id == requirement_id, usage_scope_condition(scope))
         if turn is not None and turn != '':
             query = query.filter(AgentEvent.turn_index == int(turn))
         if kind:
@@ -380,12 +471,12 @@ def admin_trace_events(requirement_id):
     with transactional_db() as db:
         return jsonify(build_events_payload(
             requirement_id, db,
-            turn=turn, kind=kind, limit=limit, offset=offset))
+            turn=turn, kind=kind, limit=limit, offset=offset, scope='requirement'))
 
 
 # ==================== 轮次 ====================
 
-def build_turns_payload(requirement_id, session) -> dict:
+def build_turns_payload(requirement_id, session, *, scope=None) -> dict:
     """轮次 + 汇总 + 阶段时间线 + 按模型 —— 时间线的唯一实现。
 
     驱动详情页顶部的「轮次切换器」。turn_index 在**写入时**确定（存入
@@ -393,18 +484,17 @@ def build_turns_payload(requirement_id, session) -> dict:
     的方式既脆弱又慢。
     """
     from models.models import AgentEvent
+    scoped = (AgentEvent.requirement_id == requirement_id, usage_scope_condition(scope))
 
     with _use_db(session) as db:
         rows = db.query(
             AgentEvent.turn_index,
             func.count(AgentEvent.id).label('event_count'),
-            func.sum(case((AgentEvent.kind == 'llm_turn', 1), else_=0)).label('llm_calls'),
+            *build_usage_aggregate_columns(),
             func.min(AgentEvent.ts).label('started_at'),
             func.max(AgentEvent.ts).label('ended_at'),
             func.sum(AgentEvent.duration_ms).label('total_duration_ms'),
-        ).filter(
-            AgentEvent.requirement_id == requirement_id
-        ).group_by(AgentEvent.turn_index).order_by(AgentEvent.turn_index).all()
+        ).filter(*scoped).group_by(AgentEvent.turn_index).order_by(AgentEvent.turn_index).all()
 
         items = []
         for r in rows:
@@ -414,7 +504,7 @@ def build_turns_payload(requirement_id, session) -> dict:
                 'turn_index': int(r.turn_index or 0),
                 'mode': '初次生成' if int(r.turn_index or 0) == 0 else f'第 {int(r.turn_index or 0) + 1} 轮对话',
                 'event_count': int(r.event_count or 0),
-                'llm_calls': int(r.llm_calls or 0),
+                **usage_summary_from_aggregate(r),
                 'started_at': _iso_utc(started),
                 'ended_at': _iso_utc(ended),
                 'duration_ms': duration,
@@ -425,25 +515,15 @@ def build_turns_payload(requirement_id, session) -> dict:
         # 耗时取 max(ts) - min(ts) 的**墙钟跨度**，与列表页 duration_ms 同口径；
         # 不是把各事件的 duration_ms 相加 —— 那样会把并行/包含的耗时重复计入。
         tot = db.query(
-            func.count(AgentEvent.id),
-            func.sum(case((AgentEvent.kind == 'llm_turn', 1), else_=0)),
-            func.sum(case((AgentEvent.kind == 'tool_call', 1), else_=0)),
-            func.sum(case((AgentEvent.status == 'error', 1), else_=0)),
-            func.sum(AgentEvent.tokens_in),
-            func.sum(AgentEvent.tokens_out),
-            func.sum(AgentEvent.cost),
-            func.min(AgentEvent.ts),
-            func.max(AgentEvent.ts),
-            # ⚠️ 新字段一律追加在末尾：插在中间会让 tot[7]/tot[8] 的时间列整体
-            # 错位，而 SQLAlchemy 不会报错，只会让 duration 静默算成 0。
-            func.sum(AgentEvent.cached_tokens),
-            # 命中率的分母与样本量只含「上报过缓存信息」的调用（见 _hit_rate）
-            func.sum(case((AgentEvent.cached_tokens.isnot(None),
-                           AgentEvent.tokens_in), else_=0)),
-            func.sum(case((AgentEvent.cached_tokens.isnot(None), 1), else_=0)),
-        ).filter(AgentEvent.requirement_id == requirement_id).first()
+            func.count(AgentEvent.id).label('events'),
+            func.sum(case((AgentEvent.kind == 'tool_call', 1), else_=0)).label('tool_calls'),
+            func.sum(case((AgentEvent.status == 'error', 1), else_=0)).label('error_count'),
+            func.min(AgentEvent.ts).label('first_ts'),
+            func.max(AgentEvent.ts).label('last_ts'),
+            *build_usage_aggregate_columns(),
+        ).filter(*scoped).first()
 
-        first_ts, last_ts = tot[7], tot[8]
+        first_ts, last_ts = tot.first_ts, tot.last_ts
         duration_ms = int((last_ts - first_ts).total_seconds() * 1000) \
             if (first_ts and last_ts) else 0
 
@@ -451,17 +531,15 @@ def build_turns_payload(requirement_id, session) -> dict:
         # 这里**按阶段聚合**，不是按连续段切分：横条要回答的是「每个阶段总共
         # 花了多久」，聚合才对。「验收→修复→再验收」的因果顺序由左栏时间线
         # （按连续段分组）保证 —— 两种视图各回答一个问题，不重复。
+        stage_key = func.coalesce(func.nullif(AgentEvent.stage, ''), 'unclassified')
         stage_rows = db.query(
-            AgentEvent.stage,
+            stage_key,
             func.count(AgentEvent.id),
             func.sum(case((AgentEvent.kind == 'llm_turn', 1), else_=0)),
             func.sum(AgentEvent.duration_ms),
             func.min(AgentEvent.ts),
             func.max(AgentEvent.ts),
-        ).filter(
-            AgentEvent.requirement_id == requirement_id,
-            AgentEvent.stage.isnot(None),
-        ).group_by(AgentEvent.stage).all()
+        ).filter(*scoped).group_by(stage_key).all()
 
         stages = []
         for s, cnt, llms, dur_sum, s_first, s_last in stage_rows:
@@ -483,23 +561,21 @@ def build_turns_payload(requirement_id, session) -> dict:
         # 而 model 是事件自带字段，不用另算。
         model_rows = db.query(
             AgentEvent.model,
-            func.count(AgentEvent.id),
-            func.sum(AgentEvent.cost),
+            *build_usage_aggregate_columns(),
         ).filter(
-            AgentEvent.requirement_id == requirement_id,
+            *scoped,
             AgentEvent.kind == 'llm_turn',
             AgentEvent.model.isnot(None),
         ).group_by(AgentEvent.model).order_by(
             func.count(AgentEvent.id).desc()).all()
-        by_model = [{'model': m, 'calls': int(c or 0),
-                     'cost': round(float(cost or 0), 6)}
-                    for m, c, cost in model_rows]
+        by_model = [{'model': r.model, 'calls': int(r.llm_calls or 0),
+                     **usage_summary_from_aggregate(r)} for r in model_rows]
 
         # ---- 首个 LLM 调用耗时 ----
         # 字段名如实叫 first_llm_ms：我们没有 TTFT 埋点，拿不到真正的「首 Token」。
         # 用 first_token 命名就等于在界面上宣称一个没测过的量 —— 宁可名字长一点。
         first_llm = db.query(AgentEvent.duration_ms).filter(
-            AgentEvent.requirement_id == requirement_id,
+            *scoped,
             AgentEvent.kind == 'llm_turn',
             AgentEvent.duration_ms.isnot(None),
         ).order_by(AgentEvent.seq).limit(1).scalar()
@@ -508,28 +584,20 @@ def build_turns_payload(requirement_id, session) -> dict:
         # 轮次结论直接取 verify 里程碑写入的 verdict，不靠猜。按 seq 排序就是
         # 验收发生的顺序，最后一条即最终判定。
         verdicts = [m.get('verdict') for (m,) in db.query(AgentEvent.meta).filter(
-            AgentEvent.requirement_id == requirement_id,
+            *scoped,
             AgentEvent.kind == 'verify',
         ).order_by(AgentEvent.seq).all() if isinstance(m, dict)]
         repair_rounds = db.query(func.count(AgentEvent.id)).filter(
-            AgentEvent.requirement_id == requirement_id,
+            *scoped,
             AgentEvent.kind == 'repair',
         ).scalar() or 0
 
         summary = {
             'turns': len(items),
-            'events': int(tot[0] or 0),
-            'llm_calls': int(tot[1] or 0),
-            'tool_calls': int(tot[2] or 0),
-            'error_count': int(tot[3] or 0),
-            'tokens': int(tot[4] or 0) + int(tot[5] or 0),
-            'tokens_in': int(tot[4] or 0),
-            'tokens_out': int(tot[5] or 0),
-            # cached 是 tokens_in 的子集，界面必须标清楚，别被读成第三类 token
-            'cached_tokens': int(tot[9] or 0),
-            'cache_hit_rate': _hit_rate(int(tot[9] or 0), int(tot[10] or 0)),
-            'cache_reported_calls': int(tot[11] or 0),
-            'cost': round(float(tot[6] or 0), 6),
+            'events': int(tot.events or 0),
+            'tool_calls': int(tot.tool_calls or 0),
+            'error_count': int(tot.error_count or 0),
+            **usage_summary_from_aggregate(tot),
             'duration_ms': duration_ms,
             'first_llm_ms': int(first_llm) if first_llm else 0,
             'tail_ms': max(0, duration_ms - int(first_llm or 0)),
@@ -562,7 +630,7 @@ def build_turns_payload(requirement_id, session) -> dict:
         # 头部要能一键复制。取任意一条事件的值即可（同一 run 内一致）；
         # 一条都没有（早期数据没埋）就留空，前端会自行隐藏复制入口。
         trace = db.query(AgentEvent.trace_id).filter(
-            AgentEvent.requirement_id == requirement_id,
+            *scoped,
             AgentEvent.trace_id.isnot(None),
         ).order_by(AgentEvent.seq).limit(1).scalar()
 
@@ -586,7 +654,7 @@ def build_turns_payload(requirement_id, session) -> dict:
 def admin_trace_turns(requirement_id):
     """对话轮次列表 —— 驱动详情页顶部的「轮次切换器」。"""
     with transactional_db() as db:
-        return jsonify(build_turns_payload(requirement_id, db))
+        return jsonify(build_turns_payload(requirement_id, db, scope='requirement'))
 
 
 # ==================== 事件详情 ====================
@@ -709,7 +777,9 @@ def admin_trace_contract():
     不再需要在前端 KIND_LABEL / KIND_COLOR 两张 map 里同步补一遍。
     """
     from harness.observability.event_contract import contract_payload
-    return jsonify(contract_payload())
+    contract = contract_payload()
+    contract['stages']['unclassified'] = {'label': '未归类', 'color': 'oklch(62% 0.02 70)'}
+    return jsonify(contract)
 
 
 # ==================== 概览统计 ====================
@@ -738,8 +808,13 @@ def admin_trace_stats():
     if raw_range is None:
         raw_range = request.args.get('days')
     since = _range_since(raw_range)
+    scope = _requested_scope()
+    if scope is None:
+        return jsonify({'error': 'scope must be requirement or independent'}), 400
 
     with transactional_db() as db:
+        if scope == 'independent':
+            return jsonify(_independent_stats(db, since, raw_range))
         def _windowed_ids():
             """窗口内的需求 id 集合；since 为空返回 None（不过滤）。
 
@@ -751,7 +826,7 @@ def admin_trace_stats():
             first = db.query(
                 AgentEvent.requirement_id.label('rid'),
                 func.min(AgentEvent.ts).label('t0'),
-            ).group_by(AgentEvent.requirement_id).subquery()
+            ).filter(usage_scope_condition(scope)).group_by(AgentEvent.requirement_id).subquery()
             rows = db.query(first.c.rid).outerjoin(
                 Requirement, Requirement.id == first.c.rid
             ).filter(
@@ -769,6 +844,7 @@ def admin_trace_stats():
             「3 天前创建、今天还在跑」的需求从窗口里划出去，于是 chip 写 17、
             点进去 15（这恰恰是本模块反复强调不能出现的那类不一致）。
             """
+            q = q.filter(usage_scope_condition(scope))
             if _ids is None:
                 return q
             # 空集合直接判假：SQLAlchemy 对 `IN ()` 会告警，且语义不直观
@@ -780,21 +856,10 @@ def admin_trace_stats():
         )).group_by(AgentEvent.kind).all()
 
         agg = windowed(db.query(
-            func.count(AgentEvent.id),
-            func.count(func.distinct(AgentEvent.requirement_id)),
-            func.sum(AgentEvent.tokens_in),
-            func.sum(AgentEvent.tokens_out),
-            func.sum(AgentEvent.cost),
-            # ⚠️ 追加在末尾：agg[0..4] 的下标在多处被引用（含下方 token 输出），
-            # 插在中间会静默错位 —— 不报错，只是数字悄悄错。
-            func.sum(AgentEvent.cached_tokens),
-            # 命中率的**分母与样本量**：只统计「上报过缓存信息」的调用。
-            # 用全部 tokens_in 当分母的话，那些压根没带缓存字段的调用会把分母
-            # 撑大而分子不动 —— 命中率被系统性算低，且看起来依然「像那么回事」。
-            func.sum(case((AgentEvent.cached_tokens.isnot(None),
-                           AgentEvent.tokens_in), else_=0)),
-            func.sum(case((AgentEvent.cached_tokens.isnot(None), 1), else_=0)),
+            func.count(AgentEvent.id).label('events'),
+            *build_usage_aggregate_columns(),
         )).first()
+        usage = usage_summary_from_aggregate(agg)
 
         # 状态分布的**分母是「有事件索引的需求」**，与列表页完全同源（列表页就是
         # 从 agent_events 聚合出来的）。用 outerjoin 而不是 join：`agent_events`
@@ -838,10 +903,9 @@ def admin_trace_stats():
         ).scalar() or 0
 
         today_agg = db.query(
-            func.sum(AgentEvent.cost),
-            func.sum(case((AgentEvent.kind == 'llm_turn', 1), else_=0)),
-            func.count(AgentEvent.id),
-        ).filter(AgentEvent.ts >= today_start).first()
+            func.count(AgentEvent.id).label('events'),
+            *build_usage_aggregate_columns(),
+        ).filter(AgentEvent.ts >= today_start, usage_scope_condition(scope)).first()
 
         # ---------- 进行中 / 等待用户确认 ----------
         # 用**有轨迹**的口径（与筛选 chip 同一分母），不是需求表全量：
@@ -867,7 +931,7 @@ def admin_trace_stats():
             AgentEvent.requirement_id,
             func.min(AgentEvent.ts).label('t0'),
             func.max(AgentEvent.ts).label('t1'),
-        ).group_by(AgentEvent.requirement_id).all()
+        ).filter(usage_scope_condition(scope)).group_by(AgentEvent.requirement_id).all()
         done_ids = {rid for (rid,) in db.query(Requirement.id).filter(
             Requirement.status.in_(DONE_STATUSES)).all()}
         # 列序：0 = requirement_id，1 = t0，2 = t1。写错下标不会报错，
@@ -896,13 +960,12 @@ def admin_trace_stats():
 
         # 全库最近一次事件时间 —— 首页副标题「最近更新于 N 分钟前」用。
         # 拿它当「数据是否还在进来」的活体信号：长时间不动通常意味着后台挂了。
-        last_ts = db.query(func.max(AgentEvent.ts)).scalar()
+        last_ts = db.query(func.max(AgentEvent.ts)).filter(usage_scope_condition(scope)).scalar()
 
         # 埋点自身的健康度：写入失败只告警不抛出（不能阻断主流程），
         # 但必须能被看到 —— 否则「后台没数据」和「这次没产生数据」无法区分。
-        from harness.observability.trace_writer import write_failure_count
-
         return jsonify({
+            'scope': scope,
             'by_kind': [{'kind': k, 'count': c} for k, c in kind_rows],
             'by_status': [{'status': s or 'unknown', 'count': c}
                           for s, c in status_rows],
@@ -910,29 +973,20 @@ def admin_trace_stats():
                 {'key': k, 'count': buckets[k]}
                 for k in ('active', 'done', 'failed', 'unknown')
             ],
-            'total_events': int(agg[0] or 0),
+            'total_events': int(agg.events or 0),
             # 「覆盖需求」＝ 各状态桶之和（同一个窗口内），这样「全部 N」chip
             # 与点进去的行数必然相等。用 agg 的 distinct 计数会绕开时间窗。
             'total_requirements': sum(int(c or 0) for _, c in status_rows),
             'requirements_total': int(total_reqs),
-            'total_tokens': int(agg[2] or 0) + int(agg[3] or 0),
-            # cached 是 tokens_in 的子集；命中率分母只含「上报过缓存信息」的调用
-            'tokens_in': int(agg[2] or 0),
-            'cached_tokens': int(agg[5] or 0),
-            'cache_hit_rate': _hit_rate(int(agg[5] or 0), int(agg[6] or 0)),
-            # 样本量：命中率是在多少次调用、多少 input token 上算出来的。
-            # 不带上它，一个 3 次调用得出的 99% 和一个 500 次得出的 60%
-            # 在界面上没有区别。
-            'cache_reported_calls': int(agg[7] or 0),
-            'cache_reported_tokens_in': int(agg[6] or 0),
-            'total_cost': round(float(agg[4] or 0), 6),
+            **usage,
+            'total_tokens': usage['tokens'],
+            'total_cost': usage['cost'],
             'last_event_at': _iso_utc(last_ts),
             'today': {
                 'finished': int(today_finished),
                 'finished_prev': int(prev_finished),
-                'cost': round(float(today_agg[0] or 0), 6),
-                'llm_calls': int(today_agg[1] or 0),
-                'events': int(today_agg[2] or 0),
+                **usage_summary_from_aggregate(today_agg),
+                'events': int(today_agg.events or 0),
             },
             'active': {
                 'total': int(active_total),
@@ -943,7 +997,7 @@ def admin_trace_stats():
                 'p95_ms': p95_ms,
                 'sample': len(dur_secs),
             },
-            'writer_failures': write_failure_count(),
+            **_accounting_health(),
             # 当前窗口与排序：前端副标题与 KPI 的窗口标注直接读，不在前端再拼一次
             'range': _range_label(raw_range) or 'all',
         })

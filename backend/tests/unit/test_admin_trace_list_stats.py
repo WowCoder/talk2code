@@ -101,6 +101,159 @@ def _mk_event(db, requirement_id, *, seq=1, kind="llm_turn", ts=None,
     return ev
 
 
+def test_requirement_views_and_stats_exclude_explicit_other_origins(app_client, admin_token):
+    before = _get(app_client, admin_token, "/api/admin/traces/stats")
+    with SessionLocal() as db:
+        req = _mk_req(db, _mk_user(db), "finished", title=f"scope-{_run}")
+        rid = req.id
+        for seq, origin, tokens in ((1, "requirement", 100), (2, "independent", 200), (3, "evaluation", 300)):
+            event = _mk_event(db, rid, seq=seq, tokens_in=tokens, model="scope-model")
+            event.meta = {"origin": origin, "has_usage": True, "cost_decimal": str(tokens / 1000)}
+        db.commit()
+    listed = _get(app_client, admin_token, f"/api/admin/traces?q={rid}")["items"]
+    row = next(item for item in listed if item["requirement_id"] == rid)
+    assert (row["event_count"], row["llm_calls"], row["tokens"], row["cost"]) == (1, 1, 100, .1)
+    turns = _get(app_client, admin_token, f"/api/admin/traces/{rid}/turns")
+    assert turns["summary"]["tokens"] == 100
+    assert turns["summary"]["events"] == 1
+    assert _get(app_client, admin_token, f"/api/admin/traces/{rid}/events")["total"] == 1
+    after = _get(app_client, admin_token, "/api/admin/traces/stats")
+    assert after["llm_calls"] - before["llm_calls"] == 1
+    assert after["total_tokens"] - before["total_tokens"] == 100
+    assert after["total_cost"] - before["total_cost"] == pytest.approx(.1)
+    assert after["today"]["llm_calls"] - before["today"]["llm_calls"] == 1
+
+
+def test_independent_scope_lists_each_attempt_and_uses_unique_event_details(app_client, admin_token):
+    from sqlalchemy import func
+
+    marker = f"independent-{_run}"
+    before = _get(app_client, admin_token, "/api/admin/traces/stats?scope=independent")
+    with SessionLocal() as db:
+        seq = int(db.query(func.max(AgentEvent.seq)).filter(AgentEvent.requirement_id == 0).scalar() or 0)
+        ids = []
+        for number, status, amount in ((1, "ok", 111), (2, "error", 222)):
+            event = _mk_event(db, 0, seq=seq + number, tokens_in=amount, status=status,
+                              model=marker, duration_ms=number * 100)
+            event.attempt_id = __import__("uuid").uuid4().hex
+            event.call_id = event.attempt_id
+            event.trace_id = event.attempt_id
+            event.meta = {"origin": "independent", "has_usage": True, "purpose": marker}
+            ids.append(event.id)
+        # Main DB evaluation rows must not be included in independent totals.
+        event = _mk_event(db, 0, seq=seq + 3, tokens_in=9999, model=marker)
+        event.meta = {"origin": "evaluation", "has_usage": True}
+        db.commit()
+    listed = _get(app_client, admin_token, f"/api/admin/traces?scope=independent&q={marker}")
+    assert listed["scope"] == "independent"
+    assert listed["total"] == 2
+    assert {item["event_id"] for item in listed["items"]} == set(ids)
+    assert all(item["requirement_id"] == 0 and item["llm_calls"] == 1 for item in listed["items"])
+    assert sorted(item["tokens"] for item in listed["items"]) == [111, 222]
+    for event_id in ids:
+        detail = _get(app_client, admin_token, f"/api/admin/traces/events/{event_id}")
+        assert detail["id"] == event_id
+        assert detail["model"] == marker
+    # The requirement-0 timeline remains a legacy requirement view, not all independent calls merged.
+    events = _get(app_client, admin_token, "/api/admin/traces/0/events")
+    assert not (set(ids) & {item["id"] for item in events["items"]})
+    after = _get(app_client, admin_token, "/api/admin/traces/stats?scope=independent")
+    assert after["total_independent_calls"] - before["total_independent_calls"] == 2
+    assert after["llm_calls"] - before["llm_calls"] == 2
+    assert after["total_tokens"] - before["total_tokens"] == 333
+
+
+def test_stage_summary_retains_unclassified_legacy_calls(app_client, admin_token):
+    with SessionLocal() as db:
+        req = _mk_req(db, _mk_user(db), "finished")
+        rid = req.id
+        _mk_event(db, rid, seq=1, tokens_in=100, stage=None, duration_ms=200)
+        _mk_event(db, rid, seq=2, tokens_in=200, stage="coding", duration_ms=100)
+    summary = _get(app_client, admin_token, f"/api/admin/traces/{rid}/turns")["summary"]
+    stages = {row["stage"]: row for row in summary["stages"]}
+    assert stages["unclassified"]["llm_calls"] == 1
+    assert stages["unclassified"]["events"] == 1
+    assert stages["unclassified"]["ms"] == 200
+    assert sum(row["llm_calls"] for row in summary["stages"]) == summary["llm_calls"] == 2
+
+
+def test_scope_stats_exposes_pending_attempts_separately_from_failure_history(app_client, admin_token, monkeypatch):
+    from harness.observability import llm_accounting
+
+    monkeypatch.setattr(llm_accounting, "pending_attempt_count", lambda: 3, raising=False)
+    stats = _get(app_client, admin_token, "/api/admin/traces/stats")
+    assert stats["pending_attempts"] == 3
+    assert isinstance(stats["writer_failures"], int)
+
+
+def test_legacy_requirement_zero_calls_move_to_independent_while_nonllm_history_stays(app_client, admin_token):
+    from sqlalchemy import func
+
+    marker = f"legacy-independent-{_run}"
+    before = _get(app_client, admin_token, "/api/admin/traces/stats")
+    before_independent = _get(app_client, admin_token, "/api/admin/traces/stats?scope=independent")
+    with SessionLocal() as db:
+        seq = int(db.query(func.max(AgentEvent.seq)).filter(AgentEvent.requirement_id == 0).scalar() or 0)
+        missing = _mk_event(db, 0, seq=seq + 1, model=marker)
+        known = _mk_event(db, 0, seq=seq + 2, model=marker, tokens_in=125)
+        known.cost = .125
+        history = _mk_event(db, 0, seq=seq + 3, kind="plan", model=marker)
+        orphan = _mk_event(db, _ORPHAN_BASE + 2, model=marker, tokens_in=25)
+        orphan.cost = .025
+        db.commit()
+        call_ids, history_id = {missing.id, known.id}, history.id
+    after = _get(app_client, admin_token, "/api/admin/traces/stats")
+    assert after["llm_calls"] - before["llm_calls"] == 1
+    assert after["total_tokens"] - before["total_tokens"] == 25
+    assert after["total_cost"] - before["total_cost"] == pytest.approx(.025)
+    assert after["total_events"] - before["total_events"] == 2
+    independent = _get(app_client, admin_token, f"/api/admin/traces?scope=independent&q={marker}")
+    assert independent["total"] == 2
+    assert {item["event_id"] for item in independent["items"]} == call_ids
+    assert sorted(item["usage_reported_calls"] for item in independent["items"]) == [0, 1]
+    independent_stats = _get(app_client, admin_token, "/api/admin/traces/stats?scope=independent")
+    assert independent_stats["llm_calls"] - before_independent["llm_calls"] == 2
+    assert independent_stats["tokens"] - before_independent["tokens"] == 125
+    assert independent_stats["total_cost"] - before_independent["total_cost"] == pytest.approx(.125)
+    history = _get(app_client, admin_token, "/api/admin/traces/0/events?limit=1000")
+    assert history_id in {item["id"] for item in history["items"]}
+    assert not (call_ids & {item["id"] for item in history["items"]})
+
+
+def test_requirement_usage_matches_admin_list_turns_and_stats(app_client, admin_token):
+    from routes.requirements import _build_requirement_detail
+
+    before = _get(app_client, admin_token, "/api/admin/traces/stats")
+    with SessionLocal() as db:
+        req = _mk_req(db, _mk_user(db), "finished")
+        one = _mk_event(db, req.id, tokens_in=100, tokens_out=20, cached_tokens=0)
+        one.meta = {"has_usage": True, "cost_fallback": True,
+                    "cost_decimal": "0.000000123456",
+                    "cache_savings": "0.00000001"}
+        two = _mk_event(db, req.id, seq=2)
+        two.meta = {"has_usage": False, "cost_fallback": True}
+        db.commit()
+        detail = _build_requirement_detail(req)
+        rid = req.id
+
+    expected = detail["usage_summary"]
+    assert expected["usage_coverage"] == .5
+    assert expected["cache_coverage"] == 1
+    assert expected["cost_fallback_calls"] == 1
+    assert expected["cost"] == pytest.approx(.000000123456)
+    listed = _get(app_client, admin_token, f"/api/admin/traces?q={rid}")["items"]
+    row = next(item for item in listed if item["requirement_id"] == rid)
+    turns = _get(app_client, admin_token, f"/api/admin/traces/{rid}/turns")
+    for key, value in expected.items():
+        assert row[key] == value
+        assert turns["summary"][key] == value
+        assert turns["items"][0][key] == value
+    after = _get(app_client, admin_token, "/api/admin/traces/stats")
+    assert after["usage_reported_calls"] - before["usage_reported_calls"] == 1
+    assert after["cost_fallback_calls"] - before["cost_fallback_calls"] == 1
+    assert after["total_cost"] - before["total_cost"] == pytest.approx(expected["cost"])
+
+
 def _counts(stats):
     return {x["status"]: x["count"] for x in stats["by_status"]}
 
@@ -714,3 +867,52 @@ def test_cached_tokens_never_exceed_input(app_client, admin_token):
         assert 0.0 <= s["cache_hit_rate"] <= 1.0
     for b in s["status_buckets"]:
         assert b["count"] >= 0
+
+
+def test_list_rows_expose_cache_hit_rate(app_client, admin_token):
+    """列表每行都要带缓存命中三件套，且口径与详情页同源。
+
+    此前列表只聚合 tokens_in / tokens_out / cost，命中率只有详情页有 ——
+    于是「哪个需求的上下文前缀不稳定」在列表上根本对比不了，而这个指标
+    本来就是按需求横向比较才有意义。
+    """
+    db = SessionLocal()
+    try:
+        u = _mk_user(db)
+        tag = f"tlcache{_run}"
+        r_hit = _mk_req(db, u, "finished", title=tag)
+        r_none = _mk_req(db, u, "finished", title=tag)
+        _mk_event(db, r_hit.id, seq=1, tokens_in=1000, cached_tokens=600)
+        _mk_event(db, r_hit.id, seq=2, tokens_in=1000, cached_tokens=200)
+        # 整条需求都没上报：命中率必须是 None，不能是 0.0
+        _mk_event(db, r_none.id, seq=1, tokens_in=9000, cached_tokens=None)
+        ids = (r_hit.id, r_none.id)
+    finally:
+        db.close()
+
+    try:
+        data = _get(app_client, admin_token,
+                    f"/api/admin/traces?page_size=100&q={tag}")
+        rows = {x["requirement_id"]: x for x in data["items"]}
+        assert ids[0] in rows and ids[1] in rows, "刚建的需求应能被 q 筛到"
+        hit, none_row = rows[ids[0]], rows[ids[1]]
+
+        assert hit["cached_tokens"] == 800
+        assert hit["cache_reported_tokens_in"] == 2000
+        assert hit["cache_reported_calls"] == 2
+        assert hit["cache_hit_rate"] == 0.4
+        # 没上报 → None（没数据），不是 0.0（查过、没命中）
+        assert none_row["cache_hit_rate"] is None
+        assert none_row["cache_reported_calls"] == 0
+        # 但输入 token 要如实记账，不能为了让分母好看把它藏起来
+        assert none_row["tokens_in"] == 9000
+        assert none_row["tokens"] == 9000
+
+        # 列表口径与详情口径必须同源：同一个数字两个页面两个算法是最糟的
+        detail = _get(app_client, admin_token,
+                      f"/api/admin/traces/{ids[0]}/turns")["summary"]
+        assert detail["cache_hit_rate"] == hit["cache_hit_rate"]
+        assert detail["cached_tokens"] == hit["cached_tokens"]
+        assert detail["cache_reported_tokens_in"] == hit["cache_reported_tokens_in"]
+    finally:
+        _cleanup_reqs(*ids)

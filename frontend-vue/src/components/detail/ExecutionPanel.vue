@@ -1,10 +1,10 @@
 <template>
   <div v-if="traceData" class="exec-panel">
     <div class="exec-panel-header" @click="expanded = !expanded">
-      📊 执行详情
+      📊 本次执行详情
       <span>
         {{ spanCount }} 步 · {{ (totalDuration / 1000).toFixed(1) }}s ·
-        {{ totalTokens }} tokens · {{ formatCost(totalCost, 4) }}
+        {{ totalTokens ?? '—' }} tokens · 估算成本 USD {{ formatCost(totalCost, 4) }}
         {{ expanded ? '▾' : '▸' }}
       </span>
     </div>
@@ -21,15 +21,18 @@
         </span>
       </div>
       <div v-if="totalTokens" class="exec-row" style="font-weight:600;border-top:1px solid var(--dark-border);padding-top:4px;margin-top:4px">
-        Total: {{ totalTokens }} tokens · Cost: {{ formatCost(totalCost, 4) }}
+        本次执行：{{ totalTokens }} tokens · 估算成本 USD {{ formatCost(totalCost, 4) }}
       </div>
+      <div v-if="traceData.cost_fallback_calls" class="exec-row">{{ traceData.cost_fallback_calls }} 次调用按兜底价估算</div>
+      <div v-if="traceData.cache_savings != null" class="exec-row" :title="cacheSavingsTitle(traceData)">已知样本缓存净节省 USD {{ formatCost(traceData.cache_savings) }}</div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, computed } from 'vue'
-import { formatCost } from '@/utils/cost'
+import { formatCost, reportedCost } from '@/utils/cost'
+import { cacheSavingsTitle } from '@/utils/usageDisplay'
 import type { SSETraceSummaryData } from '@/types/sse'
 
 const props = defineProps<{
@@ -40,8 +43,8 @@ const expanded = ref(false)
 
 const spanCount = computed(() => props.traceData?.spans?.length || props.traceData?.span_count || 0)
 const totalDuration = computed(() => props.traceData?.total_duration_ms || 0)
-const totalTokens = computed(() => props.traceData?.total_tokens || 0)
-const totalCost = computed(() => props.traceData?.total_cost || 0)
+const totalTokens = computed(() => props.traceData?.total_tokens)
+const totalCost = computed(() => reportedCost(props.traceData?.total_cost, props.traceData?.usage_reported_calls, props.traceData?.llm_calls))
 </script>
 
 <style scoped>

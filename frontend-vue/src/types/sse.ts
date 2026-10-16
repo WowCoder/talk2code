@@ -2,6 +2,7 @@
 
 import type { RequirementStatus, VerifyStep } from './api'
 import type { PlanSpec } from './spec'
+import type { UsageAccounting } from './usage'
 
 export type SSEEventType =
   | 'connected'
@@ -135,11 +136,20 @@ export interface SSECompleteData {
   }>
 }
 
-export interface SSETraceSummaryData {
+export interface SSETraceSummaryData extends UsageAccounting {
   total_tokens?: number
   total_cost?: number
   total_duration_ms?: number
   span_count?: number
+  /** 输入 token 总量（含缓存命中部分） */
+  input_tokens?: number
+  /** 命中 KV 缓存的输入 token 数 —— 是 input_tokens 的**子集**，不是第三类 token */
+  cached_tokens?: number
+  /**
+   * 缓存命中率（0~1）。`null` = 没有任何一次调用上报缓存信息，
+   * 与 0（查过、一次没命中）是两件事，界面必须分开显示。
+   */
+  cache_hit_rate?: number | null
   spans?: Array<{
     name: string
     status: 'success' | 'failure' | 'running'

@@ -1,3 +1,5 @@
+import type { UsageAccounting } from './usage'
+
 /**
  * 后台轨迹视图的共享类型。
  *
@@ -28,7 +30,7 @@ export interface StageSeg {
 }
 
 /** 轨迹级汇总 —— 轮次/题可以单选切换，但「总共花了多少」必须一眼可见 */
-export interface Summary {
+export interface Summary extends UsageAccounting {
   turns: number
   events: number
   llm_calls: number

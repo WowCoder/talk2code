@@ -251,6 +251,8 @@ class AgentEvent(Base):
     requirement_id = Column(Integer, nullable=False)
     trace_id = Column(String(32))
     call_id = Column(String(32))
+    # 每次实际 HTTP 请求的 UUID。旧事件为 NULL，保留历史 call_id 的兼容性。
+    attempt_id = Column(String(32), nullable=True)
     seq = Column(Integer, nullable=False)
     turn_index = Column(Integer, default=0)
     iteration = Column(Integer)
@@ -287,6 +289,7 @@ class AgentEvent(Base):
         # 并发写（chat 与 resume 竞争、回填与运行并行）会产生重复 seq，
         # 唯一索引让冲突显式失败并由写入方重排重试，而不是静默乱序。
         Index("ux_ae_req_seq", "requirement_id", "seq", unique=True),
+        Index("ux_ae_attempt_id", "attempt_id", unique=True),
         Index("ix_ae_req_turn", "requirement_id", "turn_index", "seq"),
         Index("ix_ae_kind", "kind"),
         Index("ix_ae_ts", "ts"),
@@ -694,6 +697,13 @@ def init_db():
     # 与「记录为 0」区分开（详见 AgentEvent.cached_tokens 的注释）。
     # NULLABLE 列若加了 DEFAULT，PG 会把存量行也改写成该默认值，语义就没了。
     _add_column("agent_events", "cached_tokens", pg="INTEGER", sqlite="INTEGER")
+    _add_column("agent_events", "attempt_id", pg="VARCHAR(32)", sqlite="VARCHAR(32)")
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_ae_attempt_id "
+                              "ON agent_events(attempt_id)"))
+    except Exception as e:
+        logger.warning("[init_db] 请求尝试唯一索引创建失败：%s", e)
 
     # 迁移：可观测性 —— seq 唯一索引。create_all 不会给已存在的表补索引，
     # 存量库里 agent_events 只有普通索引，必须显式补上，否则并发写入

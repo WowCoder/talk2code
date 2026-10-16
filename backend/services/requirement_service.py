@@ -28,6 +28,9 @@ from harness.tools.code_tools import CodeToolHandler
 from harness.constraints.hooks import create_default_hook_manager
 
 from harness.observability.tracer import Tracer
+from harness.observability.log_context import (
+    bind_requirement, bind_turn_index, clear as clear_log_context, llm_context,
+)
 from harness.observability.cost import shared_cost_tracker
 from harness.observability.sse_reporter import SSEReporter
 from harness.runtime import ToolCallLoop
@@ -275,9 +278,12 @@ class RequirementService:
                 error_parts.append(f"连续 {np_count} 轮无进展")
         requirement.error_message = " — ".join(error_parts)
 
+    @llm_context(stage='planning')
     def process_requirement(self, requirement_id: int) -> bool:
         """处理需求：执行 LangGraph 多智能体协同流程"""
         with get_db() as db:
+            tracer = None
+            trace = None
             try:
                 requirement = db.query(Requirement).filter(Requirement.id == requirement_id).first()
                 if not requirement:
@@ -288,6 +294,8 @@ class RequirementService:
                     logger.info(f"需求 {requirement_id} 状态为 {requirement.status}，跳过")
                     return False
     
+                bind_requirement(requirement_id)
+                bind_turn_index(0)
                 # 清除上一次可能遗留的取消信号，避免新任务被旧信号立即判定为已取消
                 RequirementService.clear_cancel(requirement_id)
     
@@ -297,49 +305,59 @@ class RequirementService:
     
                 # ===== 意图路由：非 TASK 请求快速返回，不进入完整工作流 =====
                 if '[用户补充说明]' not in requirement.content:
-                    router = IntentRouter()
-                    intent_result = router.classify(requirement.content)
-                    logger.info(f"需求 {requirement_id} 意图分类: {intent_result.intent.value}")
-
-                    # 里程碑：意图路由结果。时间线的第一条事件 ——
-                    # 「需求根本没进工作流」这种情况在后台要一眼可见，
-                    # 否则排查时会以为任务跑了却什么都没记录。
-                    # llm_trace：意图判定背后是一次真实 LLM 调用，输入输出
-                    # 一并落库，后台点开能看到「依据什么文本、模型原话是什么」，
-                    # 而不是只有 confidence 一个数字。SKILL 确定性命中无调用，
-                    # trace 为 None，落库走纯结论事件。
+                    intent_tracer = Tracer(db_session=db, cost_tracker=shared_cost_tracker())
+                    intent_trace = intent_tracer.start_trace(requirement_id, requirement.user_id)
+                    intent_status = "finished"
                     try:
-                        from harness.observability.trace_writer import record_event
-                        _trace = getattr(intent_result, "llm_trace", None) or {}
-                        record_event(
-                            requirement_id, "intent",
-                            f"意图识别 · {intent_result.intent.value}",
-                            status="ok",
-                            meta={"intent": intent_result.intent.value,
-                                  "confidence": getattr(intent_result, "confidence", None),
-                                  "skill_name": getattr(intent_result, "skill_name", None)},
-                            messages=_trace.get("messages"),
-                            response=_trace.get("response"),
-                        )
-                    except Exception:
-                        pass
+                        router = IntentRouter()
+                        intent_result = router.classify(requirement.content)
+                        logger.info(f"需求 {requirement_id} 意图分类: {intent_result.intent.value}")
 
-                    if intent_result.intent == IntentType.QUICK:
-                        return self._handle_quick_answer(db, requirement, requirement_id, intent_result)
-                    elif intent_result.intent == IntentType.SEARCH:
-                        return self._handle_search_answer(db, requirement, requirement_id, intent_result)
-                    elif intent_result.intent == IntentType.AMBIGUOUS:
-                        return self._handle_ambiguous_direct(db, requirement, requirement_id)
-                    elif intent_result.intent == IntentType.OUT_OF_SCOPE:
-                        return self._handle_out_of_scope(db, requirement, requirement_id)
-                    elif intent_result.intent == IntentType.SKILL:
-                        # SKILL 进入完整工作流：SkillLoader 会将该技能的 SKILL.md
-                        # 注入编码 Prompt，Coder 可经 run_skill 工具编排/组合子技能。
-                        logger.info(
-                            f"需求 {requirement_id} 命中工作流技能: "
-                            f"{intent_result.skill_name}，进入完整工作流"
-                        )
-    
+                        # 里程碑：意图路由结果。时间线的第一条事件 ——
+                        # 「需求根本没进工作流」这种情况在后台要一眼可见，
+                        # 否则排查时会以为任务跑了却什么都没记录。
+                        # llm_trace：意图判定背后是一次真实 LLM 调用，输入输出
+                        # 一并落库，后台点开能看到「依据什么文本、模型原话是什么」，
+                        # 而不是只有 confidence 一个数字。SKILL 确定性命中无调用，
+                        # trace 为 None，落库走纯结论事件。
+                        try:
+                            from harness.observability.trace_writer import record_event
+                            _trace = getattr(intent_result, "llm_trace", None) or {}
+                            record_event(
+                                requirement_id, "intent",
+                                f"意图识别 · {intent_result.intent.value}",
+                                status="ok",
+                                meta={"intent": intent_result.intent.value,
+                                      "confidence": getattr(intent_result, "confidence", None),
+                                      "skill_name": getattr(intent_result, "skill_name", None)},
+                                messages=_trace.get("messages"),
+                                response=_trace.get("response"),
+                            )
+                        except Exception:
+                            pass
+
+                        if intent_result.intent == IntentType.QUICK:
+                            return self._handle_quick_answer(db, requirement, requirement_id, intent_result)
+                        elif intent_result.intent == IntentType.SEARCH:
+                            return self._handle_search_answer(db, requirement, requirement_id, intent_result)
+                        elif intent_result.intent == IntentType.AMBIGUOUS:
+                            return self._handle_ambiguous_direct(db, requirement, requirement_id)
+                        elif intent_result.intent == IntentType.OUT_OF_SCOPE:
+                            return self._handle_out_of_scope(db, requirement, requirement_id)
+                        elif intent_result.intent == IntentType.SKILL:
+                            # SKILL 进入完整工作流：SkillLoader 会将该技能的 SKILL.md
+                            # 注入编码 Prompt，Coder 可经 run_skill 工具编排/组合子技能。
+                            logger.info(
+                                f"需求 {requirement_id} 命中工作流技能: "
+                                f"{intent_result.skill_name}，进入完整工作流"
+                            )
+
+                    except Exception:
+                        intent_status = "error"
+                        raise
+                    finally:
+                        intent_tracer.end_trace(intent_trace.trace_id, status=intent_status)
+
                 # 初始化 harness 各层
                 workspace = WorkspaceFS(requirement.user_id, requirement_id)
                 workspace.init(requirement.code_files)
@@ -457,6 +475,7 @@ class RequirementService:
                 # 开始链路追踪
                 trace = tracer.start_trace(requirement_id, requirement.user_id)
                 initial_state['metadata']['trace_id'] = trace.trace_id
+                bind_turn_index(initial_state['metadata'].get('turn_index', 0))
     
                 from harness.observability import progress_plan as _pp_seq
                 sse.progress(
@@ -490,6 +509,7 @@ class RequirementService:
                         flag_modified(requirement, 'dialogue_history')
                     requirement.status = 'pending'
                     db.commit()
+                    self._close_trace(tracer, trace.trace_id, requirement_id, sse, status='paused')
                     return True
     
                 # TL 完成（成功或失败），暂停等待用户确认 Plan
@@ -508,6 +528,8 @@ class RequirementService:
                     requirement.status = 'planning'
                     db.commit()
                     logger.info(f"[Service] 需求 {requirement_id} 进入 planning 状态，等待用户确认")
+                    self._close_trace(tracer, trace.trace_id, requirement_id, sse,
+                                      status='awaiting_confirmation')
                     return True
     
                 # 处理最终状态
@@ -524,6 +546,9 @@ class RequirementService:
                 return False
     
             finally:
+                if tracer and trace:
+                    self._close_trace(tracer, trace.trace_id, requirement_id, status='error')
+                clear_log_context()
                 # 清理 ContextVar，避免线程池复用时下一个任务拿到上一个任务的 tool_loop/workspace
                 clear_harness_components()
                 # 任务结束：回收 SPEC 推送标记与取消信号，避免全局集合无界增长
@@ -781,27 +806,27 @@ class RequirementService:
                     db.commit()
                     logger.info(f"[ConfirmPlan] 需求 {requirement_id} 有反馈，重置状态重新走完整工作流")
     
-                # 异步重新执行完整工作流（经由 task_queue 提交：
-                # 获得全局并发上限，且不阻塞进程退出；在新的 RequirementService
-                # 实例上执行，避免状态污染）。
-                # dedupe=False：本函数**自身就跑在需求 X 的任务里**，默认去重会把
-                # 这个后续任务判定成"已在处理中"直接丢弃 —— 结果是状态被置回
-                # pending 但没有任何 worker 接手，需求永久卡住。
-                from services.task_queue import task_queue
-                new_service = RequirementService()
-                task_id = task_queue.submit(
-                    requirement_id,
-                    new_service.process_requirement,
-                    requirement_id,
-                    dedupe=False,
-                )
-                if task_id is None:
-                    logger.error(
-                        f"[ConfirmPlan] 需求 {requirement_id} 的反馈重跑任务提交失败，"
-                        "需求已重置为 pending 但无人接手"
+                    # 异步重新执行完整工作流（经由 task_queue 提交：
+                    # 获得全局并发上限，且不阻塞进程退出；在新的 RequirementService
+                    # 实例上执行，避免状态污染）。
+                    # dedupe=False：本函数**自身就跑在需求 X 的任务里**，默认去重会把
+                    # 这个后续任务判定成"已在处理中"直接丢弃 —— 结果是状态被置回
+                    # pending 但没有任何 worker 接手，需求永久卡住。
+                    from services.task_queue import task_queue
+                    new_service = RequirementService()
+                    task_id = task_queue.submit(
+                        requirement_id,
+                        new_service.process_requirement,
+                        requirement_id,
+                        dedupe=False,
                     )
-                    return False
-                return True
+                    if task_id is None:
+                        logger.error(
+                            f"[ConfirmPlan] 需求 {requirement_id} 的反馈重跑任务提交失败，"
+                            "需求已重置为 pending 但无人接手"
+                        )
+                        return False
+                    return True
     
                 requirement.status = 'processing'
                 db.commit()
@@ -822,6 +847,7 @@ class RequirementService:
             finally:
                 clear_harness_components()
 
+    @llm_context(stage='planning')
     def _continue_from_plan_checkpoint(self, db, requirement, requirement_id: int) -> bool:
         """从「TL 已出 plan、等确认」的检查点直接进入 Post-Plan 编码流程。
 
@@ -838,6 +864,9 @@ class RequirementService:
         from harness.observability.cost import shared_cost_tracker
         from sqlalchemy.orm.attributes import flag_modified
 
+        tracer = None
+        trace = None
+        bind_requirement(requirement_id)
         try:
     
             # ---- 初始化 harness 组件 ----
@@ -904,6 +933,7 @@ class RequirementService:
             # 开始链路追踪
             trace = tracer.start_trace(requirement_id, requirement.user_id)
             initial_state['metadata']['trace_id'] = trace.trace_id
+            bind_turn_index(initial_state['metadata'].get('turn_index', 0))
     
             from harness.observability import progress_plan as _pp_confirm
             sse.progress(
@@ -937,6 +967,9 @@ class RequirementService:
             return False
     
         finally:
+            if tracer and trace:
+                self._close_trace(tracer, trace.trace_id, requirement_id, status='error')
+            clear_log_context()
             clear_harness_components()
 
     @staticmethod
@@ -1170,8 +1203,6 @@ class RequirementService:
                     from sqlalchemy.orm.attributes import flag_modified
                     flag_modified(requirement, 'dialogue_history')
                 db.commit()
-                # 保存 trace（供诊断）
-                self._save_trace_on_failure(final_state, requirement_id, tracer)
                 # 推送 evaluator_result SSE（确保前端能看到评估数据）
                 if evaluator_data_for_failure:
                     try:
@@ -1213,6 +1244,8 @@ class RequirementService:
                 except Exception as e:
                     logger.warning(f"记忆记账回填失败（不阻断）：{e}")
 
+                # 负样本反思也可能调用 LLM，收尾放在经验学习之后。
+                self._save_trace_on_failure(final_state, requirement_id, tracer)
                 return True
 
             requirement.status = 'finished'
@@ -1248,14 +1281,6 @@ class RequirementService:
                 db.commit()
             except Exception as e:
                 logger.warning(f"[Delivery] handoff 折叠失败（不阻断）: {e}")
-
-            # 完成追踪
-            trace_id = final_state.get('metadata', {}).get('trace_id', '')
-            if trace_id and tracer:
-                tracer.end_trace(trace_id)
-                trace_data = tracer.get_trace(trace_id)
-                if trace_data:
-                    sse.trace_summary(requirement_id, trace_data.to_dict())
 
             # 任务成功完成，清除检查点（避免下次误恢复已完成任务）
             # 注：此处必须自建 CheckpointManager —— 之前直接引用未定义的
@@ -1314,6 +1339,14 @@ class RequirementService:
             except Exception as e:
                 logger.warning(f"经验学习失败（不阻断）：{e}")
 
+            # 完成追踪
+            trace_id = final_state.get('metadata', {}).get('trace_id', '')
+            if trace_id and tracer:
+                tracer.end_trace(trace_id)
+                trace_data = tracer.get_trace(trace_id)
+                if trace_data:
+                    sse.trace_summary(requirement_id, trace_data.to_dict())
+
             self._send_complete(requirement_id)
             return True
 
@@ -1324,6 +1357,20 @@ class RequirementService:
             # 失败时也保存 trace（供诊断）
             self._save_trace_on_failure(final_state, requirement_id, tracer)
             return False
+
+    @staticmethod
+    def _close_trace(tracer, trace_id, requirement_id, sse=None, status="finished"):
+        if not tracer or not trace_id:
+            return
+        try:
+            trace = tracer.get_trace(trace_id)
+            if not trace or trace.status != "running":
+                return
+            tracer.end_trace(trace_id, status=status)
+            if sse:
+                sse.trace_summary(requirement_id, tracer.get_trace(trace_id).to_dict())
+        except Exception as exc:
+            logger.warning("[Trace] 收尾失败（不阻断）：%s", exc)
 
     def _save_trace_on_failure(self, final_state, requirement_id, tracer):
         """失败时也保存链路追踪数据，供后续诊断"""

@@ -47,26 +47,32 @@
 
         <div class="sum-card">
           <span class="sum-label">总 Token</span>
-          <span class="sum-value">{{ summary.tokens > 0 ? fmtCount(summary.tokens) : '—' }}</span>
+          <span class="sum-value">{{ summary.tokens > 0 || (summary.usage_reported_calls ?? 0) > 0 || summary.llm_calls === 0 ? fmtCount(summary.tokens) : '—' }}</span>
           <span class="sum-sub">
-            <template v-if="summary.tokens > 0">
+            <template v-if="summary.tokens > 0 || (summary.usage_reported_calls ?? 0) > 0 || summary.llm_calls === 0">
               in {{ fmtCount(summary.tokens_in) }} · out {{ fmtCount(summary.tokens_out) }}
             </template>
-            <template v-else>仅部分调用记录 usage</template>
+            <template v-else>调用未上报 usage</template>
           </span>
+          <span class="sum-sub">usage 覆盖率 {{ formatUsagePercent(summary.usage_coverage) }} · {{ summary.usage_reported_calls ?? '—' }} / {{ summary.llm_calls }} 次调用</span>
           <!-- 缓存命中单独一行：它是 in 的**子集**，塞进上一行会被读成第三类 token。
                分母只含上报过缓存信息的调用，样本量一并给出（见首页同款注释）。 -->
-          <span v-if="summary.cache_hit_rate != null" class="sum-sub">
-            缓存命中 {{ fmtCount(summary.cached_tokens) }}
-            · {{ (summary.cache_hit_rate * 100).toFixed(1) }}% of 输入
-            · {{ summary.cache_reported_calls }} 次上报
+          <span class="sum-sub" :title="cacheUsageTitle(summary)">
+            缓存命中 {{ formatUsagePercent(summary.cache_hit_rate) }}
+            · 输入覆盖率 {{ formatUsagePercent(summary.cache_coverage) }}
+          </span>
+          <span v-if="summary.cache_reported_calls" class="sum-sub">
+            {{ fmtCount(summary.cached_tokens) }} / {{ fmtCount(summary.cache_reported_tokens_in ?? 0) }} 已上报输入 token
+            · {{ summary.cache_reported_calls }} 次调用
           </span>
         </div>
 
         <div class="sum-card">
-          <span class="sum-label">总成本</span>
-          <span class="sum-value">{{ summary.cost > 0 ? formatCost(summary.cost) : '—' }}</span>
+          <span class="sum-label">累计估算成本 USD</span>
+          <span class="sum-value">{{ formatCost(reportedCost(summary.cost, summary.usage_reported_calls, summary.llm_calls)) }}</span>
           <span class="sum-sub">{{ modelSummary }}</span>
+          <span v-if="summary.cost_fallback_calls" class="sum-sub accounting-warning">{{ summary.cost_fallback_calls }} 次调用按兜底价估算</span>
+          <span v-if="summary.cache_savings != null" class="sum-sub" :title="cacheSavingsTitle(summary)">已知样本缓存净节省 USD {{ formatCost(summary.cache_savings) }}</span>
         </div>
 
         <!-- 重试 / 修复：判定序列直接取 verify 里程碑的 verdict，不靠猜 -->
@@ -173,7 +179,8 @@ import { adminFetch } from '@/composables/useAdmin'
 // 状态的中文名与语义档位与首页列表共用一份（见 ./statusMeta）
 import { statusLabel, statusTone } from './statusMeta'
 // 成本展示口径与首页列表共用一份（见 @/utils/cost）
-import { formatCost } from '@/utils/cost'
+import { formatCost, reportedCost } from '@/utils/cost'
+import { cacheSavingsTitle, cacheUsageTitle, formatUsagePercent } from '@/utils/usageDisplay'
 import { fmtClock, fmtCount, fmtDuration, fmtFull, fmtTime } from '@/utils/format'
 import type { Contract, Detail, Ev, Summary, TraceOwner, Turn } from '@/types/trace'
 
@@ -432,6 +439,7 @@ onBeforeUnmount(() => { dragging.value = 0 })
 </script>
 
 <style scoped>
+.accounting-warning { color: var(--color-warning); }
 .back-btn {
   display: inline-flex; align-items: center; gap: 5px; padding: 6px 12px;
   border: 1px solid oklch(88% 0.02 75); border-radius: 8px; background: #fff;

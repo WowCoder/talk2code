@@ -17,11 +17,12 @@
 """
 from datetime import datetime, timedelta
 
-from sqlalchemy import func, distinct
+from sqlalchemy import func, distinct, or_
 
 from config import settings
 from utils.db import get_db
 from services.market.heat import compute_heat, display_heat
+from services.usage_summary import summarize_usage, usage_scope_condition
 
 TOP_N = 20
 
@@ -43,6 +44,7 @@ def collect_metrics() -> dict:
         User, Requirement, PublishedSite, SiteLike, SiteComment, SiteVisitDedup,
         InviteCode, AgentTrace,
     )
+    from models.models import AgentEvent
 
     now = datetime.utcnow()
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -189,21 +191,26 @@ def collect_metrics() -> dict:
         invite_conversion = round(used / issued, 4) if issued else 0.0
 
         # ---------- 技术侧（可观测性） ----------
+        other_trace_ids = db.query(AgentEvent.trace_id).filter(
+            AgentEvent.trace_id.isnot(None),
+            AgentEvent.meta['origin'].as_string().in_(('independent', 'evaluation')))
+        requirement_trace_ids = db.query(AgentEvent.trace_id).filter(
+            AgentEvent.trace_id.isnot(None), usage_scope_condition('requirement'))
+        # Traces without origin-bearing events are legacy; mixed traces retain
+        # their requirement execution, while wholly independent traces stay out.
+        requirement_trace = or_(AgentTrace.trace_id.notin_(other_trace_ids),
+                                AgentTrace.trace_id.in_(requirement_trace_ids))
         traces_7d = (
             db.query(func.count(AgentTrace.id))
-            .filter(AgentTrace.created_at >= week_ago)
+            .filter(AgentTrace.created_at >= week_ago, requirement_trace)
             .scalar() or 0
         )
         avg_duration = (
             db.query(func.coalesce(func.avg(AgentTrace.duration_ms), 0))
-            .filter(AgentTrace.created_at >= week_ago)
+            .filter(AgentTrace.created_at >= week_ago, requirement_trace)
             .scalar() or 0
         )
-        total_cost = (
-            db.query(func.coalesce(func.sum(AgentTrace.total_cost), 0))
-            .filter(AgentTrace.created_at >= week_ago)
-            .scalar() or 0
-        )
+        usage_7d = summarize_usage(db, since=week_ago)
 
     return {
         'users': {
@@ -238,6 +245,9 @@ def collect_metrics() -> dict:
         'observability': {
             'traces_7d': traces_7d,
             'avg_duration_ms': round(float(avg_duration or 0), 1),
-            'cost_7d': round(float(total_cost or 0), 4),
+            'cost_7d': usage_7d['cost'],
+            'cost_currency': usage_7d['cost_currency'],
+            'cost_is_estimate': usage_7d['cost_is_estimate'],
+            'usage_7d': usage_7d,
         },
     }

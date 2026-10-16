@@ -277,6 +277,14 @@ class ToolCallLoop:
 
             # ---- LLM 调用失败 → 立即终止，不在循环内死磕 ----
             if response.is_error:
+                # 客户端已采集实际请求；此处补错误阶段。兼容客户端也保留其 usage。
+                from harness.observability.trace_writer import record_llm_turn
+                record_llm_turn(
+                    req_id, stage='coding', iteration=iteration + 1,
+                    model=getattr(client, 'model', None), messages=messages,
+                    response=response, status='error', turn_index=turn_index,
+                    trace_id=trace_id, writer=self._trace_writer,
+                )
                 logger.error(
                     f"[ToolLoop] LLM 调用失败 (iter {iteration + 1}): "
                     f"{response.error or response.content[:200]}"
@@ -291,16 +299,12 @@ class ToolCallLoop:
                 break
 
             # 记录本轮 token 用量 + 结束 span（真实耗时 = start_span 到此刻）
-            # ⚠️ 这里**不再**调 cost_tracker.record：编码调用的记账已收口到
-            #    紧随其后的 record_llm_turn（所有 LLM 调用的唯一记账点），
-            #    两处都记会让同一轮被计两次、成本翻倍。
-            #    这里只把「本轮用了多少 token」写进 span 元数据，供进度展示。
+            # 实际请求已由客户端记账，此处只写 span 的本轮进度数据。
             if span:
                 if response.usage and self.cost_tracker:
-                    _tin, _tout = self.cost_tracker.extract_usage(
-                        response.usage, client.provider
-                    )
-                    span.metadata["tokens"] = _tin + _tout
+                    from harness.observability.usage import normalize_usage
+                    _usage = normalize_usage(response.usage, client.provider)
+                    span.metadata["tokens"] = _usage['input_tokens'] + _usage['output_tokens']
                 self.tracer.end_span(span)
 
             # 统一埋点：文件明细（AGENT_EXEC_LOG=1）+ 运营后台索引。

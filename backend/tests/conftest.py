@@ -21,6 +21,28 @@ os.environ.setdefault('DATABASE_NAME', 'test_vcd.db')
 os.environ['DATABASE_URL'] = ''
 os.environ.setdefault('APP_DEBUG', 'false')
 os.environ.setdefault('DISABLE_RATE_LIMIT', 'true')  # Disable rate limiting for tests
+os.environ['LLM_ACCOUNTING_REPLAY_INTERVAL_SECONDS'] = '0'
+
+
+@pytest.fixture(autouse=True)
+def _isolate_llm_accounting_spool(tmp_path, monkeypatch):
+    from harness.observability import llm_accounting
+    monkeypatch.setattr(llm_accounting, '_spool_directory', lambda: tmp_path / 'pending')
+
+
+@pytest.fixture(autouse=True)
+def _block_unmarked_external_http(request, monkeypatch):
+    """Ordinary regressions must not contact a configured paid LLM endpoint."""
+    if request.node.get_closest_marker('slow') or request.node.get_closest_marker('e2e'):
+        return
+    from urllib.parse import urlsplit
+    import requests
+    original = requests.sessions.Session.request
+    def local_only(session, method, url, *args, **kwargs):
+        if urlsplit(str(url)).hostname not in {'localhost', '127.0.0.1', '::1'}:
+            raise requests.ConnectionError('External HTTP is disabled in ordinary tests; mock transport')
+        return original(session, method, url, *args, **kwargs)
+    monkeypatch.setattr(requests.sessions.Session, 'request', local_only)
 
 
 @pytest.fixture(autouse=True)
