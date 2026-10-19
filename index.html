@@ -11,7 +11,7 @@
 
 <meta property="og:type" content="website" />
 <meta property="og:title" content="Talk2Code · 用一句话，生成一个能跑、能发布、能被人看到的应用" />
-<meta property="og:description" content="多智能体协同：需求分析 → 批量编码 → 真实浏览器逐条验收 → 一键发布 → 上架创意市集。21 个回归任务守护质量。" />
+<meta property="og:description" content="多智能体协同：需求分析 → 批量编码 → 真实浏览器逐条验收 → 一键发布 → 上架创意市集。31 个回归任务守护质量。" />
 <meta property="og:image" content="assets/logo.png" />
 <meta name="twitter:card" content="summary_large_image" />
 
@@ -287,6 +287,52 @@
   }
   .intel-c .metric strong{font-size:20px;color:var(--red);font-weight:750;letter-spacing:-.02em}
 
+  /* ---------- observability ---------- */
+  .tmock{
+    max-width:900px;margin:0 auto;background:#fff;border:1px solid var(--line);
+    border-radius:var(--radius);padding:18px 18px 14px;box-shadow:var(--shadow-s);
+  }
+  .tmock-head{display:flex;align-items:center;gap:12px;font-size:13px;color:var(--muted);margin-bottom:14px}
+  .tmock-head b{color:var(--ink);font-weight:650}
+  .tmock-ok{
+    margin-left:auto;font-size:11.5px;font-weight:700;color:#1E8A4C;
+    background:rgba(30,138,76,.1);padding:3px 9px;border-radius:6px;white-space:nowrap;
+  }
+  .tmock-bar{display:flex;gap:4px;margin-bottom:14px}
+  .tb{
+    display:flex;flex-direction:column;justify-content:center;gap:2px;height:38px;
+    padding:0 9px;border-radius:5px;color:#fff;font-size:11.5px;
+    white-space:nowrap;overflow:hidden;
+  }
+  .tb em{font-style:normal;font-size:10.5px;opacity:.78}
+  .tb-plan{flex:3;background:#6C5BD4}
+  .tb-code{flex:2;background:#2E8B57}
+  .tb-verify{flex:4;background:#3AA76D}
+  .tb-deliver{flex:1;min-width:52px;background:#232329}
+  .tmock-kpi{
+    display:flex;flex-wrap:wrap;gap:8px 22px;padding:12px 2px;
+    border-top:1px dashed var(--line);border-bottom:1px dashed var(--line);
+    font-size:12.5px;color:var(--muted);
+  }
+  .tmock-kpi b{
+    color:var(--ink);font-size:15px;font-weight:700;letter-spacing:-.01em;margin-right:3px;
+  }
+  .tmock-events{margin-top:11px;display:flex;flex-direction:column;gap:8px}
+  .tevt{display:flex;align-items:center;gap:9px;font-size:12.5px;color:var(--ink-2)}
+  .tevt i{width:7px;height:7px;border-radius:50%;flex:none}
+  .tevt em{margin-left:auto;font-style:normal;font-size:11.5px;color:var(--faint)}
+  .d-intent{background:#3B82F6}
+  .d-clarify{background:#D9A21B}
+  .d-llm{background:#E2632E}
+  .tmock-cap{margin:12px 0 30px;text-align:center;font-size:12.5px;color:var(--muted)}
+  .obs-note{
+    margin:22px auto 0;max-width:800px;text-align:center;font-size:13.5px;color:var(--muted);
+  }
+  .obs-note code{
+    font:12.5px var(--mono);background:var(--soft-2);border:1px solid var(--line);
+    border-radius:5px;padding:1px 6px;color:var(--ink-2);white-space:nowrap;
+  }
+
   /* ---------- architecture ---------- */
   .arch{
     background:var(--dark);border-radius:var(--radius);overflow:hidden;
@@ -390,6 +436,7 @@
       <a href="#workflow">工作流</a>
       <a href="#ship">发布与市集</a>
       <a href="#quality">工程质量</a>
+      <a href="#observability">可观测性</a>
       <a href="#arch">架构</a>
       <a href="#start">快速开始</a>
     </div>
@@ -419,8 +466,8 @@
     <div class="stats">
       <div class="stat"><b>3</b><span>个智能体分工协作</span></div>
       <div class="stat"><b>14</b><span>个内置品类技能包</span></div>
-      <div class="stat"><b>21</b><span>个回归任务守护质量</span></div>
-      <div class="stat"><b>66</b><span>条断言自动执行，不抽样</span></div>
+      <div class="stat"><b>31</b><span>个回归任务守护质量</span></div>
+      <div class="stat"><b>99</b><span>条断言自动执行，不抽样</span></div>
     </div>
 
     <div class="flow" role="list" aria-label="从需求到发布的完整链路">
@@ -615,8 +662,8 @@
       </div>
       <div class="intel-c rv">
         <span class="n">EVAL</span>
-        <h3>21 个回归任务</h3>
-        <p>固化的任务共 66 条断言，覆盖 ES Module、外部 CDN 依赖、跨文件引用、小游戏交互等真实场景。改核心逻辑前后各跑一次基线做对照，<b>用数据判断这次改动到底更好还是更差</b>。</p>
+        <h3>31 个回归任务</h3>
+        <p>固化的任务共 99 条断言，覆盖 ES Module、外部 CDN 依赖、跨文件引用、小游戏交互，以及表格、响应式导航、拖拽、图表等真实场景。改核心逻辑前后各跑一次基线做对照，<b>用数据判断这次改动到底更好还是更差</b>。</p>
         <div class="metric">改前改后 <strong>逐条比对</strong></div>
       </div>
       <div class="intel-c rv">
@@ -629,13 +676,78 @@
   </div>
 </section>
 
+<!-- ============ OBSERVABILITY ============ -->
+<section id="observability">
+  <div class="wrap">
+    <div class="center">
+      <span class="eyebrow">可观测性</span>
+      <h2>出了问题，得说得清卡在哪一步</h2>
+      <p class="sec-lead">
+        生成类系统最容易变成黑盒：跑得慢、花得多、验收没通过，却说不清为什么。
+        每一次需求执行都留下一条可回查的 trace——阶段、调用、token、成本、缓存命中，一路能点到底。
+      </p>
+    </div>
+
+    <div class="tmock rv" aria-hidden="true">
+      <div class="tmock-head">
+        <span><b>需求 #225</b> · 一个极简待办清单页面</span>
+        <span class="tmock-ok">已完成 · 3m 9s</span>
+      </div>
+      <div class="tmock-bar">
+        <span class="tb tb-plan">规划<em>55s</em></span>
+        <span class="tb tb-code">编码<em>29s</em></span>
+        <span class="tb tb-verify">验收<em>1m 34s</em></span>
+        <span class="tb tb-deliver">交付<em>—</em></span>
+      </div>
+      <div class="tmock-kpi">
+        <span><b>12</b>次调用</span>
+        <span><b>131.2k</b>token</span>
+        <span><b>$0.0552</b>估算成本</span>
+        <span><b>59.0%</b>缓存命中</span>
+      </div>
+      <div class="tmock-events">
+        <div class="tevt"><i class="d-intent"></i><span>意图识别</span><em>task · 10:36:24</em></div>
+        <div class="tevt"><i class="d-clarify"></i><span>需求待澄清</span><em>1 个问题 · 10:36:25</em></div>
+        <div class="tevt"><i class="d-llm"></i><span>LLM 调用 · 2 messages · 15s</span><em>10:36:47</em></div>
+      </div>
+    </div>
+    <p class="tmock-cap">示意图：一条真实轨迹的阶段、成本与事件，任意一条都能在后台点开看完整的请求与响应</p>
+
+    <div class="intel">
+      <div class="intel-c rv">
+        <span class="n">TRACE</span>
+        <h3>每次执行一条链路</h3>
+        <p>规划 → 编码 → 验收 → 修复 → 交付五段式时间线，下钻到每次 LLM 调用与工具调用，多轮重跑按需求聚合。<b>阶段与事件类型单点定义</b>，前端从接口拉契约。</p>
+        <div class="metric">事件类型 <strong>单点定义</strong></div>
+      </div>
+      <div class="intel-c rv">
+        <span class="n">COST</span>
+        <h3>成本可对账</h3>
+        <p>每个真实请求一个 <b>attempt_id</b>，记录 token、估算成本与 KV-cache 命中；<b>未知不当零</b>，覆盖率如实给出。独立调用与离线评测单列，不混进用户需求费用。</p>
+        <div class="metric">未知 <strong>不当零</strong></div>
+      </div>
+      <div class="intel-c rv">
+        <span class="n">CLOSED LOOP</span>
+        <h3>线上与离线同构</h3>
+        <p>回归任务写隔离的轨迹库，后台用同一套时间线渲染。线上发现的失败模式，可以直接变成一条评测用例，再交给 CI 守住。</p>
+        <div class="metric">一套渲染 <strong>两处复用</strong></div>
+      </div>
+    </div>
+
+    <p class="obs-note">
+      记账先落本地持久队列再入库，按 <code>attempt_id</code> 幂等补记，进程崩溃重启后自动补齐、不重发请求；
+      日志按模块互斥分流，<code>/api/metrics</code> 输出 Prometheus 文本——不引入重型依赖，出口保持标准形态。
+    </p>
+  </div>
+</section>
+
 <!-- ============ ARCH ============ -->
 <section id="arch">
   <div class="wrap">
     <div class="center">
       <span class="eyebrow">架构与技术栈</span>
       <h2>一条链路，看得清楚</h2>
-      <p class="sec-lead">前端实时呈现 Agent 思考与产出，后端用 LangGraph 编排，全程 SSE 流式回传；沙箱、边界、可观测性横切全程。</p>
+      <p class="sec-lead">前端实时呈现 Agent 思考与产出，后端用 LangGraph 编排，全程 SSE 流式回传；沙箱与能力边界横切全程，执行链路见上一节的轨迹后台。</p>
     </div>
     <div class="arch rv">
       <img src="assets/architecture.svg" alt="Talk2Code 架构流程图：三个 Agent 节点、交付门禁、一键发布、创意市集与横切能力" loading="lazy" />
