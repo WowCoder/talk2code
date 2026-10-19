@@ -43,7 +43,8 @@
 | 🚦 **Delivery gate** | Critical defects must reach zero before release; no "it runs, ship it" |
 | 🚀 **One-click publish** | Artifacts become a shareable dedicated-subdomain URL, re-verified after publishing |
 | 🛒 **Creation Market** | Opt-in public listing with deduplicated visitors and weighted hotness ranking |
-| 🔁 **Learns from mistakes** | 21 regression tasks + cross-session memory |
+| 🔍 **Every step attributable** | One trace per run: stage timeline plus tokens / cost / cache hits for every call, failures pinned to the exact step |
+| 🔁 **Learns from mistakes** | 31 regression tasks (99 assertions) + cross-session memory |
 
 ## 🛠 Tech Stack
 
@@ -87,7 +88,7 @@ talk2code/
 │   ├── harness/         # agent runtime: instructions / tools / state / constraints / observability
 │   └── services/        # publish / market / notify / invite / sse / task_queue
 ├── frontend-vue/        # Vue 3 + TypeScript frontend (views / components / stores / composables)
-├── eval/                # 21 regression tasks and the CI quality baseline
+├── eval/                # 31 regression tasks and the CI quality baseline
 ├── docker-compose.yml   # PostgreSQL (pgvector) + Redis
 └── openspec/            # OpenSpec spec-driven development records
 ```
@@ -102,6 +103,8 @@ talk2code/
 
 **Engineering quality** — patterns that are guaranteed to break in the preview sandbox (ES Modules, external CDN scripts) are rejected before a file is written; functions referenced across files are checked against what's actually exported; requests that would need a backend get their limits stated up front, along with alternatives that can still be delivered; progress is reported per action ("creating js/app.js", "2/4 done").
 
+**Observability** — one trace per run: a stage timeline plus tokens, estimated cost and KV-cache hits for every LLM call, so a failure points at the exact step. Standalone calls and offline evals are accounted separately, and unknown data stays unknown. See the [observability design](docs/observability-design.md).
+
 Details live in [Architecture & Design](docs/ARCHITECTURE.md).
 
 ## ⚠️ Notes
@@ -111,11 +114,11 @@ Details live in [Architecture & Design](docs/ARCHITECTURE.md).
 3. **Reverse proxy**: do not enable `TRUST_PROXY_HEADERS=true` unless behind a trusted proxy, otherwise rate-limit IPs can be spoofed.
 4. **Registration**: invite codes are required by default (single use, 7 days). Use `python manage.py invite create --count N` during private beta, or follow the request → admin approval flow.
 5. **Publishing**: with an empty `PUBLISH_APEX`, publish endpoints return warnings and the UI says the link is unavailable instead of handing out a dead URL.
-6. **Debugging**: `backend/logs/` holds `app` / `agent` / `llm` / `llm_traffic` (JSON Lines, 7-day rotation) / `agent_exec` (needs `AGENT_EXEC_LOG=true`; the first place to look when an agent keeps re-reading the same file without producing anything).
+6. **Debugging path**: start from the requirement (`grep 'req=76' backend/logs/*.log`), then follow `trace=xxx` from the log back into `agent_traces`; `llm_traffic.log` pairs requests and responses by `call_id` for 400/500 and endpoint-validation problems; for "the agent keeps re-reading the same file without producing anything", set `AGENT_EXEC_LOG=true` and read `agent_exec` (off by default). Channels and fields are covered in the [observability design](docs/observability-design.md).
 
 ## ✅ Quality
 
-`eval/tasks/tasks.yaml` pins 21 regression tasks covering real historical failure modes (ES Module/CORS, CDN sandbox, broken cross-file exports, …). On every PR to `main`, CI runs the full eval against a golden baseline (20/21 = 95.2%); a lower pass rate fails the gate.
+`eval/tasks/tasks.yaml` pins 31 regression tasks with 99 assertions, covering real historical failure modes (ES Module/CORS, CDN sandbox, broken cross-file exports, …) as well as common artifact shapes such as tables, responsive navs, drag-and-drop and charts. On every PR to `main`, CI runs the full eval against the golden baseline in `eval/baseline_golden.json`; a lower pass rate fails the gate.
 
 ```bash
 cd backend && PYTHONPATH=. python ../eval/run_eval.py --no-preview
@@ -134,6 +137,7 @@ Drop `--no-preview` to enable real-browser acceptance: headless Chromium loads t
 | Doc | Contents |
 |-----|----------|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How it works today: acceptance model, delivery gate, context pipeline, memory, publishing & market, sandbox, observability. **Kept in sync with the code — start here** |
+| [docs/observability-design.md](docs/observability-design.md) | Observability: the five channels and two endpoint families, log fields and debugging recipes, trace / cost / usage-accounting rules |
 | [docs/design/](docs/design/) | Design notes and rationale per module — the "why", not the current state. Details may lag behind the code |
 | [openspec/](openspec/) | OpenSpec spec-driven development records |
 

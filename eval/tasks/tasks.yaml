@@ -1,4 +1,4 @@
-# Eval 任务集 —— 21 个固定需求，从简单到复杂
+# Eval 任务集 —— 31 个固定需求，从简单到复杂
 # 每个任务包含 id / name / requirement（用户原话）/ 断言列表。
 # 断言类型：
 #   file_exists:        指定文件存在
@@ -8,8 +8,10 @@
 #   preview_no_error:   Playwright 运行 index.html 无 pageerror/console.error
 #   file_min_lines:     某文件行数 ≥ N（防偷懒空文件）
 #
-# 难度分级：L1 单页静态(5) / L2 交互+本地存储(7) / L3 复杂多状态+回归专项(6) / L4 综合(3)
-# 编号约定：t01..t21，按难度递增（t21 为回归专项，归入 L3）
+# 难度分级：L1 单页静态(8) / L2 交互+本地存储(10) / L3 复杂多状态+回归专项(9) / L4 综合(4)
+# 编号约定：t01..t21 为第一批（按难度递增，t21 为回归专项、归入 L3）；
+#           t22..t31 为第二批扩展（补齐表格 / 响应式 / 拖拽 / 图表 / 复杂表单等场景），
+#           追加在文件末尾，不重排既有编号 —— 历史基线与 run 目录都按 id 引用。
 
 tasks:
   # ===== L1: 单页静态展示（5）=====
@@ -219,4 +221,114 @@ tasks:
       - {type: content_not_contains, filename: index.html, text: "type=\"module\""}
       # ENV-2：无网络沙箱，CDN 必挂（#110-116 多次踩坑）
       - {type: content_not_contains, filename: index.html, text: "cdn.tailwindcss.com"}
+      - {type: preview_no_error}
+
+  # ===== 第二批扩展（t22..t31）=====
+  # 补齐第一批没覆盖的产物形态：数据表格 / 团队页 / 动效落地页 / 单位换算 /
+  # 生成式表单 / 评分组件 / 拖拽 / 响应式导航 / 图表 / 双栏聊天。
+  # 断言口径与第一批一致：只卡「产物是否成立」，同一个语义有多种合法写法时
+  # 用逗号并集，不逼模型猜我们心里的那一种；运行期错误一律走 preview_no_error。
+
+  - id: t22
+    name: 产品参数对比表
+    level: 1
+    requirement: "做一个三款手机的参数对比表，列是型号，行是价格、屏幕、电池、重量，窄屏时表格可以横向滚动"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: html_has_element, selector: "table"}
+      - {type: preview_no_error}
+
+  - id: t23
+    name: 团队介绍页
+    level: 1
+    requirement: "做一个团队成员介绍页，四个成员卡片（头像占位、姓名、职位、社交链接），两列网格布局"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: html_has_element, selector: "a"}
+      - {type: preview_no_error}
+
+  - id: t24
+    name: 活动报名落地页
+    level: 1
+    requirement: "做一个活动报名落地页，顶部标题有淡入动画，中间三个亮点，底部报名按钮，整体浅色渐变背景"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      # 「报名按钮」可能是 <button>，也可能是 <a class="btn">（跳转语义更常见）
+      - {type: html_has_element, selector: "button, [class*=btn]"}
+      - {type: preview_no_error}
+
+  - id: t25
+    name: 单位换算器
+    level: 2
+    requirement: "做一个单位换算器，长度（米/厘米/英寸）和重量（千克/克/磅）两组单位，选好单位后输入数字实时换算"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      # 单位选择既可能用 <select>，也可能用一排按钮 —— 两者都算合法
+      - {type: html_has_element, selector: "select, input"}
+      - {type: preview_no_error}
+
+  - id: t26
+    name: 密码生成器
+    level: 2
+    requirement: "做一个随机密码生成器，可以调长度（8 到 32 位），勾选是否包含大写、数字、符号，点按钮生成并显示密码强度"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: html_has_element, selector: "input"}
+      - {type: preview_no_error}
+
+  - id: t27
+    name: 五星评分组件
+    level: 2
+    requirement: "做一个五星评分组件，鼠标移到星星上预览分数，点击提交评分，刷新后显示上次的评分"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      # 星星可以是 ★ 文本、<span>、<button>、内联 SVG，也可以由 JS 动态渲染到
+      # 一个容器里（2026-10-19 实测：产物把五星渲染进 <div class="stars">，
+      # 静态 HTML 里没有 span/button/svg —— 只认标签又会误杀合格写法）。
+      - {type: html_has_element, selector: "span, button, svg, [class*=star], [class*=rating]"}
+      - {type: content_contains, filename: script.js, text: "localStorage"}
+      - {type: preview_no_error}
+
+  - id: t28
+    name: 拖拽排序待办
+    level: 3
+    requirement: "做一个可拖拽排序的待办列表，拖动调整顺序，顺序保存在 localStorage，刷新后顺序不变"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      # 用子串 "drag" 而不是字面 "dragstart"：draggable / ondragstart / dragenter 都命中
+      - {type: content_contains, filename: script.js, text: "drag"}
+      - {type: content_contains, filename: script.js, text: "localStorage"}
+      - {type: preview_no_error}
+
+  - id: t29
+    name: 响应式导航栏
+    level: 3
+    requirement: "做一个响应式顶部导航栏，宽屏横向排列菜单，窄屏折叠成汉堡按钮，点击展开或收起菜单"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      # 语义标签与 class 命名两种写法都接受（nav / navbar / menu）
+      - {type: html_has_element, selector: "nav, [class*=nav], [class*=menu]"}
+      - {type: preview_no_error}
+
+  - id: t30
+    name: 月度销售柱状图
+    level: 3
+    requirement: "做一个月度销售柱状图，用 SVG 或 Canvas 画 6 根柱子，鼠标悬停显示当月数值，带坐标轴和月份标签"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      # 不静态断言 <svg>/<canvas>：2026-10-19 实测产物把 SVG 用
+      # document.createElementNS 动态插进 #chart-container，静态 HTML 里只有
+      # 一个空 section —— 只认标签会把「运行后才出生的图表」误杀。
+      # 图表能否真正渲染交给 preview_no_error（运行时无异常）兜底。
+      - {type: preview_no_error}
+
+  - id: t31
+    name: 双栏聊天界面
+    level: 4
+    requirement: "做一个聊天界面，左侧会话列表，右侧消息气泡区分自己和对方，底部输入框回车发送，消息保存到 localStorage"
+    assertions:
+      - {type: file_exists, filename: index.html}
+      - {type: file_min_lines, filename: index.html, min: 40}
+      - {type: content_contains, filename: script.js, text: "localStorage"}
+      - {type: html_has_element, selector: "input"}
       - {type: preview_no_error}

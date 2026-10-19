@@ -248,27 +248,34 @@ L5 Compaction   仅当 L4 装不下时，最旧段交 LLM 摘要注入为一条 
 | 指标端点 | `/api/metrics`（Prometheus 文本）、`/api/health` 系列健康检查 |
 | 执行明细 | `AGENT_EXEC_LOG=true` 时按需求输出 `logs/agent_exec/<req_id>.jsonl` |
 
+查询面：`/admin/traces` 需求轨迹后台（列表 KPI + 阶段时间线 + 轮次切换 + 事件明细，评测集详情复用同一套渲染）；事件类型与阶段在 `harness/observability/event_contract.py` 单点定义，前端从 `/api/admin/traces/contract` 拉取。
+
 原则：按需求聚合而非分流（全局性共因需要跨需求视图才能识别）；自研轻量实现，不引入
-OpenTelemetry；**宁可低估不可高估**——统计口径取不到时归零，绝不产出看似漂亮的假数字。
+OpenTelemetry；**未知不当零**——没有上报的 usage、缓存或价格保留未知状态并给出覆盖率，
+宁可显示「未上报」也不产出看似漂亮的假数字；用户需求、独立调用与离线评测分开记账。
 
 排查入口：`grep 'req=76' backend/logs/*.log` → 从日志里的 `trace=xxx` 回查 `agent_traces`；
-`logs/llm_traffic.log` 按 `call_id` 配对请求/响应，用于定位 400/500 与端点校验问题。
+`logs/llm_traffic.log` 按 `call_id` 配对请求/响应，用于定位 400/500 与端点校验问题；
+后台按需求号直接打开 `/admin/traces/<requirement_id>` 看同一条链路。
 
 ## 学习闭环
 
-`eval/tasks/tasks.yaml` 里固化的 21 个回归任务，覆盖的都是**历史上真实踩过的坑**，
+`eval/tasks/tasks.yaml` 里固化的 31 个回归任务（99 条断言），覆盖的都是**历史上真实踩过的坑**，
 而不是凑数的样例：
 
 - `t21` 贪吃蛇 —— 曾连续七次失败的失败模式专项
 - `ENV-3` —— `file://` 下 ES Module 被 CORS 拦截（需求 #115 的直接死因）
 - `ENV-2` —— 无网络沙箱里 CDN 必挂（#110–116 反复踩坑）
+- `t22`–`t31`（第二批）—— 表格、团队页、动效落地页、单位换算、生成式表单、评分组件、
+  拖拽排序、响应式导航、图表、双栏聊天，补齐第一批没覆盖的产物形态
 
 改 harness 核心时前后各跑一次基线做对照，用数据判断「这次改动到底更好还是更差」，
 而不是靠感觉。
 
-最近一次全量基线（2026-08-31）：20/21 通过（95.2%），唯一未通过项定位为上游模型端点读超时，
-非架构缺陷。完整报告见 `eval/results/baseline_20260831_113741.md`，黄金基线在
-`eval/baseline_golden.json`（CI 门禁对比用）。
+最近一次 21 题全量基线（2026-10-08）：21/21 通过（100%）。更早的 2026-08-31 基线为
+20/21（95.2%），唯一未通过项定位为上游模型端点读超时，非架构缺陷。题库扩到 31 题后，
+`eval/baseline_golden.json` 仍是 21 题时期的门槛，扩题基线需要重跑一次刷新；完整报告见
+`eval/results/`。
 
 标准命令（在 `backend/` 目录下执行）：
 

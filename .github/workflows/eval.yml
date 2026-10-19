@@ -1,7 +1,7 @@
 name: Eval Quality Gate
 
-# 每次向 main 提 PR 自动跑 21 任务生成质量 eval，对比黄金基线（95.2%），
-# 通过率低于黄金基线即判定为质量回归、门禁失败。
+# 每次向 main 提 PR 自动跑 31 任务生成质量 eval，对比黄金基线
+# （eval/baseline_golden.json），通过率低于基线即判定为质量回归、门禁失败。
 #
 # 前置：在仓库 Settings → Secrets 配置 LLM_API_KEY（agnes 端点 Key）。
 #       LLM_BASE_URL / LLM_MODEL 有默认值（agnes），如需换模型可覆盖同名 Secret。
@@ -13,7 +13,7 @@ on:
 
 jobs:
   eval:
-    name: Generation quality eval (21 regression tasks)
+    name: Generation quality eval (31 regression tasks)
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:

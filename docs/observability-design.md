@@ -20,6 +20,11 @@ Talk2Code 内置一套轻量级可观测性设施，目标是**每一次需求�
 | 指标端点 | `/api/metrics`（Prometheus 文本格式）、`/api/health` 系列健康检查 |
 | 执行明细 | 开关控制的 JSONL，记录每轮 LLM 请求/响应与工具调用（开发排查用，默认关闭） |
 
+两条配套机制（不产生新数据，消费上面的表与日志）：
+
+- **需求轨迹后台**：`/admin/traces` 提供按需求聚合的列表与详情（阶段时间线 / 轮次切换 / 事件明细），评测集详情复用同一套渲染。事件类型与阶段由 `event_contract.py` 单点定义，前端启动时从 `/api/admin/traces/contract` 拉取，新增类型不必改前端。
+- **用量记账**：每次真实 HTTP 请求（含重试、错误、备用模型）生成唯一 `attempt_id`，先写本地持久队列再落库，按 `attempt_id` 幂等补记；独立调用与离线评测单列，不混入用户需求费用。口径见 [用量计量设计](design/usage-accounting.md)。
+
 ## 日志
 
 - **位置**：`backend/logs/`，全部日志收敛于同一目录，不随启动目录漂移
@@ -84,4 +89,4 @@ PYTHONPATH=. python scripts/rebuild_usage.py --requirement-id 123 --apply
 
 1. 第二批：评估结果落库，上线质量层指标（首次通过率、验收条件失败分布）
 2. 补全 span 覆盖，形成完整的节点级调用树
-3. 前端单需求执行时间线视图（读 `agent_traces`）
+3. ~~前端单需求执行时间线视图（读 `agent_traces`）~~ —— 已完成：`/admin/traces` 列表与详情，评测集详情复用同一条时间线

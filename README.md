@@ -42,7 +42,8 @@
 | 🚦 **交付门禁** | 关键缺陷清零才放行，杜绝「能跑就行」 |
 | 🚀 **一键发布** | 产物直接变成可分享的独立子域链接，发布后在新环境重跑验收 |
 | 🛒 **创意市集** | 作者同意即可上架公开列表，去重访客 + 加权热度排序 |
-| 🔁 **越用越聪明** | 21 个回归任务 + 跨会话记忆，踩过的坑不再踩 |
+| 🔍 **每一步可归因** | 每次执行一条 trace：阶段时间线 + 每次调用的 token / 成本 / 缓存命中，失败定位到具体那一步 |
+| 🔁 **越用越聪明** | 31 个回归任务（99 条断言）+ 跨会话记忆，踩过的坑不再踩 |
 
 ## 🛠 技术栈
 
@@ -86,7 +87,7 @@ talk2code/
 │   ├── harness/         # Agent 运行时：instructions / tools / state / constraints / observability
 │   └── services/        # publish / market / notify / invite / sse / task_queue
 ├── frontend-vue/        # Vue 3 + TypeScript 前端（views / components / stores / composables）
-├── eval/                # 21 个回归任务与 CI 质量基线
+├── eval/                # 31 个回归任务与 CI 质量基线
 ├── docker-compose.yml   # PostgreSQL(pgvector) + Redis
 └── openspec/            # OpenSpec 规范驱动开发记录
 ```
@@ -101,6 +102,8 @@ talk2code/
 
 **工程质量** — 写入文件前自动拦掉在预览环境里必然跑不起来的写法（ES Module、外部 CDN 脚本等）；跨文件引用的函数会校验是否真的导出；需要后端的需求会在澄清阶段讲清能做什么，并给出照样能交付的替代方案；进度播报到具体动作（「正在创建 js/app.js」「已完成 2/4」）。
 
+**可观测性** — 每次执行一条 trace：阶段时间线、每次 LLM 调用的 token / 估算成本 / KV-cache 命中，失败能定位到具体那一步；独立调用与离线评测分开记账，取不到的数据保留未知。详见 [可观测性设计](docs/observability-design.md)。
+
 实现细节见 [架构与设计](docs/ARCHITECTURE.md)。
 
 ## ⚠️ 使用注意
@@ -110,11 +113,11 @@ talk2code/
 3. **反向代理**：未部署在可信反向代理之后时请勿开启 `TRUST_PROXY_HEADERS=true`，否则限流 IP 可被伪造。
 4. **注册准入**：默认需邀请码（一次性、7 天有效）。内测期可用 `python manage.py invite create --count N` 应急发码，或走「申请 → 后台审批」链路。
 5. **发布能力**：`PUBLISH_APEX` 为空时发布接口返回 warnings，前端提示「链接不可用」而不会给出打不开的地址。
-6. **排查入口**：`backend/logs/` 下 `app` / `agent` / `llm` / `llm_traffic`（JSON Lines，按天轮转 7 天）/ `agent_exec`（需 `AGENT_EXEC_LOG=true`，排查「Agent 反复读同一文件却不出活」的首选）。
+6. **排查路径**：先按需求扫日志 `grep 'req=76' backend/logs/*.log`，再用日志里的 `trace=xxx` 回查 `agent_traces`；`llm_traffic.log` 按 `call_id` 配对请求与响应，定位 400/500 与端点校验问题；「Agent 反复读同一文件却不出活」开 `AGENT_EXEC_LOG=true` 看 `agent_exec`（默认关闭）。完整通道与字段见 [可观测性设计](docs/observability-design.md)。
 
 ## ✅ 质量保障
 
-`eval/tasks/tasks.yaml` 固化 21 个回归任务，覆盖历史上真实踩过的坑（ES Module/CORS、CDN 沙箱、跨文件导出断裂等）。PR 到 `main` 时 CI 自动跑全量 eval 并与黄金基线（20/21 = 95.2%）比对，通过率低于基线即判定质量回归。
+`eval/tasks/tasks.yaml` 固化 31 个回归任务、99 条断言，覆盖历史上真实踩过的坑（ES Module/CORS、CDN 沙箱、跨文件导出断裂等），也覆盖表格、响应式导航、拖拽、图表等常见产物形态。PR 到 `main` 时 CI 自动跑全量 eval 并与 `eval/baseline_golden.json` 的黄金基线比对，通过率低于基线即判定质量回归。
 
 ```bash
 cd backend && PYTHONPATH=. python ../eval/run_eval.py --no-preview
@@ -133,6 +136,7 @@ cd backend && PYTHONPATH=. python ../eval/run_eval.py --no-preview
 | 文档 | 内容 |
 |------|------|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 当前实现说明：验收模型、交付门禁、上下文管线、记忆系统、发布与市集、沙箱、可观测性。**与代码同步维护，从这里看起** |
+| [docs/observability-design.md](docs/observability-design.md) | 可观测性：五条通道与两类端点、日志字段与排查手法、trace / 成本 / 用量记账口径 |
 | [docs/design/](docs/design/) | 各模块的设计记录与决策依据，回答「为什么这么做」。属设计稿，细节可能滞后于代码 |
 | [openspec/](openspec/) | OpenSpec 规范驱动开发记录 |
 
