@@ -7,7 +7,7 @@
 <h1 align="center">Talk2Code</h1>
 
 <p align="center">
-  <b>用一句话，生成一个能跑、能发布、能被人看到的应用。</b>
+  <b>一句话，生成一个能跑、能改、能发布的应用。</b>
 </p>
 
 <p align="center">
@@ -24,13 +24,15 @@
 </p>
 
 <p align="center">
-  <img src="docs/talk2code_pitch.gif" alt="Talk2Code 演示：一句话生成贪吃龙小游戏" width="100%" />
+  <a href="https://wowcoder.github.io/talk2code/#demo"><img src="docs/talk2code_pitch.gif" alt="Talk2Code 产品演示：需求确认、协作开发、验收修复与全程追溯" width="100%" /></a>
 </p>
 
 <p align="center">
   🌐 <a href="https://wowcoder.github.io/talk2code/"><b>项目主页（含完整演示视频）</b></a>
   &nbsp;·&nbsp; 🎬 <a href="https://github.com/WowCoder/talk2code/blob/main/docs/talk2code_pitch.mp4">观看高清视频（MP4）</a>
 </p>
+
+<p align="center"><a href="docs/talk2code_pitch.credits.txt">音乐署名与素材说明</a></p>
 
 ## ✨ 特性
 

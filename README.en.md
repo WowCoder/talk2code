@@ -7,7 +7,7 @@
 <h1 align="center">Talk2Code</h1>
 
 <p align="center">
-  <b>One sentence in. An app that runs, ships, and gets seen.</b>
+  <b>One sentence in. An app that runs, evolves, and ships.</b>
 </p>
 
 <p align="center">
@@ -25,13 +25,15 @@
 </p>
 
 <p align="center">
-  <img src="docs/talk2code_pitch.gif" alt="Talk2Code demo: generating a Snake game from one sentence" width="100%" />
+  <a href="https://wowcoder.github.io/talk2code/#demo"><img src="docs/talk2code_pitch.gif" alt="Talk2Code product demo: clarify, build, verify, iterate, and trace" width="100%" /></a>
 </p>
 
 <p align="center">
   🌐 <a href="https://wowcoder.github.io/talk2code/"><b>Project page (full demo video)</b></a>
   &nbsp;·&nbsp; 🎬 <a href="https://github.com/WowCoder/talk2code/blob/main/docs/talk2code_pitch.mp4">Watch the HD video (MP4)</a>
 </p>
+
+<p align="center"><a href="docs/talk2code_pitch.credits.txt">Music credits and source</a></p>
 
 ## ✨ Features
 
