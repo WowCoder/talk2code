@@ -3,14 +3,14 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Talk2Code · 用一句话，生成一个能跑、能发布、能被人看到的应用</title>
+<title>Talk2Code · 一句话，生成一个能跑、能改、能发布的应用</title>
 <meta name="description" content="Talk2Code：输入自然语言需求，AI 多智能体协同完成需求分析、批量编码与真实浏览器验收，一键发布成可分享的独立网址，还可上架创意市集。" />
 <meta name="theme-color" content="#E23B2E" />
 <link rel="icon" href="assets/logo.png" />
 <link rel="apple-touch-icon" href="assets/logo.png" />
 
 <meta property="og:type" content="website" />
-<meta property="og:title" content="Talk2Code · 用一句话，生成一个能跑、能发布、能被人看到的应用" />
+<meta property="og:title" content="Talk2Code · 一句话，生成一个能跑、能改、能发布的应用" />
 <meta property="og:description" content="多智能体协同：需求分析 → 批量编码 → 真实浏览器逐条验收 → 一键发布 → 上架创意市集。31 个回归任务守护质量。" />
 <meta property="og:image" content="assets/logo.png" />
 <meta name="twitter:card" content="summary_large_image" />
@@ -166,6 +166,8 @@
   .video-card video{width:100%;display:block;background:#000;aspect-ratio:16/9;object-fit:cover}
   .video-note{margin:22px auto 0;max-width:760px;font-size:14px;color:var(--muted);text-align:center}
   .video-note b{color:var(--ink);font-weight:600}
+  .video-credit{margin:12px auto 0;max-width:760px;font-size:12px;color:var(--muted);text-align:center}
+  .video-credit a{text-decoration:underline;text-underline-offset:3px}
   .video-stage{position:relative;line-height:0}
   .video-stage .play-btn{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
     width:78px;height:78px;border:0;border-radius:50%;cursor:pointer;line-height:1;
@@ -453,14 +455,14 @@
 <header class="hero">
   <div class="wrap">
     <span class="pill"><span class="dot"></span>LangGraph 多智能体 · 真实浏览器验收 · 一键发布</span>
-    <h1>用一句话，<br />生成一个<em>能跑、能发布、能被人看到</em>的应用</h1>
+    <h1>一句话，<br />生成一个<em>能跑、能改、能发布</em>的应用</h1>
     <p class="lead">
       输入自然语言需求 → 多智能体协同完成 <b>需求分析 / 批量编码 / 真实浏览器验收</b>
       → 一键发布成<b>可分享的独立网址</b>，还可以上架创意市集。
     </p>
     <div class="cta-row">
       <a class="btn btn-primary" href="https://github.com/WowCoder/talk2code" target="_blank" rel="noopener">查看 GitHub 仓库</a>
-      <a class="btn btn-ghost" href="#demo">观看 60 秒演示 ↓</a>
+      <a class="btn btn-ghost" href="#demo">观看 90 秒演示 ↓</a>
     </div>
 
     <div class="stats">
@@ -490,26 +492,26 @@
 <section id="demo" class="soft">
   <div class="wrap center">
     <span class="eyebrow">端到端演示</span>
-    <h2>75 秒看完整流程</h2>
-    <p class="sec-lead">从一句话需求，到验收通过、可以发给别人打开的应用——全程真实录屏，可复现。点击播放，带旁白解说。</p>
+    <h2>90 秒看懂从需求到应用</h2>
+    <p class="sec-lead">需求澄清、Spec 确认、多智能体开发、浏览器验收与定向修复，再到持续迭代和全程追溯。真实案例重放，等待时间已压缩。</p>
     <div class="video-card rv">
       <div class="video-bar">
         <i style="background:#FF5F57"></i><i style="background:#FEBC2E"></i><i style="background:#28C840"></i>
-        <span class="t">talk2code · 输入需求 → 生成 → 验收 → 放行</span>
+        <span class="t">talk2code · 需求确认 → 协作开发 → 验收修复 → 迭代追溯</span>
       </div>
       <div class="video-stage">
-        <video src="assets/talk2code_pitch.mp4" poster="assets/talk2code_pitch_poster.jpg"
+        <video src="assets/talk2code_pitch.mp4?v=49a820c7" poster="assets/talk2code_pitch_poster.jpg?v=49a820c7"
                controls playsinline preload="metadata"
-               aria-label="Talk2Code 端到端演示录屏"></video>
-        <button class="play-btn" type="button" aria-label="播放演示视频（含旁白解说）">
+               aria-label="Talk2Code 产品演示：从需求澄清到验收修复与全程追溯"></video>
+        <button class="play-btn" type="button" aria-label="播放 Talk2Code 产品演示">
           <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
         </button>
       </div>
     </div>
     <p class="video-note">
-      流程说明：<b>输入一句话需求</b> → 技术负责人拆解方案与验收条件 → 开发工程师批量产出文件
-      → 质量工程师在浏览器里逐条执行验收条件 → <b>评分放行</b> → 一键发布成可分享的网址。
+      <b>输入需求</b> → 澄清与确认 Spec → 开发记录与任务同步 → 逐条验收、定向修复 → 对话迭代 → <b>全程可追溯</b>。
     </p>
+    <p class="video-credit">Music: Eric Skiff — Arpanauts — Resistor Anthems · <a href="https://ericskiff.com/music/" target="_blank" rel="noopener">音乐来源</a> · <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a> · 已剪辑、调整音量并混音</p>
   </div>
 </section>
 
@@ -827,7 +829,7 @@
       <a href="https://github.com/WowCoder/talk2code/blob/main/LICENSE" target="_blank" rel="noopener">MIT License</a>
     </div>
     <div class="fine">
-      Talk2Code · 用一句话，生成一个能跑、能发布、能被人看到的应用 · 本项目基于 MIT License 开源
+      Talk2Code · 一句话，生成一个能跑、能改、能发布的应用 · 本项目基于 MIT License 开源
     </div>
   </div>
 </footer>
